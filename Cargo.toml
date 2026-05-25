@@ -1,0 +1,10 @@
+[package]
+name = "jucode-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossterm = "0.29"
+serde_json = "1"
+unicode-width = "0.2"
+ureq = { version = "2", features = ["json"] }
