@@ -1,9 +1,6 @@
 use crossterm::{
-    cursor::{MoveTo, Show},
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseEventKind,
-    },
+    cursor::{Hide, MoveTo, Show},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     style::ResetColor,
     terminal::{self, Clear, ClearType},
@@ -22,8 +19,6 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(120);
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 128_000;
 const TOOL_OUTPUT_PREVIEW_LINES: usize = 12;
 const TOOL_OUTPUT_PREVIEW_BYTES: usize = 2_000;
-const HISTORY_SCROLL_PAGE_ROWS: usize = 10;
-const HISTORY_SCROLL_WHEEL_ROWS: usize = 3;
 const COMMANDS: &[&str] = &[
     "/help",
     "/config",
@@ -36,8 +31,12 @@ const COMMANDS: &[&str] = &[
     "/quit",
 ];
 const CURSOR_MARKER: &str = "\x1b_jucode:cursor\x07";
+const VISIBLE_CURSOR: &str = "|";
 const HIDE_CURSOR: &str = "\x1b[?25l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
+const SHOW_HARDWARE_CURSOR: bool = false;
+const DISABLE_SCROLL_ON_OUTPUT: &str = "\x1b[?1010l";
+const ENABLE_SCROLL_ON_OUTPUT: &str = "\x1b[?1010h";
 const SYNC_START: &str = "\x1b[?2026h";
 const SYNC_END: &str = "\x1b[?2026l";
 const RESET: &str = "\x1b[0m";
@@ -87,8 +86,6 @@ struct UiLine {
 struct UiDocument {
     history: Vec<UiLine>,
     controls: Vec<UiLine>,
-    history_scroll: usize,
-    viewport_height: usize,
     reset_screen: bool,
 }
 
@@ -101,20 +98,6 @@ struct CursorTarget {
 struct RenderedFrame {
     lines: Vec<String>,
     cursor: Option<CursorTarget>,
-}
-
-impl UiDocument {
-    fn wrapped_history_len(&self, width: usize) -> usize {
-        wrap_lines(&self.history, width).len()
-    }
-
-    fn max_history_scroll(&self, width: usize) -> usize {
-        let history_rows = self.wrapped_history_len(width);
-        let control_rows = wrap_lines(&self.controls, width).len();
-        let (history_capacity, _) =
-            history_layout(history_rows, control_rows, self.viewport_height);
-        history_rows.saturating_sub(history_capacity)
-    }
 }
 
 pub trait TuiRuntime {
@@ -140,9 +123,6 @@ pub struct TuiApp<R> {
     completion_index: usize,
     tree_view: Option<TreeState>,
     pending_messages: Vec<String>,
-    history_scroll: usize,
-    last_history_width: usize,
-    last_history_rows: usize,
     reset_screen: bool,
 }
 
@@ -219,9 +199,6 @@ impl<R: TuiRuntime> TuiApp<R> {
             completion_index: 0,
             tree_view: None,
             pending_messages: Vec::new(),
-            history_scroll: 0,
-            last_history_width: 0,
-            last_history_rows: 0,
             reset_screen: false,
         };
         let events = app.runtime.startup_events();
@@ -250,11 +227,9 @@ impl<R: TuiRuntime> TuiApp<R> {
             }
 
             if render_dirty {
-                let (width, height) = terminal::size()?;
+                let (width, _) = terminal::size()?;
                 let width = width.max(1) as usize;
-                let height = height.max(1) as usize;
-                let mut document = self.build_document(width, height, now);
-                self.prepare_history_scroll(&mut document, width);
+                let document = self.build_document(width, now);
                 renderer.render(&mut stdout, &document)?;
                 if document.reset_screen {
                     self.reset_screen = false;
@@ -273,18 +248,6 @@ impl<R: TuiRuntime> TuiApp<R> {
                     }
                     Event::Resize(_, _) => {
                         renderer.force_full_redraw();
-                        render_dirty = true;
-                    }
-                    Event::Mouse(mouse) => {
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp => {
-                                self.scroll_history_up(HISTORY_SCROLL_WHEEL_ROWS);
-                            }
-                            MouseEventKind::ScrollDown => {
-                                self.scroll_history_down(HISTORY_SCROLL_WHEEL_ROWS);
-                            }
-                            _ => {}
-                        }
                         render_dirty = true;
                     }
                     _ => {}
@@ -346,22 +309,6 @@ impl<R: TuiRuntime> TuiApp<R> {
                 self.completion_index = 0;
                 false
             }
-            KeyCode::PageUp => {
-                self.scroll_history_up(HISTORY_SCROLL_PAGE_ROWS);
-                false
-            }
-            KeyCode::PageDown => {
-                self.scroll_history_down(HISTORY_SCROLL_PAGE_ROWS);
-                false
-            }
-            KeyCode::Home => {
-                self.history_scroll = usize::MAX;
-                false
-            }
-            KeyCode::End => {
-                self.history_scroll = 0;
-                false
-            }
             KeyCode::Enter => {
                 if self.should_complete_on_enter() {
                     self.complete_selected_command();
@@ -374,7 +321,6 @@ impl<R: TuiRuntime> TuiApp<R> {
                 if submitted.is_empty() {
                     return false;
                 }
-                self.history_scroll = 0;
 
                 if submitted.starts_with('/') {
                     let (quit, events) = self.runtime.handle_command(&submitted);
@@ -388,32 +334,6 @@ impl<R: TuiRuntime> TuiApp<R> {
             }
             _ => false,
         }
-    }
-
-    fn scroll_history_up(&mut self, rows: usize) {
-        self.history_scroll = self.history_scroll.saturating_add(rows);
-    }
-
-    fn scroll_history_down(&mut self, rows: usize) {
-        self.history_scroll = self.history_scroll.saturating_sub(rows);
-    }
-
-    fn prepare_history_scroll(&mut self, document: &mut UiDocument, width: usize) {
-        let history_rows = document.wrapped_history_len(width);
-        if self.history_scroll > 0
-            && self.last_history_width == width
-            && self.last_history_rows > 0
-            && history_rows > self.last_history_rows
-        {
-            self.history_scroll = self
-                .history_scroll
-                .saturating_add(history_rows - self.last_history_rows);
-        }
-
-        self.history_scroll = self.history_scroll.min(document.max_history_scroll(width));
-        document.history_scroll = self.history_scroll;
-        self.last_history_width = width;
-        self.last_history_rows = history_rows;
     }
 
     fn handle_tree_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -675,14 +595,19 @@ impl<R: TuiRuntime> TuiApp<R> {
         });
     }
 
-    fn build_document(&self, width: usize, height: usize, now: Instant) -> UiDocument {
+    fn build_document(&self, width: usize, now: Instant) -> UiDocument {
         let command_matches = self.command_matches();
         UiBuilder::new()
             .chat(&self.chat)
             .live_assistant(self.live_assistant.as_deref())
             .tree(self.tree_view.as_ref())
             .pending_messages(&self.pending_messages)
-            .input(&self.input, &command_matches, self.completion_index)
+            .input(
+                &self.input,
+                &command_matches,
+                self.completion_index,
+                !self.activity.is_active(),
+            )
             .progress(&self.activity, now, width)
             .bottom_status(
                 &self.provider,
@@ -691,8 +616,6 @@ impl<R: TuiRuntime> TuiApp<R> {
                 self.total_output_tokens,
                 width,
             )
-            .history_scroll(self.history_scroll)
-            .viewport_height(height)
             .reset_screen(self.reset_screen)
             .finish()
     }
@@ -1008,13 +931,17 @@ impl TreeState {
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
-        execute!(io::stdout(), Show, EnableMouseCapture)?;
+        let mut stdout = io::stdout();
+        execute!(stdout, Hide)?;
+        stdout.write_all(DISABLE_SCROLL_ON_OUTPUT.as_bytes())?;
+        stdout.flush()?;
         Ok(Self)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let _ = io::stdout().write_all(ENABLE_SCROLL_ON_OUTPUT.as_bytes());
         let _ = execute!(
             io::stdout(),
             MoveTo(
@@ -1025,7 +952,6 @@ impl Drop for TerminalGuard {
             ),
             Clear(ClearType::CurrentLine),
             ResetColor,
-            DisableMouseCapture,
             Show
         );
         let _ = terminal::disable_raw_mode();
@@ -1035,8 +961,6 @@ impl Drop for TerminalGuard {
 struct UiBuilder {
     history: Vec<UiLine>,
     controls: Vec<UiLine>,
-    history_scroll: usize,
-    viewport_height: usize,
     reset_screen: bool,
 }
 
@@ -1045,8 +969,6 @@ impl UiBuilder {
         Self {
             history: Vec::new(),
             controls: Vec::new(),
-            history_scroll: 0,
-            viewport_height: usize::MAX,
             reset_screen: false,
         }
     }
@@ -1147,8 +1069,19 @@ impl UiBuilder {
         self
     }
 
-    fn input(mut self, input: &str, command_matches: &[&str], selected_index: usize) -> Self {
-        self.control_line(UiKind::Input, format!("> {input}{CURSOR_MARKER}"));
+    fn input(
+        mut self,
+        input: &str,
+        command_matches: &[&str],
+        selected_index: usize,
+        show_cursor: bool,
+    ) -> Self {
+        let cursor = if show_cursor {
+            format!("{CURSOR_MARKER}{VISIBLE_CURSOR}")
+        } else {
+            String::new()
+        };
+        self.control_line(UiKind::Input, format!("> {input}{cursor}"));
         if input.starts_with('/') && !command_matches.is_empty() {
             for (index, command) in command_matches.iter().enumerate() {
                 let kind = if index == selected_index {
@@ -1198,22 +1131,10 @@ impl UiBuilder {
         self
     }
 
-    fn history_scroll(mut self, history_scroll: usize) -> Self {
-        self.history_scroll = history_scroll;
-        self
-    }
-
-    fn viewport_height(mut self, viewport_height: usize) -> Self {
-        self.viewport_height = viewport_height;
-        self
-    }
-
     fn finish(self) -> UiDocument {
         UiDocument {
             history: self.history,
             controls: self.controls,
-            history_scroll: self.history_scroll,
-            viewport_height: self.viewport_height,
             reset_screen: self.reset_screen,
         }
     }
@@ -1319,7 +1240,7 @@ impl TerminalRenderer {
     ) -> io::Result<()> {
         let mut buffer = render_buffer_start();
         if clear {
-            buffer.push_str("\x1b[2J\x1b[H\x1b[3J");
+            buffer.push_str("\x1b[2J\x1b[H");
         }
         append_lines_to_buffer(&mut buffer, &frame.lines);
         buffer.push_str(SYNC_END);
@@ -1474,7 +1395,12 @@ impl TerminalRenderer {
         } else if row_delta < 0 {
             stdout.write_all(format!("\x1b[{}A", -row_delta).as_bytes())?;
         }
-        stdout.write_all(format!("\x1b[{}G{SHOW_CURSOR}", column + 1).as_bytes())?;
+        stdout.write_all(format!("\x1b[{}G", column + 1).as_bytes())?;
+        if SHOW_HARDWARE_CURSOR {
+            stdout.write_all(SHOW_CURSOR.as_bytes())?;
+        } else {
+            stdout.write_all(HIDE_CURSOR.as_bytes())?;
+        }
         self.hardware_cursor_row = target_row;
         Ok(())
     }
@@ -1483,27 +1409,16 @@ impl TerminalRenderer {
 impl RenderedFrame {
     fn build(document: &UiDocument, width: u16) -> Self {
         let width = width as usize;
-        let wrapped_history = wrap_lines(&document.history, width);
+        let mut lines = wrap_lines(&document.history, width)
+            .into_iter()
+            .map(|line| render_ansi_line(&line))
+            .collect::<Vec<_>>();
         let mut controls = wrap_lines(&document.controls, width);
         let cursor = extract_cursor(&mut controls).map(|cursor| CursorTarget {
             row: cursor.row,
             column: cursor.column,
         });
-        let (history_capacity, separator) = history_layout(
-            wrapped_history.len(),
-            controls.len(),
-            document.viewport_height,
-        );
-        let max_scroll = wrapped_history.len().saturating_sub(history_capacity);
-        let scroll = document.history_scroll.min(max_scroll);
-        let history_end = wrapped_history.len().saturating_sub(scroll);
-        let history_start = history_end.saturating_sub(history_capacity);
-
-        let mut lines = wrapped_history[history_start..history_end]
-            .iter()
-            .map(render_ansi_line)
-            .collect::<Vec<_>>();
-        if separator {
+        if !document.history.is_empty() && !document.controls.is_empty() {
             lines.push(String::new());
         }
         let controls_start_row = lines.len();
@@ -1515,21 +1430,6 @@ impl RenderedFrame {
 
         Self { lines, cursor }
     }
-}
-
-fn history_layout(
-    history_rows: usize,
-    control_rows: usize,
-    viewport_height: usize,
-) -> (usize, bool) {
-    let remaining = viewport_height.max(1).saturating_sub(control_rows);
-    let separator = history_rows > 0 && control_rows > 0 && remaining > 1;
-    let history_capacity = if separator {
-        remaining.saturating_sub(1)
-    } else {
-        remaining
-    };
-    (history_capacity, separator)
 }
 
 fn append_lines_to_buffer(buffer: &mut String, lines: &[String]) {
@@ -1989,8 +1889,6 @@ mod tests {
                     kind: UiKind::Input,
                     text: format!("> prompt{CURSOR_MARKER}"),
                 }],
-                history_scroll: 0,
-                viewport_height: usize::MAX,
                 reset_screen: false,
             },
             80,
@@ -2004,12 +1902,15 @@ mod tests {
     #[test]
     fn command_completion_renders_below_input_with_selected_color() {
         let document = UiBuilder::new()
-            .input("/", &["/help", "/config"], 1)
+            .input("/", &["/help", "/config"], 1, true)
             .finish();
 
         assert_eq!(document.controls.len(), 3);
         assert_eq!(document.controls[0].kind, UiKind::Input);
-        assert_eq!(document.controls[0].text, format!("> /{CURSOR_MARKER}"));
+        assert_eq!(
+            document.controls[0].text,
+            format!("> /{CURSOR_MARKER}{VISIBLE_CURSOR}")
+        );
         assert_eq!(document.controls[1].kind, UiKind::Status);
         assert_eq!(document.controls[1].text, "  /help");
         assert_eq!(document.controls[2].kind, UiKind::Selected);
@@ -2019,12 +1920,15 @@ mod tests {
     #[test]
     fn model_and_tokens_render_below_input_without_ready_status() {
         let document = UiBuilder::new()
-            .input("hello", &[], 0)
+            .input("hello", &[], 0, true)
             .bottom_status("openai", "gpt-5", 12, 34, 48)
             .finish();
 
         assert_eq!(document.controls.len(), 2);
-        assert_eq!(document.controls[0].text, format!("> hello{CURSOR_MARKER}"));
+        assert_eq!(
+            document.controls[0].text,
+            format!("> hello{CURSOR_MARKER}{VISIBLE_CURSOR}")
+        );
         assert!(document.controls[1].text.starts_with("openai / gpt-5"));
         assert!(document.controls[1]
             .text
@@ -2034,6 +1938,13 @@ mod tests {
             UnicodeWidthStr::width(document.controls[1].text.as_str()),
             48
         );
+    }
+
+    #[test]
+    fn input_can_render_without_hardware_cursor_marker() {
+        let document = UiBuilder::new().input("hello", &[], 0, false).finish();
+
+        assert_eq!(document.controls[0].text, "> hello");
     }
 
     #[test]
@@ -2200,49 +2111,26 @@ mod tests {
     }
 
     #[test]
-    fn rendered_frame_follows_latest_history_when_not_scrolled() {
-        let document = UiBuilder::new()
-            .history_scroll(0)
-            .viewport_height(8)
-            .finish_with_history_and_input(20);
+    fn rendered_frame_keeps_full_history_for_native_scrollback() {
+        let document = UiBuilder::new().finish_with_history_and_input(20);
 
         let frame = RenderedFrame::build(&document, 80);
         let output = frame.lines.join("\n");
 
-        assert!(!output.contains("line 0"));
-        assert!(output.contains("line 17"));
+        assert!(output.contains("line 0"));
         assert!(output.contains("line 19"));
-        assert!(frame.lines.len() <= 8);
+        assert_eq!(frame.lines.len(), 22);
     }
 
     #[test]
-    fn rendered_frame_keeps_older_history_visible_when_scrolled() {
-        let document = UiBuilder::new()
-            .history_scroll(5)
-            .viewport_height(8)
-            .finish_with_history_and_input(20);
-
-        let frame = RenderedFrame::build(&document, 80);
-        let output = frame.lines.join("\n");
-
-        assert!(output.contains("line 12"));
-        assert!(output.contains("line 14"));
-        assert!(!output.contains("line 19"));
-        assert!(frame.lines.len() <= 8);
-    }
-
-    #[test]
-    fn cursor_row_accounts_for_cropped_history() {
-        let document = UiBuilder::new()
-            .history_scroll(0)
-            .viewport_height(6)
-            .finish_with_history_and_input(20);
+    fn cursor_row_accounts_for_full_history() {
+        let document = UiBuilder::new().finish_with_history_and_input(20);
 
         let frame = RenderedFrame::build(&document, 80);
         let cursor = frame.cursor.expect("cursor marker should be found");
 
-        assert_eq!(frame.lines.len(), 6);
-        assert_eq!(cursor.row, 5);
+        assert_eq!(frame.lines.len(), 22);
+        assert_eq!(cursor.row, 21);
         assert_eq!(cursor.column, 2);
     }
 
@@ -2361,6 +2249,6 @@ impl TestUiBuilderExt for UiBuilder {
         for index in 0..history_lines {
             self.history_line(UiKind::Assistant, format!("line {index}"));
         }
-        self.input("", &[], 0).finish()
+        self.input("", &[], 0, true).finish()
     }
 }
