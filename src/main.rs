@@ -1,44 +1,35 @@
-mod agent_core;
-mod config;
-mod event;
-mod llm;
-mod session;
-mod tools;
-mod tui;
-
-use crate::{
-    agent_core::AgentCore,
-    event::AgentEvent,
-    tui::{TuiApp, TuiRuntime},
-};
+use jucode_agent_core::{AgentCore, AgentEvent};
+use jucode_tui::{TuiApp, TuiRuntime};
 use std::io;
 
-impl TuiRuntime for AgentCore {
+struct Runtime(AgentCore);
+
+impl TuiRuntime for Runtime {
     fn startup_events(&self) -> Vec<AgentEvent> {
-        AgentCore::startup_events(self)
+        self.0.startup_events()
     }
 
     fn model_status_event(&self) -> AgentEvent {
-        AgentCore::model_status_event(self)
+        self.0.model_status_event()
     }
 
     fn submit_user_message(&mut self, message: String) -> Vec<AgentEvent> {
-        AgentCore::submit_user_message(self, message)
+        self.0.submit_user_message(message)
     }
 
     fn steer(&mut self) -> Vec<AgentEvent> {
-        AgentCore::steer(self)
+        self.0.steer()
     }
 
     fn handle_command(&mut self, input: &str) -> (bool, Vec<AgentEvent>) {
-        AgentCore::handle_command(self, input)
+        self.0.handle_command(input)
     }
 
     fn poll_events(&mut self) -> Vec<AgentEvent> {
-        AgentCore::poll_events(self)
+        self.0.poll_events()
     }
 }
 
 fn main() -> io::Result<()> {
-    TuiApp::new(AgentCore::new()?).run()
+    TuiApp::new(Runtime(AgentCore::new()?)).run()
 }

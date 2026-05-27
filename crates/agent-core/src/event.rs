@@ -7,6 +7,13 @@ pub struct TreeNodeView {
 }
 
 #[derive(Debug, Clone)]
+pub struct SessionListItemView {
+    pub id: String,
+    pub label: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone)]
 pub enum TranscriptItem {
     User(String),
     Assistant(String),
@@ -31,18 +38,30 @@ pub enum AgentEvent {
     ThinkingStart,
     AssistantStart,
     AssistantDelta(String),
+    Retrying {
+        attempt: usize,
+    },
     ToolStart {
+        call_id: String,
         name: String,
     },
-    ToolOutput {
+    ToolUpdate {
+        call_id: String,
         name: String,
         output: String,
+    },
+    ToolOutput {
+        call_id: String,
+        name: String,
+        output: String,
+        is_error: bool,
     },
     Usage {
         input_tokens: u64,
         output_tokens: u64,
     },
     TreeView(Vec<TreeNodeView>),
+    ResumeView(Vec<SessionListItemView>),
     Transcript(Vec<TranscriptItem>),
     Info(String),
     Error(String),

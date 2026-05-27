@@ -1,0 +1,10 @@
+[package]
+name = "jucode-tui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossterm = "0.29"
+jucode-agent-core = { path = "../agent-core" }
+serde_json = "1"
+unicode-width = "0.2"

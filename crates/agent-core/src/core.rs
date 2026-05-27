@@ -1,6 +1,6 @@
 use crate::{
     config::{profile_dir, AuthStore, Config},
-    event::AgentEvent,
+    event::{AgentEvent, SessionListItemView},
     llm::{OpenAiClient, StreamEvent},
     session::{EntryKind, SessionStore, SessionSummary},
 };
@@ -17,14 +17,24 @@ use std::{
 enum WorkerEvent {
     CallStart,
     Delta(String),
+    Retrying {
+        attempt: usize,
+    },
     ResponseItem(Value),
     ToolStart {
+        call_id: String,
         name: String,
+    },
+    ToolUpdate {
+        call_id: String,
+        name: String,
+        output: String,
     },
     ToolOutput {
         call_id: String,
         name: String,
         output: String,
+        is_error: bool,
     },
     Usage {
         input_tokens: u64,
@@ -125,45 +135,47 @@ impl AgentCore {
         let events = match command {
             "/quit" | "/exit" => return (true, Vec::new()),
             "/help" | "/" => vec![AgentEvent::Info(
-                "/help /config /tree /switch <id|root> /branch [id|root] /resume [session-id] /context /quit"
+                "/help /config /tree /fork <label> /checkout [label] /delete <label> /resume [session-id] /context /quit"
                     .to_string(),
             )],
             "/config" => vec![AgentEvent::Info(format!(
-                "provider={} model={} base_url={} auth_key={} api_key_env={}",
+                "provider={} model={} base_url={} auth_key={} api_key_env={} retry_attempts={}",
                 self.config.provider,
                 self.config.model,
                 self.config.base_url,
                 mask_key(self.auth.key_for(&self.config.provider)),
-                self.config.api_key_env
+                self.config.api_key_env,
+                self.config.retry_attempts
             ))],
             "/tree" => vec![AgentEvent::TreeView(self.session.tree_view())],
-            "/switch" => {
-                let target = parts.next().unwrap_or_default();
-                let id = if target == "root" || target == "none" {
-                    None
+            "/checkout" => {
+                let label = input[command.len()..].trim();
+                if label.is_empty() {
+                    vec![AgentEvent::TreeView(self.session.tree_view())]
                 } else {
-                    match SessionStore::parse_id(target) {
-                        Some(id) => Some(id),
-                        None => {
-                            return (
-                                false,
-                                vec![AgentEvent::Error(format!(
-                                    "usage: {command} <entry-id|root>"
-                                ))],
-                            );
-                        }
-                    }
-                };
-
-                match self.session.switch_to(id) {
+                    match self.session.checkout(label) {
                     Ok(()) => {
                         let save_event = self.save_session_event();
                         vec![
                             AgentEvent::Transcript(self.session.transcript_items()),
-                            AgentEvent::Status(format!(
-                                "active leaf: {}",
-                                format_leaf(self.session.leaf_id())
-                            )),
+                            AgentEvent::Status(format!("checked out {label}")),
+                        ]
+                        .into_iter()
+                        .chain(save_event)
+                        .collect()
+                    }
+                    Err(error) => vec![AgentEvent::Error(error)],
+                    }
+                }
+            }
+            "/fork" => {
+                let label = input[command.len()..].trim();
+                match self.session.fork(label) {
+                    Ok(id) => {
+                        let save_event = self.save_session_event();
+                        vec![
+                            AgentEvent::Transcript(self.session.transcript_items()),
+                            AgentEvent::Status(format!("forked {label}: {}", id.display())),
                         ]
                         .into_iter()
                         .chain(save_event)
@@ -172,30 +184,15 @@ impl AgentCore {
                     Err(error) => vec![AgentEvent::Error(error)],
                 }
             }
-            "/branch" => {
-                let target = parts.next();
-                let id = match target {
-                    None => self.session.leaf_id(),
-                    Some("root" | "none") => None,
-                    Some(target) => match SessionStore::parse_id(target) {
-                        Some(id) => Some(id),
-                        None => {
-                            return (
-                                false,
-                                vec![AgentEvent::Error(
-                                    "usage: /branch [entry-id|root]".to_string(),
-                                )],
-                            );
-                        }
-                    },
-                };
-
-                match self.session.branch_from(id) {
-                    Ok(id) => {
+            "/delete" => {
+                let label = input[command.len()..].trim();
+                match self.session.delete_branch(label) {
+                    Ok(()) => {
                         let save_event = self.save_session_event();
                         vec![
                             AgentEvent::Transcript(self.session.transcript_items()),
-                            AgentEvent::Status(format!("created branch: {}", id.display())),
+                            AgentEvent::TreeView(self.session.tree_view()),
+                            AgentEvent::Status(format!("deleted branch {label}")),
                         ]
                         .into_iter()
                         .chain(save_event)
@@ -209,11 +206,7 @@ impl AgentCore {
                 Some(session_id) => self.resume_session_events(session_id),
             },
             "/context" => self
-                .session
-                .context_items()
-                .into_iter()
-                .map(|item| AgentEvent::Info(item.to_string()))
-                .collect(),
+                .context_events(),
             _ => vec![AgentEvent::Error(format!("unknown command: {command}"))],
         };
         (false, events)
@@ -228,17 +221,32 @@ impl AgentCore {
                 match event {
                     WorkerEvent::CallStart => events.push(AgentEvent::ThinkingStart),
                     WorkerEvent::Delta(delta) => events.push(AgentEvent::AssistantDelta(delta)),
+                    WorkerEvent::Retrying { attempt } => {
+                        events.push(AgentEvent::Retrying { attempt });
+                    }
                     WorkerEvent::ResponseItem(item) => {
                         self.session.append(EntryKind::ResponseItem { item });
                         events.extend(self.save_session_event());
                     }
-                    WorkerEvent::ToolStart { name } => {
-                        events.push(AgentEvent::ToolStart { name });
+                    WorkerEvent::ToolStart { call_id, name } => {
+                        events.push(AgentEvent::ToolStart { call_id, name });
+                    }
+                    WorkerEvent::ToolUpdate {
+                        call_id,
+                        name,
+                        output,
+                    } => {
+                        events.push(AgentEvent::ToolUpdate {
+                            call_id,
+                            name,
+                            output,
+                        });
                     }
                     WorkerEvent::ToolOutput {
                         call_id,
                         name,
                         output,
+                        is_error,
                     } => {
                         self.session.append(EntryKind::ToolOutput {
                             call_id: call_id.clone(),
@@ -246,7 +254,12 @@ impl AgentCore {
                             output: output.clone(),
                         });
                         events.extend(self.save_session_event());
-                        events.push(AgentEvent::ToolOutput { name, output });
+                        events.push(AgentEvent::ToolOutput {
+                            call_id,
+                            name,
+                            output,
+                            is_error,
+                        });
                     }
                     WorkerEvent::Usage {
                         input_tokens,
@@ -312,6 +325,7 @@ impl AgentCore {
             self.config.base_url.clone(),
             self.auth.key_for(&self.config.provider),
             &self.config.api_key_env,
+            self.config.retry_attempts,
         ) else {
             let mut events = save_event;
             events.push(AgentEvent::Error(
@@ -320,7 +334,7 @@ impl AgentCore {
             return events;
         };
 
-        let input = self.session.context_items();
+        let input = self.session.context_projection().items;
         let cwd = self.cwd.clone();
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
@@ -331,16 +345,30 @@ impl AgentCore {
                 let mapped = match event {
                     StreamEvent::CallStart => WorkerEvent::CallStart,
                     StreamEvent::Delta(delta) => WorkerEvent::Delta(delta),
+                    StreamEvent::Retrying { attempt } => WorkerEvent::Retrying { attempt },
                     StreamEvent::ResponseItem(item) => WorkerEvent::ResponseItem(item),
-                    StreamEvent::ToolStart { name } => WorkerEvent::ToolStart { name },
+                    StreamEvent::ToolStart { call_id, name } => {
+                        WorkerEvent::ToolStart { call_id, name }
+                    }
+                    StreamEvent::ToolUpdate {
+                        call_id,
+                        name,
+                        output,
+                    } => WorkerEvent::ToolUpdate {
+                        call_id,
+                        name,
+                        output,
+                    },
                     StreamEvent::ToolOutput {
                         call_id,
                         name,
                         output,
+                        is_error,
                     } => WorkerEvent::ToolOutput {
                         call_id,
                         name,
                         output,
+                        is_error,
                     },
                     StreamEvent::Usage {
                         input_tokens,
@@ -387,11 +415,20 @@ impl AgentCore {
                     "no sessions for current directory".to_string(),
                 )]
             }
-            Ok(sessions) => {
-                let mut lines = vec![format!("sessions for {}", self.cwd.display())];
-                lines.extend(sessions.into_iter().map(format_session_summary));
-                vec![AgentEvent::Info(lines.join("\n"))]
-            }
+            Ok(sessions) => vec![AgentEvent::ResumeView(
+                sessions
+                    .into_iter()
+                    .map(|summary| {
+                        let active = summary.id == self.session.session_id();
+                        let id = summary.id.clone();
+                        SessionListItemView {
+                            active,
+                            label: format_session_summary(summary),
+                            id,
+                        }
+                    })
+                    .collect(),
+            )],
             Err(error) => vec![AgentEvent::Error(format!(
                 "failed to list sessions: {error}"
             ))],
@@ -412,6 +449,21 @@ impl AgentCore {
             ))],
         }
     }
+
+    fn context_events(&self) -> Vec<AgentEvent> {
+        let projection = self.session.context_projection();
+        let mut events = vec![AgentEvent::Info(format!(
+            "context projection: branch_entries={} projected_entries={}",
+            projection.branch_entries, projection.projected_entries
+        ))];
+        events.extend(
+            projection
+                .items
+                .into_iter()
+                .map(|item| AgentEvent::Info(item.to_string())),
+        );
+        events
+    }
 }
 
 fn mask_key(value: Option<&str>) -> String {
@@ -422,11 +474,6 @@ fn mask_key(value: Option<&str>) -> String {
         Some(_) => "(set)".to_string(),
         None => "(not set)".to_string(),
     }
-}
-
-fn format_leaf(id: Option<crate::session::EntryId>) -> String {
-    id.map(crate::session::EntryId::display)
-        .unwrap_or_else(|| "root".to_string())
 }
 
 fn format_session_summary(summary: SessionSummary) -> String {

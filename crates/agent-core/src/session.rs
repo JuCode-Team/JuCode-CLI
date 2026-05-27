@@ -2,11 +2,13 @@ use crate::event::{TranscriptItem, TreeNodeView};
 use serde_json::{json, Value};
 use std::{
     cmp::Reverse,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+const ROOT_BRANCH: &str = "root";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EntryId(u64);
@@ -46,6 +48,7 @@ pub struct SessionEntry {
 pub struct SessionStore {
     entries: Vec<SessionEntry>,
     by_id: HashMap<EntryId, usize>,
+    branch_heads: HashMap<String, EntryId>,
     leaf_id: Option<EntryId>,
     next_id: u64,
     session_id: String,
@@ -59,6 +62,13 @@ pub struct SessionSummary {
     pub updated_at: u64,
     pub entries: usize,
     pub leaf: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextProjection {
+    pub items: Vec<Value>,
+    pub branch_entries: usize,
+    pub projected_entries: usize,
 }
 
 impl SessionStore {
@@ -76,6 +86,7 @@ impl SessionStore {
         &self.session_id
     }
 
+    #[cfg(test)]
     pub fn leaf_id(&self) -> Option<EntryId> {
         self.leaf_id
     }
@@ -91,6 +102,7 @@ impl SessionStore {
         self.by_id.insert(id, self.entries.len());
         self.entries.push(entry);
         self.leaf_id = Some(id);
+        self.update_head_for_entry(id);
         self.updated_at = now_secs();
         id
     }
@@ -106,18 +118,66 @@ impl SessionStore {
         Ok(())
     }
 
-    pub fn branch_from(&mut self, id: Option<EntryId>) -> Result<EntryId, String> {
-        self.switch_to(id)?;
-        let label = match id {
-            Some(id) => format!("branch from {}", id.display()),
-            None => "branch from root".to_string(),
-        };
+    pub fn fork(&mut self, label: &str) -> Result<EntryId, String> {
+        let label = normalize_branch_label(label)?;
+        if label == ROOT_BRANCH {
+            return Err("root is reserved".to_string());
+        }
+        if self.branch_heads.contains_key(&label) {
+            return Err(format!("branch already exists: {label}"));
+        }
         Ok(self.append(EntryKind::Branch { label }))
     }
 
-    pub fn parse_id(text: &str) -> Option<EntryId> {
-        let trimmed = text.trim().trim_start_matches('e');
-        trimmed.parse::<u64>().ok().map(EntryId)
+    pub fn checkout(&mut self, label: &str) -> Result<(), String> {
+        let label = normalize_branch_label(label)?;
+        if let Some(id) = parse_entry_id(&label) {
+            return self.checkout_before_user(id);
+        }
+        if label == ROOT_BRANCH {
+            self.leaf_id = self.branch_heads.get(ROOT_BRANCH).copied();
+            self.updated_at = now_secs();
+            return Ok(());
+        }
+        let Some(id) = self.branch_heads.get(&label).copied() else {
+            return Err(format!("branch not found: {label}"));
+        };
+        self.switch_to(Some(id))
+    }
+
+    fn checkout_before_user(&mut self, id: EntryId) -> Result<(), String> {
+        let Some(entry) = self.entry(id) else {
+            return Err(format!("entry {} not found", id.display()));
+        };
+        if !matches!(entry.kind, EntryKind::User { .. }) {
+            return Err(format!("entry {} is not a user node", id.display()));
+        }
+        self.switch_to(entry.parent_id)
+    }
+
+    pub fn delete_branch(&mut self, label: &str) -> Result<(), String> {
+        let label = normalize_branch_label(label)?;
+        if label == ROOT_BRANCH {
+            return Err("cannot delete root branch".to_string());
+        }
+        let Some(root_id) = self.branch_entry_id(&label) else {
+            return Err(format!("branch not found: {label}"));
+        };
+        let parent_id = self.entry(root_id).and_then(|entry| entry.parent_id);
+        let removed = self.descendant_ids(root_id);
+        let active_removed = self
+            .leaf_id
+            .map(|id| removed.contains(&id))
+            .unwrap_or(false);
+
+        self.entries.retain(|entry| !removed.contains(&entry.id));
+        self.rebuild_indexes();
+        self.rebuild_branch_heads();
+        if active_removed {
+            self.leaf_id = parent_id.filter(|id| self.by_id.contains_key(id));
+        }
+        self.updated_at = now_secs();
+        Ok(())
     }
 
     pub fn branch(&self) -> Vec<&SessionEntry> {
@@ -135,9 +195,10 @@ impl SessionStore {
         path
     }
 
-    pub fn context_items(&self) -> Vec<Value> {
-        self.branch()
-            .into_iter()
+    pub fn context_projection(&self) -> ContextProjection {
+        let branch = self.branch();
+        let items = branch
+            .iter()
             .filter_map(|entry| match &entry.kind {
                 EntryKind::Branch { .. } => None,
                 EntryKind::User { content } => Some(json!({
@@ -153,17 +214,35 @@ impl SessionStore {
                     "output": output
                 })),
             })
-            .collect()
+            .collect::<Vec<_>>();
+        ContextProjection {
+            branch_entries: branch.len(),
+            projected_entries: items.len(),
+            items,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn context_items(&self) -> Vec<Value> {
+        self.context_projection().items
     }
 
     pub fn tree_view(&self) -> Vec<TreeNodeView> {
+        let active = self.active_user_id();
         self.entries
             .iter()
-            .map(|entry| TreeNodeView {
-                id: entry.id.display(),
-                parent_id: entry.parent_id.map(EntryId::display),
-                label: entry.summary(),
-                active: Some(entry.id) == self.leaf_id,
+            .filter_map(|entry| {
+                let EntryKind::User { content } = &entry.kind else {
+                    return None;
+                };
+                Some(TreeNodeView {
+                    id: entry.id.display(),
+                    parent_id: self
+                        .nearest_user_ancestor(entry.parent_id)
+                        .map(EntryId::display),
+                    label: truncate(content),
+                    active: Some(entry.id) == active,
+                })
             })
             .collect()
     }
@@ -234,7 +313,91 @@ impl SessionStore {
         Ok(sessions)
     }
 
+    fn entry(&self, id: EntryId) -> Option<&SessionEntry> {
+        self.by_id.get(&id).map(|index| &self.entries[*index])
+    }
+
+    fn branch_entry_id(&self, label: &str) -> Option<EntryId> {
+        self.entries.iter().find_map(|entry| match &entry.kind {
+            EntryKind::Branch { label: entry_label } if entry_label == label => Some(entry.id),
+            _ => None,
+        })
+    }
+
+    fn descendant_ids(&self, root_id: EntryId) -> HashSet<EntryId> {
+        let mut removed = HashSet::from([root_id]);
+        loop {
+            let before = removed.len();
+            for entry in &self.entries {
+                if entry
+                    .parent_id
+                    .map(|parent_id| removed.contains(&parent_id))
+                    .unwrap_or(false)
+                {
+                    removed.insert(entry.id);
+                }
+            }
+            if removed.len() == before {
+                return removed;
+            }
+        }
+    }
+
+    fn update_head_for_entry(&mut self, id: EntryId) {
+        let label = self.branch_name_for_entry(id);
+        self.branch_heads.insert(label, id);
+    }
+
+    fn branch_name_for_entry(&self, id: EntryId) -> String {
+        let mut current = Some(id);
+        while let Some(id) = current {
+            let Some(entry) = self.entry(id) else {
+                break;
+            };
+            if let EntryKind::Branch { label } = &entry.kind {
+                return label.clone();
+            }
+            current = entry.parent_id;
+        }
+        ROOT_BRANCH.to_string()
+    }
+
+    fn nearest_user_ancestor(&self, id: Option<EntryId>) -> Option<EntryId> {
+        let mut current = id;
+        while let Some(id) = current {
+            let entry = self.entry(id)?;
+            if matches!(entry.kind, EntryKind::User { .. }) {
+                return Some(id);
+            }
+            current = entry.parent_id;
+        }
+        None
+    }
+
+    fn active_user_id(&self) -> Option<EntryId> {
+        self.nearest_user_ancestor(self.leaf_id)
+    }
+
+    fn rebuild_indexes(&mut self) {
+        self.by_id.clear();
+        for (index, entry) in self.entries.iter().enumerate() {
+            self.by_id.insert(entry.id, index);
+        }
+    }
+
+    fn rebuild_branch_heads(&mut self) {
+        self.branch_heads.clear();
+        for entry in self.entries.clone() {
+            self.update_head_for_entry(entry.id);
+        }
+    }
+
     fn to_json(&self) -> Value {
+        let branch_heads = self
+            .branch_heads
+            .iter()
+            .map(|(label, id)| (label.clone(), json!(id.0)))
+            .collect::<serde_json::Map<_, _>>();
         json!({
             "version": 1,
             "id": self.session_id,
@@ -242,6 +405,7 @@ impl SessionStore {
             "updated_at": self.updated_at,
             "leaf_id": self.leaf_id.map(|id| id.0),
             "next_id": self.next_id,
+            "branch_heads": branch_heads,
             "entries": self.entries.iter().map(entry_to_json).collect::<Vec<_>>()
         })
     }
@@ -275,15 +439,34 @@ impl SessionStore {
             .unwrap_or("unknown")
             .to_string();
 
-        Ok(Self {
+        let branch_heads = value
+            .get("branch_heads")
+            .and_then(Value::as_object)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|(label, id)| {
+                        let id = EntryId(id.as_u64()?);
+                        by_id.contains_key(&id).then_some((label.clone(), id))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+
+        let mut store = Self {
             entries,
             by_id,
+            branch_heads,
             leaf_id,
             next_id,
             session_id,
             created_at: value.get("created_at").and_then(Value::as_u64).unwrap_or(0),
             updated_at: value.get("updated_at").and_then(Value::as_u64).unwrap_or(0),
-        })
+        };
+        if store.branch_heads.is_empty() {
+            store.rebuild_branch_heads();
+        }
+        Ok(store)
     }
 
     fn summary_from_json(value: &Value) -> Option<SessionSummary> {
@@ -308,24 +491,20 @@ impl SessionStore {
     }
 }
 
-impl SessionEntry {
-    fn summary(&self) -> String {
-        match &self.kind {
-            EntryKind::Branch { label } => label.clone(),
-            EntryKind::User { content } => format!("user: {}", truncate(content)),
-            EntryKind::ResponseItem { item } => {
-                if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                    let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
-                    format!("assistant tool_call: {name}")
-                } else {
-                    format!("assistant: {}", truncate(&extract_response_text(item)))
-                }
-            }
-            EntryKind::ToolOutput { name, output, .. } => {
-                format!("tool {name}: {}", truncate(output))
-            }
-        }
+fn normalize_branch_label(label: &str) -> Result<String, String> {
+    let label = label.trim();
+    if label.is_empty() {
+        return Err("branch label is required".to_string());
     }
+    if label.contains('\n') || label.contains('\r') {
+        return Err("branch label must be a single line".to_string());
+    }
+    Ok(label.to_string())
+}
+
+fn parse_entry_id(text: &str) -> Option<EntryId> {
+    let trimmed = text.trim().trim_start_matches('e');
+    trimmed.parse::<u64>().ok().map(EntryId)
 }
 
 fn truncate(text: &str) -> String {
@@ -474,5 +653,99 @@ mod tests {
         let context = session.context_items();
 
         assert_eq!(context.len(), 1);
+    }
+
+    #[test]
+    fn context_projection_reports_branch_and_projected_entries() {
+        let mut session = SessionStore::new();
+        session.fork("work").unwrap();
+        session.append(EntryKind::User {
+            content: "first".to_string(),
+        });
+
+        let projection = session.context_projection();
+
+        assert_eq!(projection.branch_entries, 2);
+        assert_eq!(projection.projected_entries, 1);
+        assert_eq!(projection.items.len(), 1);
+    }
+
+    #[test]
+    fn checkout_returns_to_branch_last_leaf() {
+        let mut session = SessionStore::new();
+        session.append(EntryKind::User {
+            content: "root".to_string(),
+        });
+        session.fork("work").unwrap();
+        session.append(EntryKind::User {
+            content: "work 1".to_string(),
+        });
+        let work_leaf = session.append(EntryKind::User {
+            content: "work 2".to_string(),
+        });
+        session.checkout(ROOT_BRANCH).unwrap();
+
+        session.checkout("work").unwrap();
+
+        assert_eq!(session.leaf_id(), Some(work_leaf));
+    }
+
+    #[test]
+    fn checkout_entry_id_moves_to_before_user_message() {
+        let mut session = SessionStore::new();
+        let first = session.append(EntryKind::User {
+            content: "first".to_string(),
+        });
+        let second = session.append(EntryKind::User {
+            content: "second".to_string(),
+        });
+
+        session.checkout(&second.display()).unwrap();
+
+        assert_eq!(session.leaf_id(), Some(first));
+    }
+
+    #[test]
+    fn tree_view_shows_only_user_messages_with_user_parent_links() {
+        let mut session = SessionStore::new();
+        let first = session.append(EntryKind::User {
+            content: "first prompt".to_string(),
+        });
+        session.append(EntryKind::ResponseItem {
+            item: json!({
+                "type": "message",
+                "content": [{ "text": "assistant response" }]
+            }),
+        });
+        let second = session.append(EntryKind::User {
+            content: "second prompt".to_string(),
+        });
+
+        let tree = session.tree_view();
+
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree[0].id, first.display());
+        assert_eq!(tree[0].label, "first prompt");
+        assert_eq!(tree[1].id, second.display());
+        assert_eq!(tree[1].parent_id, Some(first.display()));
+        assert_eq!(tree[1].label, "second prompt");
+    }
+
+    #[test]
+    fn delete_branch_removes_descendants_and_moves_active_leaf_to_parent() {
+        let mut session = SessionStore::new();
+        let root_leaf = session.append(EntryKind::User {
+            content: "root".to_string(),
+        });
+        session.fork("feature").unwrap();
+        session.append(EntryKind::User {
+            content: "work".to_string(),
+        });
+
+        session.delete_branch("feature").unwrap();
+
+        assert_eq!(session.leaf_id(), Some(root_leaf));
+        assert_eq!(session.tree_view().len(), 1);
+        assert!(session.checkout("feature").is_err());
     }
 }

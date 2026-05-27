@@ -11,6 +11,7 @@ pub struct Config {
     pub model: String,
     pub base_url: String,
     pub api_key_env: String,
+    pub retry_attempts: usize,
     path: PathBuf,
 }
 
@@ -29,6 +30,7 @@ impl Config {
                 model: "gpt-5".to_string(),
                 base_url: "https://api.openai.com/v1".to_string(),
                 api_key_env: "OPENAI_API_KEY".to_string(),
+                retry_attempts: 3,
                 path,
             };
             config.save()?;
@@ -46,6 +48,7 @@ impl Config {
                 "https://api.openai.com/v1",
             )),
             api_key_env: read_api_key_env(&value),
+            retry_attempts: read_usize(&value, "retry_attempts", 3),
             path,
         };
         config.save()?;
@@ -61,7 +64,8 @@ impl Config {
             "provider": self.provider,
             "model": self.model,
             "base_url": normalize_base_url(&self.base_url),
-            "api_key_env": self.api_key_env
+            "api_key_env": self.api_key_env,
+            "retry_attempts": self.retry_attempts
         });
         fs::write(
             &self.path,
@@ -135,6 +139,14 @@ fn read_string(value: &Value, key: &str, default: &str) -> String {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(default)
         .to_string()
+}
+
+fn read_usize(value: &Value, key: &str, default: usize) -> usize {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(default)
 }
 
 fn read_api_key_env(value: &Value) -> String {

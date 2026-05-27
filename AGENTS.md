@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This is a lightweight Rust CLI/TUI project. The binary entry point is `src/main.rs`, application state and command handling live in `src/app.rs`, and terminal rendering lives in `src/ui.rs`. Keep source code under `src/`; add tests next to the module they cover with `#[cfg(test)]`. Build artifacts such as `target/` and `target-msvc/` are generated outputs.
+This is a lightweight Rust CLI/TUI workspace. The binary entry point is `src/main.rs`; agent state, sessions, tools, and LLM streaming live in `crates/agent-core/`; terminal rendering and input handling live in `crates/tui/`. Keep tests next to the module they cover with `#[cfg(test)]`. Build artifacts such as `target/` and `target-msvc/` are generated outputs.
 
 ## Build, Test, and Development Commands
 
