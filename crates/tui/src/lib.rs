@@ -5,7 +5,9 @@ use crossterm::{
     style::ResetColor,
     terminal::{self, Clear, ClearType},
 };
-use jucode_agent_core::{AgentEvent, SessionListItemView, TranscriptItem, TreeNodeView};
+use jucode_agent_core::{
+    AgentEvent, CommandView, ModelOptionView, SessionListItemView, TranscriptItem, TreeNodeView,
+};
 use std::{
     collections::HashSet,
     io::{self, Stdout, Write},
@@ -16,20 +18,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(120);
-const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 128_000;
 const TOOL_OUTPUT_PREVIEW_LINES: usize = 12;
 const TOOL_OUTPUT_PREVIEW_BYTES: usize = 2_000;
-const COMMANDS: &[&str] = &[
-    "/help",
-    "/config",
-    "/tree",
-    "/fork",
-    "/checkout",
-    "/delete",
-    "/resume",
-    "/context",
-    "/quit",
-];
 const CURSOR_MARKER: &str = "\x1b_jucode:cursor\x07";
 const VISIBLE_CURSOR: &str = "|";
 const HIDE_CURSOR: &str = "\x1b[?25l";
@@ -100,6 +90,53 @@ struct RenderedFrame {
     cursor: Option<CursorTarget>,
 }
 
+struct BottomStatus<'a> {
+    provider: &'a str,
+    model: &'a str,
+    reasoning_effort: &'a str,
+    input_tokens: u64,
+    output_tokens: u64,
+    context_window: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandCandidate {
+    command: String,
+    marker: Option<String>,
+}
+
+impl From<CommandView> for CommandCandidate {
+    fn from(value: CommandView) -> Self {
+        Self {
+            command: value.command,
+            marker: value.marker,
+        }
+    }
+}
+
+fn default_commands() -> Vec<CommandCandidate> {
+    [
+        "/help",
+        "/new",
+        "/config",
+        "/model",
+        "/tree",
+        "/fork",
+        "/checkout",
+        "/delete",
+        "/resume",
+        "/extensions",
+        "/context",
+        "/quit",
+    ]
+    .iter()
+    .map(|command| CommandCandidate {
+        command: (*command).to_string(),
+        marker: None,
+    })
+    .collect()
+}
+
 pub trait TuiRuntime {
     fn startup_events(&self) -> Vec<AgentEvent>;
     fn model_status_event(&self) -> AgentEvent;
@@ -117,26 +154,38 @@ pub struct TuiApp<R> {
     status: String,
     provider: String,
     model: String,
+    reasoning_effort: String,
+    context_window: u64,
+    max_output_tokens: u64,
+    reasoning_efforts: Vec<String>,
     total_input_tokens: u64,
     total_output_tokens: u64,
     activity: ActivityState,
+    commands: Vec<CommandCandidate>,
     completion_index: usize,
-    tree_view: Option<TreeState>,
+    picker_view: Option<PickerState>,
     pending_messages: Vec<String>,
     reset_screen: bool,
 }
 
 #[derive(Debug, Clone)]
-struct TreeState {
-    all_rows: Vec<TreeRow>,
-    rows: Vec<TreeRow>,
+struct PickerState {
+    rows: Vec<PickerRow>,
     selected: usize,
-    expanded: HashSet<String>,
-    mode: TreeMode,
+    mode: PickerMode,
+    tree: Option<TreeRows>,
+    efforts: Vec<String>,
+    selected_effort: usize,
 }
 
 #[derive(Debug, Clone)]
-struct TreeRow {
+struct TreeRows {
+    all_rows: Vec<PickerRow>,
+    expanded: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PickerRow {
     id: String,
     parent_id: Option<String>,
     depth: usize,
@@ -144,12 +193,15 @@ struct TreeRow {
     label: String,
     active: bool,
     has_children: bool,
+    detail: String,
+    reasoning_efforts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TreeMode {
+enum PickerMode {
     Checkout,
     Resume,
+    Model,
 }
 
 #[derive(Debug, Clone)]
@@ -193,11 +245,16 @@ impl<R: TuiRuntime> TuiApp<R> {
             status: "ready".to_string(),
             provider: "unknown".to_string(),
             model: "unknown".to_string(),
+            reasoning_effort: "medium".to_string(),
+            context_window: 128_000,
+            max_output_tokens: 128_000,
+            reasoning_efforts: vec!["medium".to_string()],
             total_input_tokens: 0,
             total_output_tokens: 0,
             activity: ActivityState::idle(),
+            commands: default_commands(),
             completion_index: 0,
-            tree_view: None,
+            picker_view: None,
             pending_messages: Vec::new(),
             reset_screen: false,
         };
@@ -259,8 +316,8 @@ impl<R: TuiRuntime> TuiApp<R> {
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
-        if self.tree_view.is_some() {
-            return self.handle_tree_key(code, modifiers);
+        if self.picker_view.is_some() {
+            return self.handle_picker_key(code, modifiers);
         }
 
         match code {
@@ -297,6 +354,10 @@ impl<R: TuiRuntime> TuiApp<R> {
             }
             KeyCode::Tab if self.command_completion_active() => {
                 self.complete_selected_command();
+                false
+            }
+            KeyCode::BackTab => {
+                self.cycle_reasoning_effort();
                 false
             }
             KeyCode::Esc => {
@@ -336,7 +397,7 @@ impl<R: TuiRuntime> TuiApp<R> {
         }
     }
 
-    fn handle_tree_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    fn handle_picker_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
         match code {
             KeyCode::Char('c') | KeyCode::Char('q')
                 if modifiers.contains(KeyModifiers::CONTROL) =>
@@ -344,35 +405,44 @@ impl<R: TuiRuntime> TuiApp<R> {
                 true
             }
             KeyCode::Esc => {
-                self.tree_view = None;
+                self.picker_view = None;
                 false
             }
             KeyCode::Up => {
-                if let Some(tree) = self.tree_view.as_mut() {
-                    tree.move_previous();
+                if let Some(picker) = self.picker_view.as_mut() {
+                    picker.move_previous();
                 }
                 false
             }
             KeyCode::Down => {
-                if let Some(tree) = self.tree_view.as_mut() {
-                    tree.move_next();
+                if let Some(picker) = self.picker_view.as_mut() {
+                    picker.move_next();
                 }
                 false
             }
             KeyCode::Left => {
-                if let Some(tree) = self.tree_view.as_mut() {
-                    tree.move_parent();
+                if let Some(picker) = self.picker_view.as_mut() {
+                    picker.move_parent();
                 }
                 false
             }
             KeyCode::Right => {
-                if let Some(tree) = self.tree_view.as_mut() {
-                    tree.move_first_child();
+                if let Some(picker) = self.picker_view.as_mut() {
+                    picker.move_first_child();
+                }
+                false
+            }
+            KeyCode::BackTab => {
+                if let Some(picker) = self.picker_view.as_mut() {
+                    picker.cycle_effort();
                 }
                 false
             }
             KeyCode::Delete => {
-                let Some(command) = self.tree_view.as_ref().and_then(TreeState::delete_command)
+                let Some(command) = self
+                    .picker_view
+                    .as_ref()
+                    .and_then(PickerState::delete_command)
                 else {
                     return false;
                 };
@@ -382,14 +452,14 @@ impl<R: TuiRuntime> TuiApp<R> {
             }
             KeyCode::Enter => {
                 let Some(command) = self
-                    .tree_view
+                    .picker_view
                     .as_ref()
-                    .and_then(TreeState::selected_command)
+                    .and_then(PickerState::selected_command)
                 else {
-                    self.tree_view = None;
+                    self.picker_view = None;
                     return false;
                 };
-                self.tree_view = None;
+                self.picker_view = None;
                 let (_, events) = self.runtime.handle_command(&command);
                 self.apply_events(events);
                 false
@@ -413,11 +483,24 @@ impl<R: TuiRuntime> TuiApp<R> {
                 AgentEvent::ModelStatus {
                     provider,
                     model,
+                    reasoning_effort,
+                    context_window,
+                    max_output_tokens,
+                    reasoning_efforts,
                     state,
                 } => {
-                    let changed = self.provider != provider || self.model != model;
+                    let changed = self.provider != provider
+                        || self.model != model
+                        || self.reasoning_effort != reasoning_effort
+                        || self.context_window != context_window
+                        || self.max_output_tokens != max_output_tokens
+                        || self.reasoning_efforts != reasoning_efforts;
                     self.provider = provider;
                     self.model = model;
+                    self.reasoning_effort = reasoning_effort;
+                    self.context_window = context_window;
+                    self.max_output_tokens = max_output_tokens;
+                    self.reasoning_efforts = reasoning_efforts;
                     self.apply_status(state) || changed
                 }
                 AgentEvent::PendingMessages(messages) => {
@@ -479,11 +562,23 @@ impl<R: TuiRuntime> TuiApp<R> {
                     true
                 }
                 AgentEvent::TreeView(nodes) => {
-                    self.tree_view = Some(TreeState::checkout(nodes));
+                    self.picker_view = Some(PickerState::checkout(nodes));
                     true
                 }
                 AgentEvent::ResumeView(sessions) => {
-                    self.tree_view = Some(TreeState::resume(sessions));
+                    self.picker_view = Some(PickerState::resume(sessions));
+                    true
+                }
+                AgentEvent::ModelView {
+                    models,
+                    active_effort,
+                } => {
+                    self.picker_view = Some(PickerState::model(models, active_effort));
+                    true
+                }
+                AgentEvent::CommandList(commands) => {
+                    self.commands = commands.into_iter().map(CommandCandidate::from).collect();
+                    self.clamp_completion_index();
                     true
                 }
                 AgentEvent::Transcript(items) => {
@@ -600,7 +695,7 @@ impl<R: TuiRuntime> TuiApp<R> {
         UiBuilder::new()
             .chat(&self.chat)
             .live_assistant(self.live_assistant.as_deref())
-            .tree(self.tree_view.as_ref())
+            .picker(self.picker_view.as_ref())
             .pending_messages(&self.pending_messages)
             .input(
                 &self.input,
@@ -610,10 +705,14 @@ impl<R: TuiRuntime> TuiApp<R> {
             )
             .progress(&self.activity, now, width)
             .bottom_status(
-                &self.provider,
-                &self.model,
-                self.total_input_tokens,
-                self.total_output_tokens,
+                BottomStatus {
+                    provider: &self.provider,
+                    model: &self.model,
+                    reasoning_effort: &self.reasoning_effort,
+                    input_tokens: self.total_input_tokens,
+                    output_tokens: self.total_output_tokens,
+                    context_window: self.context_window,
+                },
                 width,
             )
             .reset_screen(self.reset_screen)
@@ -628,17 +727,21 @@ impl<R: TuiRuntime> TuiApp<R> {
         self.command_completion_active()
     }
 
-    fn command_matches(&self) -> Vec<&'static str> {
+    fn command_matches(&self) -> Vec<CommandCandidate> {
         if !self.input.starts_with('/') {
             return Vec::new();
         }
-        if COMMANDS.contains(&self.input.as_str()) {
+        if self
+            .commands
+            .iter()
+            .any(|candidate| candidate.command == self.input)
+        {
             return Vec::new();
         }
-        COMMANDS
+        self.commands
             .iter()
-            .copied()
-            .filter(|command| command.starts_with(self.input.as_str()))
+            .filter(|candidate| candidate.command.starts_with(self.input.as_str()))
+            .cloned()
             .collect()
     }
 
@@ -653,12 +756,23 @@ impl<R: TuiRuntime> TuiApp<R> {
 
     fn complete_selected_command(&mut self) {
         let matches = self.command_matches();
-        if let Some(command) = matches.get(self.completion_index).copied() {
+        if let Some(command) = matches.get(self.completion_index) {
             self.input.clear();
-            self.input.push_str(command);
+            self.input.push_str(&command.command);
             self.input.push(' ');
             self.completion_index = 0;
         }
+    }
+
+    fn cycle_reasoning_effort(&mut self) {
+        if self.model == "unknown" {
+            return;
+        }
+        let next = next_reasoning_effort(&self.reasoning_efforts, &self.reasoning_effort);
+        let (_, events) = self
+            .runtime
+            .handle_command(&format!("/model {} {next}", self.model));
+        self.apply_events(events);
     }
 }
 
@@ -796,7 +910,7 @@ enum SpinnerPreset {
     Scan,
 }
 
-impl TreeState {
+impl PickerState {
     fn checkout(nodes: Vec<TreeNodeView>) -> Self {
         let all_rows = build_tree_rows(&nodes);
         let expanded = all_rows
@@ -807,18 +921,19 @@ impl TreeState {
         let rows = visible_tree_rows(&all_rows, &expanded);
         let selected = rows.iter().position(|row| row.active).unwrap_or(0);
         Self {
-            all_rows,
             rows,
             selected,
-            expanded,
-            mode: TreeMode::Checkout,
+            mode: PickerMode::Checkout,
+            tree: Some(TreeRows { all_rows, expanded }),
+            efforts: Vec::new(),
+            selected_effort: 0,
         }
     }
 
     fn resume(sessions: Vec<SessionListItemView>) -> Self {
         let rows = sessions
             .into_iter()
-            .map(|session| TreeRow {
+            .map(|session| PickerRow {
                 id: session.id,
                 parent_id: None,
                 depth: 0,
@@ -826,15 +941,56 @@ impl TreeState {
                 label: session.label,
                 active: session.active,
                 has_children: false,
+                detail: String::new(),
+                reasoning_efforts: Vec::new(),
             })
             .collect::<Vec<_>>();
         let selected = rows.iter().position(|row| row.active).unwrap_or(0);
         Self {
-            all_rows: rows.clone(),
             rows,
             selected,
-            expanded: HashSet::new(),
-            mode: TreeMode::Resume,
+            mode: PickerMode::Resume,
+            tree: None,
+            efforts: Vec::new(),
+            selected_effort: 0,
+        }
+    }
+
+    fn model(models: Vec<ModelOptionView>, active_effort: String) -> Self {
+        let selected = models.iter().position(|row| row.active).unwrap_or(0);
+        let efforts = models
+            .get(selected)
+            .map(|model| model.reasoning_efforts.clone())
+            .unwrap_or_default();
+        let selected_effort = efforts
+            .iter()
+            .position(|effort| effort == &active_effort)
+            .unwrap_or(0);
+        let rows = models
+            .into_iter()
+            .map(|model| PickerRow {
+                id: model.model.clone(),
+                parent_id: None,
+                depth: 0,
+                prefix: String::new(),
+                label: model.model,
+                active: model.active,
+                has_children: false,
+                detail: format!(
+                    "ctx {} out {}",
+                    format_token_count(model.context_window),
+                    format_token_count(model.max_output_tokens)
+                ),
+                reasoning_efforts: model.reasoning_efforts,
+            })
+            .collect::<Vec<_>>();
+        Self {
+            rows,
+            selected,
+            mode: PickerMode::Model,
+            tree: None,
+            efforts,
+            selected_effort,
         }
     }
 
@@ -844,11 +1000,14 @@ impl TreeState {
 
     fn selected_command(&self) -> Option<String> {
         let id = self.selected_id()?;
-        let command = match self.mode {
-            TreeMode::Checkout => "/checkout",
-            TreeMode::Resume => "/resume",
-        };
-        Some(format!("{command} {id}"))
+        match self.mode {
+            PickerMode::Checkout => Some(format!("/checkout {id}")),
+            PickerMode::Resume => Some(format!("/resume {id}")),
+            PickerMode::Model => {
+                let effort = self.efforts.get(self.selected_effort)?;
+                Some(format!("/model {id} {effort}"))
+            }
+        }
     }
 
     fn delete_command(&self) -> Option<String> {
@@ -857,22 +1016,27 @@ impl TreeState {
 
     fn move_previous(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+        self.sync_selected_model_efforts();
     }
 
     fn move_next(&mut self) {
         if self.selected + 1 < self.rows.len() {
             self.selected += 1;
         }
+        self.sync_selected_model_efforts();
     }
 
     fn move_parent(&mut self) {
-        if self.mode != TreeMode::Checkout {
+        if self.mode != PickerMode::Checkout {
             return;
         }
         let Some(selected_id) = self.selected_id() else {
             return;
         };
-        if self.expanded.remove(&selected_id) {
+        let Some(tree) = self.tree.as_mut() else {
+            return;
+        };
+        if tree.expanded.remove(&selected_id) {
             self.rebuild_visible_rows(Some(selected_id));
             return;
         }
@@ -889,15 +1053,20 @@ impl TreeState {
     }
 
     fn move_first_child(&mut self) {
-        if self.mode != TreeMode::Checkout {
+        if self.mode != PickerMode::Checkout {
             return;
         }
         let Some(id) = self.rows.get(self.selected).map(|row| row.id.as_str()) else {
             return;
         };
-        if self.has_children(id) && !self.expanded.contains(id) {
+        let Some(tree) = self.tree.as_ref() else {
+            return;
+        };
+        if self.has_children(id) && !tree.expanded.contains(id) {
             let selected_id = id.to_string();
-            self.expanded.insert(selected_id.clone());
+            if let Some(tree) = self.tree.as_mut() {
+                tree.expanded.insert(selected_id.clone());
+            }
             self.rebuild_visible_rows(Some(selected_id));
             return;
         }
@@ -911,13 +1080,19 @@ impl TreeState {
     }
 
     fn has_children(&self, id: &str) -> bool {
-        self.all_rows
+        let Some(tree) = self.tree.as_ref() else {
+            return false;
+        };
+        tree.all_rows
             .iter()
             .any(|row| row.parent_id.as_deref() == Some(id))
     }
 
     fn rebuild_visible_rows(&mut self, selected_id: Option<String>) {
-        self.rows = visible_tree_rows(&self.all_rows, &self.expanded);
+        let Some(tree) = self.tree.as_ref() else {
+            return;
+        };
+        self.rows = visible_tree_rows(&tree.all_rows, &tree.expanded);
         if let Some(selected_id) = selected_id {
             if let Some(index) = self.rows.iter().position(|row| row.id == selected_id) {
                 self.selected = index;
@@ -925,6 +1100,32 @@ impl TreeState {
             }
         }
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+    }
+
+    fn cycle_effort(&mut self) {
+        if self.mode != PickerMode::Model || self.efforts.is_empty() {
+            return;
+        }
+        self.selected_effort = (self.selected_effort + 1) % self.efforts.len();
+    }
+
+    fn sync_selected_model_efforts(&mut self) {
+        if self.mode != PickerMode::Model {
+            return;
+        }
+        let Some(row) = self.rows.get(self.selected) else {
+            return;
+        };
+        let current = self.efforts.get(self.selected_effort).cloned();
+        self.efforts = row.reasoning_efforts.clone();
+        self.selected_effort = current
+            .and_then(|value| self.efforts.iter().position(|effort| effort == &value))
+            .unwrap_or_else(|| {
+                self.efforts
+                    .iter()
+                    .position(|effort| effort == "medium")
+                    .unwrap_or(0)
+            });
     }
 }
 
@@ -1008,24 +1209,36 @@ impl UiBuilder {
         self
     }
 
-    fn tree(mut self, tree: Option<&TreeState>) -> Self {
-        let Some(tree) = tree else {
+    fn picker(mut self, picker: Option<&PickerState>) -> Self {
+        let Some(picker) = picker else {
             return self;
         };
-        let hint = match tree.mode {
-            TreeMode::Checkout => "tree: arrows move/expand, enter checkout, esc close",
-            TreeMode::Resume => "resume: arrows move, enter resume, esc close",
+        let hint = match picker.mode {
+            PickerMode::Checkout => "tree: arrows move/expand, enter checkout, esc close",
+            PickerMode::Resume => "resume: arrows move, enter resume, esc close",
+            PickerMode::Model => "model: arrows move, shift+tab effort, enter select, esc close",
         };
         self.control_line(UiKind::Status, hint.to_string());
-        if tree.rows.is_empty() {
+        if picker.mode == PickerMode::Model && !picker.efforts.is_empty() {
+            let effort = &picker.efforts[picker.selected_effort];
+            self.control_line(
+                UiKind::Status,
+                format!("thinking: {}", colored_reasoning_effort(effort)),
+            );
+        }
+        if picker.rows.is_empty() {
             self.control_line(UiKind::Status, "(empty)".to_string());
             return self;
         }
-        for (index, row) in tree.rows.iter().enumerate() {
+        for (index, row) in picker.rows.iter().enumerate() {
             let active = if row.active { " *" } else { "" };
-            let marker = if index == tree.selected { "> " } else { "  " };
+            let marker = if index == picker.selected { "> " } else { "  " };
             let directory = if row.has_children {
-                if tree.expanded.contains(&row.id) {
+                if picker
+                    .tree
+                    .as_ref()
+                    .is_some_and(|tree| tree.expanded.contains(&row.id))
+                {
                     "[-] "
                 } else {
                     "[+] "
@@ -1033,7 +1246,7 @@ impl UiBuilder {
             } else {
                 "    "
             };
-            let kind = if index == tree.selected {
+            let kind = if index == picker.selected {
                 UiKind::Selected
             } else if row.active {
                 UiKind::Brand
@@ -1042,9 +1255,17 @@ impl UiBuilder {
             } else {
                 UiKind::Status
             };
+            let detail = if row.detail.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", row.detail)
+            };
             self.control_line(
                 kind,
-                format!("{marker}{}{directory}{}{active}", row.prefix, row.label),
+                format!(
+                    "{marker}{}{directory}{}{}{active}",
+                    row.prefix, row.label, detail
+                ),
             );
         }
         self.control_line(UiKind::System, String::new());
@@ -1072,7 +1293,7 @@ impl UiBuilder {
     fn input(
         mut self,
         input: &str,
-        command_matches: &[&str],
+        command_matches: &[CommandCandidate],
         selected_index: usize,
         show_cursor: bool,
     ) -> Self {
@@ -1083,13 +1304,18 @@ impl UiBuilder {
         };
         self.control_line(UiKind::Input, format!("> {input}{cursor}"));
         if input.starts_with('/') && !command_matches.is_empty() {
-            for (index, command) in command_matches.iter().enumerate() {
+            for (index, candidate) in command_matches.iter().enumerate() {
                 let kind = if index == selected_index {
                     UiKind::Selected
                 } else {
                     UiKind::Status
                 };
-                self.control_line(kind, format!("  {command}"));
+                let marker = candidate
+                    .marker
+                    .as_ref()
+                    .map(|marker| format!(" {marker}"))
+                    .unwrap_or_default();
+                self.control_line(kind, format!("  {}{marker}", candidate.command));
             }
         }
         self
@@ -1110,19 +1336,26 @@ impl UiBuilder {
         self
     }
 
-    fn bottom_status(
-        mut self,
-        provider: &str,
-        model: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        width: usize,
-    ) -> Self {
-        let total = input_tokens + output_tokens;
-        let percent = (total as f64 / DEFAULT_CONTEXT_WINDOW_TOKENS as f64 * 100.0).min(100.0);
-        let left = format!("{provider} / {model}");
-        let right = format!("tokens {input_tokens}/{output_tokens} | context {percent:.1}%");
-        self.control_line(UiKind::Status, format_status_line(&left, &right, width));
+    fn bottom_status(mut self, status: BottomStatus<'_>, width: usize) -> Self {
+        let total = status.input_tokens + status.output_tokens;
+        let percent = if status.context_window == 0 {
+            0.0
+        } else {
+            (total as f64 / status.context_window as f64 * 100.0).min(100.0)
+        };
+        let plain_left = format!(
+            "{} / {} ({})",
+            status.provider, status.model, status.reasoning_effort
+        );
+        let right = format!(
+            "tokens {}/{} | context {percent:.1}%",
+            status.input_tokens, status.output_tokens
+        );
+        let line = format_status_line(&plain_left, &right, width).replace(
+            &format!("({})", status.reasoning_effort),
+            &format!("({})", colored_reasoning_effort(status.reasoning_effort)),
+        );
+        self.control_line(UiKind::Status, line);
         self
     }
 
@@ -1468,7 +1701,7 @@ fn viewport_top(line_count: usize, height: u16) -> usize {
         .saturating_sub(height as usize)
 }
 
-fn build_tree_rows(nodes: &[TreeNodeView]) -> Vec<TreeRow> {
+fn build_tree_rows(nodes: &[TreeNodeView]) -> Vec<PickerRow> {
     let mut rows = Vec::new();
     push_tree_rows(None, 0, nodes, &mut rows);
     rows
@@ -1478,13 +1711,13 @@ fn push_tree_rows(
     parent_id: Option<&str>,
     depth: usize,
     nodes: &[TreeNodeView],
-    rows: &mut Vec<TreeRow>,
+    rows: &mut Vec<PickerRow>,
 ) {
     for node in nodes
         .iter()
         .filter(|node| node.parent_id.as_deref() == parent_id)
     {
-        rows.push(TreeRow {
+        rows.push(PickerRow {
             id: node.id.clone(),
             parent_id: node.parent_id.clone(),
             depth,
@@ -1494,12 +1727,14 @@ fn push_tree_rows(
             has_children: nodes
                 .iter()
                 .any(|candidate| candidate.parent_id.as_deref() == Some(node.id.as_str())),
+            detail: String::new(),
+            reasoning_efforts: Vec::new(),
         });
         push_tree_rows(Some(node.id.as_str()), depth + 1, nodes, rows);
     }
 }
 
-fn visible_tree_rows(rows: &[TreeRow], expanded: &HashSet<String>) -> Vec<TreeRow> {
+fn visible_tree_rows(rows: &[PickerRow], expanded: &HashSet<String>) -> Vec<PickerRow> {
     let mut visible = Vec::new();
     push_visible_tree_rows(None, "", rows, expanded, &mut visible);
     visible
@@ -1508,9 +1743,9 @@ fn visible_tree_rows(rows: &[TreeRow], expanded: &HashSet<String>) -> Vec<TreeRo
 fn push_visible_tree_rows(
     parent_id: Option<&str>,
     ancestor_prefix: &str,
-    rows: &[TreeRow],
+    rows: &[PickerRow],
     expanded: &HashSet<String>,
-    visible: &mut Vec<TreeRow>,
+    visible: &mut Vec<PickerRow>,
 ) {
     let children = rows
         .iter()
@@ -1859,6 +2094,18 @@ fn color_code(kind: UiKind) -> &'static str {
     }
 }
 
+fn colored_reasoning_effort(effort: &str) -> String {
+    let color = match effort {
+        "none" | "minimal" => "\x1b[38;2;150;150;150m",
+        "low" => "\x1b[38;2;90;190;140m",
+        "medium" => "\x1b[38;2;230;200;90m",
+        "high" => "\x1b[38;2;245;150;70m",
+        "xhigh" => "\x1b[38;2;245;90;90m",
+        _ => color_code(UiKind::Status),
+    };
+    format!("{color}{effort}{RESET}{}", color_code(UiKind::Status))
+}
+
 fn estimate_tokens(text: &str) -> u64 {
     if text.is_empty() {
         return 0;
@@ -1867,9 +2114,51 @@ fn estimate_tokens(text: &str) -> u64 {
     u64::max(1, chars.div_ceil(4))
 }
 
+fn format_token_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.2}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{}k", value / 1_000)
+    } else {
+        value.to_string()
+    }
+}
+
+fn next_reasoning_effort(efforts: &[String], current: &str) -> String {
+    if efforts.is_empty() {
+        return current.to_string();
+    }
+    let index = efforts
+        .iter()
+        .position(|effort| effort == current)
+        .map(|index| (index + 1) % efforts.len())
+        .unwrap_or(0);
+    efforts[index].clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strip_ansi(text: &str) -> String {
+        let mut output = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '\x1b' {
+                output.push(ch);
+                continue;
+            }
+            if chars.next() != Some('[') {
+                continue;
+            }
+            for ch in chars.by_ref() {
+                if ch.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+        output
+    }
 
     #[test]
     fn cursor_row_is_relative_to_whole_frame() {
@@ -1902,7 +2191,21 @@ mod tests {
     #[test]
     fn command_completion_renders_below_input_with_selected_color() {
         let document = UiBuilder::new()
-            .input("/", &["/help", "/config"], 1, true)
+            .input(
+                "/",
+                &[
+                    CommandCandidate {
+                        command: "/help".to_string(),
+                        marker: None,
+                    },
+                    CommandCandidate {
+                        command: "/review".to_string(),
+                        marker: Some("SKILL".to_string()),
+                    },
+                ],
+                1,
+                true,
+            )
             .finish();
 
         assert_eq!(document.controls.len(), 3);
@@ -1914,14 +2217,24 @@ mod tests {
         assert_eq!(document.controls[1].kind, UiKind::Status);
         assert_eq!(document.controls[1].text, "  /help");
         assert_eq!(document.controls[2].kind, UiKind::Selected);
-        assert_eq!(document.controls[2].text, "  /config");
+        assert_eq!(document.controls[2].text, "  /review SKILL");
     }
 
     #[test]
     fn model_and_tokens_render_below_input_without_ready_status() {
         let document = UiBuilder::new()
             .input("hello", &[], 0, true)
-            .bottom_status("openai", "gpt-5", 12, 34, 48)
+            .bottom_status(
+                BottomStatus {
+                    provider: "openai",
+                    model: "gpt-5",
+                    reasoning_effort: "medium",
+                    input_tokens: 12,
+                    output_tokens: 34,
+                    context_window: 400_000,
+                },
+                64,
+            )
             .finish();
 
         assert_eq!(document.controls.len(), 2);
@@ -1929,14 +2242,17 @@ mod tests {
             document.controls[0].text,
             format!("> hello{CURSOR_MARKER}{VISIBLE_CURSOR}")
         );
-        assert!(document.controls[1].text.starts_with("openai / gpt-5"));
+        assert!(document.controls[1].text.starts_with("openai / gpt-5 ("));
+        assert!(document.controls[1]
+            .text
+            .contains(&colored_reasoning_effort("medium")));
         assert!(document.controls[1]
             .text
             .ends_with("tokens 12/34 | context 0.0%"));
         assert!(!document.controls[1].text.contains("ready"));
         assert_eq!(
-            UnicodeWidthStr::width(document.controls[1].text.as_str()),
-            48
+            UnicodeWidthStr::width(strip_ansi(&document.controls[1].text).as_str()),
+            64
         );
     }
 
@@ -2136,7 +2452,7 @@ mod tests {
 
     #[test]
     fn checkout_tree_enter_maps_to_checkout_command() {
-        let tree = TreeState::checkout(vec![TreeNodeView {
+        let tree = PickerState::checkout(vec![TreeNodeView {
             id: "e3".to_string(),
             parent_id: None,
             label: "selected prompt".to_string(),
@@ -2149,7 +2465,7 @@ mod tests {
 
     #[test]
     fn checkout_tree_defaults_to_two_visible_levels_and_expands_right() {
-        let mut tree = TreeState::checkout(vec![
+        let mut tree = PickerState::checkout(vec![
             TreeNodeView {
                 id: "e1".to_string(),
                 parent_id: None,
@@ -2193,7 +2509,7 @@ mod tests {
 
     #[test]
     fn checkout_tree_marks_rows_with_children_as_directories() {
-        let tree = TreeState::checkout(vec![
+        let tree = PickerState::checkout(vec![
             TreeNodeView {
                 id: "e1".to_string(),
                 parent_id: None,
@@ -2213,7 +2529,7 @@ mod tests {
                 active: false,
             },
         ]);
-        let document = UiBuilder::new().tree(Some(&tree)).finish();
+        let document = UiBuilder::new().picker(Some(&tree)).finish();
 
         assert!(document
             .controls
@@ -2227,7 +2543,7 @@ mod tests {
 
     #[test]
     fn resume_picker_enter_maps_to_resume_command_without_delete() {
-        let tree = TreeState::resume(vec![SessionListItemView {
+        let tree = PickerState::resume(vec![SessionListItemView {
             id: "s123".to_string(),
             label: "s123 | entries 3 | leaf e2 | updated 1".to_string(),
             active: false,
@@ -2235,6 +2551,78 @@ mod tests {
 
         assert_eq!(tree.selected_command().as_deref(), Some("/resume s123"));
         assert_eq!(tree.delete_command(), None);
+    }
+
+    #[test]
+    fn model_picker_enter_includes_selected_effort() {
+        let mut picker = PickerState::model(
+            vec![
+                ModelOptionView {
+                    model: "gpt-5.2".to_string(),
+                    active: false,
+                    context_window: 400_000,
+                    max_output_tokens: 128_000,
+                    reasoning_efforts: vec!["none".to_string(), "low".to_string()],
+                },
+                ModelOptionView {
+                    model: "gpt-5.3-codex".to_string(),
+                    active: true,
+                    context_window: 400_000,
+                    max_output_tokens: 128_000,
+                    reasoning_efforts: vec![
+                        "low".to_string(),
+                        "medium".to_string(),
+                        "high".to_string(),
+                        "xhigh".to_string(),
+                    ],
+                },
+            ],
+            "low".to_string(),
+        );
+
+        assert_eq!(
+            picker.selected_command().as_deref(),
+            Some("/model gpt-5.3-codex low")
+        );
+
+        picker.cycle_effort();
+
+        assert_eq!(
+            picker.selected_command().as_deref(),
+            Some("/model gpt-5.3-codex medium")
+        );
+    }
+
+    #[test]
+    fn model_picker_renders_effort_hint() {
+        let picker = PickerState::model(
+            vec![ModelOptionView {
+                model: "gpt-5.2".to_string(),
+                active: true,
+                context_window: 400_000,
+                max_output_tokens: 128_000,
+                reasoning_efforts: vec!["none".to_string(), "low".to_string()],
+            }],
+            "none".to_string(),
+        );
+        let document = UiBuilder::new().picker(Some(&picker)).finish();
+
+        assert!(document.controls.iter().any(|line| line
+            .text
+            .contains(&format!("thinking: {}", colored_reasoning_effort("none")))));
+        assert!(document
+            .controls
+            .iter()
+            .any(|line| line.text.contains("gpt-5.2") && line.text.contains(" *")));
+    }
+
+    #[test]
+    fn shift_tab_effort_cycle_wraps() {
+        let efforts = vec!["none".to_string(), "low".to_string(), "medium".to_string()];
+        assert_eq!(next_reasoning_effort(&efforts, "none"), "low");
+        assert_eq!(next_reasoning_effort(&efforts, "low"), "medium");
+        assert_eq!(next_reasoning_effort(&efforts, "medium"), "none");
+        assert_eq!(next_reasoning_effort(&efforts, "unknown"), "none");
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::{session::extract_response_text, tools};
+use crate::{extensions::ExtensionRegistry, session::extract_response_text, tools};
 use serde_json::{json, Value};
 use std::{
     env,
@@ -8,14 +8,27 @@ use std::{
     time::Duration,
 };
 
-const SYSTEM_PROMPT: &str = "You are JuCode, a lightweight coding agent. Use tools when you need filesystem or shell access. Keep responses concise and factual.";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct OpenAiClient {
     api_key: String,
     pub model: String,
+    reasoning_effort: String,
+    system_prompt: String,
+    extensions: ExtensionRegistry,
     base_url: String,
     retry_attempts: usize,
+}
+
+pub struct OpenAiClientConfig<'a> {
+    pub model: String,
+    pub reasoning_effort: String,
+    pub system_prompt: String,
+    pub extensions: ExtensionRegistry,
+    pub base_url: String,
+    pub api_key: Option<&'a str>,
+    pub api_key_env: &'a str,
+    pub retry_attempts: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -48,24 +61,24 @@ pub enum StreamEvent {
 }
 
 impl OpenAiClient {
-    pub fn from_config(
-        model: String,
-        base_url: String,
-        api_key: Option<&str>,
-        api_key_env: &str,
-        retry_attempts: usize,
-    ) -> Result<Self, String> {
-        let api_key = match api_key {
+    pub fn from_config(config: OpenAiClientConfig<'_>) -> Result<Self, String> {
+        let api_key = match config.api_key {
             Some(value) if !value.trim().is_empty() => value.trim().to_string(),
-            _ => env::var(api_key_env).map_err(|_| {
-                format!("api_key is not set and {api_key_env} is not set. Configure one before sending prompts.")
+            _ => env::var(config.api_key_env).map_err(|_| {
+                format!(
+                    "api_key is not set and {} is not set. Configure one before sending prompts.",
+                    config.api_key_env
+                )
             })?,
         };
         Ok(Self {
             api_key,
-            model,
-            base_url,
-            retry_attempts,
+            model: config.model,
+            reasoning_effort: config.reasoning_effort,
+            system_prompt: config.system_prompt,
+            extensions: config.extensions,
+            base_url: config.base_url,
+            retry_attempts: config.retry_attempts,
         })
     }
 
@@ -118,6 +131,14 @@ impl OpenAiClient {
                         output,
                     })
                 });
+                let result = if result.is_error && result.output.contains("unknown tool") {
+                    match self.extensions.run_tool(&name, arguments, cwd) {
+                        Some((output, is_error)) => tools::ToolExecutionResult { output, is_error },
+                        None => result,
+                    }
+                } else {
+                    result
+                };
                 let output = result.output;
                 input.push(json!({
                     "type": "function_call_output",
@@ -141,9 +162,12 @@ impl OpenAiClient {
     ) -> Result<Vec<Value>, String> {
         let body = json!({
             "model": self.model,
-            "instructions": SYSTEM_PROMPT,
+            "instructions": self.system_prompt,
+            "reasoning": {
+                "effort": self.reasoning_effort
+            },
             "input": input,
-            "tools": tools::definitions(),
+            "tools": self.tool_definitions(),
             "tool_choice": "auto",
             "stream": true
         });
@@ -215,6 +239,12 @@ impl OpenAiClient {
             return Ok(output_items);
         }
         read_sse_output(response.into_reader(), emit)
+    }
+
+    fn tool_definitions(&self) -> Vec<Value> {
+        let mut definitions = tools::definitions();
+        definitions.extend(self.extensions.definitions());
+        definitions
     }
 }
 

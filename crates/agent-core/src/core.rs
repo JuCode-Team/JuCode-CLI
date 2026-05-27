@@ -1,7 +1,12 @@
 use crate::{
     config::{profile_dir, AuthStore, Config},
-    event::{AgentEvent, SessionListItemView},
-    llm::{OpenAiClient, StreamEvent},
+    event::{AgentEvent, CommandView, ModelOptionView, SessionListItemView},
+    extensions::ExtensionRegistry,
+    llm::{OpenAiClient, OpenAiClientConfig, StreamEvent},
+    prompt::{
+        build_system_prompt, discover_project_instructions, discover_skills, skill_commands,
+        skill_message, PromptContext,
+    },
     session::{EntryKind, SessionStore, SessionSummary},
 };
 use serde_json::Value;
@@ -11,6 +16,7 @@ use std::{
     path::PathBuf,
     sync::mpsc::{self, Receiver},
     thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug)]
@@ -77,6 +83,7 @@ impl AgentCore {
                 config_path: self.config.path().display().to_string(),
             },
             self.model_status_event(),
+            self.command_list_event(),
         ]
     }
 
@@ -89,11 +96,46 @@ impl AgentCore {
             format!("queued: {}", self.queued.len())
         };
 
+        let model_config = self.config.current_model_config();
         AgentEvent::ModelStatus {
             provider: self.config.provider.clone(),
             model: self.config.model.clone(),
+            reasoning_effort: self.config.reasoning_effort.clone(),
+            context_window: model_config.context_window,
+            max_output_tokens: model_config.max_output_tokens,
+            reasoning_efforts: model_config.reasoning_efforts,
             state,
         }
+    }
+
+    fn command_list_event(&self) -> AgentEvent {
+        let mut commands = [
+            "/help",
+            "/new",
+            "/config",
+            "/model",
+            "/tree",
+            "/fork",
+            "/checkout",
+            "/delete",
+            "/resume",
+            "/extensions",
+            "/context",
+            "/quit",
+        ]
+        .iter()
+        .map(|command| CommandView {
+            command: (*command).to_string(),
+            marker: None,
+        })
+        .collect::<Vec<_>>();
+        if let Ok(skill_commands) = skill_commands(self.config.profile_dir(), &self.cwd) {
+            commands.extend(skill_commands.into_iter().map(|entry| CommandView {
+                command: entry.command,
+                marker: Some("SKILL".to_string()),
+            }));
+        }
+        AgentEvent::CommandList(commands)
     }
 
     pub fn submit_user_message(&mut self, message: String) -> Vec<AgentEvent> {
@@ -131,22 +173,28 @@ impl AgentCore {
     pub fn handle_command(&mut self, input: &str) -> (bool, Vec<AgentEvent>) {
         let mut parts = input.split_whitespace();
         let command = parts.next().unwrap_or_default();
+        if let Some(events) = self.skill_command_events(command, input[command.len()..].trim()) {
+            return (false, events);
+        }
 
         let events = match command {
             "/quit" | "/exit" => return (true, Vec::new()),
             "/help" | "/" => vec![AgentEvent::Info(
-                "/help /config /tree /fork <label> /checkout [label] /delete <label> /resume [session-id] /context /quit"
+                "/help /new /config /model [model] [effort] /tree /fork <label> /checkout [label] /delete <label> /resume [session-id] /extensions /context /quit"
                     .to_string(),
             )],
+            "/new" => self.new_session_events(),
             "/config" => vec![AgentEvent::Info(format!(
-                "provider={} model={} base_url={} auth_key={} api_key_env={} retry_attempts={}",
+                "provider={} model={} reasoning_effort={} base_url={} auth_key={} api_key_env={} retry_attempts={}",
                 self.config.provider,
                 self.config.model,
+                self.config.reasoning_effort,
                 self.config.base_url,
                 mask_key(self.auth.key_for(&self.config.provider)),
                 self.config.api_key_env,
                 self.config.retry_attempts
             ))],
+            "/model" => self.model_command_events(parts.collect()),
             "/tree" => vec![AgentEvent::TreeView(self.session.tree_view())],
             "/checkout" => {
                 let label = input[command.len()..].trim();
@@ -205,11 +253,43 @@ impl AgentCore {
                 None => self.resume_list_events(),
                 Some(session_id) => self.resume_session_events(session_id),
             },
+            "/extensions" => self.extension_events(),
             "/context" => self
                 .context_events(),
             _ => vec![AgentEvent::Error(format!("unknown command: {command}"))],
         };
         (false, events)
+    }
+
+    fn skill_command_events(&mut self, command: &str, request: &str) -> Option<Vec<AgentEvent>> {
+        let commands = skill_commands(self.config.profile_dir(), &self.cwd).ok()?;
+        let skill = commands
+            .into_iter()
+            .find(|entry| entry.command == command)?
+            .skill;
+        let message = match skill_message(&skill, request) {
+            Ok(message) => message,
+            Err(error) => {
+                return Some(vec![AgentEvent::Error(format!(
+                    "failed to read skill: {error}"
+                ))])
+            }
+        };
+        if self.running {
+            self.queued.push_back(message);
+            return Some(vec![
+                AgentEvent::PendingMessages(self.queued.iter().cloned().collect()),
+                AgentEvent::Status(format!("queued: {}", self.queued.len())),
+            ]);
+        }
+        let display = if request.is_empty() {
+            command.to_string()
+        } else {
+            format!("{command} {request}")
+        };
+        let mut events = vec![AgentEvent::UserMessage(display)];
+        events.extend(self.start_turn(message));
+        Some(events)
     }
 
     pub fn poll_events(&mut self) -> Vec<AgentEvent> {
@@ -320,13 +400,74 @@ impl AgentCore {
             return events;
         }
 
-        let Ok(client) = OpenAiClient::from_config(
-            self.config.model.clone(),
-            self.config.base_url.clone(),
-            self.auth.key_for(&self.config.provider),
-            &self.config.api_key_env,
-            self.config.retry_attempts,
-        ) else {
+        let base_prompt = match self.config.system_prompt() {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                let mut events = save_event;
+                events.push(AgentEvent::Error(format!(
+                    "failed to read prompt.txt: {error}"
+                )));
+                return events;
+            }
+        };
+        let skills = match discover_skills(self.config.profile_dir(), &self.cwd) {
+            Ok(skills) => skills,
+            Err(error) => {
+                let mut events = save_event;
+                events.push(AgentEvent::Error(format!(
+                    "failed to discover skills: {error}"
+                )));
+                return events;
+            }
+        };
+        let project_instructions = if self.config.include_project_instructions {
+            match discover_project_instructions(&self.cwd) {
+                Ok(instructions) => instructions,
+                Err(error) => {
+                    let mut events = save_event;
+                    events.push(AgentEvent::Error(format!(
+                        "failed to discover project instructions: {error}"
+                    )));
+                    return events;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let system_prompt = build_system_prompt(
+            &base_prompt,
+            &PromptContext {
+                date: current_utc_date(),
+                cwd: self.cwd.clone(),
+                tools: vec![
+                    "read",
+                    "edit",
+                    "write",
+                    "bash",
+                    "apply_patch",
+                    "diff",
+                    "ls",
+                    "ripgrep",
+                ],
+                project_instructions,
+                skills,
+            },
+        );
+
+        let Ok(client) = OpenAiClient::from_config(OpenAiClientConfig {
+            model: self.config.model.clone(),
+            reasoning_effort: self.config.reasoning_effort.clone(),
+            system_prompt,
+            extensions: ExtensionRegistry::load(
+                &self.config.extensions,
+                &self.cwd,
+                self.config.profile_dir(),
+            ),
+            base_url: self.config.base_url.clone(),
+            api_key: self.auth.key_for(&self.config.provider),
+            api_key_env: &self.config.api_key_env,
+            retry_attempts: self.config.retry_attempts,
+        }) else {
             let mut events = save_event;
             events.push(AgentEvent::Error(
                 "missing API key in auth.json or env".to_string(),
@@ -408,6 +549,27 @@ impl AgentCore {
         }
     }
 
+    fn new_session_events(&mut self) -> Vec<AgentEvent> {
+        if self.running {
+            return vec![AgentEvent::Error(
+                "cannot start a new session while a response is running".to_string(),
+            )];
+        }
+        self.queued.clear();
+        self.receiver = None;
+        self.session = SessionStore::new();
+        let session_id = self.session.session_id().to_string();
+        let save_event = self.save_session_event();
+        vec![
+            AgentEvent::Transcript(self.session.transcript_items()),
+            AgentEvent::PendingMessages(Vec::new()),
+            AgentEvent::Status(format!("new session {session_id}")),
+        ]
+        .into_iter()
+        .chain(save_event)
+        .collect()
+    }
+
     fn resume_list_events(&self) -> Vec<AgentEvent> {
         match SessionStore::list_for_cwd(&self.profile_dir, &self.cwd) {
             Ok(sessions) if sessions.is_empty() => {
@@ -464,6 +626,153 @@ impl AgentCore {
         );
         events
     }
+
+    fn extension_events(&self) -> Vec<AgentEvent> {
+        if self.config.extensions.is_empty() {
+            return vec![AgentEvent::Info("extensions: none".to_string())];
+        }
+
+        let registry = ExtensionRegistry::load(
+            &self.config.extensions,
+            &self.cwd,
+            self.config.profile_dir(),
+        );
+        let mut events = Vec::new();
+        for extension in &self.config.extensions {
+            let tools = registry
+                .summaries()
+                .into_iter()
+                .filter(|summary| summary.extension == extension.name)
+                .map(|summary| {
+                    if summary.description.is_empty() {
+                        summary.tool
+                    } else {
+                        format!("{} - {}", summary.tool, summary.description)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let error = registry
+                .errors()
+                .iter()
+                .find(|(name, _)| name == &extension.name)
+                .map(|(_, error)| error);
+            if let Some(error) = error {
+                events.push(AgentEvent::Info(format!(
+                    "extension {}: failed to initialize: {error}",
+                    extension.name
+                )));
+            } else if tools.is_empty() {
+                events.push(AgentEvent::Info(format!(
+                    "extension {}: no tools",
+                    extension.name
+                )));
+            } else {
+                events.push(AgentEvent::Info(format!(
+                    "extension {}: {}",
+                    extension.name,
+                    tools.join(", ")
+                )));
+            }
+        }
+        events
+    }
+
+    fn model_command_events(&mut self, args: Vec<&str>) -> Vec<AgentEvent> {
+        match args.as_slice() {
+            [] => vec![AgentEvent::ModelView {
+                models: self.model_options(),
+                active_effort: self.config.reasoning_effort.clone(),
+            }],
+            [model] if self.is_reasoning_effort_for_current_model(model) => {
+                self.set_model_config(self.config.model.clone(), (*model).to_string())
+            }
+            [model] => {
+                let reasoning_effort = self
+                    .reasoning_efforts_for_model(model)
+                    .into_iter()
+                    .find(|effort| effort == &self.config.reasoning_effort)
+                    .unwrap_or_else(|| self.default_reasoning_effort_for_model(model));
+                self.set_model_config((*model).to_string(), reasoning_effort)
+            }
+            [model, effort] => {
+                if !self.is_reasoning_effort_for_model(model, effort) {
+                    return vec![AgentEvent::Error(format!(
+                        "{model} does not support reasoning effort: {effort}"
+                    ))];
+                }
+                self.set_model_config((*model).to_string(), (*effort).to_string())
+            }
+            _ => vec![AgentEvent::Error(
+                "usage: /model [model] [none|low|medium|high]".to_string(),
+            )],
+        }
+    }
+
+    fn set_model_config(&mut self, model: String, reasoning_effort: String) -> Vec<AgentEvent> {
+        if model.trim().is_empty() {
+            return vec![AgentEvent::Error("model cannot be empty".to_string())];
+        }
+        if !self.is_reasoning_effort_for_model(&model, &reasoning_effort) {
+            return vec![AgentEvent::Error(format!(
+                "{model} does not support reasoning effort: {reasoning_effort}"
+            ))];
+        }
+
+        self.config.model = model;
+        self.config.reasoning_effort = reasoning_effort;
+        match self.config.save() {
+            Ok(()) => vec![self.model_status_event()],
+            Err(error) => vec![AgentEvent::Error(format!("failed to save config: {error}"))],
+        }
+    }
+
+    fn model_options(&self) -> Vec<ModelOptionView> {
+        self.config
+            .models
+            .iter()
+            .map(|model_config| {
+                let active = model_config.name == self.config.model;
+                ModelOptionView {
+                    model: model_config.name.clone(),
+                    active,
+                    context_window: model_config.context_window,
+                    max_output_tokens: model_config.max_output_tokens,
+                    reasoning_efforts: model_config.reasoning_efforts.clone(),
+                }
+            })
+            .collect()
+    }
+
+    fn reasoning_efforts_for_model(&self, model: &str) -> Vec<String> {
+        self.config
+            .models
+            .iter()
+            .find(|entry| entry.name == model)
+            .map(|entry| entry.reasoning_efforts.clone())
+            .unwrap_or_else(|| self.config.current_model_config().reasoning_efforts)
+    }
+
+    fn default_reasoning_effort_for_model(&self, model: &str) -> String {
+        let efforts = self.reasoning_efforts_for_model(model);
+        if efforts.iter().any(|effort| effort == "medium") {
+            "medium".to_string()
+        } else {
+            efforts
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "medium".to_string())
+        }
+    }
+
+    fn is_reasoning_effort_for_current_model(&self, value: &str) -> bool {
+        self.is_reasoning_effort_for_model(&self.config.model, value)
+    }
+
+    fn is_reasoning_effort_for_model(&self, model: &str, value: &str) -> bool {
+        self.reasoning_efforts_for_model(model)
+            .iter()
+            .any(|effort| effort == value)
+    }
 }
 
 fn mask_key(value: Option<&str>) -> String {
@@ -474,6 +783,29 @@ fn mask_key(value: Option<&str>) -> String {
         Some(_) => "(set)".to_string(),
         None => "(not set)".to_string(),
     }
+}
+
+fn current_utc_date() -> String {
+    let days = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() / 86_400)
+        .unwrap_or(0);
+    let (year, month, day) = civil_from_days(days as i64);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += if month <= 2 { 1 } else { 0 };
+    (year as i32, month as u32, day as u32)
 }
 
 fn format_session_summary(summary: SessionSummary) -> String {

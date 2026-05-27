@@ -1,9 +1,13 @@
 mod config;
 mod core;
 pub mod event;
+mod extensions;
 mod llm;
+mod prompt;
 mod session;
 mod tools;
 
 pub use core::AgentCore;
-pub use event::{AgentEvent, SessionListItemView, TranscriptItem, TreeNodeView};
+pub use event::{
+    AgentEvent, CommandView, ModelOptionView, SessionListItemView, TranscriptItem, TreeNodeView,
+};

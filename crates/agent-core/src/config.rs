@@ -5,14 +5,51 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub const DEFAULT_SYSTEM_PROMPT: &str = r#"You are JuCode, a focused coding agent.
+
+Work with care before speed. Understand the task and the existing code before making changes. If the request is ambiguous or a key detail cannot be inferred safely, say so and ask a concise question. If there are multiple reasonable approaches, surface the tradeoff briefly.
+
+Prefer the smallest change that correctly solves the problem. Avoid speculative features, unnecessary abstraction, broad refactors, and hidden compatibility layers unless they are explicitly needed. Match the project's existing structure, style, naming, and conventions.
+
+Fix root causes rather than symptoms. Do not hide problems with silent fallback behavior or vague recovery paths. Use defensive programming only when the boundary is real and relevant.
+
+Use tools when you need filesystem, search, shell, or verification access. Inspect before editing. Keep edits scoped to the affected files, and do not modify unrelated work.
+
+Be accurate. Do not fabricate facts about APIs, tools, commands, or the codebase. When uncertain, verify from reliable sources or state the uncertainty clearly.
+
+Verify before claiming completion. Use the smallest meaningful checks for the change, such as focused tests, builds, formatters, or linters. If verification is not possible, report that plainly.
+
+For user-facing work, preserve the existing product language and design system. Build coherent, useful interfaces without fake data, decorative filler, or new visual styles unless requested.
+
+Communicate directly and concisely. Report behavior-level changes, important risks, verification results, and any remaining gaps."#;
+const PROMPT_FILE_NAME: &str = "prompt.txt";
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub provider: String,
     pub model: String,
+    pub reasoning_effort: String,
+    pub models: Vec<ModelConfig>,
     pub base_url: String,
     pub api_key_env: String,
     pub retry_attempts: usize,
+    pub include_project_instructions: bool,
+    pub extensions: Vec<ExtensionConfig>,
     path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionConfig {
+    pub name: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelConfig {
+    pub name: String,
+    pub context_window: u64,
+    pub max_output_tokens: u64,
+    pub reasoning_efforts: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -24,13 +61,18 @@ pub struct AuthStore {
 impl Config {
     pub fn load_or_create() -> io::Result<Self> {
         let path = config_path()?;
+        ensure_system_prompt_file()?;
         if !path.exists() {
             let config = Self {
                 provider: "openai".to_string(),
                 model: "gpt-5".to_string(),
+                reasoning_effort: "medium".to_string(),
+                models: default_model_configs(),
                 base_url: "https://api.openai.com/v1".to_string(),
                 api_key_env: "OPENAI_API_KEY".to_string(),
                 retry_attempts: 3,
+                include_project_instructions: true,
+                extensions: Vec::new(),
                 path,
             };
             config.save()?;
@@ -39,9 +81,17 @@ impl Config {
 
         let content = fs::read_to_string(&path)?;
         let value = serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({}));
+        let model = read_string(&value, "model", "gpt-5");
+        let mut models = read_model_configs(&value);
+        if !models.iter().any(|entry| entry.name == model) {
+            models.insert(0, default_model_config(&model));
+        }
+        let reasoning_effort = read_reasoning_effort(&value, &model, &models);
         let config = Self {
             provider: read_string(&value, "provider", "openai"),
-            model: read_string(&value, "model", "gpt-5"),
+            model,
+            reasoning_effort,
+            models,
             base_url: normalize_base_url(&read_string(
                 &value,
                 "base_url",
@@ -49,6 +99,8 @@ impl Config {
             )),
             api_key_env: read_api_key_env(&value),
             retry_attempts: read_usize(&value, "retry_attempts", 3),
+            include_project_instructions: read_bool(&value, "include_project_instructions", true),
+            extensions: read_extensions(&value),
             path,
         };
         config.save()?;
@@ -63,9 +115,13 @@ impl Config {
         let value = json!({
             "provider": self.provider,
             "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "models": self.models.iter().map(model_config_value).collect::<Vec<_>>(),
             "base_url": normalize_base_url(&self.base_url),
             "api_key_env": self.api_key_env,
-            "retry_attempts": self.retry_attempts
+            "retry_attempts": self.retry_attempts,
+            "include_project_instructions": self.include_project_instructions,
+            "extensions": self.extensions.iter().map(extension_config_value).collect::<Vec<_>>()
         });
         fs::write(
             &self.path,
@@ -79,6 +135,18 @@ impl Config {
 
     pub fn profile_dir(&self) -> &Path {
         self.path.parent().unwrap_or_else(|| Path::new("."))
+    }
+
+    pub fn current_model_config(&self) -> ModelConfig {
+        self.models
+            .iter()
+            .find(|entry| entry.name == self.model)
+            .cloned()
+            .unwrap_or_else(|| default_model_config(&self.model))
+    }
+
+    pub fn system_prompt(&self) -> io::Result<String> {
+        fs::read_to_string(system_prompt_path()?)
     }
 }
 
@@ -149,6 +217,10 @@ fn read_usize(value: &Value, key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn read_bool(value: &Value, key: &str, default: bool) -> bool {
+    value.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+
 fn read_api_key_env(value: &Value) -> String {
     let raw = value
         .get("api_key_env")
@@ -161,6 +233,184 @@ fn read_api_key_env(value: &Value) -> String {
     } else {
         raw.to_string()
     }
+}
+
+fn read_reasoning_effort(value: &Value, model: &str, models: &[ModelConfig]) -> String {
+    let effort = read_string(value, "reasoning_effort", "medium");
+    let supported = models
+        .iter()
+        .find(|entry| entry.name == model)
+        .map(|entry| entry.reasoning_efforts.as_slice())
+        .unwrap_or(&[]);
+    if supported.iter().any(|entry| entry == &effort) {
+        effort
+    } else if supported.iter().any(|entry| entry == "medium") {
+        "medium".to_string()
+    } else {
+        supported
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "medium".to_string())
+    }
+}
+
+fn read_model_configs(value: &Value) -> Vec<ModelConfig> {
+    let Some(models) = value.get("models").and_then(Value::as_array) else {
+        return default_model_configs();
+    };
+
+    let mut configs = Vec::new();
+    for model in models {
+        let Some(name) = model
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let reasoning_efforts = model
+            .get("reasoning_efforts")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|values| !values.is_empty())
+            .unwrap_or_else(default_reasoning_efforts);
+
+        configs.push(ModelConfig {
+            name: name.to_string(),
+            context_window: model
+                .get("context_window")
+                .and_then(Value::as_u64)
+                .unwrap_or(400_000),
+            max_output_tokens: model
+                .get("max_output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(128_000),
+            reasoning_efforts,
+        });
+    }
+
+    if configs.is_empty() {
+        default_model_configs()
+    } else {
+        configs
+    }
+}
+
+fn read_extensions(value: &Value) -> Vec<ExtensionConfig> {
+    let Some(extensions) = value.get("extensions").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    extensions
+        .iter()
+        .filter_map(|extension| {
+            let name = extension
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let command = extension
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            Some(ExtensionConfig {
+                name: name.to_string(),
+                command: command.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn model_config_value(model: &ModelConfig) -> Value {
+    json!({
+        "name": model.name,
+        "context_window": model.context_window,
+        "max_output_tokens": model.max_output_tokens,
+        "reasoning_efforts": model.reasoning_efforts,
+    })
+}
+
+fn extension_config_value(extension: &ExtensionConfig) -> Value {
+    json!({
+        "name": extension.name,
+        "command": extension.command,
+    })
+}
+
+fn default_reasoning_efforts() -> Vec<String> {
+    ["none", "low", "medium", "high", "xhigh"]
+        .iter()
+        .map(|value| value.to_string())
+        .collect()
+}
+
+fn default_model_configs() -> Vec<ModelConfig> {
+    [
+        (
+            "gpt-5.5",
+            1_050_000,
+            128_000,
+            &["none", "low", "medium", "high", "xhigh"][..],
+        ),
+        (
+            "gpt-5.4",
+            1_050_000,
+            128_000,
+            &["none", "low", "medium", "high", "xhigh"],
+        ),
+        (
+            "gpt-5.4-mini",
+            400_000,
+            128_000,
+            &["none", "low", "medium", "high", "xhigh"],
+        ),
+        (
+            "gpt-5.3-codex",
+            400_000,
+            128_000,
+            &["low", "medium", "high", "xhigh"],
+        ),
+        (
+            "gpt-5.2",
+            400_000,
+            128_000,
+            &["none", "low", "medium", "high", "xhigh"],
+        ),
+    ]
+    .iter()
+    .map(
+        |(name, context_window, max_output_tokens, reasoning_efforts)| ModelConfig {
+            name: (*name).to_string(),
+            context_window: *context_window,
+            max_output_tokens: *max_output_tokens,
+            reasoning_efforts: reasoning_efforts
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+        },
+    )
+    .collect()
+}
+
+fn default_model_config(name: &str) -> ModelConfig {
+    default_model_configs()
+        .into_iter()
+        .find(|entry| entry.name == name)
+        .unwrap_or_else(|| ModelConfig {
+            name: name.to_string(),
+            context_window: 400_000,
+            max_output_tokens: 128_000,
+            reasoning_efforts: default_reasoning_efforts(),
+        })
 }
 
 fn read_provider_keys(providers: &Map<String, Value>) -> BTreeMap<String, String> {
@@ -179,6 +429,21 @@ fn config_path() -> io::Result<PathBuf> {
 
 fn auth_path() -> io::Result<PathBuf> {
     Ok(jucode_dir()?.join("auth.json"))
+}
+
+fn system_prompt_path() -> io::Result<PathBuf> {
+    Ok(jucode_dir()?.join(PROMPT_FILE_NAME))
+}
+
+fn ensure_system_prompt_file() -> io::Result<()> {
+    let path = system_prompt_path()?;
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, format!("{DEFAULT_SYSTEM_PROMPT}\n"))
 }
 
 fn jucode_dir() -> io::Result<PathBuf> {

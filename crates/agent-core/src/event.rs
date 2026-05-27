@@ -14,6 +14,21 @@ pub struct SessionListItemView {
 }
 
 #[derive(Debug, Clone)]
+pub struct ModelOptionView {
+    pub model: String,
+    pub active: bool,
+    pub context_window: u64,
+    pub max_output_tokens: u64,
+    pub reasoning_efforts: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommandView {
+    pub command: String,
+    pub marker: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub enum TranscriptItem {
     User(String),
     Assistant(String),
@@ -31,6 +46,10 @@ pub enum AgentEvent {
     ModelStatus {
         provider: String,
         model: String,
+        reasoning_effort: String,
+        context_window: u64,
+        max_output_tokens: u64,
+        reasoning_efforts: Vec<String>,
         state: String,
     },
     PendingMessages(Vec<String>),
@@ -62,6 +81,11 @@ pub enum AgentEvent {
     },
     TreeView(Vec<TreeNodeView>),
     ResumeView(Vec<SessionListItemView>),
+    ModelView {
+        models: Vec<ModelOptionView>,
+        active_effort: String,
+    },
+    CommandList(Vec<CommandView>),
     Transcript(Vec<TranscriptItem>),
     Info(String),
     Error(String),
