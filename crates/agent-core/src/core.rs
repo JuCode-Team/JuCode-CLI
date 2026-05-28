@@ -92,11 +92,15 @@ impl AgentCore {
     }
 
     pub fn startup_events(&self) -> Vec<AgentEvent> {
+        let model_config = self.config.current_model_config();
         vec![
             AgentEvent::Startup {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 profile_dir: self.config.profile_dir().display().to_string(),
                 config_path: self.config.path().display().to_string(),
+                cwd: self.cwd.display().to_string(),
+                model: self.config.model.clone(),
+                context_window: model_config.context_window,
             },
             self.model_status_event(),
             self.command_list_event(),

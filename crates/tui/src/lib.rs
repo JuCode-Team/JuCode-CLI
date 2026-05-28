@@ -42,6 +42,10 @@ const RESET: &str = "\x1b[0m";
 const INVERSE_ON: &str = "\x1b[7m";
 const INVERSE_OFF: &str = "\x1b[27m";
 const BOX_BORDER: &str = "\x1b[90m";
+const STARTUP_TEXT: &str = "\x1b[38;2;180;176;187m";
+const STARTUP_DIM: &str = "\x1b[38;2;125;121;134m";
+const STARTUP_ACCENT: &str = "\x1b[38;2;190;160;255m";
+const STARTUP_STRONG: &str = "\x1b[38;2;232;228;238m";
 const ANSI_ESCAPE: char = '\x1b';
 
 #[derive(Debug, Clone)]
@@ -50,6 +54,9 @@ enum ChatLine {
         version: String,
         profile_dir: String,
         config_path: String,
+        cwd: String,
+        model: String,
+        context_window: u64,
     },
     User(String),
     Assistant(String),
@@ -209,6 +216,45 @@ fn format_compact_number(value: u64) -> String {
         format!("{:.1}K", value as f64 / 1_000.0)
     } else {
         value.to_string()
+    }
+}
+
+fn format_context_window(value: u64) -> String {
+    if value >= 1_000_000 && value % 1_000_000 == 0 {
+        format!("{}M", value / 1_000_000)
+    } else if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{}K", value / 1_000)
+    } else {
+        value.to_string()
+    }
+}
+
+fn compact_home_path(path: &str) -> String {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok();
+    let Some(home) = home else {
+        return path.to_string();
+    };
+    let home = home.trim_end_matches(['\\', '/']);
+    if path == home {
+        "~".to_string()
+    } else {
+        path.strip_prefix(&format!("{home}\\"))
+            .or_else(|| path.strip_prefix(&format!("{home}/")))
+            .map(|rest| format!("~/{rest}").replace('\\', "/"))
+            .unwrap_or_else(|| path.to_string())
+    }
+}
+
+fn pad_to_width(text: &str, width: usize) -> String {
+    let visible_width = UnicodeWidthStr::width(text);
+    if visible_width >= width {
+        text.to_string()
+    } else {
+        format!("{}{}", text, " ".repeat(width - visible_width))
     }
 }
 
@@ -1014,8 +1060,18 @@ impl<R: TuiRuntime> TuiApp<R> {
                     version,
                     profile_dir,
                     config_path,
+                    cwd,
+                    model,
+                    context_window,
                 } => {
-                    self.push_startup(version, profile_dir, config_path);
+                    self.push_startup(
+                        version,
+                        profile_dir,
+                        config_path,
+                        cwd,
+                        model,
+                        context_window,
+                    );
                     true
                 }
                 AgentEvent::ModelStatus {
@@ -1224,11 +1280,22 @@ impl<R: TuiRuntime> TuiApp<R> {
         self.reset_screen = true;
     }
 
-    fn push_startup(&mut self, version: String, profile_dir: String, config_path: String) {
+    fn push_startup(
+        &mut self,
+        version: String,
+        profile_dir: String,
+        config_path: String,
+        cwd: String,
+        model: String,
+        context_window: u64,
+    ) {
         self.chat.push(ChatLine::Startup {
             version,
             profile_dir,
             config_path,
+            cwd,
+            model,
+            context_window,
         });
     }
 
@@ -1765,7 +1832,17 @@ impl UiBuilder {
                     version,
                     profile_dir,
                     config_path,
-                } => self.push_startup_box(version, profile_dir, config_path),
+                    cwd,
+                    model,
+                    context_window,
+                } => self.push_startup_box(
+                    version,
+                    profile_dir,
+                    config_path,
+                    cwd,
+                    model,
+                    *context_window,
+                ),
                 ChatLine::User(text) => self.push_history(UiKind::User, text),
                 ChatLine::Assistant(text) => self.push_history(UiKind::Assistant, text),
                 ChatLine::Tool {
@@ -1989,34 +2066,50 @@ impl UiBuilder {
         }
     }
 
-    fn push_startup_box(&mut self, version: &str, profile_dir: &str, _config_path: &str) {
-        let title = format!(">_ JuCode CLI (v{version})");
-        let model = "model:     /model to choose";
-        let profile = format!("profile:   {profile_dir}");
-        let content_width = [title.as_str(), model, profile.as_str()]
+    fn push_startup_box(
+        &mut self,
+        _version: &str,
+        _profile_dir: &str,
+        _config_path: &str,
+        cwd: &str,
+        model: &str,
+        context_window: u64,
+    ) {
+        let mascot = [" \\/", "<'l", " ll", " llama~", " || ||", " '' ''"];
+        let title = format!(
+            "Welcome to JuCode ({} · {} context)",
+            model,
+            format_context_window(context_window)
+        );
+        let cwd = format!("cwd: {}", compact_home_path(cwd));
+        let help = "/help for commands · /exit to quit";
+        let content_width = [title.as_str(), cwd.as_str(), help]
             .iter()
             .map(|line| UnicodeWidthStr::width(*line))
             .max()
-            .unwrap_or(0)
-            .min(96);
+            .unwrap_or(0);
+        let mascot_width = mascot
+            .iter()
+            .map(|line| UnicodeWidthStr::width(*line))
+            .max()
+            .unwrap_or(0);
+        let content_width = (mascot_width + 3 + content_width).min(96);
+        let right_width = content_width.saturating_sub(mascot_width + 3);
+        let right_lines = [title.as_str(), "", cwd.as_str(), "", help, ""];
 
         self.history_line(UiKind::Brand, rounded_box_border('╭', '╮', content_width));
-        self.history_line(
-            UiKind::Brand,
-            rounded_box_line(&title, content_width, UiKind::Brand),
-        );
-        self.history_line(
-            UiKind::Brand,
-            rounded_box_line("", content_width, UiKind::Brand),
-        );
-        self.history_line(
-            UiKind::System,
-            rounded_box_line(model, content_width, UiKind::System),
-        );
-        self.history_line(
-            UiKind::System,
-            rounded_box_line(&profile, content_width, UiKind::System),
-        );
+        for (index, mascot_line) in mascot.iter().enumerate() {
+            self.history_line(
+                UiKind::System,
+                startup_box_line(
+                    mascot_line,
+                    right_lines[index],
+                    mascot_width,
+                    right_width,
+                    content_width,
+                ),
+            );
+        }
         self.history_line(UiKind::Brand, rounded_box_border('╰', '╯', content_width));
     }
 
@@ -2982,14 +3075,48 @@ fn rounded_box_border(left: char, right: char, width: usize) -> String {
     format!("{BOX_BORDER}{left}{}{right}{RESET}", "─".repeat(width + 2))
 }
 
-fn rounded_box_line(text: &str, width: usize, text_kind: UiKind) -> String {
-    let text = truncate_to_width(text, width);
-    let text_width = UnicodeWidthStr::width(text.as_str());
+fn startup_box_line(
+    mascot: &str,
+    text: &str,
+    mascot_width: usize,
+    right_width: usize,
+    width: usize,
+) -> String {
+    let plain_width = mascot_width + 3 + right_width;
+    let text_width = UnicodeWidthStr::width(text);
+    let text_padding = " ".repeat(right_width.saturating_sub(text_width));
+    let colored = format!(
+        "{}{}{}   {}{}{}",
+        STARTUP_ACCENT,
+        pad_to_width(mascot, mascot_width),
+        STARTUP_TEXT,
+        color_startup_text(text),
+        text_padding,
+        RESET
+    );
     format!(
-        "{BOX_BORDER}│{RESET} {}{text}{RESET}{} {BOX_BORDER}│{RESET}",
-        color_code(text_kind),
-        " ".repeat(width.saturating_sub(text_width))
+        "{BOX_BORDER}│{RESET} {colored}{} {BOX_BORDER}│{RESET}",
+        " ".repeat(width.saturating_sub(plain_width))
     )
+}
+
+fn color_startup_text(text: &str) -> String {
+    if let Some(rest) = text.strip_prefix("Welcome to ") {
+        if let Some(details) = rest.strip_prefix("JuCode") {
+            return format!(
+                "{STARTUP_STRONG}Welcome to {STARTUP_ACCENT}JuCode{STARTUP_DIM}{details}{STARTUP_TEXT}"
+            );
+        }
+    }
+    if let Some(path) = text.strip_prefix("cwd: ") {
+        return format!("{STARTUP_TEXT}cwd: {STARTUP_STRONG}{path}{STARTUP_TEXT}");
+    }
+    if text == "/help for commands · /exit to quit" {
+        return format!(
+            "{STARTUP_STRONG}/help{STARTUP_TEXT} for commands · {STARTUP_STRONG}/exit{STARTUP_TEXT} to quit"
+        );
+    }
+    format!("{STARTUP_TEXT}{text}")
 }
 
 fn spinner_char(preset: SpinnerPreset, tick: usize, step: usize) -> &'static str {
@@ -3147,6 +3274,23 @@ mod tests {
             }
         }
         output
+    }
+
+    fn ansi_visible_width(text: &str) -> usize {
+        let mut width = 0;
+        let mut rest = text;
+        while !rest.is_empty() {
+            if let Some((_, next)) = split_ansi_sequence(rest) {
+                rest = next;
+                continue;
+            }
+            let Some(ch) = rest.chars().next() else {
+                break;
+            };
+            width += ch.width().unwrap_or(0);
+            rest = &rest[ch.len_utf8()..];
+        }
+        width
     }
 
     #[derive(Default)]
@@ -3498,20 +3642,38 @@ mod tests {
                 version: "0.1.2".to_string(),
                 profile_dir: "C:\\Users\\me\\.jucode".to_string(),
                 config_path: "E:\\Code\\Projects\\JuCode\\JuCode-CLI".to_string(),
+                cwd: "C:\\Users\\me\\projects\\jucode".to_string(),
+                model: "claude-opus-4-7".to_string(),
+                context_window: 1_000_000,
             }])
             .finish();
 
         assert!(document.history[0].text.starts_with("\x1b[90m╭"));
         assert!(document.history[1].text.contains("\x1b[90m│"));
         assert!(strip_ansi(&document.history[0].text).starts_with('╭'));
-        assert!(strip_ansi(&document.history[1].text).contains(">_ JuCode CLI (v0.1.2)"));
-        assert!(strip_ansi(&document.history[3].text).contains("model:"));
+        assert!(strip_ansi(&document.history[1].text).contains(" \\/"));
+        assert!(strip_ansi(&document.history[1].text)
+            .contains("Welcome to JuCode (claude-opus-4-7 · 1M context)"));
+        assert!(strip_ansi(&document.history[2].text).contains("<'l"));
+        assert!(!strip_ansi(&document.history[2].text).contains("cwd:"));
+        assert!(strip_ansi(&document.history[3].text).contains(" ll"));
+        assert!(strip_ansi(&document.history[3].text).contains("cwd:"));
         assert!(!document
             .history
             .iter()
             .any(|line| strip_ansi(&line.text).contains("directory:")));
-        assert!(strip_ansi(&document.history[4].text).contains("profile:   C:\\Users\\me\\.jucode"));
-        assert!(strip_ansi(&document.history[5].text).starts_with('╰'));
+        assert!(strip_ansi(&document.history[5].text).contains(" || ||"));
+        assert!(strip_ansi(&document.history[5].text).contains("/help for commands"));
+        assert!(strip_ansi(&document.history[7].text).starts_with('╰'));
+        let border_width = ansi_visible_width(&document.history[0].text);
+        for line in document.history.iter().take(8) {
+            assert_eq!(
+                ansi_visible_width(&line.text),
+                border_width,
+                "{}",
+                strip_ansi(&line.text)
+            );
+        }
     }
 
     #[test]

@@ -86,8 +86,19 @@ fn event_json(event: AgentEvent) -> Value {
             version,
             profile_dir,
             config_path,
+            cwd,
+            model,
+            context_window,
         } => {
-            json!({ "type": "startup", "version": version, "profile_dir": profile_dir, "config_path": config_path })
+            json!({
+                "type": "startup",
+                "version": version,
+                "profile_dir": profile_dir,
+                "config_path": config_path,
+                "cwd": cwd,
+                "model": model,
+                "context_window": context_window
+            })
         }
         AgentEvent::ModelStatus {
             provider,

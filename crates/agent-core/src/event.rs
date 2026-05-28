@@ -53,6 +53,9 @@ pub enum AgentEvent {
         version: String,
         profile_dir: String,
         config_path: String,
+        cwd: String,
+        model: String,
+        context_window: u64,
     },
     ModelStatus {
         provider: String,
