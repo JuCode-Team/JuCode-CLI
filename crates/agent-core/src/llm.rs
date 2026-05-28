@@ -149,7 +149,7 @@ impl OpenAiClient {
                 let result = if result.is_error && result.output.contains("unknown tool") {
                     match self.extensions.run_tool(&name, arguments, cwd) {
                         Some((output, is_error)) => tools::ToolExecutionResult {
-                            model_output: output.clone(),
+                            model_output: tools::project_model_output(&name, &output, cwd),
                             output,
                             is_error,
                         },

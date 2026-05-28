@@ -15,6 +15,7 @@ use std::{
     collections::VecDeque,
     env, io,
     path::PathBuf,
+    process::Command,
     sync::mpsc::{self, Receiver},
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -60,6 +61,8 @@ pub struct AgentCore {
     queued: VecDeque<String>,
     running: bool,
     receiver: Option<Receiver<WorkerEvent>>,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
 }
 
 impl AgentCore {
@@ -73,6 +76,8 @@ impl AgentCore {
             queued: VecDeque::new(),
             running: false,
             receiver: None,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
         })
     }
 
@@ -123,6 +128,8 @@ impl AgentCore {
             "/resume",
             "/extensions",
             "/context",
+            "/stats",
+            "/doctor",
             "/quit",
         ]
         .iter()
@@ -182,7 +189,7 @@ impl AgentCore {
         let events = match command {
             "/quit" | "/exit" => return (true, Vec::new()),
             "/help" | "/" => vec![AgentEvent::Info(
-                "/help /login [web-url] [api-url] /new /config /model [model] [effort] /tree /fork <label> /checkout [label] /delete <label> /resume [session-id] /extensions /context /quit"
+                "/help /login [web-url] [api-url] /new /config /model [model] [effort] /tree /fork <label> /checkout [label] /delete <label> /resume [session-id] /extensions /context /stats /doctor /quit"
                     .to_string(),
             )],
             "/login" => self.login_events(input[command.len()..].trim()),
@@ -259,8 +266,9 @@ impl AgentCore {
                 Some(session_id) => self.resume_session_events(session_id),
             },
             "/extensions" => self.extension_events(),
-            "/context" => self
-                .context_events(),
+            "/context" => self.context_events(),
+            "/stats" => self.stats_events(),
+            "/doctor" => self.doctor_events(),
             _ => vec![AgentEvent::Error(format!("unknown command: {command}"))],
         };
         (false, events)
@@ -349,10 +357,14 @@ impl AgentCore {
                     WorkerEvent::Usage {
                         input_tokens,
                         output_tokens,
-                    } => events.push(AgentEvent::Usage {
-                        input_tokens,
-                        output_tokens,
-                    }),
+                    } => {
+                        self.total_input_tokens += input_tokens;
+                        self.total_output_tokens += output_tokens;
+                        events.push(AgentEvent::Usage {
+                            input_tokens,
+                            output_tokens,
+                        });
+                    }
                     WorkerEvent::Done => {
                         self.running = false;
                         disconnected = true;
@@ -458,10 +470,13 @@ impl AgentCore {
                     "edit",
                     "write",
                     "bash",
+                    "write_stdin",
                     "apply_patch",
                     "diff",
                     "ls",
                     "ripgrep",
+                    "outline",
+                    "checkpoint",
                 ],
                 project_instructions,
                 skills,
@@ -737,6 +752,55 @@ impl AgentCore {
         events
     }
 
+    fn stats_events(&self) -> Vec<AgentEvent> {
+        let projection = self.session.context_projection();
+        vec![AgentEvent::Info(format!(
+            "stats: total_input_tokens={} total_output_tokens={} session_entries={} projected_entries={} compacted={}",
+            self.total_input_tokens,
+            self.total_output_tokens,
+            projection.branch_entries,
+            projection.projected_entries,
+            projection.compacted
+        ))]
+    }
+
+    fn doctor_events(&self) -> Vec<AgentEvent> {
+        let mut lines = Vec::new();
+        lines.push(format!("provider: {}", self.config.provider));
+        lines.push(format!("model: {}", self.config.model));
+        lines.push(format!(
+            "auth: {}",
+            if self.auth.key_for(&self.config.provider).is_some()
+                || env::var_os(&self.config.api_key_env).is_some()
+            {
+                "ok"
+            } else {
+                "missing"
+            }
+        ));
+        lines.push(format!("cwd: {}", self.cwd.display()));
+        lines.push(format!("git: {}", command_ok("git", "--version")));
+        lines.push(format!("rg: {}", command_ok("rg", "--version")));
+        match discover_project_instructions(&self.cwd) {
+            Ok(instructions) => lines.push(format!(
+                "project instructions: {} file(s)",
+                instructions.len()
+            )),
+            Err(error) => lines.push(format!("project instructions: error: {error}")),
+        }
+        let extensions = ExtensionRegistry::load(
+            &self.config.extensions,
+            &self.cwd,
+            self.config.profile_dir(),
+        );
+        lines.push(format!(
+            "extensions: {} tool(s), {} error(s)",
+            extensions.definitions().len(),
+            extensions.errors().len()
+        ));
+        vec![AgentEvent::Info(lines.join("\n"))]
+    }
+
     fn extension_events(&self) -> Vec<AgentEvent> {
         if self.config.extensions.is_empty() {
             return vec![AgentEvent::Info("extensions: none".to_string())];
@@ -917,6 +981,13 @@ fn is_jucode_supported_model(model: &str) -> bool {
         model,
         "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.3-codex" | "gpt-5.2"
     ) || model.starts_with("claude-")
+}
+
+fn command_ok(program: &str, arg: &str) -> &'static str {
+    match Command::new(program).arg(arg).output() {
+        Ok(output) if output.status.success() => "ok",
+        _ => "missing",
+    }
 }
 
 fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {

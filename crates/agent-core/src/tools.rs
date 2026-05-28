@@ -1,9 +1,10 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     fs::File,
-    io::{self, BufRead, BufReader, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
@@ -20,6 +21,7 @@ const DEFAULT_RIPGREP_LIMIT: usize = 100;
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 60;
 const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_MODEL_OUTPUT_BYTES: usize = 24 * 1024;
+const MAX_IMAGE_READ_BYTES: u64 = 1024 * 1024;
 const COMMAND_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct ToolExecutionResult {
@@ -37,7 +39,7 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "name": "read",
-            "description": "Read a UTF-8 text file. Supports 1-indexed offset and line limit; output is truncated when large.",
+            "description": "Read a text file, image, or binary file metadata. Text supports 1-indexed offset and line limit. Images return base64 when small enough.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -176,6 +178,36 @@ pub fn definitions() -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
+        json!({
+            "type": "function",
+            "name": "outline",
+            "description": "Return a lightweight symbol outline for a source file without reading the full body.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Source file path." },
+                    "limit": { "type": "number", "description": "Maximum symbols to return. Defaults to 200." }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "checkpoint",
+            "description": "Create, list, or restore lightweight file checkpoints under .jucode/checkpoints. This is for local rollback, not git.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["create", "list", "restore"], "description": "Checkpoint action." },
+                    "name": { "type": "string", "description": "Checkpoint name for create." },
+                    "id": { "type": "string", "description": "Checkpoint id for restore." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Files to snapshot for create." }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        }),
     ]
 }
 
@@ -212,6 +244,8 @@ pub fn run_tool_with_events(
         "diff" => diff_workspace(&args, cwd),
         "ls" => list_dir(&args, cwd),
         "ripgrep" => ripgrep(&args, cwd),
+        "outline" => outline_file(&args, cwd),
+        "checkpoint" => checkpoint_tool(&args, cwd),
         _ => json!({ "error": format!("unknown tool: {name}") }),
     };
     tool_result(name, result, cwd)
@@ -219,7 +253,7 @@ pub fn run_tool_with_events(
 
 fn tool_result(name: &str, value: Value, cwd: &Path) -> ToolExecutionResult {
     let output = value.to_string();
-    let model_output = model_projection(name, &output, cwd);
+    let model_output = project_model_output(name, &output, cwd);
     ToolExecutionResult {
         is_error: value.get("error").is_some()
             || value
@@ -246,32 +280,60 @@ fn read_file(args: &Value, cwd: &Path) -> Value {
         .unwrap_or(DEFAULT_READ_LIMIT)
         .max(1);
 
-    let file = match File::open(&path) {
-        Ok(file) => file,
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
         Err(error) => {
             return json!({ "path": path.display().to_string(), "error": error.to_string() })
         }
     };
-
-    let mut content = String::new();
-    let mut lines_read = 0usize;
-    let mut truncated = false;
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    let mut line_number = 0usize;
-
-    loop {
-        line.clear();
-        let bytes = match reader.read_line(&mut line) {
+    if let Some(mime) = image_mime(&path) {
+        if metadata.len() > MAX_IMAGE_READ_BYTES {
+            return json!({
+                "path": path.display().to_string(),
+                "kind": "image",
+                "mime": mime,
+                "bytes": metadata.len(),
+                "truncated": true,
+                "error": "image is too large to inline; inspect it with an external viewer or a narrower tool"
+            });
+        }
+        let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) => {
                 return json!({ "path": path.display().to_string(), "error": error.to_string() })
             }
         };
-        if bytes == 0 {
-            break;
-        }
+        mark_read(&path);
+        return json!({
+            "path": path.display().to_string(),
+            "kind": "image",
+            "mime": mime,
+            "bytes": bytes.len(),
+            "base64": BASE64_STANDARD.encode(bytes),
+        });
+    }
 
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return json!({ "path": path.display().to_string(), "error": error.to_string() })
+        }
+    };
+    let Ok(text) = String::from_utf8(bytes.clone()) else {
+        return json!({
+            "path": path.display().to_string(),
+            "kind": "binary",
+            "bytes": bytes.len(),
+            "error": "file is not valid UTF-8 text"
+        });
+    };
+
+    let mut content = String::new();
+    let mut lines_read = 0usize;
+    let mut truncated = false;
+    let mut line_number = 0usize;
+
+    for line in text.split_inclusive('\n') {
         line_number += 1;
         if line_number < offset {
             continue;
@@ -284,9 +346,11 @@ fn read_file(args: &Value, cwd: &Path) -> Value {
         content.push_str(&line);
         lines_read += 1;
     }
+    mark_read(&path);
 
     json!({
         "path": path.display().to_string(),
+        "kind": "text",
         "offset": offset,
         "lines_read": lines_read,
         "truncated": truncated,
@@ -306,6 +370,12 @@ fn edit_file(args: &Value, cwd: &Path) -> Value {
     }
 
     let path = resolve_path(cwd, path);
+    if !has_read(&path) {
+        return json!({
+            "path": path.display().to_string(),
+            "error": "edit requires reading this file first so oldText matches bytes on disk"
+        });
+    }
     let original = match fs::read_to_string(&path) {
         Ok(content) => content,
         Err(error) => {
@@ -353,8 +423,10 @@ fn edit_file(args: &Value, cwd: &Path) -> Value {
     }
     output.push_str(&original[cursor..]);
 
+    let _ = create_checkpoint(cwd, "auto-edit", &[path.clone()]);
     match fs::write(&path, &output) {
         Ok(()) => {
+            mark_read(&path);
             let diff = unified_diff_for_file(cwd, &path, &original, &output);
             json!({
                 "path": path.display().to_string(),
@@ -383,8 +455,10 @@ fn write_file(args: &Value, cwd: &Path) -> Value {
         }
     }
 
+    let _ = create_checkpoint(cwd, "auto-write", &[path.clone()]);
     match fs::write(&path, content) {
         Ok(()) => {
+            mark_read(&path);
             let diff = unified_diff_for_file(cwd, &path, &original, content);
             json!({
                 "path": path.display().to_string(),
@@ -637,7 +711,7 @@ fn shell_sessions() -> &'static Mutex<HashMap<u64, ShellSession>> {
     SHELL_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn model_projection(name: &str, output: &str, cwd: &Path) -> String {
+pub fn project_model_output(name: &str, output: &str, cwd: &Path) -> String {
     if output.len() <= MAX_MODEL_OUTPUT_BYTES {
         return output.to_string();
     }
@@ -873,6 +947,273 @@ fn ripgrep(args: &Value, cwd: &Path) -> Value {
     }
     value["path"] = json!(search_path.display().to_string());
     value
+}
+
+fn outline_file(args: &Value, cwd: &Path) -> Value {
+    let Some(path) = args.get("path").and_then(Value::as_str) else {
+        return json!({ "error": "missing path" });
+    };
+    let path = resolve_path(cwd, path);
+    let limit = optional_usize(args, "limit").unwrap_or(200).max(1);
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            return json!({ "path": path.display().to_string(), "error": error.to_string() })
+        }
+    };
+    let mut symbols = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        if let Some(symbol) = symbol_from_line(line) {
+            symbols.push(json!({ "line": index + 1, "symbol": symbol }));
+            if symbols.len() >= limit {
+                break;
+            }
+        }
+    }
+    json!({
+        "path": path.display().to_string(),
+        "symbols": symbols,
+        "truncated": content.lines().count() > limit && symbols.len() == limit,
+    })
+}
+
+fn checkpoint_tool(args: &Value, cwd: &Path) -> Value {
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match action {
+        "create" => {
+            let paths = args
+                .get("paths")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(|path| resolve_path(cwd, path))
+                .collect::<Vec<_>>();
+            if paths.is_empty() {
+                return json!({ "error": "checkpoint create requires paths" });
+            }
+            let name = args.get("name").and_then(Value::as_str).unwrap_or("manual");
+            match create_checkpoint(cwd, name, &paths) {
+                Ok(meta) => meta,
+                Err(error) => json!({ "error": error.to_string() }),
+            }
+        }
+        "list" => match list_checkpoints(cwd) {
+            Ok(items) => json!({ "checkpoints": items }),
+            Err(error) => json!({ "error": error.to_string() }),
+        },
+        "restore" => {
+            let Some(id) = args.get("id").and_then(Value::as_str) else {
+                return json!({ "error": "checkpoint restore requires id" });
+            };
+            match restore_checkpoint(cwd, id) {
+                Ok(value) => value,
+                Err(error) => json!({ "error": error.to_string() }),
+            }
+        }
+        _ => json!({ "error": "checkpoint action must be create, list, or restore" }),
+    }
+}
+
+fn image_mime(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => Some("image/png"),
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn symbol_from_line(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let prefixes = [
+        "fn ",
+        "pub fn ",
+        "struct ",
+        "pub struct ",
+        "enum ",
+        "pub enum ",
+        "trait ",
+        "pub trait ",
+        "impl ",
+        "func ",
+        "type ",
+        "class ",
+        "export function ",
+        "function ",
+        "export class ",
+    ];
+    prefixes
+        .iter()
+        .find(|prefix| trimmed.starts_with(**prefix))
+        .map(|_| trimmed.trim_end().to_string())
+}
+
+fn mark_read(path: &Path) {
+    if let Ok(mut paths) = read_tracker().lock() {
+        paths.insert(normalize_path_key(path));
+    }
+}
+
+fn has_read(path: &Path) -> bool {
+    read_tracker()
+        .lock()
+        .map(|paths| paths.contains(&normalize_path_key(path)))
+        .unwrap_or(false)
+}
+
+fn normalize_path_key(path: &Path) -> String {
+    let value = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    if cfg!(windows) {
+        value.to_ascii_lowercase()
+    } else {
+        value
+    }
+}
+
+static READ_TRACKER: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn read_tracker() -> &'static Mutex<HashSet<String>> {
+    READ_TRACKER.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn create_checkpoint(cwd: &Path, name: &str, paths: &[PathBuf]) -> io::Result<Value> {
+    let id = format!("cp-{}", now_nanos());
+    let mut files = Vec::new();
+    let mut bytes = 0usize;
+    for path in paths {
+        let abs = resolve_existing_or_future(cwd, path);
+        if !is_inside(cwd, &abs) {
+            continue;
+        }
+        let rel = diff_label(cwd, &abs);
+        let content = match fs::read_to_string(&abs) {
+            Ok(content) => {
+                bytes += content.len();
+                Value::String(content)
+            }
+            Err(_) if abs.exists() => Value::Null,
+            Err(_) => Value::Null,
+        };
+        files.push(json!({ "path": rel, "content": content }));
+    }
+    let checkpoint = json!({
+        "id": id,
+        "name": name,
+        "created_at": now_secs(),
+        "files": files,
+        "bytes": bytes,
+    });
+    let dir = checkpoint_dir(cwd);
+    fs::create_dir_all(&dir)?;
+    fs::write(
+        dir.join(format!("{id}.json")),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&checkpoint).map_err(io::Error::other)?
+        ),
+    )?;
+    Ok(json!({
+        "id": id,
+        "name": name,
+        "files": checkpoint["files"].as_array().map(Vec::len).unwrap_or(0),
+        "bytes": bytes,
+    }))
+}
+
+fn list_checkpoints(cwd: &Path) -> io::Result<Vec<Value>> {
+    let dir = checkpoint_dir(cwd);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut items = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        items.push(json!({
+            "id": value.get("id").cloned().unwrap_or_default(),
+            "name": value.get("name").cloned().unwrap_or_default(),
+            "created_at": value.get("created_at").cloned().unwrap_or_default(),
+            "files": value.get("files").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+            "bytes": value.get("bytes").cloned().unwrap_or_default(),
+        }));
+    }
+    items.sort_by_key(|item| item.get("created_at").and_then(Value::as_u64).unwrap_or(0));
+    items.reverse();
+    Ok(items)
+}
+
+fn restore_checkpoint(cwd: &Path, id: &str) -> io::Result<Value> {
+    let path = checkpoint_dir(cwd).join(format!("{id}.json"));
+    let value =
+        serde_json::from_str::<Value>(&fs::read_to_string(path)?).map_err(io::Error::other)?;
+    let mut restored = Vec::new();
+    let mut removed = Vec::new();
+    for file in value
+        .get("files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(rel) = file.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let abs = resolve_path(cwd, rel);
+        if !is_inside(cwd, &abs) {
+            continue;
+        }
+        if let Some(content) = file.get("content").and_then(Value::as_str) {
+            if let Some(parent) = abs.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&abs, content)?;
+            mark_read(&abs);
+            restored.push(rel.to_string());
+        } else if abs.exists() {
+            fs::remove_file(&abs)?;
+            removed.push(rel.to_string());
+        }
+    }
+    Ok(json!({ "id": id, "restored": restored, "removed": removed }))
+}
+
+fn checkpoint_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".jucode").join("checkpoints")
+}
+
+fn resolve_existing_or_future(cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn is_inside(root: &Path, path: &Path) -> bool {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    path == root || path.starts_with(root)
 }
 
 #[derive(Clone)]
@@ -1139,14 +1480,25 @@ fn shell_command(command: &str) -> (&'static str, Vec<&str>) {
 }
 
 fn temp_output_path(label: &str) -> PathBuf {
-    let nanos = SystemTime::now()
+    env::temp_dir().join(format!(
+        "jucode-tool-{label}-{}-{}.log",
+        std::process::id(),
+        now_nanos()
+    ))
+}
+
+fn now_nanos() -> u128 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    env::temp_dir().join(format!(
-        "jucode-tool-{label}-{}-{nanos}.log",
-        std::process::id()
-    ))
+        .unwrap_or(0)
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn optional_usize(args: &Value, key: &str) -> Option<usize> {
@@ -1197,6 +1549,7 @@ mod tests {
         let path = dir.join("sample.txt");
         fs::create_dir_all(&dir).unwrap();
         fs::write(&path, "same\nsame\n").unwrap();
+        let _ = run_tool("read", &json!({ "path": path }).to_string(), &dir);
 
         let result = run_tool(
             "edit",
@@ -1220,6 +1573,7 @@ mod tests {
         let path = dir.join("sample.txt");
         fs::create_dir_all(&dir).unwrap();
         fs::write(&path, "alpha\nbeta\n").unwrap();
+        let _ = run_tool("read", &json!({ "path": path }).to_string(), &dir);
 
         let result = run_tool(
             "edit",
@@ -1295,7 +1649,9 @@ mod tests {
                 "apply_patch",
                 "diff",
                 "ls",
-                "ripgrep"
+                "ripgrep",
+                "outline",
+                "checkpoint"
             ]
         );
     }
@@ -1370,13 +1726,19 @@ mod tests {
         let session_id = value["session_id"].as_u64().unwrap();
         assert_eq!(value["running"], true);
 
-        std::thread::sleep(Duration::from_millis(500));
-        let result = run_tool(
-            "write_stdin",
-            &json!({ "session_id": session_id, "yield_time_ms": 100 }).to_string(),
-            &dir,
-        );
-        let value = serde_json::from_str::<Value>(&result).unwrap();
+        let mut value = json!({ "running": true });
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(100));
+            let result = run_tool(
+                "write_stdin",
+                &json!({ "session_id": session_id, "yield_time_ms": 100 }).to_string(),
+                &dir,
+            );
+            value = serde_json::from_str::<Value>(&result).unwrap();
+            if value["running"] != true {
+                break;
+            }
+        }
 
         assert_eq!(value["exit_code"], 0);
         assert!(value["stdout"].as_str().unwrap().contains("done"));
@@ -1398,6 +1760,88 @@ mod tests {
             .model_output
             .contains("Full result saved at: .jucode/truncated-results/"));
         assert!(dir.join(".jucode").join("truncated-results").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_reports_image_payloads() {
+        let dir = test_dir("read-image");
+        let path = dir.join("tiny.png");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, [137, 80, 78, 71]).unwrap();
+
+        let result = run_tool("read", &json!({ "path": path }).to_string(), &dir);
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["kind"], "image");
+        assert_eq!(value["mime"], "image/png");
+        assert_eq!(value["base64"], "iVBORw==");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn edit_requires_read_first() {
+        let dir = test_dir("read-before-edit");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "alpha\n").unwrap();
+
+        let result = run_tool(
+            "edit",
+            &json!({ "path": path, "edits": [{ "oldText": "alpha", "newText": "beta" }] })
+                .to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert!(value["error"]
+            .as_str()
+            .unwrap()
+            .contains("requires reading"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn checkpoint_can_restore_file_content() {
+        let dir = test_dir("checkpoint");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "before\n").unwrap();
+
+        let created = run_tool(
+            "checkpoint",
+            &json!({ "action": "create", "name": "manual", "paths": [path] }).to_string(),
+            &dir,
+        );
+        let created = serde_json::from_str::<Value>(&created).unwrap();
+        fs::write(dir.join("sample.txt"), "after\n").unwrap();
+        let restored = run_tool(
+            "checkpoint",
+            &json!({ "action": "restore", "id": created["id"] }).to_string(),
+            &dir,
+        );
+        let restored = serde_json::from_str::<Value>(&restored).unwrap();
+
+        assert_eq!(restored["restored"][0], "sample.txt");
+        assert_eq!(
+            fs::read_to_string(dir.join("sample.txt")).unwrap(),
+            "before\n"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn outline_extracts_lightweight_symbols() {
+        let dir = test_dir("outline");
+        let path = dir.join("lib.rs");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "pub struct App {}\nimpl App {}\npub fn run() {}\n").unwrap();
+
+        let result = run_tool("outline", &json!({ "path": path }).to_string(), &dir);
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["symbols"][0]["symbol"], "pub struct App {}");
+        assert_eq!(value["symbols"][2]["symbol"], "pub fn run() {}");
         let _ = fs::remove_dir_all(dir);
     }
 
