@@ -1,8 +1,9 @@
 use crate::{
-    config::{profile_dir, AuthStore, Config},
+    config::{profile_dir, AuthStore, Config, ModelConfig},
     event::{AgentEvent, CommandView, ModelOptionView, SessionListItemView},
     extensions::ExtensionRegistry,
     llm::{OpenAiClient, OpenAiClientConfig, StreamEvent},
+    oauth,
     prompt::{
         build_system_prompt, discover_project_instructions, discover_skills, skill_commands,
         skill_message, PromptContext,
@@ -111,6 +112,7 @@ impl AgentCore {
     fn command_list_event(&self) -> AgentEvent {
         let mut commands = [
             "/help",
+            "/login",
             "/new",
             "/config",
             "/model",
@@ -180,16 +182,19 @@ impl AgentCore {
         let events = match command {
             "/quit" | "/exit" => return (true, Vec::new()),
             "/help" | "/" => vec![AgentEvent::Info(
-                "/help /new /config /model [model] [effort] /tree /fork <label> /checkout [label] /delete <label> /resume [session-id] /extensions /context /quit"
+                "/help /login [web-url] [api-url] /new /config /model [model] [effort] /tree /fork <label> /checkout [label] /delete <label> /resume [session-id] /extensions /context /quit"
                     .to_string(),
             )],
+            "/login" => self.login_events(input[command.len()..].trim()),
             "/new" => self.new_session_events(),
             "/config" => vec![AgentEvent::Info(format!(
-                "provider={} model={} reasoning_effort={} base_url={} auth_key={} api_key_env={} retry_attempts={}",
+                "provider={} model={} reasoning_effort={} base_url={} jucode_web_url={} jucode_api_url={} auth_key={} api_key_env={} retry_attempts={}",
                 self.config.provider,
                 self.config.model,
                 self.config.reasoning_effort,
                 self.config.base_url,
+                self.config.jucode_web_url,
+                self.config.jucode_api_url,
                 mask_key(self.auth.key_for(&self.config.provider)),
                 self.config.api_key_env,
                 self.config.retry_attempts
@@ -391,7 +396,7 @@ impl AgentCore {
         self.session.append(EntryKind::User { content: message });
         let save_event = self.save_session_event();
 
-        if self.config.provider != "openai" {
+        if self.config.provider != "openai" && self.config.provider != "jucode" {
             let mut events = save_event;
             events.push(AgentEvent::Error(format!(
                 "unsupported provider '{}'. MVP supports openai.",
@@ -568,6 +573,78 @@ impl AgentCore {
         .into_iter()
         .chain(save_event)
         .collect()
+    }
+
+    fn login_events(&mut self, arg: &str) -> Vec<AgentEvent> {
+        if self.running {
+            return vec![AgentEvent::Error(
+                "cannot login while a response is running".to_string(),
+            )];
+        }
+        let mut parts = arg.split_whitespace();
+        let web_url = parts
+            .next()
+            .map(str::to_string)
+            .unwrap_or_else(|| self.config.jucode_web_url.clone());
+        let api_url = parts.next().map(str::to_string).unwrap_or_else(|| {
+            if arg.is_empty() {
+                self.config.jucode_api_url.clone()
+            } else {
+                web_url.clone()
+            }
+        });
+        let mut events = vec![AgentEvent::Info(format!(
+            "opening browser for JuCode OAuth: {web_url}"
+        ))];
+        match oauth::login(&web_url, &api_url) {
+            Ok(result) => {
+                self.config.provider = "jucode".to_string();
+                self.config.jucode_web_url = result.web_url.clone();
+                self.config.jucode_api_url = result.api_url.clone();
+                self.config.base_url = format!("{}/v1", result.api_url);
+                for model in &result.models {
+                    if !self.config.models.iter().any(|entry| entry.name == *model) {
+                        self.config.models.push(ModelConfig {
+                            name: model.clone(),
+                            context_window: 400_000,
+                            max_output_tokens: 128_000,
+                            reasoning_efforts: vec![
+                                "none".to_string(),
+                                "low".to_string(),
+                                "medium".to_string(),
+                                "high".to_string(),
+                                "xhigh".to_string(),
+                            ],
+                        });
+                    }
+                }
+                if let Some(model) = result.models.first() {
+                    self.config.model = model.clone();
+                    let supported = self.reasoning_efforts_for_model(model);
+                    if !supported
+                        .iter()
+                        .any(|effort| effort == &self.config.reasoning_effort)
+                    {
+                        self.config.reasoning_effort =
+                            self.default_reasoning_effort_for_model(model);
+                    }
+                }
+                self.auth.set_key_for("jucode", result.api_key);
+                match self.auth.save().and_then(|_| self.config.save()) {
+                    Ok(()) => {
+                        events.push(AgentEvent::Info(
+                            "JuCode account connected; provider switched to jucode".to_string(),
+                        ));
+                        events.push(self.model_status_event());
+                    }
+                    Err(error) => {
+                        events.push(AgentEvent::Error(format!("failed to save login: {error}")))
+                    }
+                }
+            }
+            Err(error) => events.push(AgentEvent::Error(format!("JuCode login failed: {error}"))),
+        }
+        events
     }
 
     fn resume_list_events(&self) -> Vec<AgentEvent> {

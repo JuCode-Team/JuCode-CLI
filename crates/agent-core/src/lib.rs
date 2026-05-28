@@ -3,6 +3,7 @@ mod core;
 pub mod event;
 mod extensions;
 mod llm;
+mod oauth;
 mod prompt;
 mod session;
 mod tools;

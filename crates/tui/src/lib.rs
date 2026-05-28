@@ -117,6 +117,7 @@ impl From<CommandView> for CommandCandidate {
 fn default_commands() -> Vec<CommandCandidate> {
     [
         "/help",
+        "/login",
         "/new",
         "/config",
         "/model",

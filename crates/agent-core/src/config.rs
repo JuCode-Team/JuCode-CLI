@@ -31,6 +31,8 @@ pub struct Config {
     pub reasoning_effort: String,
     pub models: Vec<ModelConfig>,
     pub base_url: String,
+    pub jucode_web_url: String,
+    pub jucode_api_url: String,
     pub api_key_env: String,
     pub retry_attempts: usize,
     pub include_project_instructions: bool,
@@ -69,6 +71,8 @@ impl Config {
                 reasoning_effort: "medium".to_string(),
                 models: default_model_configs(),
                 base_url: "https://api.openai.com/v1".to_string(),
+                jucode_web_url: "https://api.jucode.cn".to_string(),
+                jucode_api_url: "https://api.jucode.cn".to_string(),
                 api_key_env: "OPENAI_API_KEY".to_string(),
                 retry_attempts: 3,
                 include_project_instructions: true,
@@ -87,6 +91,18 @@ impl Config {
             models.insert(0, default_model_config(&model));
         }
         let reasoning_effort = read_reasoning_effort(&value, &model, &models);
+        let legacy_jucode_url = read_string(&value, "jucode_base_url", "");
+        let default_jucode_web_url =
+            if legacy_jucode_url.is_empty() || legacy_jucode_url == "http://localhost:8090" {
+                "https://api.jucode.cn"
+            } else {
+                &legacy_jucode_url
+            };
+        let default_jucode_api_url = if legacy_jucode_url.is_empty() {
+            "https://api.jucode.cn"
+        } else {
+            &legacy_jucode_url
+        };
         let config = Self {
             provider: read_string(&value, "provider", "openai"),
             model,
@@ -96,6 +112,16 @@ impl Config {
                 &value,
                 "base_url",
                 "https://api.openai.com/v1",
+            )),
+            jucode_web_url: normalize_base_url(&read_string(
+                &value,
+                "jucode_web_url",
+                default_jucode_web_url,
+            )),
+            jucode_api_url: normalize_base_url(&read_string(
+                &value,
+                "jucode_api_url",
+                default_jucode_api_url,
             )),
             api_key_env: read_api_key_env(&value),
             retry_attempts: read_usize(&value, "retry_attempts", 3),
@@ -118,6 +144,8 @@ impl Config {
             "reasoning_effort": self.reasoning_effort,
             "models": self.models.iter().map(model_config_value).collect::<Vec<_>>(),
             "base_url": normalize_base_url(&self.base_url),
+            "jucode_web_url": normalize_base_url(&self.jucode_web_url),
+            "jucode_api_url": normalize_base_url(&self.jucode_api_url),
             "api_key_env": self.api_key_env,
             "retry_attempts": self.retry_attempts,
             "include_project_instructions": self.include_project_instructions,
@@ -177,6 +205,10 @@ impl AuthStore {
 
     pub fn key_for(&self, provider: &str) -> Option<&str> {
         self.keys.get(provider).map(String::as_str)
+    }
+
+    pub fn set_key_for(&mut self, provider: &str, key: String) {
+        self.keys.insert(provider.to_string(), key);
     }
 
     pub fn save(&self) -> io::Result<()> {
