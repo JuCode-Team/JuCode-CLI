@@ -236,6 +236,12 @@ struct TerminalRenderer {
     force_full_redraw: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullRenderMode {
+    FullHistory,
+    VisibleViewport,
+}
+
 impl<R: TuiRuntime> TuiApp<R> {
     pub fn new(runtime: R) -> Self {
         let mut app = Self {
@@ -1444,12 +1450,24 @@ impl TerminalRenderer {
         }
 
         if document.reset_screen || !self.initialized {
-            self.full_render(stdout, &frame, document.reset_screen, height)?;
+            self.full_render(
+                stdout,
+                &frame,
+                document.reset_screen,
+                height,
+                FullRenderMode::FullHistory,
+            )?;
         } else if self.force_full_redraw
             || self.previous_width != width
             || self.previous_height != height
         {
-            self.full_render(stdout, &frame, true, height)?;
+            self.full_render(
+                stdout,
+                &frame,
+                true,
+                height,
+                FullRenderMode::VisibleViewport,
+            )?;
         } else {
             self.diff_render(stdout, &frame, height)?;
         }
@@ -1471,15 +1489,17 @@ impl TerminalRenderer {
         frame: &RenderedFrame,
         clear: bool,
         height: u16,
+        mode: FullRenderMode,
     ) -> io::Result<()> {
         let mut buffer = render_buffer_start();
         if clear {
             buffer.push_str("\x1b[2J\x1b[H");
         }
-        append_lines_to_buffer(&mut buffer, &frame.lines);
+        let (start, end) = full_render_window(frame.lines.len(), height, mode);
+        append_lines_to_buffer(&mut buffer, &frame.lines[start..end]);
         buffer.push_str(SYNC_END);
         stdout.write_all(buffer.as_bytes())?;
-        self.hardware_cursor_row = frame.lines.len().saturating_sub(1);
+        self.hardware_cursor_row = end.saturating_sub(1);
         self.previous_viewport_top = viewport_top(frame.lines.len(), height);
         Ok(())
     }
@@ -1496,7 +1516,7 @@ impl TerminalRenderer {
         };
 
         if first_changed < self.previous_viewport_top {
-            return self.full_render(stdout, frame, true, height);
+            return self.full_render(stdout, frame, true, height, FullRenderMode::VisibleViewport);
         }
 
         if first_changed >= frame.lines.len() {
@@ -1580,7 +1600,7 @@ impl TerminalRenderer {
     ) -> io::Result<()> {
         let target_row = frame.lines.len().saturating_sub(1);
         if target_row < self.previous_viewport_top {
-            return self.full_render(stdout, frame, true, height);
+            return self.full_render(stdout, frame, true, height, FullRenderMode::VisibleViewport);
         }
 
         let mut buffer = render_buffer_start();
@@ -1700,6 +1720,17 @@ fn viewport_top(line_count: usize, height: u16) -> usize {
     line_count
         .max(height as usize)
         .saturating_sub(height as usize)
+}
+
+fn full_render_window(line_count: usize, height: u16, mode: FullRenderMode) -> (usize, usize) {
+    match mode {
+        FullRenderMode::FullHistory => (0, line_count),
+        FullRenderMode::VisibleViewport => {
+            let start = viewport_top(line_count, height);
+            let end = start.saturating_add(height as usize).min(line_count);
+            (start, end)
+        }
+    }
 }
 
 fn build_tree_rows(nodes: &[TreeNodeView]) -> Vec<PickerRow> {
@@ -2480,6 +2511,20 @@ mod tests {
         assert!(output.contains("line 0"));
         assert!(output.contains("line 19"));
         assert_eq!(frame.lines.len(), 22);
+    }
+
+    #[test]
+    fn resize_full_redraw_only_renders_visible_viewport() {
+        let document = UiBuilder::new().finish_with_history_and_input(20);
+        let frame = RenderedFrame::build(&document, 80);
+        let (start, end) =
+            full_render_window(frame.lines.len(), 5, FullRenderMode::VisibleViewport);
+        let visible = frame.lines[start..end].join("\n");
+
+        assert_eq!(end - start, 5);
+        assert!(!visible.contains("line 0"));
+        assert!(visible.contains("line 19"));
+        assert!(visible.contains(">"));
     }
 
     #[test]
