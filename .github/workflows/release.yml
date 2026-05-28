@@ -59,6 +59,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
     steps:
       - uses: actions/checkout@v4
@@ -110,9 +112,7 @@ jobs:
             dist/npm/*.tgz
 
       - name: Publish npm packages
-        if: ${{ secrets.NPM_TOKEN != '' }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        if: ${{ env.NODE_AUTH_TOKEN != '' }}
         run: |
           npm publish ./npm/cli-darwin-arm64 --access public
           npm publish ./npm/cli-darwin-x64 --access public
