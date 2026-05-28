@@ -30,6 +30,7 @@ for (const directory of packageDirectories) {
   packageJson.version = cargoVersion;
 
   if (directory === rootPackageDirectory) {
+    packageJson.optionalDependencies = {};
     for (const target of releaseTargets) {
       packageJson.optionalDependencies[target.packageName] = cargoVersion;
     }

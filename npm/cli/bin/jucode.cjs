@@ -3,8 +3,6 @@
 const { spawnSync } = require("node:child_process");
 
 const packageByPlatform = {
-  "darwin:arm64": "@jucode/cli-darwin-arm64",
-  "darwin:x64": "@jucode/cli-darwin-x64",
   "linux:x64": "@jucode/cli-linux-x64",
   "win32:x64": "@jucode/cli-win32-x64"
 };

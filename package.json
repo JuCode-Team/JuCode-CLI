@@ -3,8 +3,6 @@
   "private": true,
   "workspaces": [
     "npm/cli",
-    "npm/cli-darwin-arm64",
-    "npm/cli-darwin-x64",
     "npm/cli-linux-x64",
     "npm/cli-win32-x64"
   ],

@@ -2268,13 +2268,13 @@ mod tests {
     fn startup_renders_inside_box() {
         let document = UiBuilder::new()
             .chat(&[ChatLine::Startup {
-                version: "0.1.0".to_string(),
+                version: "0.1.1".to_string(),
                 profile_dir: "C:\\Users\\me\\.jucode".to_string(),
             }])
             .finish();
 
         assert!(document.history[0].text.starts_with('+'));
-        assert!(document.history[1].text.contains("JUCODE CLI v0.1.0"));
+        assert!(document.history[1].text.contains("JUCODE CLI v0.1.1"));
         assert!(document.history[2]
             .text
             .contains("profile C:\\Users\\me\\.jucode"));

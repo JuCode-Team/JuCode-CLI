@@ -1,17 +1,5 @@
 export const releaseTargets = [
   {
-    directory: "cli-darwin-arm64",
-    packageName: "@jucode/cli-darwin-arm64",
-    rustTarget: "aarch64-apple-darwin",
-    binaryName: "jucode"
-  },
-  {
-    directory: "cli-darwin-x64",
-    packageName: "@jucode/cli-darwin-x64",
-    rustTarget: "x86_64-apple-darwin",
-    binaryName: "jucode"
-  },
-  {
     directory: "cli-linux-x64",
     packageName: "@jucode/cli-linux-x64",
     rustTarget: "x86_64-unknown-linux-gnu",

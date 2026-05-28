@@ -25,12 +25,6 @@ jobs:
           - runner: ubuntu-latest
             rust_target: x86_64-unknown-linux-gnu
             binary_name: jucode
-          - runner: macos-13
-            rust_target: x86_64-apple-darwin
-            binary_name: jucode
-          - runner: macos-14
-            rust_target: aarch64-apple-darwin
-            binary_name: jucode
 
     steps:
       - uses: actions/checkout@v4
@@ -114,8 +108,6 @@ jobs:
       - name: Publish npm packages
         if: ${{ env.NODE_AUTH_TOKEN != '' }}
         run: |
-          npm publish ./npm/cli-darwin-arm64 --access public
-          npm publish ./npm/cli-darwin-x64 --access public
           npm publish ./npm/cli-linux-x64 --access public
           npm publish ./npm/cli-win32-x64 --access public
           npm publish ./npm/cli --access public

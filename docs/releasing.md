@@ -11,8 +11,6 @@ JuCode CLI follows the same distribution shape as Codex CLI:
 - `npm/cli`: meta package with the `jucode` launcher.
 - `npm/cli-win32-x64`: Windows x64 native binary.
 - `npm/cli-linux-x64`: Linux x64 native binary.
-- `npm/cli-darwin-x64`: macOS Intel native binary.
-- `npm/cli-darwin-arm64`: macOS Apple Silicon native binary.
 
 ## One-time setup
 
@@ -24,7 +22,7 @@ JuCode CLI follows the same distribution shape as Codex CLI:
 
 1. Bump the version in `Cargo.toml`.
 2. Trigger the release workflow with `release_version=X.Y.Z`, or create and push a git tag in the form `vX.Y.Z`.
-3. GitHub Actions builds all native binaries, packs the npm packages, creates the GitHub Release, and publishes to npm when `NPM_TOKEN` is present.
+3. GitHub Actions builds the Windows and Linux native binaries, packs the npm packages, creates the GitHub Release, and publishes to npm when `NPM_TOKEN` is present.
 
 ## Local verification
 
