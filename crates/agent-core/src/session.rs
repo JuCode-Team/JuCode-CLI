@@ -36,6 +36,10 @@ pub enum EntryKind {
         name: String,
         output: String,
     },
+    PinnedSkill {
+        name: String,
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -296,6 +300,7 @@ impl SessionStore {
                     name: name.clone(),
                     output: output.clone(),
                 }),
+                EntryKind::PinnedSkill { .. } => None,
             })
             .collect()
     }
@@ -676,6 +681,13 @@ fn context_item_for_entry(entry: &SessionEntry) -> Option<Value> {
             "call_id": call_id,
             "output": output
         })),
+        EntryKind::PinnedSkill { name, content } => Some(json!({
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": format!("Pinned skill for future turns: {name}\n\n{content}")
+            }]
+        })),
     }
 }
 
@@ -704,6 +716,9 @@ fn summarize_compacted_entries<'a>(entries: impl Iterator<Item = &'a SessionEntr
                 }
             }
             EntryKind::ToolOutput { name, .. } => tool_calls.push(name.clone()),
+            EntryKind::PinnedSkill { name, .. } => {
+                tool_calls.push(format!("pinned skill:{name}"));
+            }
             EntryKind::Branch { .. } => {}
         }
     }
@@ -774,6 +789,9 @@ fn entry_to_json(entry: &SessionEntry) -> Value {
             "name": name,
             "output": output
         }),
+        EntryKind::PinnedSkill { name, content } => {
+            json!({ "type": "pinned_skill", "name": name, "content": content })
+        }
     };
     json!({
         "id": entry.id.0,
@@ -801,6 +819,10 @@ fn entry_from_json(value: &Value) -> Option<SessionEntry> {
             call_id: kind_value.get("call_id")?.as_str()?.to_string(),
             name: kind_value.get("name")?.as_str()?.to_string(),
             output: kind_value.get("output")?.as_str()?.to_string(),
+        },
+        "pinned_skill" => EntryKind::PinnedSkill {
+            name: kind_value.get("name")?.as_str()?.to_string(),
+            content: kind_value.get("content")?.as_str()?.to_string(),
         },
         _ => return None,
     };
@@ -994,6 +1016,20 @@ mod tests {
         assert_eq!(tree[1].id, second.display());
         assert_eq!(tree[1].parent_id, Some(first.display()));
         assert_eq!(tree[1].label, "second prompt");
+    }
+
+    #[test]
+    fn pinned_skill_is_context_but_not_transcript() {
+        let mut session = SessionStore::new();
+        session.append(EntryKind::PinnedSkill {
+            name: "review".to_string(),
+            content: "Review carefully.".to_string(),
+        });
+
+        let context = session.context_items();
+
+        assert!(context[0].to_string().contains("Pinned skill"));
+        assert!(session.transcript_items().is_empty());
     }
 
     #[test]

@@ -6,7 +6,7 @@ use crate::{
     oauth,
     prompt::{
         build_system_prompt, discover_project_instructions, discover_skills, skill_commands,
-        skill_message, PromptContext,
+        skill_message, skill_pin_message, PromptContext,
     },
     session::{EntryKind, SessionStore, SessionSummary},
 };
@@ -130,6 +130,7 @@ impl AgentCore {
             "/context",
             "/stats",
             "/doctor",
+            "/pin",
             "/quit",
         ]
         .iter()
@@ -189,7 +190,7 @@ impl AgentCore {
         let events = match command {
             "/quit" | "/exit" => return (true, Vec::new()),
             "/help" | "/" => vec![AgentEvent::Info(
-                "/help /login [web-url] [api-url] /new /config /model [model] [effort] /tree /fork <label> /checkout [label] /delete <label> /resume [session-id] /extensions /context /stats /doctor /quit"
+                "/help /login [web-url] [api-url] /new /config /model [model] [effort] /tree /fork <label> /checkout [label] /delete <label> /resume [session-id] /extensions /context /stats /doctor /pin <skill> /quit"
                     .to_string(),
             )],
             "/login" => self.login_events(input[command.len()..].trim()),
@@ -269,9 +270,50 @@ impl AgentCore {
             "/context" => self.context_events(),
             "/stats" => self.stats_events(),
             "/doctor" => self.doctor_events(),
+            "/pin" => self.pin_skill_events(input[command.len()..].trim()),
             _ => vec![AgentEvent::Error(format!("unknown command: {command}"))],
         };
         (false, events)
+    }
+
+    fn pin_skill_events(&mut self, name: &str) -> Vec<AgentEvent> {
+        if self.running {
+            return vec![AgentEvent::Error(
+                "cannot pin a skill while a response is running".to_string(),
+            )];
+        }
+        let wanted = name.trim().trim_start_matches('/');
+        if wanted.is_empty() {
+            return vec![AgentEvent::Error("usage: /pin <skill>".to_string())];
+        }
+        let commands = match skill_commands(self.config.profile_dir(), &self.cwd) {
+            Ok(commands) => commands,
+            Err(error) => {
+                return vec![AgentEvent::Error(format!(
+                    "failed to discover skills: {error}"
+                ))]
+            }
+        };
+        let Some(skill) = commands
+            .into_iter()
+            .find(|entry| {
+                entry.command.trim_start_matches('/') == wanted || entry.skill.name == wanted
+            })
+            .map(|entry| entry.skill)
+        else {
+            return vec![AgentEvent::Error(format!("skill not found: {wanted}"))];
+        };
+        let content = match skill_pin_message(&skill) {
+            Ok(content) => content,
+            Err(error) => return vec![AgentEvent::Error(format!("failed to read skill: {error}"))],
+        };
+        self.session.append(EntryKind::PinnedSkill {
+            name: skill.name.clone(),
+            content,
+        });
+        let mut events = vec![AgentEvent::Status(format!("pinned skill {}", skill.name))];
+        events.extend(self.save_session_event());
+        events
     }
 
     fn skill_command_events(&mut self, command: &str, request: &str) -> Option<Vec<AgentEvent>> {

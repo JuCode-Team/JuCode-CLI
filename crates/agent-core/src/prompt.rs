@@ -122,6 +122,16 @@ pub fn skill_message(skill: &SkillPromptItem, request: &str) -> io::Result<Strin
     Ok(message)
 }
 
+pub fn skill_pin_message(skill: &SkillPromptItem) -> io::Result<String> {
+    let content = fs::read_to_string(&skill.path)?;
+    Ok(format!(
+        "<skill name=\"{}\" path=\"{}\">\n{}\n</skill>",
+        escape_xml(&skill.name),
+        escape_xml(&skill.path.display().to_string()),
+        content.trim_end()
+    ))
+}
+
 pub fn discover_project_instructions(cwd: &Path) -> io::Result<Vec<ProjectInstruction>> {
     let dirs = project_instruction_dirs(cwd);
 
