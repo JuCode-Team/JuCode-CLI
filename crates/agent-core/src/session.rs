@@ -3,7 +3,8 @@ use serde_json::{json, Value};
 use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
-    fs, io,
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -54,6 +55,8 @@ pub struct SessionStore {
     session_id: String,
     created_at: u64,
     updated_at: u64,
+    persisted_entries: usize,
+    needs_snapshot: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +181,7 @@ impl SessionStore {
             self.leaf_id = parent_id.filter(|id| self.by_id.contains_key(id));
         }
         self.updated_at = now_secs();
+        self.needs_snapshot = true;
         Ok(())
     }
 
@@ -300,15 +304,45 @@ impl SessionStore {
         self.updated_at = now_secs();
         let dir = sessions_dir(profile_dir, cwd);
         fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{}.json", self.session_id));
+        let journal_path = dir.join(format!("{}.jsonl", self.session_id));
+        let mut journal = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&journal_path)?;
+        if self.needs_snapshot || self.persisted_entries > self.entries.len() {
+            write_json_line(
+                &mut journal,
+                &json!({ "type": "snapshot", "session": self.to_json() }),
+            )?;
+        } else {
+            for entry in &self.entries[self.persisted_entries..] {
+                write_json_line(
+                    &mut journal,
+                    &json!({ "type": "entry", "entry": entry_to_json(entry) }),
+                )?;
+            }
+        }
+        write_json_line(
+            &mut journal,
+            &json!({ "type": "state", "state": self.state_json() }),
+        )?;
+        self.persisted_entries = self.entries.len();
+        self.needs_snapshot = false;
+
+        let summary_path = dir.join(format!("{}.json", self.session_id));
         fs::write(
-            path,
-            format!("{}\n", serde_json::to_string_pretty(&self.to_json())?),
+            summary_path,
+            format!("{}\n", serde_json::to_string_pretty(&self.summary_json())?),
         )
     }
 
     pub fn load_for_cwd(profile_dir: &Path, cwd: &Path, session_id: &str) -> io::Result<Self> {
-        let path = sessions_dir(profile_dir, cwd).join(format!("{session_id}.json"));
+        let dir = sessions_dir(profile_dir, cwd);
+        let journal_path = dir.join(format!("{session_id}.jsonl"));
+        if journal_path.exists() {
+            return Self::load_from_journal(&journal_path);
+        }
+        let path = dir.join(format!("{session_id}.json"));
         let content = fs::read_to_string(path)?;
         let value = serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({}));
         Self::from_json(&value)
@@ -420,11 +454,12 @@ impl SessionStore {
     }
 
     fn to_json(&self) -> Value {
-        let branch_heads = self
-            .branch_heads
-            .iter()
-            .map(|(label, id)| (label.clone(), json!(id.0)))
-            .collect::<serde_json::Map<_, _>>();
+        let mut value = self.state_json();
+        value["entries"] = json!(self.entries.iter().map(entry_to_json).collect::<Vec<_>>());
+        value
+    }
+
+    fn state_json(&self) -> Value {
         json!({
             "version": 1,
             "id": self.session_id,
@@ -432,9 +467,31 @@ impl SessionStore {
             "updated_at": self.updated_at,
             "leaf_id": self.leaf_id.map(|id| id.0),
             "next_id": self.next_id,
-            "branch_heads": branch_heads,
-            "entries": self.entries.iter().map(entry_to_json).collect::<Vec<_>>()
+            "branch_heads": self.branch_heads_json()
         })
+    }
+
+    fn summary_json(&self) -> Value {
+        json!({
+            "version": 2,
+            "id": self.session_id,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "leaf_id": self.leaf_id.map(|id| id.0),
+            "next_id": self.next_id,
+            "branch_heads": self.branch_heads_json(),
+            "entries_count": self.entries.len(),
+            "journal": format!("{}.jsonl", self.session_id)
+        })
+    }
+
+    fn branch_heads_json(&self) -> Value {
+        Value::Object(
+            self.branch_heads
+                .iter()
+                .map(|(label, id)| (label.clone(), json!(id.0)))
+                .collect::<serde_json::Map<_, _>>(),
+        )
     }
 
     fn from_json(value: &Value) -> io::Result<Self> {
@@ -489,6 +546,8 @@ impl SessionStore {
             session_id,
             created_at: value.get("created_at").and_then(Value::as_u64).unwrap_or(0),
             updated_at: value.get("updated_at").and_then(Value::as_u64).unwrap_or(0),
+            persisted_entries: 0,
+            needs_snapshot: true,
         };
         if store.branch_heads.is_empty() {
             store.rebuild_branch_heads();
@@ -496,13 +555,92 @@ impl SessionStore {
         Ok(store)
     }
 
+    fn load_from_journal(path: &Path) -> io::Result<Self> {
+        let content = fs::read_to_string(path)?;
+        let mut store = SessionStore::new();
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            let Ok(record) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            match record.get("type").and_then(Value::as_str) {
+                Some("snapshot") => {
+                    if let Some(session) = record.get("session") {
+                        store = Self::from_json(session)?;
+                    }
+                }
+                Some("entry") => {
+                    if let Some(entry) = record.get("entry").and_then(entry_from_json) {
+                        store.push_loaded_entry(entry);
+                    }
+                }
+                Some("state") => {
+                    if let Some(state) = record.get("state") {
+                        store.apply_state_json(state);
+                    }
+                }
+                _ => {}
+            }
+        }
+        store.persisted_entries = store.entries.len();
+        store.needs_snapshot = false;
+        Ok(store)
+    }
+
+    fn push_loaded_entry(&mut self, entry: SessionEntry) {
+        if self.by_id.contains_key(&entry.id) {
+            return;
+        }
+        self.next_id = self.next_id.max(entry.id.0 + 1);
+        self.by_id.insert(entry.id, self.entries.len());
+        self.leaf_id = Some(entry.id);
+        self.entries.push(entry.clone());
+        self.update_head_for_entry(entry.id);
+    }
+
+    fn apply_state_json(&mut self, value: &Value) {
+        if let Some(id) = value.get("id").and_then(Value::as_str) {
+            self.session_id = id.to_string();
+        }
+        if let Some(created_at) = value.get("created_at").and_then(Value::as_u64) {
+            self.created_at = created_at;
+        }
+        if let Some(updated_at) = value.get("updated_at").and_then(Value::as_u64) {
+            self.updated_at = updated_at;
+        }
+        if let Some(next_id) = value.get("next_id").and_then(Value::as_u64) {
+            self.next_id = next_id;
+        }
+        self.leaf_id = value
+            .get("leaf_id")
+            .and_then(Value::as_u64)
+            .map(EntryId)
+            .filter(|id| self.by_id.contains_key(id));
+        self.branch_heads = value
+            .get("branch_heads")
+            .and_then(Value::as_object)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|(label, id)| {
+                        let id = EntryId(id.as_u64()?);
+                        self.by_id.contains_key(&id).then_some((label.clone(), id))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        if self.branch_heads.is_empty() {
+            self.rebuild_branch_heads();
+        }
+    }
+
     fn summary_from_json(value: &Value) -> Option<SessionSummary> {
         let id = value.get("id")?.as_str()?.to_string();
         let updated_at = value.get("updated_at").and_then(Value::as_u64).unwrap_or(0);
         let entries = value
-            .get("entries")
-            .and_then(Value::as_array)
-            .map(Vec::len)
+            .get("entries_count")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .or_else(|| value.get("entries").and_then(Value::as_array).map(Vec::len))
             .unwrap_or(0);
         let leaf = value
             .get("leaf_id")
@@ -516,6 +654,11 @@ impl SessionStore {
             leaf,
         })
     }
+}
+
+fn write_json_line(file: &mut fs::File, value: &Value) -> io::Result<()> {
+    serde_json::to_writer(&mut *file, value)?;
+    file.write_all(b"\n")
 }
 
 fn context_item_for_entry(entry: &SessionEntry) -> Option<Value> {
@@ -869,5 +1012,73 @@ mod tests {
         assert_eq!(session.leaf_id(), Some(root_leaf));
         assert_eq!(session.tree_view().len(), 1);
         assert!(session.checkout("feature").is_err());
+    }
+
+    #[test]
+    fn save_writes_append_only_journal_and_small_summary() {
+        let root = test_dir("session-journal");
+        let profile = root.join("profile");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut session = SessionStore::new();
+        let session_id = session.session_id().to_string();
+
+        session.append(EntryKind::User {
+            content: "first prompt".to_string(),
+        });
+        session.save_for_cwd(&profile, &cwd).unwrap();
+        session.append(EntryKind::User {
+            content: "second prompt".to_string(),
+        });
+        session.save_for_cwd(&profile, &cwd).unwrap();
+
+        let dir = sessions_dir(&profile, &cwd);
+        let summary = fs::read_to_string(dir.join(format!("{session_id}.json"))).unwrap();
+        let journal = fs::read_to_string(dir.join(format!("{session_id}.jsonl"))).unwrap();
+        let loaded = SessionStore::load_for_cwd(&profile, &cwd, &session_id).unwrap();
+
+        assert!(summary.contains("\"entries_count\": 2"));
+        assert!(!summary.contains("first prompt"));
+        assert!(journal
+            .lines()
+            .any(|line| line.contains("\"type\":\"entry\"")));
+        assert_eq!(loaded.branch().len(), 2);
+        assert_eq!(loaded.transcript_items().len(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn journal_snapshot_preserves_branch_deletions() {
+        let root = test_dir("session-journal-delete");
+        let profile = root.join("profile");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut session = SessionStore::new();
+        let session_id = session.session_id().to_string();
+
+        session.append(EntryKind::User {
+            content: "root".to_string(),
+        });
+        session.fork("feature").unwrap();
+        session.append(EntryKind::User {
+            content: "branch only".to_string(),
+        });
+        session.save_for_cwd(&profile, &cwd).unwrap();
+        session.delete_branch("feature").unwrap();
+        session.save_for_cwd(&profile, &cwd).unwrap();
+
+        let mut loaded = SessionStore::load_for_cwd(&profile, &cwd, &session_id).unwrap();
+
+        assert_eq!(loaded.tree_view().len(), 1);
+        assert!(loaded.checkout("feature").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("jucode-{name}-{nanos}"))
     }
 }
