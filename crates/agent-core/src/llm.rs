@@ -12,6 +12,12 @@ use std::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SUBAGENT_OUTPUT_BYTES: usize = 16 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderKind {
+    OpenAiResponses,
+    AnthropicMessages,
+}
+
 pub struct OpenAiClient {
     api_key: String,
     pub model: String,
@@ -22,6 +28,7 @@ pub struct OpenAiClient {
     max_output_tokens: u64,
     retry_attempts: usize,
     allow_subagents: bool,
+    provider_kind: ProviderKind,
 }
 
 pub struct OpenAiClientConfig<'a> {
@@ -76,6 +83,7 @@ impl OpenAiClient {
                 )
             })?,
         };
+        let provider_kind = ProviderKind::from_model(&config.model);
         Ok(Self {
             api_key,
             model: config.model,
@@ -86,6 +94,7 @@ impl OpenAiClient {
             max_output_tokens: config.max_output_tokens,
             retry_attempts: config.retry_attempts,
             allow_subagents: true,
+            provider_kind,
         })
     }
 
@@ -97,10 +106,13 @@ impl OpenAiClient {
     ) -> Result<(), String> {
         loop {
             emit(StreamEvent::CallStart)?;
-            let output_items = if is_anthropic_model(&self.model) {
-                self.create_anthropic_message_streaming(input.clone(), &mut emit)?
-            } else {
-                self.create_response_streaming(input.clone(), &mut emit)?
+            let output_items = match self.provider_kind {
+                ProviderKind::OpenAiResponses => {
+                    self.create_response_streaming(input.clone(), &mut emit)?
+                }
+                ProviderKind::AnthropicMessages => {
+                    self.create_anthropic_message_streaming(input.clone(), &mut emit)?
+                }
             };
             let mut function_calls = Vec::new();
 
@@ -393,6 +405,7 @@ impl OpenAiClient {
             max_output_tokens: self.max_output_tokens,
             retry_attempts: self.retry_attempts,
             allow_subagents: false,
+            provider_kind: ProviderKind::from_model(model),
         };
         let input = vec![json!({
             "role": "user",
@@ -440,6 +453,16 @@ impl OpenAiClient {
             model_output: output.clone(),
             is_error: value.get("success").and_then(Value::as_bool) != Some(true),
             output,
+        }
+    }
+}
+
+impl ProviderKind {
+    fn from_model(model: &str) -> Self {
+        if is_anthropic_model(model) {
+            Self::AnthropicMessages
+        } else {
+            Self::OpenAiResponses
         }
     }
 }

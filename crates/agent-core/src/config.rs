@@ -44,6 +44,7 @@ pub struct Config {
 pub struct ExtensionConfig {
     pub name: String,
     pub command: String,
+    pub lazy: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +358,7 @@ fn read_extensions(value: &Value) -> Vec<ExtensionConfig> {
             Some(ExtensionConfig {
                 name: name.to_string(),
                 command: command.to_string(),
+                lazy: read_bool(extension, "lazy", false),
             })
         })
         .collect()
@@ -375,6 +377,7 @@ fn extension_config_value(extension: &ExtensionConfig) -> Value {
     json!({
         "name": extension.name,
         "command": extension.command,
+        "lazy": extension.lazy,
     })
 }
 

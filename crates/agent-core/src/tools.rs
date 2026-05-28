@@ -319,12 +319,12 @@ fn read_file(args: &Value, cwd: &Path) -> Value {
             return json!({ "path": path.display().to_string(), "error": error.to_string() })
         }
     };
-    let Ok(text) = String::from_utf8(bytes.clone()) else {
+    let Some((text, encoding)) = decode_text_bytes(&bytes) else {
         return json!({
             "path": path.display().to_string(),
             "kind": "binary",
             "bytes": bytes.len(),
-            "error": "file is not valid UTF-8 text"
+            "error": "file is not supported text encoding"
         });
     };
 
@@ -351,6 +351,7 @@ fn read_file(args: &Value, cwd: &Path) -> Value {
     json!({
         "path": path.display().to_string(),
         "kind": "text",
+        "encoding": encoding,
         "offset": offset,
         "lines_read": lines_read,
         "truncated": truncated,
@@ -1031,6 +1032,35 @@ fn image_mime(path: &Path) -> Option<&'static str> {
         Some("webp") => Some("image/webp"),
         _ => None,
     }
+}
+
+fn decode_text_bytes(bytes: &[u8]) -> Option<(String, &'static str)> {
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        return decode_utf16(&bytes[2..], true).map(|text| (text, "utf-16le"));
+    }
+    if bytes.starts_with(&[0xfe, 0xff]) {
+        return decode_utf16(&bytes[2..], false).map(|text| (text, "utf-16be"));
+    }
+    String::from_utf8(bytes.to_vec())
+        .ok()
+        .map(|text| (text, "utf-8"))
+}
+
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> Option<String> {
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let units = bytes
+        .chunks_exact(2)
+        .map(|chunk| {
+            if little_endian {
+                u16::from_le_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            }
+        })
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).ok()
 }
 
 fn symbol_from_line(line: &str) -> Option<String> {
@@ -1776,6 +1806,22 @@ mod tests {
         assert_eq!(value["kind"], "image");
         assert_eq!(value["mime"], "image/png");
         assert_eq!(value["base64"], "iVBORw==");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_supports_utf16_bom_text() {
+        let dir = test_dir("read-utf16");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, [0xff, 0xfe, b'h', 0, b'i', 0, b'\n', 0]).unwrap();
+
+        let result = run_tool("read", &json!({ "path": path }).to_string(), &dir);
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["kind"], "text");
+        assert_eq!(value["encoding"], "utf-16le");
+        assert_eq!(value["content"], "hi\n");
         let _ = fs::remove_dir_all(dir);
     }
 
