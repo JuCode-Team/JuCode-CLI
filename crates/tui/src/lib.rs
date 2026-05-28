@@ -41,12 +41,15 @@ const SYNC_END: &str = "\x1b[?2026l";
 const RESET: &str = "\x1b[0m";
 const INVERSE_ON: &str = "\x1b[7m";
 const INVERSE_OFF: &str = "\x1b[27m";
+const BOX_BORDER: &str = "\x1b[90m";
+const ANSI_ESCAPE: char = '\x1b';
 
 #[derive(Debug, Clone)]
 enum ChatLine {
     Startup {
         version: String,
         profile_dir: String,
+        config_path: String,
     },
     User(String),
     Assistant(String),
@@ -134,18 +137,7 @@ impl From<CommandView> for CommandCandidate {
 
 fn default_commands() -> Vec<CommandCandidate> {
     [
-        "/help",
-        "/login",
-        "/new",
-        "/config",
-        "/model",
-        "/tree",
-        "/fork",
-        "/checkout",
-        "/delete",
-        "/resume",
-        "/extensions",
-        "/context",
+        "/help", "/login", "/new", "/model", "/tree", "/resume", "/context", "/doctor", "/pin",
         "/quit",
     ]
     .iter()
@@ -426,6 +418,7 @@ struct PickerState {
     tree: Option<TreeRows>,
     efforts: Vec<String>,
     selected_effort: usize,
+    prompt: Option<TreePrompt>,
 }
 
 #[derive(Debug, Clone)]
@@ -452,6 +445,18 @@ enum PickerMode {
     Checkout,
     Resume,
     Model,
+}
+
+#[derive(Debug, Clone)]
+struct TreePrompt {
+    action: TreePromptAction,
+    input: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreePromptAction {
+    Fork,
+    Delete,
 }
 
 #[derive(Debug, Clone)]
@@ -813,7 +818,58 @@ impl<R: TuiRuntime> TuiApp<R> {
         self.paste_burst.clear_after_non_char();
     }
 
+    fn handle_picker_prompt_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        match code {
+            KeyCode::Char('c') | KeyCode::Char('q')
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                true
+            }
+            KeyCode::Esc => {
+                if let Some(picker) = self.picker_view.as_mut() {
+                    picker.cancel_prompt();
+                }
+                false
+            }
+            KeyCode::Backspace => {
+                if let Some(picker) = self.picker_view.as_mut() {
+                    picker.pop_prompt_char();
+                }
+                false
+            }
+            KeyCode::Enter => {
+                let Some(command) = self
+                    .picker_view
+                    .as_mut()
+                    .and_then(PickerState::take_prompt_command)
+                else {
+                    return false;
+                };
+                let (_, events) = self.runtime.handle_command(&command);
+                self.apply_events(events);
+                false
+            }
+            KeyCode::Char(ch)
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(picker) = self.picker_view.as_mut() {
+                    picker.push_prompt_char(ch);
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     fn handle_picker_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        if self
+            .picker_view
+            .as_ref()
+            .is_some_and(|picker| picker.prompt.is_some())
+        {
+            return self.handle_picker_prompt_key(code, modifiers);
+        }
+
         match code {
             KeyCode::Char('c') | KeyCode::Char('q')
                 if modifiers.contains(KeyModifiers::CONTROL) =>
@@ -854,16 +910,18 @@ impl<R: TuiRuntime> TuiApp<R> {
                 }
                 false
             }
+            KeyCode::Char('f') | KeyCode::Char('n')
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(picker) = self.picker_view.as_mut() {
+                    picker.begin_tree_prompt(TreePromptAction::Fork);
+                }
+                false
+            }
             KeyCode::Delete => {
-                let Some(command) = self
-                    .picker_view
-                    .as_ref()
-                    .and_then(PickerState::delete_command)
-                else {
-                    return false;
-                };
-                let (_, events) = self.runtime.handle_command(&command);
-                self.apply_events(events);
+                if let Some(picker) = self.picker_view.as_mut() {
+                    picker.begin_tree_prompt(TreePromptAction::Delete);
+                }
                 false
             }
             KeyCode::Enter => {
@@ -1099,10 +1157,10 @@ impl<R: TuiRuntime> TuiApp<R> {
     }
 
     fn push_startup(&mut self, version: String, profile_dir: String, config_path: String) {
-        let _ = config_path;
         self.chat.push(ChatLine::Startup {
             version,
             profile_dir,
+            config_path,
         });
     }
 
@@ -1346,6 +1404,7 @@ impl PickerState {
             tree: Some(TreeRows { all_rows, expanded }),
             efforts: Vec::new(),
             selected_effort: 0,
+            prompt: None,
         }
     }
 
@@ -1372,6 +1431,7 @@ impl PickerState {
             tree: None,
             efforts: Vec::new(),
             selected_effort: 0,
+            prompt: None,
         }
     }
 
@@ -1410,6 +1470,7 @@ impl PickerState {
             tree: None,
             efforts,
             selected_effort,
+            prompt: None,
         }
     }
 
@@ -1429,8 +1490,42 @@ impl PickerState {
         }
     }
 
-    fn delete_command(&self) -> Option<String> {
-        None
+    fn begin_tree_prompt(&mut self, action: TreePromptAction) {
+        if self.mode != PickerMode::Checkout {
+            return;
+        }
+        self.prompt = Some(TreePrompt {
+            action,
+            input: String::new(),
+        });
+    }
+
+    fn cancel_prompt(&mut self) {
+        self.prompt = None;
+    }
+
+    fn push_prompt_char(&mut self, ch: char) {
+        if let Some(prompt) = self.prompt.as_mut() {
+            prompt.input.push(ch);
+        }
+    }
+
+    fn pop_prompt_char(&mut self) {
+        if let Some(prompt) = self.prompt.as_mut() {
+            prompt.input.pop();
+        }
+    }
+
+    fn take_prompt_command(&mut self) -> Option<String> {
+        let prompt = self.prompt.take()?;
+        let label = prompt.input.trim();
+        if label.is_empty() {
+            return None;
+        }
+        match prompt.action {
+            TreePromptAction::Fork => Some(format!("/fork {label}")),
+            TreePromptAction::Delete => Some(format!("/delete {label}")),
+        }
     }
 
     fn move_previous(&mut self) {
@@ -1601,7 +1696,8 @@ impl UiBuilder {
                 ChatLine::Startup {
                     version,
                     profile_dir,
-                } => self.push_startup_box(version, profile_dir),
+                    config_path,
+                } => self.push_startup_box(version, profile_dir, config_path),
                 ChatLine::User(text) => self.push_history(UiKind::User, text),
                 ChatLine::Assistant(text) => self.push_history(UiKind::Assistant, text),
                 ChatLine::Tool {
@@ -1635,11 +1731,23 @@ impl UiBuilder {
             return self;
         };
         let hint = match picker.mode {
-            PickerMode::Checkout => "tree: arrows move/expand, enter checkout, esc close",
+            PickerMode::Checkout => {
+                "tree: arrows move/expand, enter checkout, f fork, delete branch, esc close"
+            }
             PickerMode::Resume => "resume: arrows move, enter resume, esc close",
             PickerMode::Model => "model: arrows move, shift+tab effort, enter select, esc close",
         };
         self.control_line(UiKind::Status, hint.to_string());
+        if let Some(prompt) = picker.prompt.as_ref() {
+            let label = match prompt.action {
+                TreePromptAction::Fork => "fork branch",
+                TreePromptAction::Delete => "delete branch",
+            };
+            self.control_line(
+                UiKind::Input,
+                format!("> {label}: {}{CURSOR_MARKER}{VISIBLE_CURSOR}", prompt.input),
+            );
+        }
         if picker.mode == PickerMode::Model && !picker.efforts.is_empty() {
             let effort = &picker.efforts[picker.selected_effort];
             self.control_line(
@@ -1813,17 +1921,35 @@ impl UiBuilder {
         }
     }
 
-    fn push_startup_box(&mut self, version: &str, profile_dir: &str) {
-        let title = format!("JUCODE CLI v{version}");
-        let profile = format!("profile {profile_dir}");
-        let inner_width = UnicodeWidthStr::width(title.as_str())
-            .max(UnicodeWidthStr::width(profile.as_str()))
-            .min(76);
-        let top = format!("+{}+", "-".repeat(inner_width + 2));
-        self.history_line(UiKind::Brand, top.clone());
-        self.history_line(UiKind::Brand, box_line(&title, inner_width));
-        self.history_line(UiKind::System, box_line(&profile, inner_width));
-        self.history_line(UiKind::Brand, top);
+    fn push_startup_box(&mut self, version: &str, profile_dir: &str, _config_path: &str) {
+        let title = format!(">_ JuCode CLI (v{version})");
+        let model = "model:     /model to choose";
+        let profile = format!("profile:   {profile_dir}");
+        let content_width = [title.as_str(), model, profile.as_str()]
+            .iter()
+            .map(|line| UnicodeWidthStr::width(*line))
+            .max()
+            .unwrap_or(0)
+            .min(96);
+
+        self.history_line(UiKind::Brand, rounded_box_border('╭', '╮', content_width));
+        self.history_line(
+            UiKind::Brand,
+            rounded_box_line(&title, content_width, UiKind::Brand),
+        );
+        self.history_line(
+            UiKind::Brand,
+            rounded_box_line("", content_width, UiKind::Brand),
+        );
+        self.history_line(
+            UiKind::System,
+            rounded_box_line(model, content_width, UiKind::System),
+        );
+        self.history_line(
+            UiKind::System,
+            rounded_box_line(&profile, content_width, UiKind::System),
+        );
+        self.history_line(UiKind::Brand, rounded_box_border('╰', '╯', content_width));
     }
 
     fn push_tool_preview(&mut self, text: &str, prefix: &str) {
@@ -2389,6 +2515,9 @@ fn extract_cursor(lines: &mut [UiLine]) -> Option<CursorTarget> {
 }
 
 fn render_ansi_line(line: &UiLine) -> String {
+    if line.text.contains(ANSI_ESCAPE) {
+        return line.text.clone();
+    }
     format!("{}{}{}", color_code(line.kind), line.text, RESET)
 }
 
@@ -2781,10 +2910,18 @@ fn diff_line_kind(line: &str) -> UiKind {
     }
 }
 
-fn box_line(text: &str, width: usize) -> String {
+fn rounded_box_border(left: char, right: char, width: usize) -> String {
+    format!("{BOX_BORDER}{left}{}{right}{RESET}", "─".repeat(width + 2))
+}
+
+fn rounded_box_line(text: &str, width: usize, text_kind: UiKind) -> String {
     let text = truncate_to_width(text, width);
     let text_width = UnicodeWidthStr::width(text.as_str());
-    format!("| {text}{} |", " ".repeat(width.saturating_sub(text_width)))
+    format!(
+        "{BOX_BORDER}│{RESET} {}{text}{RESET}{} {BOX_BORDER}│{RESET}",
+        color_code(text_kind),
+        " ".repeat(width.saturating_sub(text_width))
+    )
 }
 
 fn spinner_char(preset: SpinnerPreset, tick: usize, step: usize) -> &'static str {
@@ -2947,6 +3084,7 @@ mod tests {
     #[derive(Default)]
     struct TestRuntime {
         submitted: Vec<String>,
+        commands: Vec<String>,
     }
 
     impl TuiRuntime for TestRuntime {
@@ -2967,7 +3105,8 @@ mod tests {
             Vec::new()
         }
 
-        fn handle_command(&mut self, _input: &str) -> (bool, Vec<AgentEvent>) {
+        fn handle_command(&mut self, input: &str) -> (bool, Vec<AgentEvent>) {
+            self.commands.push(input.to_string());
             (false, Vec::new())
         }
 
@@ -3288,17 +3427,23 @@ mod tests {
     fn startup_renders_inside_box() {
         let document = UiBuilder::new()
             .chat(&[ChatLine::Startup {
-                version: "0.1.1".to_string(),
+                version: "0.1.2".to_string(),
                 profile_dir: "C:\\Users\\me\\.jucode".to_string(),
+                config_path: "E:\\Code\\Projects\\JuCode\\JuCode-CLI".to_string(),
             }])
             .finish();
 
-        assert!(document.history[0].text.starts_with('+'));
-        assert!(document.history[1].text.contains("JUCODE CLI v0.1.1"));
-        assert!(document.history[2]
-            .text
-            .contains("profile C:\\Users\\me\\.jucode"));
-        assert_eq!(document.history[0].text, document.history[3].text);
+        assert!(document.history[0].text.starts_with("\x1b[90m╭"));
+        assert!(document.history[1].text.contains("\x1b[90m│"));
+        assert!(strip_ansi(&document.history[0].text).starts_with('╭'));
+        assert!(strip_ansi(&document.history[1].text).contains(">_ JuCode CLI (v0.1.2)"));
+        assert!(strip_ansi(&document.history[3].text).contains("model:"));
+        assert!(!document
+            .history
+            .iter()
+            .any(|line| strip_ansi(&line.text).contains("directory:")));
+        assert!(strip_ansi(&document.history[4].text).contains("profile:   C:\\Users\\me\\.jucode"));
+        assert!(strip_ansi(&document.history[5].text).starts_with('╰'));
     }
 
     #[test]
@@ -3561,7 +3706,7 @@ mod tests {
 
     #[test]
     fn checkout_tree_enter_maps_to_checkout_command() {
-        let tree = PickerState::checkout(vec![TreeNodeView {
+        let mut tree = PickerState::checkout(vec![TreeNodeView {
             id: "e3".to_string(),
             parent_id: None,
             label: "selected prompt".to_string(),
@@ -3569,7 +3714,61 @@ mod tests {
         }]);
 
         assert_eq!(tree.selected_command().as_deref(), Some("/checkout e3"));
-        assert_eq!(tree.delete_command(), None);
+
+        tree.begin_tree_prompt(TreePromptAction::Fork);
+        for ch in "feature".chars() {
+            tree.push_prompt_char(ch);
+        }
+        assert_eq!(tree.take_prompt_command().as_deref(), Some("/fork feature"));
+    }
+
+    #[test]
+    fn checkout_tree_fork_and_delete_are_interactive_commands() {
+        let mut app = TuiApp::new(TestRuntime::default());
+        let now = Instant::now();
+        app.picker_view = Some(PickerState::checkout(vec![TreeNodeView {
+            id: "e3".to_string(),
+            parent_id: None,
+            label: "selected prompt".to_string(),
+            active: true,
+        }]));
+
+        app.handle_key_at(KeyCode::Char('f'), KeyModifiers::empty(), now);
+        for (index, ch) in "feature".chars().enumerate() {
+            app.handle_key_at(
+                KeyCode::Char(ch),
+                KeyModifiers::empty(),
+                now + Duration::from_millis(index as u64 + 1),
+            );
+        }
+        app.handle_key_at(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+            now + Duration::from_millis(20),
+        );
+
+        app.handle_key_at(
+            KeyCode::Delete,
+            KeyModifiers::empty(),
+            now + Duration::from_millis(30),
+        );
+        for (index, ch) in "feature".chars().enumerate() {
+            app.handle_key_at(
+                KeyCode::Char(ch),
+                KeyModifiers::empty(),
+                now + Duration::from_millis(index as u64 + 31),
+            );
+        }
+        app.handle_key_at(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+            now + Duration::from_millis(50),
+        );
+
+        assert_eq!(
+            app.runtime.commands,
+            vec!["/fork feature".to_string(), "/delete feature".to_string()]
+        );
     }
 
     #[test]
@@ -3659,7 +3858,6 @@ mod tests {
         }]);
 
         assert_eq!(tree.selected_command().as_deref(), Some("/resume s123"));
-        assert_eq!(tree.delete_command(), None);
     }
 
     #[test]

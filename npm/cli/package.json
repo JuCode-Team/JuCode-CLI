@@ -1,6 +1,6 @@
 {
   "name": "@jucode/cli",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "JuCode native CLI",
   "license": "Apache-2.0",
   "publishConfig": {
@@ -13,8 +13,8 @@
     "bin/jucode.cjs"
   ],
   "optionalDependencies": {
-    "@jucode/cli-linux-x64": "0.1.1",
-    "@jucode/cli-win32-x64": "0.1.1"
+    "@jucode/cli-linux-x64": "0.1.2",
+    "@jucode/cli-win32-x64": "0.1.2"
   },
   "engines": {
     "node": ">=18"

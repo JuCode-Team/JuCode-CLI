@@ -79,6 +79,36 @@ pub struct ContextProjection {
     pub compacted: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ContextEntryCounts {
+    pub branches: usize,
+    pub users: usize,
+    pub assistant_responses: usize,
+    pub tool_calls: usize,
+    pub tool_outputs: usize,
+    pub pinned_skills: usize,
+    pub other_response_items: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextTopItem {
+    pub label: String,
+    pub estimated_tokens: usize,
+    pub chars: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextStatistics {
+    pub branch_entries: usize,
+    pub context_items: usize,
+    pub projected_items: usize,
+    pub compacted: bool,
+    pub estimated_tokens: usize,
+    pub projected_estimated_tokens: usize,
+    pub counts: ContextEntryCounts,
+    pub top_items: Vec<ContextTopItem>,
+}
+
 impl SessionStore {
     pub fn new() -> Self {
         Self {
@@ -204,6 +234,7 @@ impl SessionStore {
         path
     }
 
+    #[cfg(test)]
     pub fn context_projection(&self) -> ContextProjection {
         self.context_projection_with_budget(usize::MAX, usize::MAX)
     }
@@ -254,6 +285,51 @@ impl SessionStore {
             projected_entries: items.len(),
             items,
             compacted,
+        }
+    }
+
+    pub fn context_statistics(
+        &self,
+        max_tokens: usize,
+        keep_recent_tokens: usize,
+    ) -> ContextStatistics {
+        let branch = self.branch();
+        let projection = self.context_projection_with_budget(max_tokens, keep_recent_tokens);
+        let projected_estimated_tokens = estimate_items_tokens(projection.items.iter());
+        let mut counts = ContextEntryCounts::default();
+        let mut context_items = 0usize;
+        let mut estimated_tokens = 0usize;
+        let mut top_items = Vec::new();
+
+        for entry in &branch {
+            count_context_entry(&entry.kind, &mut counts);
+            let Some(item) = context_item_for_entry(entry) else {
+                continue;
+            };
+            let item_text = item.to_string();
+            let chars = item_text.len();
+            let estimated = chars.saturating_add(3) / 4;
+            context_items += 1;
+            estimated_tokens += estimated;
+            top_items.push(ContextTopItem {
+                label: context_entry_label(entry),
+                estimated_tokens: estimated,
+                chars,
+            });
+        }
+
+        top_items.sort_by(|left, right| right.estimated_tokens.cmp(&left.estimated_tokens));
+        top_items.truncate(5);
+
+        ContextStatistics {
+            branch_entries: projection.branch_entries,
+            context_items,
+            projected_items: projection.projected_entries,
+            compacted: projection.compacted,
+            estimated_tokens,
+            projected_estimated_tokens,
+            counts,
+            top_items,
         }
     }
 
@@ -691,6 +767,45 @@ fn context_item_for_entry(entry: &SessionEntry) -> Option<Value> {
     }
 }
 
+fn count_context_entry(kind: &EntryKind, counts: &mut ContextEntryCounts) {
+    match kind {
+        EntryKind::Branch { .. } => counts.branches += 1,
+        EntryKind::User { .. } => counts.users += 1,
+        EntryKind::ResponseItem { item } => {
+            if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                counts.tool_calls += 1;
+            } else if !extract_response_text(item).trim().is_empty() {
+                counts.assistant_responses += 1;
+            } else {
+                counts.other_response_items += 1;
+            }
+        }
+        EntryKind::ToolOutput { .. } => counts.tool_outputs += 1,
+        EntryKind::PinnedSkill { .. } => counts.pinned_skills += 1,
+    }
+}
+
+fn context_entry_label(entry: &SessionEntry) -> String {
+    match &entry.kind {
+        EntryKind::Branch { label } => format!("branch:{label}"),
+        EntryKind::User { .. } => "user".to_string(),
+        EntryKind::ResponseItem { item } => match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => item
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|name| format!("tool call:{name}"))
+                .unwrap_or_else(|| "tool call".to_string()),
+            Some(kind) if !extract_response_text(item).trim().is_empty() => {
+                format!("assistant:{kind}")
+            }
+            Some(kind) => format!("response item:{kind}"),
+            None => "response item".to_string(),
+        },
+        EntryKind::ToolOutput { name, .. } => format!("tool output:{name}"),
+        EntryKind::PinnedSkill { name, .. } => format!("pinned skill:{name}"),
+    }
+}
+
 fn estimate_items_tokens<'a>(items: impl Iterator<Item = &'a Value>) -> usize {
     items.map(estimate_item_tokens).sum()
 }
@@ -955,6 +1070,50 @@ mod tests {
             .to_string()
             .contains("CONVERSATION HISTORY SUMMARY"));
         assert!(projection.items.len() < session.context_projection().items.len());
+    }
+
+    #[test]
+    fn context_statistics_reports_counts_and_largest_items() {
+        let mut session = SessionStore::new();
+        session.fork("work").unwrap();
+        session.append(EntryKind::User {
+            content: "please inspect the terminal renderer".to_string(),
+        });
+        session.append(EntryKind::ResponseItem {
+            item: json!({
+                "type": "message",
+                "content": [{ "text": "I inspected the renderer." }]
+            }),
+        });
+        session.append(EntryKind::ResponseItem {
+            item: json!({
+                "type": "function_call",
+                "name": "read",
+                "call_id": "call_1"
+            }),
+        });
+        session.append(EntryKind::ToolOutput {
+            call_id: "call_1".to_string(),
+            name: "read".to_string(),
+            output: "line\n".repeat(100),
+        });
+        session.append(EntryKind::PinnedSkill {
+            name: "review".to_string(),
+            content: "Be careful.".to_string(),
+        });
+
+        let stats = session.context_statistics(usize::MAX, usize::MAX);
+
+        assert_eq!(stats.branch_entries, 6);
+        assert_eq!(stats.context_items, 5);
+        assert_eq!(stats.counts.branches, 1);
+        assert_eq!(stats.counts.users, 1);
+        assert_eq!(stats.counts.assistant_responses, 1);
+        assert_eq!(stats.counts.tool_calls, 1);
+        assert_eq!(stats.counts.tool_outputs, 1);
+        assert_eq!(stats.counts.pinned_skills, 1);
+        assert!(stats.estimated_tokens > 0);
+        assert_eq!(stats.top_items[0].label, "tool output:read");
     }
 
     #[test]

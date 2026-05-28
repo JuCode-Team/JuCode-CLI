@@ -8,7 +8,7 @@ use crate::{
         build_system_prompt, discover_project_instructions, discover_skills, skill_commands,
         skill_message, skill_pin_message, PromptContext,
     },
-    session::{EntryKind, SessionStore, SessionSummary},
+    session::{ContextStatistics, EntryKind, SessionStore, SessionSummary},
 };
 use serde_json::Value;
 use std::{
@@ -116,21 +116,7 @@ impl AgentCore {
 
     fn command_list_event(&self) -> AgentEvent {
         let mut commands = [
-            "/help",
-            "/login",
-            "/new",
-            "/config",
-            "/model",
-            "/tree",
-            "/fork",
-            "/checkout",
-            "/delete",
-            "/resume",
-            "/extensions",
-            "/context",
-            "/stats",
-            "/doctor",
-            "/pin",
+            "/help", "/login", "/new", "/model", "/tree", "/resume", "/context", "/doctor", "/pin",
             "/quit",
         ]
         .iter()
@@ -190,7 +176,7 @@ impl AgentCore {
         let events = match command {
             "/quit" | "/exit" => return (true, Vec::new()),
             "/help" | "/" => vec![AgentEvent::Info(
-                "/help /login [web-url] [api-url] /new /config /model [model] [effort] /tree /fork <label> /checkout [label] /delete <label> /resume [session-id] /extensions /context /stats /doctor /pin <skill> /quit"
+                "/help /login [web-url] [api-url] /new /model [model] [effort] /tree /resume [session-id] /context /doctor /pin <skill> /quit"
                     .to_string(),
             )],
             "/login" => self.login_events(input[command.len()..].trim()),
@@ -215,17 +201,17 @@ impl AgentCore {
                     vec![AgentEvent::TreeView(self.session.tree_view())]
                 } else {
                     match self.session.checkout(label) {
-                    Ok(()) => {
-                        let save_event = self.save_session_event();
-                        vec![
-                            AgentEvent::Transcript(self.session.transcript_items()),
-                            AgentEvent::Status(format!("checked out {label}")),
-                        ]
-                        .into_iter()
-                        .chain(save_event)
-                        .collect()
-                    }
-                    Err(error) => vec![AgentEvent::Error(error)],
+                        Ok(()) => {
+                            let save_event = self.save_session_event();
+                            vec![
+                                AgentEvent::Transcript(self.session.transcript_items()),
+                                AgentEvent::Status(format!("checked out {label}")),
+                            ]
+                            .into_iter()
+                            .chain(save_event)
+                            .collect()
+                        }
+                        Err(error) => vec![AgentEvent::Error(error)],
                     }
                 }
             }
@@ -236,6 +222,7 @@ impl AgentCore {
                         let save_event = self.save_session_event();
                         vec![
                             AgentEvent::Transcript(self.session.transcript_items()),
+                            AgentEvent::TreeView(self.session.tree_view()),
                             AgentEvent::Status(format!("forked {label}: {}", id.display())),
                         ]
                         .into_iter()
@@ -780,30 +767,20 @@ impl AgentCore {
     }
 
     fn context_events(&self) -> Vec<AgentEvent> {
-        let projection = self.session.context_projection();
-        let mut events = vec![AgentEvent::Info(format!(
-            "context projection: branch_entries={} projected_entries={} compacted={}",
-            projection.branch_entries, projection.projected_entries, projection.compacted
-        ))];
-        events.extend(
-            projection
-                .items
-                .into_iter()
-                .map(|item| AgentEvent::Info(item.to_string())),
+        let model_config = self.config.current_model_config();
+        let stats = self.session.context_statistics(
+            (model_config.context_window as usize).saturating_mul(3) / 4,
+            20_000,
         );
-        events
+        vec![AgentEvent::Info(format_context_statistics(
+            &stats,
+            self.total_input_tokens,
+            self.total_output_tokens,
+        ))]
     }
 
     fn stats_events(&self) -> Vec<AgentEvent> {
-        let projection = self.session.context_projection();
-        vec![AgentEvent::Info(format!(
-            "stats: total_input_tokens={} total_output_tokens={} session_entries={} projected_entries={} compacted={}",
-            self.total_input_tokens,
-            self.total_output_tokens,
-            projection.branch_entries,
-            projection.projected_entries,
-            projection.compacted
-        ))]
+        self.context_events()
     }
 
     fn doctor_events(&self) -> Vec<AgentEvent> {
@@ -830,22 +807,34 @@ impl AgentCore {
             )),
             Err(error) => lines.push(format!("project instructions: error: {error}")),
         }
-        let extensions = ExtensionRegistry::load(
-            &self.config.extensions,
-            &self.cwd,
-            self.config.profile_dir(),
-        );
-        lines.push(format!(
-            "extensions: {} tool(s), {} error(s)",
-            extensions.definitions().len(),
-            extensions.errors().len()
-        ));
+        if self.config.extensions.is_empty() {
+            lines.push("extensions: none".to_string());
+        } else {
+            let extensions = ExtensionRegistry::load(
+                &self.config.extensions,
+                &self.cwd,
+                self.config.profile_dir(),
+            );
+            lines.push(format!(
+                "extensions: {} tool(s), {} error(s)",
+                extensions.definitions().len(),
+                extensions.errors().len()
+            ));
+            lines.extend(self.extension_info_lines());
+        }
         vec![AgentEvent::Info(lines.join("\n"))]
     }
 
     fn extension_events(&self) -> Vec<AgentEvent> {
+        self.extension_info_lines()
+            .into_iter()
+            .map(AgentEvent::Info)
+            .collect()
+    }
+
+    fn extension_info_lines(&self) -> Vec<String> {
         if self.config.extensions.is_empty() {
-            return vec![AgentEvent::Info("extensions: none".to_string())];
+            return vec!["extensions: none".to_string()];
         }
 
         let registry = ExtensionRegistry::load(
@@ -873,21 +862,18 @@ impl AgentCore {
                 .find(|(name, _)| name == &extension.name)
                 .map(|(_, error)| error);
             if let Some(error) = error {
-                events.push(AgentEvent::Info(format!(
+                events.push(format!(
                     "extension {}: failed to initialize: {error}",
                     extension.name
-                )));
+                ));
             } else if tools.is_empty() {
-                events.push(AgentEvent::Info(format!(
-                    "extension {}: no tools",
-                    extension.name
-                )));
+                events.push(format!("extension {}: no tools", extension.name));
             } else {
-                events.push(AgentEvent::Info(format!(
+                events.push(format!(
                     "extension {}: {}",
                     extension.name,
                     tools.join(", ")
-                )));
+                ));
             }
         }
         events
@@ -1044,6 +1030,48 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
     let month = mp + if mp < 10 { 3 } else { -9 };
     year += if month <= 2 { 1 } else { 0 };
     (year as i32, month as u32, day as u32)
+}
+
+fn format_context_statistics(
+    stats: &ContextStatistics,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+) -> String {
+    let mut lines = vec![
+        format!(
+            "context: branch_entries={} context_items={} projected_items={} compacted={}",
+            stats.branch_entries, stats.context_items, stats.projected_items, stats.compacted
+        ),
+        format!(
+            "estimated_tokens: full={} projected={} api_usage_input={} api_usage_output={}",
+            stats.estimated_tokens,
+            stats.projected_estimated_tokens,
+            total_input_tokens,
+            total_output_tokens
+        ),
+        format!(
+            "entries: users={} assistant={} tool_calls={} tool_outputs={} pinned_skills={} branches={} other_response_items={}",
+            stats.counts.users,
+            stats.counts.assistant_responses,
+            stats.counts.tool_calls,
+            stats.counts.tool_outputs,
+            stats.counts.pinned_skills,
+            stats.counts.branches,
+            stats.counts.other_response_items
+        ),
+    ];
+    if stats.top_items.is_empty() {
+        lines.push("largest_items: none".to_string());
+    } else {
+        lines.push("largest_items:".to_string());
+        lines.extend(stats.top_items.iter().map(|item| {
+            format!(
+                "  {} ~{} tokens ({} chars)",
+                item.label, item.estimated_tokens, item.chars
+            )
+        }));
+    }
+    lines.join("\n")
 }
 
 fn format_session_summary(summary: SessionSummary) -> String {
