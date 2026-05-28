@@ -1797,6 +1797,11 @@ fn wrap_line(line: &UiLine, width: usize, output: &mut Vec<UiLine>) {
             rest = next;
             continue;
         }
+        if let Some((sequence, next)) = split_ansi_sequence(rest) {
+            current.push_str(sequence);
+            rest = next;
+            continue;
+        }
 
         let Some(ch) = rest.chars().next() else {
             break;
@@ -1821,6 +1826,17 @@ fn wrap_line(line: &UiLine, width: usize, output: &mut Vec<UiLine>) {
             text: current,
         });
     }
+}
+
+fn split_ansi_sequence(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix("\x1b[")?;
+    for (index, ch) in rest.char_indices() {
+        if ch.is_ascii_alphabetic() {
+            let end = 2 + index + ch.len_utf8();
+            return Some((&text[..end], &text[end..]));
+        }
+    }
+    None
 }
 
 fn extract_cursor(lines: &mut [UiLine]) -> Option<CursorTarget> {
@@ -2253,6 +2269,33 @@ mod tests {
         assert!(!document.controls[1].text.contains("ready"));
         assert_eq!(
             UnicodeWidthStr::width(strip_ansi(&document.controls[1].text).as_str()),
+            64
+        );
+    }
+
+    #[test]
+    fn colored_status_line_does_not_wrap_at_visible_width() {
+        let document = UiBuilder::new()
+            .input("", &[], 0, true)
+            .bottom_status(
+                BottomStatus {
+                    provider: "jucode",
+                    model: "claude-opus-4.7",
+                    reasoning_effort: "high",
+                    input_tokens: 1620,
+                    output_tokens: 13,
+                    context_window: 400_000,
+                },
+                64,
+            )
+            .finish();
+
+        let frame = RenderedFrame::build(&document, 64);
+
+        assert_eq!(frame.lines.len(), 2);
+        assert!(strip_ansi(&frame.lines[1]).contains("tokens 1620/13 | context 0.4%"));
+        assert_eq!(
+            UnicodeWidthStr::width(strip_ansi(&frame.lines[1]).as_str()),
             64
         );
     }
