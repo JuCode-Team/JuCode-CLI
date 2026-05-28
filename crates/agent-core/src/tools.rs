@@ -1,10 +1,15 @@
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     env, fs,
     fs::File,
-    io::{BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, OnceLock,
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -14,10 +19,12 @@ const DEFAULT_LIST_LIMIT: usize = 500;
 const DEFAULT_RIPGREP_LIMIT: usize = 100;
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 60;
 const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_MODEL_OUTPUT_BYTES: usize = 24 * 1024;
 const COMMAND_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct ToolExecutionResult {
     pub output: String,
+    pub model_output: String,
     pub is_error: bool,
 }
 
@@ -90,9 +97,25 @@ pub fn definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "Shell command to run." },
-                    "timeout": { "type": "number", "description": "Timeout in seconds. Defaults to 60." }
+                    "timeout": { "type": "number", "description": "Timeout in seconds. Defaults to 60." },
+                    "yield_time_ms": { "type": "number", "description": "Return early after this many milliseconds if the command is still running. Use for dev servers, watchers, and long tasks." }
                 },
                 "required": ["command"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "write_stdin",
+            "description": "Send input to a running bash session or poll it. Use the session_id returned by bash.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "number", "description": "Running bash session id." },
+                    "text": { "type": "string", "description": "Text to write to stdin. Omit or pass empty text to only poll." },
+                    "yield_time_ms": { "type": "number", "description": "Milliseconds to wait for more output. Defaults to 1000." }
+                },
+                "required": ["session_id"],
                 "additionalProperties": false
             }
         }),
@@ -171,7 +194,11 @@ pub fn run_tool_with_events(
     let args = match parsed {
         Ok(args) => args,
         Err(error) => {
-            return tool_result(json!({ "error": format!("invalid JSON arguments: {error}") }))
+            return tool_result(
+                name,
+                json!({ "error": format!("invalid JSON arguments: {error}") }),
+                cwd,
+            )
         }
     };
 
@@ -180,16 +207,19 @@ pub fn run_tool_with_events(
         "edit" => edit_file(&args, cwd),
         "write" => write_file(&args, cwd),
         "bash" | "execute" => bash(&args, cwd, &mut emit),
+        "write_stdin" => write_stdin(&args),
         "apply_patch" => apply_patch(&args, cwd, &mut emit),
         "diff" => diff_workspace(&args, cwd),
         "ls" => list_dir(&args, cwd),
         "ripgrep" => ripgrep(&args, cwd),
         _ => json!({ "error": format!("unknown tool: {name}") }),
     };
-    tool_result(result)
+    tool_result(name, result, cwd)
 }
 
-fn tool_result(value: Value) -> ToolExecutionResult {
+fn tool_result(name: &str, value: Value, cwd: &Path) -> ToolExecutionResult {
+    let output = value.to_string();
+    let model_output = model_projection(name, &output, cwd);
     ToolExecutionResult {
         is_error: value.get("error").is_some()
             || value
@@ -200,7 +230,8 @@ fn tool_result(value: Value) -> ToolExecutionResult {
                 .get("timed_out")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-        output: value.to_string(),
+        output,
+        model_output,
     }
 }
 
@@ -378,10 +409,305 @@ fn bash(
             .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
             .max(1),
     );
+    let yield_time = optional_u64(args, "yield_time_ms").map(Duration::from_millis);
 
     let (program, shell_args) = shell_command(command);
-    let result = run_command_events(program, &shell_args, None, cwd, timeout, emit);
-    command_result_json(command, result)
+    let result = if let Some(yield_time) = yield_time {
+        run_command_session(
+            program,
+            &shell_args,
+            command,
+            cwd,
+            timeout,
+            yield_time,
+            emit,
+        )
+    } else {
+        run_command_events(program, &shell_args, None, cwd, timeout, emit)
+            .map(|result| command_result_json(command, Ok(result)))
+    };
+    match result {
+        Ok(value) => value,
+        Err(error) => json!({ "command": command, "error": error }),
+    }
+}
+
+fn write_stdin(args: &Value) -> Value {
+    let Some(session_id) = args.get("session_id").and_then(Value::as_u64) else {
+        return json!({ "error": "missing session_id" });
+    };
+    let text = args.get("text").and_then(Value::as_str).unwrap_or_default();
+    let yield_time = Duration::from_millis(optional_u64(args, "yield_time_ms").unwrap_or(1000));
+    match poll_or_write_session(session_id, text, yield_time) {
+        Ok(value) => value,
+        Err(error) => json!({ "session_id": session_id, "error": error }),
+    }
+}
+
+fn run_command_session(
+    program: &str,
+    args: &[&str],
+    display_command: &str,
+    cwd: &Path,
+    timeout: Duration,
+    yield_time: Duration,
+    emit: &mut impl FnMut(ToolExecutionEvent) -> Result<(), String>,
+) -> Result<Value, String> {
+    let stdout_path = temp_output_path("stdout");
+    let stderr_path = temp_output_path("stderr");
+    let stdout_file = File::create(&stdout_path).map_err(|error| error.to_string())?;
+    let stderr_file = File::create(&stderr_path).map_err(|error| error.to_string())?;
+
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .map_err(|error| format!("failed to start {program}: {error}"))?;
+
+    let stdin = child.stdin.take();
+    let started = SystemTime::now();
+    emit(ToolExecutionEvent::Update(format!(
+        "started: {}",
+        command_display(program, args)
+    )))?;
+
+    let wait_until = yield_time.min(timeout);
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            let result = collect_command_result(status.code(), false, &stdout_path, &stderr_path);
+            return Ok(command_result_json(display_command, Ok(result)));
+        }
+        if started.elapsed().unwrap_or_default() >= wait_until {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    let (stdout, stdout_truncated) = read_output_file(&stdout_path);
+    let (stderr, stderr_truncated) = read_output_file(&stderr_path);
+    shell_sessions()
+        .lock()
+        .map_err(|_| "shell session lock is poisoned".to_string())?
+        .insert(
+            session_id,
+            ShellSession {
+                child,
+                stdin,
+                stdout_path,
+                stderr_path,
+                command: display_command.to_string(),
+                started,
+                timeout,
+            },
+        );
+
+    Ok(json!({
+        "command": display_command,
+        "session_id": session_id,
+        "running": true,
+        "stdout": stdout,
+        "stderr": stderr,
+        "truncated": stdout_truncated || stderr_truncated,
+        "note": "command is still running; use write_stdin with this session_id to poll or send input"
+    }))
+}
+
+fn poll_or_write_session(
+    session_id: u64,
+    text: &str,
+    yield_time: Duration,
+) -> Result<Value, String> {
+    let started_poll = SystemTime::now();
+    loop {
+        let mut finished = None;
+        {
+            let mut sessions = shell_sessions()
+                .lock()
+                .map_err(|_| "shell session lock is poisoned".to_string())?;
+            let Some(session) = sessions.get_mut(&session_id) else {
+                return Err("shell session not found".to_string());
+            };
+            if !text.is_empty() {
+                if let Some(stdin) = session.stdin.as_mut() {
+                    stdin
+                        .write_all(text.as_bytes())
+                        .and_then(|_| stdin.flush())
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            if session.started.elapsed().unwrap_or_default() >= session.timeout {
+                kill_child(&mut session.child);
+                finished = Some((true, None));
+            } else if let Some(status) = session
+                .child
+                .try_wait()
+                .map_err(|error| error.to_string())?
+            {
+                finished = Some((false, status.code()));
+            }
+            if let Some((timed_out, code)) = finished {
+                let session = sessions.remove(&session_id).expect("session exists");
+                let result = collect_command_result(
+                    code,
+                    timed_out,
+                    &session.stdout_path,
+                    &session.stderr_path,
+                );
+                return Ok(command_result_json(&session.command, Ok(result)));
+            }
+        }
+
+        if started_poll.elapsed().unwrap_or_default() >= yield_time {
+            let sessions = shell_sessions()
+                .lock()
+                .map_err(|_| "shell session lock is poisoned".to_string())?;
+            let Some(session) = sessions.get(&session_id) else {
+                return Err("shell session not found".to_string());
+            };
+            let (stdout, stdout_truncated) = read_output_file(&session.stdout_path);
+            let (stderr, stderr_truncated) = read_output_file(&session.stderr_path);
+            return Ok(json!({
+                "command": session.command,
+                "session_id": session_id,
+                "running": true,
+                "stdout": stdout,
+                "stderr": stderr,
+                "truncated": stdout_truncated || stderr_truncated,
+            }));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn collect_command_result(
+    exit_code: Option<i32>,
+    timed_out: bool,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> CommandResult {
+    let (stdout, stdout_truncated) = read_output_file(stdout_path);
+    let (stderr, stderr_truncated) = read_output_file(stderr_path);
+    let _ = fs::remove_file(stdout_path);
+    let _ = fs::remove_file(stderr_path);
+    CommandResult {
+        exit_code,
+        stdout,
+        stderr,
+        timed_out,
+        truncated: stdout_truncated || stderr_truncated,
+    }
+}
+
+fn kill_child(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        let id = child.id().to_string();
+        let _ = Command::new("taskkill")
+            .args(["/pid", &id, "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        return;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+struct ShellSession {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    command: String,
+    started: SystemTime,
+    timeout: Duration,
+}
+
+static SHELL_SESSIONS: OnceLock<Mutex<HashMap<u64, ShellSession>>> = OnceLock::new();
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn shell_sessions() -> &'static Mutex<HashMap<u64, ShellSession>> {
+    SHELL_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn model_projection(name: &str, output: &str, cwd: &Path) -> String {
+    if output.len() <= MAX_MODEL_OUTPUT_BYTES {
+        return output.to_string();
+    }
+    let saved_path = save_truncated_result(name, output, cwd).ok();
+    let tail_budget = 2048usize.min(MAX_MODEL_OUTPUT_BYTES / 8);
+    let head_budget = MAX_MODEL_OUTPUT_BYTES.saturating_sub(tail_budget);
+    let head = safe_prefix(output, head_budget);
+    let tail = safe_suffix(output, tail_budget);
+    let dropped = output.len().saturating_sub(head.len() + tail.len());
+    let note = saved_path
+        .map(|path| format!(" Full result saved at: {path}."))
+        .unwrap_or_default();
+    format!("{head}\n\n[...truncated {dropped} bytes for model context.{note}]\n\n{tail}")
+}
+
+fn save_truncated_result(name: &str, output: &str, cwd: &Path) -> io::Result<String> {
+    let dir = cwd.join(".jucode").join("truncated-results");
+    fs::create_dir_all(&dir)?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let filename = format!("{nanos}-{}.txt", sanitize_filename(name));
+    let path = dir.join(filename);
+    fs::write(&path, output)?;
+    Ok(path
+        .strip_prefix(cwd)
+        .unwrap_or(&path)
+        .to_string_lossy()
+        .replace('\\', "/"))
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let mut value = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(48)
+        .collect::<String>();
+    if value.is_empty() {
+        value.push_str("tool");
+    }
+    value
+}
+
+fn safe_prefix(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn safe_suffix(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut start = value.len().saturating_sub(max_bytes);
+    while start < value.len() && !value.is_char_boundary(start) {
+        start += 1;
+    }
+    value[start..].to_string()
 }
 
 fn apply_patch(
@@ -965,6 +1291,7 @@ mod tests {
                 "edit",
                 "write",
                 "bash",
+                "write_stdin",
                 "apply_patch",
                 "diff",
                 "ls",
@@ -1021,6 +1348,56 @@ mod tests {
         assert_eq!(value["exit_code"], 0);
         assert!(value["stdout"].as_str().unwrap().contains("hello"));
         assert!(updates.iter().any(|update| update.contains("started:")));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bash_can_yield_running_session_and_poll_it() {
+        let dir = test_dir("bash-session");
+        fs::create_dir_all(&dir).unwrap();
+        let command = if cfg!(windows) {
+            "Start-Sleep -Milliseconds 300; Write-Output done"
+        } else {
+            "sleep 0.3; echo done"
+        };
+
+        let result = run_tool(
+            "bash",
+            &json!({ "command": command, "timeout": 5, "yield_time_ms": 1 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        let session_id = value["session_id"].as_u64().unwrap();
+        assert_eq!(value["running"], true);
+
+        std::thread::sleep(Duration::from_millis(500));
+        let result = run_tool(
+            "write_stdin",
+            &json!({ "session_id": session_id, "yield_time_ms": 100 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["exit_code"], 0);
+        assert!(value["stdout"].as_str().unwrap().contains("done"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn long_tool_result_gets_model_projection_and_saved_copy() {
+        let dir = test_dir("tool-projection");
+        fs::create_dir_all(&dir).unwrap();
+        let result = tool_result(
+            "test_tool",
+            json!({ "content": "x".repeat(MAX_MODEL_OUTPUT_BYTES + 4096) }),
+            &dir,
+        );
+
+        assert!(result.output.len() > result.model_output.len());
+        assert!(result
+            .model_output
+            .contains("Full result saved at: .jucode/truncated-results/"));
+        assert!(dir.join(".jucode").join("truncated-results").exists());
         let _ = fs::remove_dir_all(dir);
     }
 

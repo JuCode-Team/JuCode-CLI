@@ -4,6 +4,7 @@ use std::{
 };
 
 const TOOL_GUIDANCE: &str = "prefer read/ls/ripgrep for exploration; use bash for commands and verification; use edit/apply_patch for scoped file changes.";
+const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct PromptContext {
@@ -122,22 +123,56 @@ pub fn skill_message(skill: &SkillPromptItem, request: &str) -> io::Result<Strin
 }
 
 pub fn discover_project_instructions(cwd: &Path) -> io::Result<Vec<ProjectInstruction>> {
-    let mut dirs = cwd.ancestors().collect::<Vec<_>>();
-    dirs.reverse();
+    let dirs = project_instruction_dirs(cwd);
 
     let mut instructions = Vec::new();
+    let mut remaining = PROJECT_INSTRUCTIONS_MAX_BYTES;
     for dir in dirs {
         for name in ["AGENTS.md", "CLAUDE.md"] {
             let path = dir.join(name);
             if path.exists() {
+                if remaining == 0 {
+                    return Ok(instructions);
+                }
+                let (content, bytes_read) = read_limited_utf8(&path, remaining)?;
+                remaining = remaining.saturating_sub(bytes_read);
                 instructions.push(ProjectInstruction {
                     path: path.clone(),
-                    content: fs::read_to_string(path)?,
+                    content,
                 });
             }
         }
     }
     Ok(instructions)
+}
+
+fn project_instruction_dirs(cwd: &Path) -> Vec<&Path> {
+    let mut dirs = cwd.ancestors().collect::<Vec<_>>();
+    dirs.reverse();
+    if let Some(index) = dirs.iter().position(|dir| dir.join(".git").exists()) {
+        return dirs[index..].to_vec();
+    }
+    if let Some(index) = dirs
+        .iter()
+        .position(|dir| dir.join("AGENTS.md").exists() || dir.join("CLAUDE.md").exists())
+    {
+        return dirs[index..].to_vec();
+    }
+    vec![cwd]
+}
+
+fn read_limited_utf8(path: &Path, max_bytes: usize) -> io::Result<(String, usize)> {
+    let bytes = fs::read(path)?;
+    let truncated = bytes.len() > max_bytes;
+    let mut end = bytes.len().min(max_bytes);
+    while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
+        end -= 1;
+    }
+    let mut content = String::from_utf8_lossy(&bytes[..end]).to_string();
+    if truncated {
+        content.push_str("\n\n[project instructions truncated by JuCode budget]\n");
+    }
+    Ok((content, end))
 }
 
 fn skill_command_name(name: &str) -> String {

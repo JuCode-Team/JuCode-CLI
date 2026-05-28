@@ -399,8 +399,17 @@ impl AgentCore {
         if self.config.provider != "openai" && self.config.provider != "jucode" {
             let mut events = save_event;
             events.push(AgentEvent::Error(format!(
-                "unsupported provider '{}'. MVP supports openai.",
+                "unsupported provider '{}'. Supported providers: openai, jucode.",
                 self.config.provider
+            )));
+            return events;
+        }
+
+        if self.config.provider == "jucode" && !is_jucode_supported_model(&self.config.model) {
+            let mut events = save_event;
+            events.push(AgentEvent::Error(format!(
+                "{} is not supported by JuCode CLI. Run /model and choose a GPT or Claude model.",
+                self.config.model
             )));
             return events;
         }
@@ -469,6 +478,7 @@ impl AgentCore {
                 self.config.profile_dir(),
             ),
             base_url: self.config.base_url.clone(),
+            max_output_tokens: self.config.current_model_config().max_output_tokens,
             api_key: self.auth.key_for(&self.config.provider),
             api_key_env: &self.config.api_key_env,
             retry_attempts: self.config.retry_attempts,
@@ -480,7 +490,14 @@ impl AgentCore {
             return events;
         };
 
-        let input = self.session.context_projection().items;
+        let model_config = self.config.current_model_config();
+        let input = self
+            .session
+            .context_projection_with_budget(
+                (model_config.context_window as usize).saturating_mul(3) / 4,
+                20_000,
+            )
+            .items;
         let cwd = self.cwd.clone();
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
@@ -598,27 +615,43 @@ impl AgentCore {
         ))];
         match oauth::login(&web_url, &api_url) {
             Ok(result) => {
+                let models = result
+                    .models
+                    .iter()
+                    .filter(|model| is_jucode_supported_model(model))
+                    .cloned()
+                    .collect::<Vec<_>>();
                 self.config.provider = "jucode".to_string();
                 self.config.jucode_web_url = result.web_url.clone();
                 self.config.jucode_api_url = result.api_url.clone();
                 self.config.base_url = format!("{}/v1", result.api_url);
-                for model in &result.models {
+                for model in &models {
                     if !self.config.models.iter().any(|entry| entry.name == *model) {
+                        let (context_window, max_output_tokens, reasoning_efforts) =
+                            if model.starts_with("claude-") {
+                                (200_000, 8_192, vec!["none".to_string()])
+                            } else {
+                                (
+                                    400_000,
+                                    128_000,
+                                    vec![
+                                        "none".to_string(),
+                                        "low".to_string(),
+                                        "medium".to_string(),
+                                        "high".to_string(),
+                                        "xhigh".to_string(),
+                                    ],
+                                )
+                            };
                         self.config.models.push(ModelConfig {
                             name: model.clone(),
-                            context_window: 400_000,
-                            max_output_tokens: 128_000,
-                            reasoning_efforts: vec![
-                                "none".to_string(),
-                                "low".to_string(),
-                                "medium".to_string(),
-                                "high".to_string(),
-                                "xhigh".to_string(),
-                            ],
+                            context_window,
+                            max_output_tokens,
+                            reasoning_efforts,
                         });
                     }
                 }
-                if let Some(model) = result.models.first() {
+                if let Some(model) = models.first() {
                     self.config.model = model.clone();
                     let supported = self.reasoning_efforts_for_model(model);
                     if !supported
@@ -692,8 +725,8 @@ impl AgentCore {
     fn context_events(&self) -> Vec<AgentEvent> {
         let projection = self.session.context_projection();
         let mut events = vec![AgentEvent::Info(format!(
-            "context projection: branch_entries={} projected_entries={}",
-            projection.branch_entries, projection.projected_entries
+            "context projection: branch_entries={} projected_entries={} compacted={}",
+            projection.branch_entries, projection.projected_entries, projection.compacted
         ))];
         events.extend(
             projection
@@ -789,6 +822,11 @@ impl AgentCore {
         if model.trim().is_empty() {
             return vec![AgentEvent::Error("model cannot be empty".to_string())];
         }
+        if self.config.provider == "jucode" && !is_jucode_supported_model(&model) {
+            return vec![AgentEvent::Error(format!(
+                "{model} is not supported by JuCode CLI"
+            ))];
+        }
         if !self.is_reasoning_effort_for_model(&model, &reasoning_effort) {
             return vec![AgentEvent::Error(format!(
                 "{model} does not support reasoning effort: {reasoning_effort}"
@@ -807,6 +845,9 @@ impl AgentCore {
         self.config
             .models
             .iter()
+            .filter(|model_config| {
+                self.config.provider != "jucode" || is_jucode_supported_model(&model_config.name)
+            })
             .map(|model_config| {
                 let active = model_config.name == self.config.model;
                 ModelOptionView {
@@ -869,6 +910,13 @@ fn current_utc_date() -> String {
         .unwrap_or(0);
     let (year, month, day) = civil_from_days(days as i64);
     format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn is_jucode_supported_model(model: &str) -> bool {
+    matches!(
+        model,
+        "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.3-codex" | "gpt-5.2"
+    ) || model.starts_with("claude-")
 }
 
 fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {

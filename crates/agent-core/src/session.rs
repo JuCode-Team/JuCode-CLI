@@ -69,6 +69,7 @@ pub struct ContextProjection {
     pub items: Vec<Value>,
     pub branch_entries: usize,
     pub projected_entries: usize,
+    pub compacted: bool,
 }
 
 impl SessionStore {
@@ -196,29 +197,55 @@ impl SessionStore {
     }
 
     pub fn context_projection(&self) -> ContextProjection {
+        self.context_projection_with_budget(usize::MAX, usize::MAX)
+    }
+
+    pub fn context_projection_with_budget(
+        &self,
+        max_tokens: usize,
+        keep_recent_tokens: usize,
+    ) -> ContextProjection {
         let branch = self.branch();
-        let items = branch
+        let mut entries = branch
             .iter()
-            .filter_map(|entry| match &entry.kind {
-                EntryKind::Branch { .. } => None,
-                EntryKind::User { content } => Some(json!({
-                    "role": "user",
-                    "content": [{ "type": "input_text", "text": content }]
-                })),
-                EntryKind::ResponseItem { item } => Some(item.clone()),
-                EntryKind::ToolOutput {
-                    call_id, output, ..
-                } => Some(json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": output
-                })),
-            })
+            .filter_map(|entry| context_item_for_entry(entry).map(|item| (*entry, item)))
             .collect::<Vec<_>>();
+        let full_tokens = estimate_items_tokens(entries.iter().map(|(_, item)| item));
+        let compacted = full_tokens > max_tokens && entries.len() > 4;
+        let items = if compacted {
+            let mut tail = Vec::new();
+            let mut tail_tokens = 0usize;
+            while let Some((entry, item)) = entries.pop() {
+                let tokens = estimate_item_tokens(&item);
+                if !tail.is_empty() && tail_tokens + tokens > keep_recent_tokens {
+                    entries.push((entry, item));
+                    break;
+                }
+                tail_tokens += tokens;
+                tail.push((entry, item));
+            }
+            tail.reverse();
+            let summary = summarize_compacted_entries(entries.iter().map(|(entry, _)| *entry));
+            let mut items = vec![json!({
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": format!("[CONVERSATION HISTORY SUMMARY - older turns compacted for context efficiency]\n\n{summary}")
+                }]
+            })];
+            items.extend(tail.into_iter().map(|(_, item)| item));
+            items
+        } else {
+            entries
+                .into_iter()
+                .map(|(_, item)| item)
+                .collect::<Vec<_>>()
+        };
         ContextProjection {
             branch_entries: branch.len(),
             projected_entries: items.len(),
             items,
+            compacted,
         }
     }
 
@@ -491,6 +518,77 @@ impl SessionStore {
     }
 }
 
+fn context_item_for_entry(entry: &SessionEntry) -> Option<Value> {
+    match &entry.kind {
+        EntryKind::Branch { .. } => None,
+        EntryKind::User { content } => Some(json!({
+            "role": "user",
+            "content": [{ "type": "input_text", "text": content }]
+        })),
+        EntryKind::ResponseItem { item } => Some(item.clone()),
+        EntryKind::ToolOutput {
+            call_id, output, ..
+        } => Some(json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output
+        })),
+    }
+}
+
+fn estimate_items_tokens<'a>(items: impl Iterator<Item = &'a Value>) -> usize {
+    items.map(estimate_item_tokens).sum()
+}
+
+fn estimate_item_tokens(item: &Value) -> usize {
+    item.to_string().len().saturating_add(3) / 4
+}
+
+fn summarize_compacted_entries<'a>(entries: impl Iterator<Item = &'a SessionEntry>) -> String {
+    let mut user_turns = 0usize;
+    let mut assistant_turns = 0usize;
+    let mut tool_calls = Vec::new();
+    let mut recent_user = None;
+    for entry in entries {
+        match &entry.kind {
+            EntryKind::User { content } => {
+                user_turns += 1;
+                recent_user = Some(truncate_summary_line(content));
+            }
+            EntryKind::ResponseItem { item } => {
+                if !extract_response_text(item).trim().is_empty() {
+                    assistant_turns += 1;
+                }
+            }
+            EntryKind::ToolOutput { name, .. } => tool_calls.push(name.clone()),
+            EntryKind::Branch { .. } => {}
+        }
+    }
+    tool_calls.sort();
+    tool_calls.dedup();
+    let mut lines = vec![format!(
+        "Compacted {user_turns} user turn(s) and {assistant_turns} assistant response(s)."
+    )];
+    if !tool_calls.is_empty() {
+        lines.push(format!("Tools used earlier: {}.", tool_calls.join(", ")));
+    }
+    if let Some(recent_user) = recent_user {
+        lines.push(format!("Most recent compacted user request: {recent_user}"));
+    }
+    lines.join("\n")
+}
+
+fn truncate_summary_line(text: &str) -> String {
+    let compact = text.replace('\n', " ");
+    let mut chars = compact.chars();
+    let prefix = chars.by_ref().take(160).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}...")
+    } else {
+        prefix
+    }
+}
+
 fn normalize_branch_label(label: &str) -> Result<String, String> {
     let label = label.trim();
     if label.is_empty() {
@@ -668,6 +766,30 @@ mod tests {
         assert_eq!(projection.branch_entries, 2);
         assert_eq!(projection.projected_entries, 1);
         assert_eq!(projection.items.len(), 1);
+    }
+
+    #[test]
+    fn context_projection_compacts_when_budget_is_exceeded() {
+        let mut session = SessionStore::new();
+        for index in 0..10 {
+            session.append(EntryKind::User {
+                content: format!("request {index} {}", "x".repeat(200)),
+            });
+            session.append(EntryKind::ResponseItem {
+                item: json!({
+                    "type": "message",
+                    "content": [{ "text": format!("answer {index} {}", "y".repeat(200)) }]
+                }),
+            });
+        }
+
+        let projection = session.context_projection_with_budget(100, 80);
+
+        assert!(projection.compacted);
+        assert!(projection.items[0]
+            .to_string()
+            .contains("CONVERSATION HISTORY SUMMARY"));
+        assert!(projection.items.len() < session.context_projection().items.len());
     }
 
     #[test]
