@@ -20,6 +20,13 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(120);
 const TOOL_OUTPUT_PREVIEW_LINES: usize = 12;
 const TOOL_OUTPUT_PREVIEW_BYTES: usize = 2_000;
+const PASTE_PLACEHOLDER_CHARS: usize = 200;
+const PASTE_BURST_CHAR_INTERVAL: Duration = Duration::from_millis(8);
+const PASTE_ENTER_SUPPRESS_WINDOW: Duration = Duration::from_millis(120);
+#[cfg(not(windows))]
+const PASTE_BURST_IDLE_TIMEOUT: Duration = Duration::from_millis(8);
+#[cfg(windows)]
+const PASTE_BURST_IDLE_TIMEOUT: Duration = Duration::from_millis(60);
 const CURSOR_MARKER: &str = "\x1b_jucode:cursor\x07";
 const VISIBLE_CURSOR: &str = "|";
 const HIDE_CURSOR: &str = "\x1b[?25l";
@@ -27,9 +34,13 @@ const SHOW_CURSOR: &str = "\x1b[?25h";
 const SHOW_HARDWARE_CURSOR: bool = false;
 const DISABLE_SCROLL_ON_OUTPUT: &str = "\x1b[?1010l";
 const ENABLE_SCROLL_ON_OUTPUT: &str = "\x1b[?1010h";
+const ENABLE_BRACKETED_PASTE: &str = "\x1b[?2004h";
+const DISABLE_BRACKETED_PASTE: &str = "\x1b[?2004l";
 const SYNC_START: &str = "\x1b[?2026h";
 const SYNC_END: &str = "\x1b[?2026l";
 const RESET: &str = "\x1b[0m";
+const INVERSE_ON: &str = "\x1b[7m";
+const INVERSE_OFF: &str = "\x1b[27m";
 
 #[derive(Debug, Clone)]
 enum ChatLine {
@@ -87,6 +98,13 @@ struct CursorTarget {
 
 struct RenderedFrame {
     lines: Vec<String>,
+    cursor: Option<CursorTarget>,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectedDocument {
+    transcript_lines: Vec<String>,
+    active_lines: Vec<String>,
     cursor: Option<CursorTarget>,
 }
 
@@ -149,7 +167,8 @@ pub trait TuiRuntime {
 
 pub struct TuiApp<R> {
     runtime: R,
-    input: String,
+    input: InputBuffer,
+    paste_burst: PasteBurst,
     chat: Vec<ChatLine>,
     live_assistant: Option<String>,
     status: String,
@@ -167,6 +186,236 @@ pub struct TuiApp<R> {
     picker_view: Option<PickerState>,
     pending_messages: Vec<String>,
     reset_screen: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct InputBuffer {
+    chunks: Vec<InputChunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InputChunk {
+    Text(String),
+    LargePaste(String),
+}
+
+impl InputBuffer {
+    fn text(&self) -> String {
+        self.chunks
+            .iter()
+            .map(|chunk| match chunk {
+                InputChunk::Text(text) | InputChunk::LargePaste(text) => text.as_str(),
+            })
+            .collect()
+    }
+
+    fn display_text(&self) -> String {
+        let mut display = String::new();
+        for chunk in &self.chunks {
+            match chunk {
+                InputChunk::Text(text) => display.push_str(text),
+                InputChunk::LargePaste(text) => {
+                    let char_count = text.chars().count();
+                    display.push_str(&format!("[Pasted: {char_count} chars]"));
+                }
+            }
+        }
+        display
+    }
+
+    fn clear(&mut self) {
+        self.chunks.clear();
+    }
+
+    fn push_char(&mut self, ch: char) {
+        self.push_text(&ch.to_string());
+    }
+
+    fn push_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        match self.chunks.last_mut() {
+            Some(InputChunk::Text(existing)) => existing.push_str(text),
+            _ => self.chunks.push(InputChunk::Text(text.to_string())),
+        }
+    }
+
+    fn push_paste(&mut self, text: &str) {
+        let text = normalize_pasted_text(text);
+        if text.chars().count() > PASTE_PLACEHOLDER_CHARS {
+            self.chunks.push(InputChunk::LargePaste(text));
+        } else {
+            self.push_text(&text);
+        }
+    }
+
+    fn pop(&mut self) {
+        let Some(chunk) = self.chunks.last_mut() else {
+            return;
+        };
+        match chunk {
+            InputChunk::Text(text) => {
+                text.pop();
+                if text.is_empty() {
+                    self.chunks.pop();
+                }
+            }
+            InputChunk::LargePaste(_) => {
+                self.chunks.pop();
+            }
+        }
+    }
+}
+
+fn normalize_pasted_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn paste_burst_render_delay() -> Duration {
+    PASTE_BURST_CHAR_INTERVAL + Duration::from_millis(1)
+}
+
+#[derive(Debug, Clone, Default)]
+struct PasteBurst {
+    last_plain_char_at: Option<Instant>,
+    pending_first_char: Option<(char, Instant)>,
+    buffer: String,
+    active: bool,
+    burst_window_until: Option<Instant>,
+}
+
+enum PasteCharDecision {
+    RetainFirstChar,
+    BeginBufferFromPending,
+    BufferAppend,
+}
+
+enum PasteFlush {
+    Paste(String),
+    Typed(char),
+    None,
+}
+
+impl PasteBurst {
+    fn on_plain_ascii_char(&mut self, ch: char, now: Instant) -> PasteCharDecision {
+        let rapid = self
+            .last_plain_char_at
+            .map(|last| now.saturating_duration_since(last) <= PASTE_BURST_CHAR_INTERVAL)
+            .unwrap_or(false);
+        self.last_plain_char_at = Some(now);
+
+        if self.active {
+            self.extend_window(now);
+            return PasteCharDecision::BufferAppend;
+        }
+
+        if rapid {
+            if let Some((held, held_at)) = self.pending_first_char.take() {
+                if now.saturating_duration_since(held_at) <= PASTE_BURST_CHAR_INTERVAL {
+                    self.active = true;
+                    self.buffer.push(held);
+                    self.extend_window(now);
+                    return PasteCharDecision::BeginBufferFromPending;
+                }
+            }
+        }
+
+        self.pending_first_char = Some((ch, now));
+        PasteCharDecision::RetainFirstChar
+    }
+
+    fn append_char(&mut self, ch: char, now: Instant) {
+        self.buffer.push(ch);
+        self.extend_window(now);
+    }
+
+    fn append_newline_if_active(&mut self, now: Instant) -> bool {
+        if !self.is_active() {
+            return false;
+        }
+        if let Some((ch, _)) = self.pending_first_char.take() {
+            self.buffer.push(ch);
+        }
+        self.buffer.push('\n');
+        self.extend_window(now);
+        true
+    }
+
+    fn newline_should_insert_instead_of_submit(&self, now: Instant) -> bool {
+        self.is_active()
+            || self
+                .burst_window_until
+                .map(|until| now <= until)
+                .unwrap_or(false)
+    }
+
+    fn flush_if_due(&mut self, now: Instant) -> PasteFlush {
+        let timeout = if self.is_buffering() {
+            PASTE_BURST_IDLE_TIMEOUT
+        } else {
+            PASTE_BURST_CHAR_INTERVAL
+        };
+        let timed_out = self
+            .last_plain_char_at
+            .map(|last| now.saturating_duration_since(last) > timeout)
+            .unwrap_or(false);
+        if !timed_out {
+            return PasteFlush::None;
+        }
+
+        if self.is_buffering() {
+            self.active = false;
+            return PasteFlush::Paste(std::mem::take(&mut self.buffer));
+        }
+        if let Some((ch, _)) = self.pending_first_char.take() {
+            return PasteFlush::Typed(ch);
+        }
+        PasteFlush::None
+    }
+
+    fn flush_before_non_plain_input(&mut self) -> Option<String> {
+        if !self.is_active() {
+            if let Some((ch, _)) = self.pending_first_char.take() {
+                return Some(ch.to_string());
+            }
+            return None;
+        }
+
+        self.active = false;
+        let mut text = std::mem::take(&mut self.buffer);
+        if let Some((ch, _)) = self.pending_first_char.take() {
+            text.push(ch);
+        }
+        Some(text)
+    }
+
+    fn clear_after_non_char(&mut self) {
+        self.last_plain_char_at = None;
+        self.pending_first_char = None;
+        self.burst_window_until = None;
+        self.active = false;
+    }
+
+    fn clear_after_explicit_paste(&mut self) {
+        self.last_plain_char_at = None;
+        self.pending_first_char = None;
+        self.burst_window_until = None;
+        self.buffer.clear();
+        self.active = false;
+    }
+
+    fn extend_window(&mut self, now: Instant) {
+        self.burst_window_until = Some(now + PASTE_ENTER_SUPPRESS_WINDOW);
+    }
+
+    fn is_active(&self) -> bool {
+        self.is_buffering() || self.pending_first_char.is_some()
+    }
+
+    fn is_buffering(&self) -> bool {
+        self.active || !self.buffer.is_empty()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -228,12 +477,18 @@ struct TerminalGuard;
 
 struct TerminalRenderer {
     previous_lines: Vec<String>,
+    previous_transcript_lines: Vec<String>,
     previous_width: u16,
     previous_height: u16,
     previous_viewport_top: usize,
     hardware_cursor_row: usize,
     initialized: bool,
-    force_full_redraw: bool,
+    force_transcript_rebuild: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FrameScheduler {
+    next_frame_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,11 +497,47 @@ enum FullRenderMode {
     VisibleViewport,
 }
 
+impl FrameScheduler {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_frame_at: Some(now),
+        }
+    }
+
+    fn request_now(&mut self, now: Instant) {
+        self.request_at(now);
+    }
+
+    fn request_in(&mut self, now: Instant, delay: Duration) {
+        self.request_at(now + delay);
+    }
+
+    fn request_at(&mut self, when: Instant) {
+        self.next_frame_at = Some(self.next_frame_at.map_or(when, |current| current.min(when)));
+    }
+
+    fn take_due(&mut self, now: Instant) -> bool {
+        if self.next_frame_at.is_some_and(|when| now >= when) {
+            self.next_frame_at = None;
+            return true;
+        }
+        false
+    }
+
+    fn poll_timeout(&self, now: Instant, fallback: Duration) -> Duration {
+        let Some(when) = self.next_frame_at else {
+            return fallback;
+        };
+        fallback.min(when.saturating_duration_since(now))
+    }
+}
+
 impl<R: TuiRuntime> TuiApp<R> {
     pub fn new(runtime: R) -> Self {
         let mut app = Self {
             runtime,
-            input: String::new(),
+            input: InputBuffer::default(),
+            paste_burst: PasteBurst::default(),
             chat: Vec::new(),
             live_assistant: None,
             status: "ready".to_string(),
@@ -274,23 +565,31 @@ impl<R: TuiRuntime> TuiApp<R> {
         let _guard = TerminalGuard::enter()?;
         let mut stdout = io::stdout();
         let mut renderer = TerminalRenderer::new();
-        let mut render_dirty = true;
-        let mut next_progress_at = Instant::now() + PROGRESS_INTERVAL;
+        let now = Instant::now();
+        let mut frames = FrameScheduler::new(now);
+        let mut next_progress_at = now + PROGRESS_INTERVAL;
 
         loop {
-            let events = self.runtime.poll_events();
-            render_dirty |= self.apply_events(events);
-            let status_event = self.runtime.model_status_event();
-            render_dirty |= self.apply_events(vec![status_event]);
-
             let now = Instant::now();
+            let events = self.runtime.poll_events();
+            if self.apply_events(events) {
+                frames.request_now(now);
+            }
+            let status_event = self.runtime.model_status_event();
+            if self.apply_events(vec![status_event]) {
+                frames.request_now(now);
+            }
+
             if self.activity.is_active() && now >= next_progress_at {
                 self.activity.advance_animation();
                 next_progress_at = now + PROGRESS_INTERVAL;
-                render_dirty = true;
+                frames.request_now(now);
             }
 
-            if render_dirty {
+            if frames.take_due(now) {
+                if self.handle_paste_burst_render_tick(now, &mut frames) {
+                    continue;
+                }
                 let (width, _) = terminal::size()?;
                 let width = width.max(1) as usize;
                 let document = self.build_document(width, now);
@@ -298,32 +597,53 @@ impl<R: TuiRuntime> TuiApp<R> {
                 if document.reset_screen {
                     self.reset_screen = false;
                 }
-                render_dirty = false;
+                continue;
             }
 
-            if event::poll(EVENT_POLL_INTERVAL)? {
-                match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        let quit = self.handle_key(key.code, key.modifiers);
-                        render_dirty = true;
-                        if quit {
-                            break;
+            let poll_timeout = {
+                let mut timeout = frames.poll_timeout(now, EVENT_POLL_INTERVAL);
+                if self.activity.is_active() {
+                    timeout = timeout.min(next_progress_at.saturating_duration_since(now));
+                }
+                timeout
+            };
+            if event::poll(poll_timeout)? {
+                loop {
+                    let event_now = Instant::now();
+                    match event::read()? {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => {
+                            let quit = self.handle_key_at(key.code, key.modifiers, event_now);
+                            frames.request_now(event_now);
+                            if self.paste_burst.is_active() {
+                                frames.request_in(event_now, paste_burst_render_delay());
+                            }
+                            if quit {
+                                return Ok(());
+                            }
                         }
+                        Event::Resize(_, _) => {
+                            renderer.force_transcript_rebuild();
+                            frames.request_now(event_now);
+                        }
+                        Event::Paste(text) => {
+                            self.handle_paste(&text);
+                            frames.request_now(event_now);
+                        }
+                        _ => {}
                     }
-                    Event::Resize(_, _) => {
-                        renderer.force_full_redraw();
-                        render_dirty = true;
+                    if !event::poll(Duration::ZERO)? {
+                        break;
                     }
-                    _ => {}
                 }
             }
         }
-
-        Ok(())
     }
 
-    fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    fn handle_key_at(&mut self, code: KeyCode, modifiers: KeyModifiers, now: Instant) -> bool {
+        self.flush_paste_burst_if_due(now);
+
         if self.picker_view.is_some() {
+            self.flush_paste_burst_before_non_plain_input();
             return self.handle_picker_key(code, modifiers);
         }
 
@@ -336,38 +656,61 @@ impl<R: TuiRuntime> TuiApp<R> {
             KeyCode::Char(ch)
                 if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                self.input.push(ch);
-                self.clamp_completion_index();
+                if ch.is_ascii() {
+                    match self.paste_burst.on_plain_ascii_char(ch, now) {
+                        PasteCharDecision::RetainFirstChar => {}
+                        PasteCharDecision::BeginBufferFromPending
+                        | PasteCharDecision::BufferAppend => {
+                            self.paste_burst.append_char(ch, now);
+                        }
+                    }
+                } else {
+                    self.flush_paste_burst_before_non_plain_input();
+                    self.input.push_char(ch);
+                    self.clamp_completion_index();
+                }
                 false
             }
             KeyCode::Backspace => {
+                self.flush_paste_burst_before_non_plain_input();
                 self.input.pop();
                 self.clamp_completion_index();
                 false
             }
-            KeyCode::Up if self.command_completion_active() => {
-                let count = self.command_matches().len();
-                if count > 0 {
-                    self.completion_index = (self.completion_index + count - 1) % count;
+            KeyCode::Up => {
+                self.flush_paste_burst_before_non_plain_input();
+                if self.command_completion_active() {
+                    let count = self.command_matches().len();
+                    if count > 0 {
+                        self.completion_index = (self.completion_index + count - 1) % count;
+                    }
                 }
                 false
             }
-            KeyCode::Down if self.command_completion_active() => {
-                let count = self.command_matches().len();
-                if count > 0 {
-                    self.completion_index = (self.completion_index + 1) % count;
+            KeyCode::Down => {
+                self.flush_paste_burst_before_non_plain_input();
+                if self.command_completion_active() {
+                    let count = self.command_matches().len();
+                    if count > 0 {
+                        self.completion_index = (self.completion_index + 1) % count;
+                    }
                 }
                 false
             }
-            KeyCode::Tab if self.command_completion_active() => {
-                self.complete_selected_command();
+            KeyCode::Tab => {
+                self.flush_paste_burst_before_non_plain_input();
+                if self.command_completion_active() {
+                    self.complete_selected_command();
+                }
                 false
             }
             KeyCode::BackTab => {
+                self.flush_paste_burst_before_non_plain_input();
                 self.cycle_reasoning_effort();
                 false
             }
             KeyCode::Esc => {
+                self.flush_paste_burst_before_non_plain_input();
                 if self.activity.is_active() && !self.pending_messages.is_empty() {
                     let events = self.runtime.steer();
                     self.apply_events(events);
@@ -378,12 +721,31 @@ impl<R: TuiRuntime> TuiApp<R> {
                 false
             }
             KeyCode::Enter => {
+                if modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL) {
+                    self.flush_paste_burst_before_non_plain_input();
+                    self.input.push_char('\n');
+                    self.completion_index = 0;
+                    return false;
+                }
+                if self.paste_burst.append_newline_if_active(now) {
+                    self.completion_index = 0;
+                    return false;
+                }
+                if self
+                    .paste_burst
+                    .newline_should_insert_instead_of_submit(now)
+                {
+                    self.input.push_char('\n');
+                    self.completion_index = 0;
+                    return false;
+                }
+                self.flush_paste_burst_before_non_plain_input();
                 if self.should_complete_on_enter() {
                     self.complete_selected_command();
                     return false;
                 }
 
-                let submitted = self.input.trim().to_string();
+                let submitted = self.input.text().trim().to_string();
                 self.input.clear();
                 self.completion_index = 0;
                 if submitted.is_empty() {
@@ -400,8 +762,55 @@ impl<R: TuiRuntime> TuiApp<R> {
                 self.apply_events(events);
                 false
             }
-            _ => false,
+            _ => {
+                self.flush_paste_burst_before_non_plain_input();
+                false
+            }
         }
+    }
+
+    fn handle_paste(&mut self, text: &str) {
+        self.paste_burst.clear_after_explicit_paste();
+        self.input.push_paste(text);
+        self.clamp_completion_index();
+    }
+
+    fn flush_paste_burst_if_due(&mut self, now: Instant) -> bool {
+        match self.paste_burst.flush_if_due(now) {
+            PasteFlush::Paste(text) => {
+                self.handle_paste(&text);
+                true
+            }
+            PasteFlush::Typed(ch) => {
+                self.input.push_char(ch);
+                self.clamp_completion_index();
+                true
+            }
+            PasteFlush::None => false,
+        }
+    }
+
+    fn handle_paste_burst_render_tick(
+        &mut self,
+        now: Instant,
+        frames: &mut FrameScheduler,
+    ) -> bool {
+        if self.flush_paste_burst_if_due(now) {
+            frames.request_now(now);
+            return true;
+        }
+        if self.paste_burst.is_active() {
+            frames.request_in(now, paste_burst_render_delay());
+            return true;
+        }
+        false
+    }
+
+    fn flush_paste_burst_before_non_plain_input(&mut self) {
+        if let Some(text) = self.paste_burst.flush_before_non_plain_input() {
+            self.handle_paste(&text);
+        }
+        self.paste_burst.clear_after_non_char();
     }
 
     fn handle_picker_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -699,13 +1108,14 @@ impl<R: TuiRuntime> TuiApp<R> {
 
     fn build_document(&self, width: usize, now: Instant) -> UiDocument {
         let command_matches = self.command_matches();
+        let input_display = self.input.display_text();
         UiBuilder::new()
             .chat(&self.chat)
             .live_assistant(self.live_assistant.as_deref())
             .picker(self.picker_view.as_ref())
             .pending_messages(&self.pending_messages)
             .input(
-                &self.input,
+                &input_display,
                 &command_matches,
                 self.completion_index,
                 !self.activity.is_active(),
@@ -727,7 +1137,8 @@ impl<R: TuiRuntime> TuiApp<R> {
     }
 
     fn command_completion_active(&self) -> bool {
-        self.input.starts_with('/') && !self.command_matches().is_empty()
+        let input = self.input.text();
+        !input.contains('\n') && input.starts_with('/') && !self.command_matches().is_empty()
     }
 
     fn should_complete_on_enter(&self) -> bool {
@@ -735,19 +1146,20 @@ impl<R: TuiRuntime> TuiApp<R> {
     }
 
     fn command_matches(&self) -> Vec<CommandCandidate> {
-        if !self.input.starts_with('/') {
+        let input = self.input.text();
+        if !input.starts_with('/') || input.contains('\n') {
             return Vec::new();
         }
         if self
             .commands
             .iter()
-            .any(|candidate| candidate.command == self.input)
+            .any(|candidate| candidate.command == input)
         {
             return Vec::new();
         }
         self.commands
             .iter()
-            .filter(|candidate| candidate.command.starts_with(self.input.as_str()))
+            .filter(|candidate| candidate.command.starts_with(input.as_str()))
             .cloned()
             .collect()
     }
@@ -765,8 +1177,8 @@ impl<R: TuiRuntime> TuiApp<R> {
         let matches = self.command_matches();
         if let Some(command) = matches.get(self.completion_index) {
             self.input.clear();
-            self.input.push_str(&command.command);
-            self.input.push(' ');
+            self.input.push_text(&command.command);
+            self.input.push_char(' ');
             self.completion_index = 0;
         }
     }
@@ -1141,6 +1553,7 @@ impl TerminalGuard {
         terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, Hide)?;
+        stdout.write_all(ENABLE_BRACKETED_PASTE.as_bytes())?;
         stdout.write_all(DISABLE_SCROLL_ON_OUTPUT.as_bytes())?;
         stdout.flush()?;
         Ok(Self)
@@ -1149,6 +1562,7 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let _ = io::stdout().write_all(DISABLE_BRACKETED_PASTE.as_bytes());
         let _ = io::stdout().write_all(ENABLE_SCROLL_ON_OUTPUT.as_bytes());
         let _ = execute!(
             io::stdout(),
@@ -1210,8 +1624,8 @@ impl UiBuilder {
 
     fn live_assistant(mut self, text: Option<&str>) -> Self {
         if let Some(text) = text.filter(|value| !value.is_empty()) {
-            self.push_history(UiKind::Assistant, text);
-            self.history_line(UiKind::System, String::new());
+            self.push_control_block(UiKind::Assistant, text);
+            self.control_line(UiKind::System, String::new());
         }
         self
     }
@@ -1309,7 +1723,16 @@ impl UiBuilder {
         } else {
             String::new()
         };
-        self.control_line(UiKind::Input, format!("> {input}{cursor}"));
+        let lines = input.split('\n').collect::<Vec<_>>();
+        for (index, line) in lines.iter().enumerate() {
+            let prefix = if index == 0 { "> " } else { "  " };
+            let cursor = if index + 1 == lines.len() {
+                cursor.as_str()
+            } else {
+                ""
+            };
+            self.control_line(UiKind::Input, format!("{prefix}{line}{cursor}"));
+        }
         if input.starts_with('/') && !command_matches.is_empty() {
             for (index, candidate) in command_matches.iter().enumerate() {
                 let kind = if index == selected_index {
@@ -1414,6 +1837,17 @@ impl UiBuilder {
         }
     }
 
+    fn push_control_block(&mut self, kind: UiKind, text: &str) {
+        if text.is_empty() {
+            self.control_line(kind, String::new());
+            return;
+        }
+
+        for line in text.lines() {
+            self.control_line(kind, line.to_string());
+        }
+    }
+
     fn history_line(&mut self, kind: UiKind, text: String) {
         self.history.push(UiLine { kind, text });
     }
@@ -1427,44 +1861,48 @@ impl TerminalRenderer {
     fn new() -> Self {
         Self {
             previous_lines: Vec::new(),
+            previous_transcript_lines: Vec::new(),
             previous_width: 0,
             previous_height: 0,
             previous_viewport_top: 0,
             hardware_cursor_row: 0,
             initialized: false,
-            force_full_redraw: false,
+            force_transcript_rebuild: false,
         }
     }
 
-    fn force_full_redraw(&mut self) {
-        self.force_full_redraw = true;
+    fn force_transcript_rebuild(&mut self) {
+        self.force_transcript_rebuild = true;
     }
 
     fn render(&mut self, stdout: &mut Stdout, document: &UiDocument) -> io::Result<()> {
         let (width, height) = terminal::size()?;
         let width = width.max(1);
         let height = height.max(1);
-        let mut frame = RenderedFrame::build(document, width);
+        let projection = ProjectedDocument::from_document(document, width);
+        let transcript_changed = self.previous_transcript_lines != projection.transcript_lines;
+        let mut frame = projection.clone().into_frame();
         if frame.lines.is_empty() {
             frame.lines.push(String::new());
         }
 
-        if document.reset_screen || !self.initialized {
+        if self.force_transcript_rebuild || transcript_changed {
+            self.render_transcript_projection(stdout, &projection, height)?;
+        } else if document.reset_screen || !self.initialized {
             self.full_render(
                 stdout,
                 &frame,
                 document.reset_screen,
+                false,
                 height,
                 FullRenderMode::FullHistory,
             )?;
-        } else if self.force_full_redraw
-            || self.previous_width != width
-            || self.previous_height != height
-        {
+        } else if self.previous_width != width || self.previous_height != height {
             self.full_render(
                 stdout,
                 &frame,
                 true,
+                false,
                 height,
                 FullRenderMode::VisibleViewport,
             )?;
@@ -1476,10 +1914,28 @@ impl TerminalRenderer {
         stdout.flush()?;
 
         self.previous_lines = frame.lines;
+        self.previous_transcript_lines = projection.transcript_lines;
         self.previous_width = width;
         self.previous_height = height;
         self.initialized = true;
-        self.force_full_redraw = false;
+        self.force_transcript_rebuild = false;
+        Ok(())
+    }
+
+    fn render_transcript_projection(
+        &mut self,
+        stdout: &mut Stdout,
+        projection: &ProjectedDocument,
+        height: u16,
+    ) -> io::Result<()> {
+        let frame_lines = projection.frame_lines();
+        let mut buffer = render_buffer_start();
+        buffer.push_str(clear_screen_sequence(true));
+        append_lines_to_buffer(&mut buffer, &frame_lines);
+        buffer.push_str(SYNC_END);
+        stdout.write_all(buffer.as_bytes())?;
+        self.hardware_cursor_row = frame_lines.len().saturating_sub(1);
+        self.previous_viewport_top = viewport_top(frame_lines.len(), height);
         Ok(())
     }
 
@@ -1488,12 +1944,13 @@ impl TerminalRenderer {
         stdout: &mut Stdout,
         frame: &RenderedFrame,
         clear: bool,
+        purge_scrollback: bool,
         height: u16,
         mode: FullRenderMode,
     ) -> io::Result<()> {
         let mut buffer = render_buffer_start();
         if clear {
-            buffer.push_str("\x1b[2J\x1b[H");
+            buffer.push_str(clear_screen_sequence(purge_scrollback));
         }
         let (start, end) = full_render_window(frame.lines.len(), height, mode);
         append_lines_to_buffer(&mut buffer, &frame.lines[start..end]);
@@ -1516,7 +1973,14 @@ impl TerminalRenderer {
         };
 
         if first_changed < self.previous_viewport_top {
-            return self.full_render(stdout, frame, true, height, FullRenderMode::VisibleViewport);
+            return self.full_render(
+                stdout,
+                frame,
+                true,
+                false,
+                height,
+                FullRenderMode::VisibleViewport,
+            );
         }
 
         if first_changed >= frame.lines.len() {
@@ -1600,7 +2064,14 @@ impl TerminalRenderer {
     ) -> io::Result<()> {
         let target_row = frame.lines.len().saturating_sub(1);
         if target_row < self.previous_viewport_top {
-            return self.full_render(stdout, frame, true, height, FullRenderMode::VisibleViewport);
+            return self.full_render(
+                stdout,
+                frame,
+                true,
+                false,
+                height,
+                FullRenderMode::VisibleViewport,
+            );
         }
 
         let mut buffer = render_buffer_start();
@@ -1660,10 +2131,17 @@ impl TerminalRenderer {
     }
 }
 
+#[cfg(test)]
 impl RenderedFrame {
     fn build(document: &UiDocument, width: u16) -> Self {
+        ProjectedDocument::from_document(document, width).into_frame()
+    }
+}
+
+impl ProjectedDocument {
+    fn from_document(document: &UiDocument, width: u16) -> Self {
         let width = width as usize;
-        let mut lines = wrap_lines(&document.history, width)
+        let transcript_lines = wrap_lines(&document.history, width)
             .into_iter()
             .map(|line| render_ansi_line(&line))
             .collect::<Vec<_>>();
@@ -1672,17 +2150,35 @@ impl RenderedFrame {
             row: cursor.row,
             column: cursor.column,
         });
-        if !document.history.is_empty() && !document.controls.is_empty() {
-            lines.push(String::new());
+        let mut active_lines = Vec::new();
+        if !transcript_lines.is_empty() && !document.controls.is_empty() {
+            active_lines.push(String::new());
         }
-        let controls_start_row = lines.len();
+        let controls_start_row = transcript_lines.len() + active_lines.len();
         let cursor = cursor.map(|cursor| CursorTarget {
             row: controls_start_row + cursor.row,
             column: cursor.column,
         });
-        lines.extend(controls.into_iter().map(|line| render_ansi_line(&line)));
+        active_lines.extend(controls.into_iter().map(|line| render_ansi_line(&line)));
 
-        Self { lines, cursor }
+        Self {
+            transcript_lines,
+            active_lines,
+            cursor,
+        }
+    }
+
+    fn frame_lines(&self) -> Vec<String> {
+        let mut lines = self.transcript_lines.clone();
+        lines.extend(self.active_lines.clone());
+        lines
+    }
+
+    fn into_frame(self) -> RenderedFrame {
+        RenderedFrame {
+            lines: self.frame_lines(),
+            cursor: self.cursor,
+        }
     }
 }
 
@@ -1697,6 +2193,14 @@ fn append_lines_to_buffer(buffer: &mut String, lines: &[String]) {
 
 fn render_buffer_start() -> String {
     format!("{SYNC_START}{HIDE_CURSOR}")
+}
+
+fn clear_screen_sequence(purge_scrollback: bool) -> &'static str {
+    if purge_scrollback {
+        "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H"
+    } else {
+        "\x1b[2J\x1b[H"
+    }
 }
 
 fn changed_range(previous: &[String], next: &[String]) -> Option<(usize, usize)> {
@@ -1896,7 +2400,7 @@ fn tool_output_preview(name: &str, output: &str, running: bool) -> String {
         return preview;
     }
     if let Some(diff) = diff_from_tool_output(output) {
-        return limited_preview(&diff);
+        return diff_preview(&diff);
     }
     limited_preview(output)
 }
@@ -1993,6 +2497,238 @@ fn diff_from_tool_output(output: &str) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .filter(|diff| !diff.trim().is_empty())
         .map(str::to_string)
+}
+
+fn diff_preview(diff: &str) -> String {
+    let mut preview = Vec::new();
+    let mut preview_bytes = 0usize;
+    let mut file_label = None;
+    let mut hunk_header = None;
+    let mut change_lines = Vec::new();
+    let mut in_first_hunk = false;
+    let mut saw_next_hunk = false;
+
+    for line in diff.lines() {
+        if file_label.is_none() && line.starts_with("diff --git ") {
+            file_label = Some(diff_file_label(line));
+            continue;
+        }
+        if line.starts_with("@@") {
+            if in_first_hunk {
+                saw_next_hunk = true;
+                break;
+            }
+            hunk_header = Some(line);
+            in_first_hunk = true;
+            continue;
+        }
+        if in_first_hunk && is_diff_change_line(line) {
+            change_lines.push(line);
+        }
+    }
+
+    let Some(header) = hunk_header else {
+        return limited_preview(diff);
+    };
+    if change_lines.is_empty() {
+        return limited_preview(diff);
+    }
+
+    let mut truncated = saw_next_hunk;
+    if let Some(label) = file_label.as_deref() {
+        truncated |= !push_preview_line(&mut preview, &mut preview_bytes, label);
+    }
+    truncated |= !push_preview_line(&mut preview, &mut preview_bytes, header);
+
+    let line_budget = TOOL_OUTPUT_PREVIEW_LINES.saturating_sub(preview.len());
+    let selected = balanced_diff_lines(&change_lines, line_budget);
+    truncated |= selected.len() < change_lines.len();
+    for line in render_intra_line_diff(&selected) {
+        truncated |= !push_preview_line(&mut preview, &mut preview_bytes, &line);
+    }
+
+    if truncated {
+        preview.push("... diff truncated in UI".to_string());
+    }
+
+    preview.join("\n")
+}
+
+fn diff_file_label(line: &str) -> String {
+    let parts = line.split_whitespace().collect::<Vec<_>>();
+    if parts.len() < 4 {
+        return line.to_string();
+    }
+    let old_path = parts[2].strip_prefix("a/").unwrap_or(parts[2]);
+    let new_path = parts[3].strip_prefix("b/").unwrap_or(parts[3]);
+    if old_path == new_path {
+        format!("diff {new_path}")
+    } else {
+        format!("diff {old_path} -> {new_path}")
+    }
+}
+
+fn is_diff_change_line(line: &str) -> bool {
+    (line.starts_with('+') && !line.starts_with("+++"))
+        || (line.starts_with('-') && !line.starts_with("---"))
+}
+
+fn balanced_diff_lines<'a>(lines: &[&'a str], limit: usize) -> Vec<&'a str> {
+    if lines.len() <= limit {
+        return lines.to_vec();
+    }
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let added = lines.iter().filter(|line| line.starts_with('+')).count();
+    let removed = lines.iter().filter(|line| line.starts_with('-')).count();
+    if added == 0 || removed == 0 || limit == 1 {
+        return lines.iter().copied().take(limit).collect();
+    }
+
+    let mut added_limit = added.min((limit / 2).max(1));
+    let mut removed_limit = removed.min(limit.saturating_sub(added_limit));
+    let unused = limit.saturating_sub(added_limit + removed_limit);
+    if unused > 0 {
+        let added_left = added.saturating_sub(added_limit);
+        let removed_left = removed.saturating_sub(removed_limit);
+        if added_left >= removed_left {
+            let extra = unused.min(added_left);
+            added_limit += extra;
+            removed_limit += unused.saturating_sub(extra).min(removed_left);
+        } else {
+            let extra = unused.min(removed_left);
+            removed_limit += extra;
+            added_limit += unused.saturating_sub(extra).min(added_left);
+        }
+    }
+    let mut added_used = 0usize;
+    let mut removed_used = 0usize;
+    let mut selected = Vec::new();
+
+    for line in lines {
+        if line.starts_with('+') {
+            if added_used >= added_limit {
+                continue;
+            }
+            added_used += 1;
+        } else if line.starts_with('-') {
+            if removed_used >= removed_limit {
+                continue;
+            }
+            removed_used += 1;
+        }
+        selected.push(*line);
+    }
+
+    selected
+}
+
+fn render_intra_line_diff(lines: &[&str]) -> Vec<String> {
+    let mut rendered = Vec::new();
+    let mut index = 0usize;
+
+    while index < lines.len() {
+        if !lines[index].starts_with('-') {
+            rendered.push(lines[index].to_string());
+            index += 1;
+            continue;
+        }
+
+        let removed_start = index;
+        while index < lines.len() && lines[index].starts_with('-') {
+            index += 1;
+        }
+        let added_start = index;
+        while index < lines.len() && lines[index].starts_with('+') {
+            index += 1;
+        }
+
+        let removed = &lines[removed_start..added_start];
+        let added = &lines[added_start..index];
+        if removed.len() == 1 && added.len() == 1 {
+            let (old_line, new_line) = render_intra_line_pair(removed[0], added[0]);
+            rendered.push(old_line);
+            rendered.push(new_line);
+        } else {
+            rendered.extend(removed.iter().map(|line| (*line).to_string()));
+            rendered.extend(added.iter().map(|line| (*line).to_string()));
+        }
+    }
+
+    rendered
+}
+
+fn render_intra_line_pair(old_line: &str, new_line: &str) -> (String, String) {
+    let old_content = old_line.strip_prefix('-').unwrap_or(old_line);
+    let new_content = new_line.strip_prefix('+').unwrap_or(new_line);
+    let old_chars = old_content.chars().collect::<Vec<_>>();
+    let new_chars = new_content.chars().collect::<Vec<_>>();
+    let mut prefix = 0usize;
+
+    while prefix < old_chars.len()
+        && prefix < new_chars.len()
+        && old_chars[prefix] == new_chars[prefix]
+    {
+        prefix += 1;
+    }
+
+    let mut old_suffix = old_chars.len();
+    let mut new_suffix = new_chars.len();
+    while old_suffix > prefix
+        && new_suffix > prefix
+        && old_chars[old_suffix - 1] == new_chars[new_suffix - 1]
+    {
+        old_suffix -= 1;
+        new_suffix -= 1;
+    }
+
+    (
+        format!(
+            "-{}",
+            highlight_changed_range(old_content, prefix, old_suffix)
+        ),
+        format!(
+            "+{}",
+            highlight_changed_range(new_content, prefix, new_suffix)
+        ),
+    )
+}
+
+fn highlight_changed_range(text: &str, start: usize, end: usize) -> String {
+    if start >= end {
+        return text.to_string();
+    }
+
+    let mut output = String::new();
+    for (index, ch) in text.chars().enumerate() {
+        if index == start {
+            output.push_str(INVERSE_ON);
+        }
+        output.push(ch);
+        if index + 1 == end {
+            output.push_str(INVERSE_OFF);
+        }
+    }
+    output
+}
+
+fn push_preview_line(preview: &mut Vec<String>, preview_bytes: &mut usize, line: &str) -> bool {
+    if preview.len() >= TOOL_OUTPUT_PREVIEW_LINES {
+        return false;
+    }
+
+    let next_bytes = preview_bytes
+        .saturating_add(line.len())
+        .saturating_add(usize::from(!preview.is_empty()));
+    if next_bytes > TOOL_OUTPUT_PREVIEW_BYTES {
+        return false;
+    }
+
+    preview.push(line.to_string());
+    *preview_bytes = next_bytes;
+    true
 }
 
 fn limited_preview(output: &str) -> String {
@@ -2206,6 +2942,216 @@ mod tests {
             }
         }
         output
+    }
+
+    #[derive(Default)]
+    struct TestRuntime {
+        submitted: Vec<String>,
+    }
+
+    impl TuiRuntime for TestRuntime {
+        fn startup_events(&self) -> Vec<AgentEvent> {
+            Vec::new()
+        }
+
+        fn model_status_event(&self) -> AgentEvent {
+            AgentEvent::Status("ready".to_string())
+        }
+
+        fn submit_user_message(&mut self, message: String) -> Vec<AgentEvent> {
+            self.submitted.push(message.clone());
+            vec![AgentEvent::UserMessage(message)]
+        }
+
+        fn steer(&mut self) -> Vec<AgentEvent> {
+            Vec::new()
+        }
+
+        fn handle_command(&mut self, _input: &str) -> (bool, Vec<AgentEvent>) {
+            (false, Vec::new())
+        }
+
+        fn poll_events(&mut self) -> Vec<AgentEvent> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn input_buffer_displays_large_paste_as_placeholder() {
+        let mut input = InputBuffer::default();
+        let pasted = "x".repeat(PASTE_PLACEHOLDER_CHARS + 1);
+
+        input.push_text("prefix ");
+        input.push_paste(&pasted);
+        input.push_text(" suffix");
+
+        assert_eq!(
+            input.display_text(),
+            format!(
+                "prefix [Pasted: {} chars] suffix",
+                PASTE_PLACEHOLDER_CHARS + 1
+            )
+        );
+        assert_eq!(input.text(), format!("prefix {pasted} suffix"));
+    }
+
+    #[test]
+    fn paste_normalizes_newlines_without_submitting() {
+        let mut app = TuiApp::new(TestRuntime::default());
+
+        app.handle_paste("hello\r\nworld");
+
+        assert_eq!(app.input.text(), "hello\nworld");
+        assert!(app.runtime.submitted.is_empty());
+    }
+
+    #[test]
+    fn modified_enter_inserts_newline_and_plain_enter_submits_once() {
+        let mut app = TuiApp::new(TestRuntime::default());
+        let now = Instant::now();
+
+        app.handle_key_at(KeyCode::Char('a'), KeyModifiers::empty(), now);
+        app.handle_key_at(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT,
+            now + PASTE_BURST_CHAR_INTERVAL + Duration::from_millis(1),
+        );
+        app.handle_key_at(
+            KeyCode::Char('b'),
+            KeyModifiers::empty(),
+            now + PASTE_BURST_CHAR_INTERVAL + Duration::from_millis(2),
+        );
+        app.handle_key_at(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+            now + PASTE_BURST_CHAR_INTERVAL + Duration::from_millis(11),
+        );
+
+        assert_eq!(app.runtime.submitted, vec!["a\nb".to_string()]);
+    }
+
+    #[test]
+    fn ctrl_enter_inserts_newline() {
+        let mut app = TuiApp::new(TestRuntime::default());
+        let now = Instant::now();
+
+        app.handle_key_at(KeyCode::Char('a'), KeyModifiers::empty(), now);
+        app.handle_key_at(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL,
+            now + Duration::from_millis(1),
+        );
+        app.handle_key_at(
+            KeyCode::Char('b'),
+            KeyModifiers::empty(),
+            now + Duration::from_millis(2),
+        );
+        app.flush_paste_burst_if_due(now + PASTE_BURST_CHAR_INTERVAL + Duration::from_millis(3));
+
+        assert_eq!(app.input.text(), "a\nb");
+        assert!(app.runtime.submitted.is_empty());
+    }
+
+    #[test]
+    fn paste_burst_keeps_multiline_text_in_input() {
+        let mut app = TuiApp::new(TestRuntime::default());
+        let now = Instant::now();
+
+        for (index, ch) in "hello".chars().enumerate() {
+            app.handle_key_at(
+                KeyCode::Char(ch),
+                KeyModifiers::empty(),
+                now + Duration::from_millis(index as u64),
+            );
+        }
+        app.handle_key_at(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+            now + Duration::from_millis(5),
+        );
+        for (index, ch) in "world".chars().enumerate() {
+            app.handle_key_at(
+                KeyCode::Char(ch),
+                KeyModifiers::empty(),
+                now + Duration::from_millis(6 + index as u64),
+            );
+        }
+
+        assert!(app.runtime.submitted.is_empty());
+        app.flush_paste_burst_if_due(now + PASTE_BURST_IDLE_TIMEOUT + Duration::from_millis(20));
+
+        assert_eq!(app.input.text(), "hello\nworld");
+        assert!(app.runtime.submitted.is_empty());
+    }
+
+    #[test]
+    fn paste_burst_large_text_uses_placeholder() {
+        let mut app = TuiApp::new(TestRuntime::default());
+        let now = Instant::now();
+        let pasted = "x".repeat(PASTE_PLACEHOLDER_CHARS + 1);
+
+        for (index, ch) in pasted.chars().enumerate() {
+            app.handle_key_at(
+                KeyCode::Char(ch),
+                KeyModifiers::empty(),
+                now + Duration::from_millis(index as u64),
+            );
+        }
+        app.flush_paste_burst_if_due(
+            now + Duration::from_millis(pasted.len() as u64) + PASTE_BURST_IDLE_TIMEOUT,
+        );
+
+        assert_eq!(
+            app.input.display_text(),
+            format!("[Pasted: {} chars]", PASTE_PLACEHOLDER_CHARS + 1)
+        );
+        assert_eq!(app.input.text(), pasted);
+    }
+
+    #[test]
+    fn paste_burst_render_tick_skips_until_pending_char_flushes() {
+        let mut app = TuiApp::new(TestRuntime::default());
+        let now = Instant::now();
+        let mut frames = FrameScheduler {
+            next_frame_at: None,
+        };
+
+        app.handle_key_at(KeyCode::Char('a'), KeyModifiers::empty(), now);
+
+        assert_eq!(app.input.text(), "");
+        assert!(app.paste_burst.is_active());
+        assert!(app.handle_paste_burst_render_tick(now, &mut frames));
+        assert_eq!(app.input.text(), "");
+        assert_eq!(frames.next_frame_at, Some(now + paste_burst_render_delay()));
+
+        assert!(app.handle_paste_burst_render_tick(now + paste_burst_render_delay(), &mut frames));
+        assert_eq!(app.input.text(), "a");
+        assert_eq!(frames.next_frame_at, Some(now + paste_burst_render_delay()));
+        assert!(!app.handle_paste_burst_render_tick(now + paste_burst_render_delay(), &mut frames));
+    }
+
+    #[test]
+    fn single_typed_char_flushes_after_burst_window() {
+        let mut app = TuiApp::new(TestRuntime::default());
+        let now = Instant::now();
+
+        app.handle_key_at(KeyCode::Char('a'), KeyModifiers::empty(), now);
+        assert_eq!(app.input.text(), "");
+
+        app.flush_paste_burst_if_due(now + PASTE_BURST_CHAR_INTERVAL + Duration::from_millis(1));
+
+        assert_eq!(app.input.text(), "a");
+    }
+
+    #[test]
+    fn input_renders_multiple_lines() {
+        let document = UiBuilder::new().input("one\ntwo", &[], 0, true).finish();
+
+        assert_eq!(document.controls[0].text, "> one");
+        assert_eq!(
+            document.controls[1].text,
+            format!("  two{CURSOR_MARKER}{VISIBLE_CURSOR}")
+        );
     }
 
     #[test]
@@ -2424,16 +3370,59 @@ mod tests {
     fn tool_output_preview_prefers_diff_field() {
         let output = serde_json::json!({
             "stdout": "raw",
-            "diff": "diff --git a/a b/a\n--- a/a\n+++ b/a\n-old\n+new\n"
+            "diff": "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n"
+        })
+        .to_string();
+
+        let preview = tool_output_preview("edit", &output, false);
+        let visible_preview = strip_ansi(&preview);
+
+        assert!(preview.contains("diff a"));
+        assert!(preview.contains("@@ -1 +1 @@"));
+        assert!(visible_preview.contains("-old"));
+        assert!(visible_preview.contains("+new"));
+        assert!(!visible_preview.contains("raw"));
+    }
+
+    #[test]
+    fn tool_output_preview_highlights_single_line_replacements() {
+        let output = serde_json::json!({
+            "diff": "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-JuCode is slow today\n+JuCode is fast today\n"
         })
         .to_string();
 
         let preview = tool_output_preview("edit", &output, false);
 
-        assert!(preview.contains("diff --git"));
-        assert!(preview.contains("-old"));
-        assert!(preview.contains("+new"));
-        assert!(!preview.contains("raw"));
+        assert!(preview.contains(&format!("-JuCode is {INVERSE_ON}slow{INVERSE_OFF} today")));
+        assert!(preview.contains(&format!("+JuCode is {INVERSE_ON}fast{INVERSE_OFF} today")));
+        assert!(strip_ansi(&preview).contains("-JuCode is slow today"));
+        assert!(strip_ansi(&preview).contains("+JuCode is fast today"));
+    }
+
+    #[test]
+    fn tool_output_preview_keeps_additions_after_large_removals() {
+        let removals = (0..30)
+            .map(|index| format!("-old line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let diff = format!(
+            "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1,30 +1,2 @@\n{removals}\n+new important line\n+another important line\n"
+        );
+        let output = serde_json::json!({
+            "stdout": "raw",
+            "diff": diff
+        })
+        .to_string();
+
+        let preview = tool_output_preview("edit", &output, false);
+
+        assert!(preview.contains("diff README.md"));
+        assert!(preview.contains("-old line 0"));
+        assert!(preview.contains("+new important line"));
+        assert!(preview.contains("+another important line"));
+        assert!(!preview.contains("--- a/README.md"));
+        assert!(!preview.contains("+++ b/README.md"));
+        assert!(preview.contains("diff truncated"));
     }
 
     #[test]
@@ -2525,6 +3514,37 @@ mod tests {
         assert!(!visible.contains("line 0"));
         assert!(visible.contains("line 19"));
         assert!(visible.contains(">"));
+    }
+
+    #[test]
+    fn resize_rebuild_clear_sequence_purges_scrollback() {
+        assert_eq!(clear_screen_sequence(false), "\x1b[2J\x1b[H");
+        assert!(clear_screen_sequence(true).contains("\x1b[3J"));
+        assert!(clear_screen_sequence(true).starts_with("\x1b[r\x1b[0m"));
+    }
+
+    #[test]
+    fn projection_keeps_live_assistant_out_of_transcript() {
+        let document = UiBuilder::new()
+            .chat(&[ChatLine::User("hello".to_string())])
+            .live_assistant(Some("streaming"))
+            .input("", &[], 0, true)
+            .finish();
+
+        let projection = ProjectedDocument::from_document(&document, 80);
+
+        assert!(projection
+            .transcript_lines
+            .iter()
+            .any(|line| line.contains("hello")));
+        assert!(!projection
+            .transcript_lines
+            .iter()
+            .any(|line| line.contains("streaming")));
+        assert!(projection
+            .active_lines
+            .iter()
+            .any(|line| line.contains("streaming")));
     }
 
     #[test]
