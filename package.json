@@ -1,0 +1,16 @@
+{
+  "name": "jucode-cli-release",
+  "private": true,
+  "workspaces": [
+    "npm/cli",
+    "npm/cli-darwin-arm64",
+    "npm/cli-darwin-x64",
+    "npm/cli-linux-x64",
+    "npm/cli-win32-x64"
+  ],
+  "scripts": {
+    "release:sync-version": "node ./scripts/npm/sync-version.mjs",
+    "release:stage-binaries": "node ./scripts/npm/stage-binaries.mjs",
+    "release:pack": "node ./scripts/npm/pack-packages.mjs"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "@jucode/cli",
+  "version": "0.1.0",
+  "description": "JuCode native CLI",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "jucode": "bin/jucode.cjs"
+  },
+  "files": [
+    "bin/jucode.cjs"
+  ],
+  "optionalDependencies": {
+    "@jucode/cli-darwin-arm64": "0.1.0",
+    "@jucode/cli-darwin-x64": "0.1.0",
+    "@jucode/cli-linux-x64": "0.1.0",
+    "@jucode/cli-win32-x64": "0.1.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

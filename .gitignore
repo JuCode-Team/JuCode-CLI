@@ -2,3 +2,9 @@
 /target-check*/
 /target-build-*/
 /target-msvc/
+/artifacts/
+/dist/
+/npm/cli-darwin-arm64/bin/
+/npm/cli-darwin-x64/bin/
+/npm/cli-linux-x64/bin/
+/npm/cli-win32-x64/bin/

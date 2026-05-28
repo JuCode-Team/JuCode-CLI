@@ -3,6 +3,10 @@ name = "jucode-cli"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "jucode"
+path = "src/main.rs"
+
 [workspace]
 members = [".", "crates/agent-core", "crates/tui"]
 resolver = "2"

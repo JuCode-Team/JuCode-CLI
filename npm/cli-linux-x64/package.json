@@ -1,0 +1,18 @@
+{
+  "name": "@jucode/cli-linux-x64",
+  "version": "0.1.0",
+  "description": "JuCode native CLI for Linux x64",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/jucode"
+  ]
+}

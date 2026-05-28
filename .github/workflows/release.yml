@@ -1,0 +1,121 @@
+name: Release CLI
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Release version without the leading v
+        required: true
+        type: string
+
+jobs:
+  build-native:
+    name: Build ${{ matrix.target.rust_target }}
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            binary_name: jucode.exe
+          - runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            binary_name: jucode
+          - runner: macos-13
+            rust_target: x86_64-apple-darwin
+            binary_name: jucode
+          - runner: macos-14
+            rust_target: aarch64-apple-darwin
+            binary_name: jucode
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target.rust_target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target.rust_target }}
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p artifacts/${{ matrix.target.rust_target }}
+          cp target/${{ matrix.target.rust_target }}/release/${{ matrix.target.binary_name }} artifacts/${{ matrix.target.rust_target }}/${{ matrix.target.binary_name }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target.rust_target }}
+          path: artifacts/${{ matrix.target.rust_target }}/${{ matrix.target.binary_name }}
+
+  release:
+    name: Publish release assets
+    needs: build-native
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      - name: Resolve release metadata
+        id: release_meta
+        shell: bash
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.release_version }}" >> "$GITHUB_OUTPUT"
+            echo "tag=v${{ inputs.release_version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Normalize artifact layout
+        shell: bash
+        run: |
+          mkdir -p artifacts-normalized
+          for dir in artifacts/*; do
+            target="$(basename "$dir")"
+            mkdir -p "artifacts-normalized/$target"
+            cp "$dir"/* "artifacts-normalized/$target/"
+          done
+
+      - name: Sync npm versions
+        env:
+          RELEASE_VERSION: ${{ steps.release_meta.outputs.version }}
+        run: npm run release:sync-version
+
+      - name: Stage npm binaries
+        run: npm run release:stage-binaries -- --source-root artifacts-normalized
+
+      - name: Pack npm packages
+        run: npm run release:pack
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.tag }}
+          files: |
+            artifacts-normalized/**/jucode*
+            dist/npm/*.tgz
+
+      - name: Publish npm packages
+        if: ${{ secrets.NPM_TOKEN != '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm publish ./npm/cli-darwin-arm64 --access public
+          npm publish ./npm/cli-darwin-x64 --access public
+          npm publish ./npm/cli-linux-x64 --access public
+          npm publish ./npm/cli-win32-x64 --access public
+          npm publish ./npm/cli --access public
