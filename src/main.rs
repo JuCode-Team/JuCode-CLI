@@ -179,6 +179,18 @@ fn event_json(event: AgentEvent) -> Value {
                 json!({ "command": command.command, "marker": command.marker })
             }).collect::<Vec<_>>()
         }),
+        AgentEvent::Goal(goal) => json!({
+            "type": "goal",
+            "goal": goal.map(|goal| json!({
+                "objective": goal.objective,
+                "status": goal.status,
+                "token_budget": goal.token_budget,
+                "tokens_used": goal.tokens_used,
+                "time_used_seconds": goal.time_used_seconds,
+                "created_at": goal.created_at,
+                "updated_at": goal.updated_at,
+            }))
+        }),
         AgentEvent::Transcript(items) => json!({
             "type": "transcript",
             "items": items.into_iter().map(|item| match item {

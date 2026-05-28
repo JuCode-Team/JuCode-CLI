@@ -10,5 +10,6 @@ mod tools;
 
 pub use core::AgentCore;
 pub use event::{
-    AgentEvent, CommandView, ModelOptionView, SessionListItemView, TranscriptItem, TreeNodeView,
+    AgentEvent, CommandView, GoalView, ModelOptionView, SessionListItemView, TranscriptItem,
+    TreeNodeView,
 };

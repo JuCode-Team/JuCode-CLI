@@ -29,6 +29,17 @@ pub struct CommandView {
 }
 
 #[derive(Debug, Clone)]
+pub struct GoalView {
+    pub objective: String,
+    pub status: String,
+    pub token_budget: Option<u64>,
+    pub tokens_used: u64,
+    pub time_used_seconds: u64,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone)]
 pub enum TranscriptItem {
     User(String),
     Assistant(String),
@@ -86,6 +97,7 @@ pub enum AgentEvent {
         active_effort: String,
     },
     CommandList(Vec<CommandView>),
+    Goal(Option<GoalView>),
     Transcript(Vec<TranscriptItem>),
     Info(String),
     Error(String),

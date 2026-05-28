@@ -6,6 +6,7 @@ use std::{
     error::Error as StdError,
     io::{self, BufRead, BufReader},
     path::Path,
+    sync::mpsc::{self, Sender},
     time::Duration,
 };
 
@@ -29,6 +30,7 @@ pub struct OpenAiClient {
     retry_attempts: usize,
     allow_subagents: bool,
     provider_kind: ProviderKind,
+    goal_tool_tx: Option<Sender<GoalToolRequest>>,
 }
 
 pub struct OpenAiClientConfig<'a> {
@@ -41,6 +43,20 @@ pub struct OpenAiClientConfig<'a> {
     pub api_key: Option<&'a str>,
     pub api_key_env: &'a str,
     pub retry_attempts: usize,
+    pub goal_tool_tx: Option<Sender<GoalToolRequest>>,
+}
+
+#[derive(Debug)]
+pub struct GoalToolRequest {
+    pub name: String,
+    pub arguments: String,
+    pub response_tx: Sender<ToolGoalResponse>,
+}
+
+#[derive(Debug)]
+pub struct ToolGoalResponse {
+    pub output: String,
+    pub is_error: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +111,7 @@ impl OpenAiClient {
             retry_attempts: config.retry_attempts,
             allow_subagents: true,
             provider_kind,
+            goal_tool_tx: config.goal_tool_tx,
         })
     }
 
@@ -146,7 +163,9 @@ impl OpenAiClient {
                     call_id: call_id.clone(),
                     name: name.clone(),
                 })?;
-                let result = if name == "spawn_subagent" && self.allow_subagents {
+                let result = if let Some(result) = self.run_goal_tool(&name, arguments) {
+                    result
+                } else if name == "spawn_subagent" && self.allow_subagents {
                     self.run_subagent(arguments, cwd)
                 } else {
                     tools::run_tool_with_events(&name, arguments, cwd, |event| {
@@ -345,6 +364,9 @@ impl OpenAiClient {
             definitions.push(subagent_definition());
         }
         definitions.extend(self.extensions.definitions());
+        if self.goal_tool_tx.is_some() {
+            definitions.extend(goal_tool_definitions());
+        }
         definitions
     }
 
@@ -406,6 +428,7 @@ impl OpenAiClient {
             retry_attempts: self.retry_attempts,
             allow_subagents: false,
             provider_kind: ProviderKind::from_model(model),
+            goal_tool_tx: None,
         };
         let input = vec![json!({
             "role": "user",
@@ -455,6 +478,40 @@ impl OpenAiClient {
             output,
         }
     }
+
+    fn run_goal_tool(&self, name: &str, arguments: &str) -> Option<tools::ToolExecutionResult> {
+        if !matches!(name, "get_goal" | "create_goal" | "update_goal") {
+            return None;
+        }
+        let Some(tx) = &self.goal_tool_tx else {
+            return None;
+        };
+        let (response_tx, response_rx) = mpsc::channel();
+        if tx
+            .send(GoalToolRequest {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+                response_tx,
+            })
+            .is_err()
+        {
+            let output = json!({ "error": "goal tool handler is unavailable" }).to_string();
+            return Some(tools::ToolExecutionResult {
+                output: output.clone(),
+                model_output: output,
+                is_error: true,
+            });
+        }
+        let response = response_rx.recv().unwrap_or_else(|error| ToolGoalResponse {
+            output: json!({ "error": error.to_string() }).to_string(),
+            is_error: true,
+        });
+        Some(tools::ToolExecutionResult {
+            model_output: response.output.clone(),
+            output: response.output,
+            is_error: response.is_error,
+        })
+    }
 }
 
 impl ProviderKind {
@@ -494,6 +551,52 @@ fn subagent_definition() -> Value {
             "additionalProperties": false
         }
     })
+}
+
+fn goal_tool_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "type": "function",
+            "name": "get_goal",
+            "description": "Get the current goal for this session, including status, token budget, token usage, and elapsed time.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "create_goal",
+            "description": "Create a goal only when explicitly requested. Fails if a goal already exists.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "objective": { "type": "string", "description": "Concrete objective to pursue." },
+                    "token_budget": { "type": "number", "description": "Optional positive token budget." }
+                },
+                "required": ["objective"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "update_goal",
+            "description": "Mark the existing goal complete or blocked. Do not use this for pause, resume, budget-limited, or usage-limited status changes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["complete", "blocked"],
+                        "description": "Set complete only when all required work is done; set blocked only when progress genuinely cannot continue."
+                    }
+                },
+                "required": ["status"],
+                "additionalProperties": false
+            }
+        }),
+    ]
 }
 
 fn truncate_subagent_output(value: &str) -> String {

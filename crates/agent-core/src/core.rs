@@ -1,16 +1,18 @@
 use crate::{
     config::{profile_dir, AuthStore, Config, ModelConfig},
-    event::{AgentEvent, CommandView, ModelOptionView, SessionListItemView},
+    event::{AgentEvent, CommandView, GoalView, ModelOptionView, SessionListItemView},
     extensions::ExtensionRegistry,
-    llm::{OpenAiClient, OpenAiClientConfig, StreamEvent},
+    llm::{GoalToolRequest, OpenAiClient, OpenAiClientConfig, StreamEvent, ToolGoalResponse},
     oauth,
     prompt::{
         build_system_prompt, discover_project_instructions, discover_skills, skill_commands,
         skill_message, skill_pin_message, PromptContext,
     },
-    session::{ContextStatistics, EntryKind, SessionStore, SessionSummary},
+    session::{
+        ContextStatistics, EntryKind, SessionStore, SessionSummary, ThreadGoal, ThreadGoalStatus,
+    },
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     collections::VecDeque,
     env, io,
@@ -61,8 +63,12 @@ pub struct AgentCore {
     queued: VecDeque<String>,
     running: bool,
     receiver: Option<Receiver<WorkerEvent>>,
+    goal_tool_receiver: Option<Receiver<GoalToolRequest>>,
     total_input_tokens: u64,
     total_output_tokens: u64,
+    turn_started_at: Option<SystemTime>,
+    turn_goal_tokens: u64,
+    goal_continuation_running: bool,
 }
 
 impl AgentCore {
@@ -76,8 +82,12 @@ impl AgentCore {
             queued: VecDeque::new(),
             running: false,
             receiver: None,
+            goal_tool_receiver: None,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            turn_started_at: None,
+            turn_goal_tokens: 0,
+            goal_continuation_running: false,
         })
     }
 
@@ -117,7 +127,7 @@ impl AgentCore {
     fn command_list_event(&self) -> AgentEvent {
         let mut commands = [
             "/help", "/login", "/new", "/model", "/tree", "/resume", "/context", "/doctor", "/pin",
-            "/quit",
+            "/goal", "/quit",
         ]
         .iter()
         .map(|command| CommandView {
@@ -176,7 +186,7 @@ impl AgentCore {
         let events = match command {
             "/quit" | "/exit" => return (true, Vec::new()),
             "/help" | "/" => vec![AgentEvent::Info(
-                "/help /login [web-url] [api-url] /new /model [model] [effort] /tree /resume [session-id] /context /doctor /pin <skill> /quit"
+                "/help /login [web-url] [api-url] /new /model [model] [effort] /tree /resume [session-id] /context /goal [objective|pause|resume|blocked|complete|clear] /doctor /pin <skill> /quit"
                     .to_string(),
             )],
             "/login" => self.login_events(input[command.len()..].trim()),
@@ -256,6 +266,7 @@ impl AgentCore {
             "/extensions" => self.extension_events(),
             "/context" => self.context_events(),
             "/stats" => self.stats_events(),
+            "/goal" => self.goal_command_events(input[command.len()..].trim()),
             "/doctor" => self.doctor_events(),
             "/pin" => self.pin_skill_events(input[command.len()..].trim()),
             _ => vec![AgentEvent::Error(format!("unknown command: {command}"))],
@@ -389,14 +400,19 @@ impl AgentCore {
                     } => {
                         self.total_input_tokens += input_tokens;
                         self.total_output_tokens += output_tokens;
+                        self.turn_goal_tokens = self
+                            .turn_goal_tokens
+                            .saturating_add(input_tokens.saturating_add(output_tokens));
                         events.push(AgentEvent::Usage {
                             input_tokens,
                             output_tokens,
                         });
                     }
                     WorkerEvent::Done => {
+                        events.extend(self.finish_goal_turn());
                         self.running = false;
                         disconnected = true;
+                        self.goal_tool_receiver = None;
                         if !self.queued.is_empty() {
                             events.push(AgentEvent::PendingMessages(
                                 self.queued.iter().cloned().collect(),
@@ -409,8 +425,10 @@ impl AgentCore {
                         }));
                     }
                     WorkerEvent::Error(error) => {
+                        events.extend(self.finish_goal_turn());
                         self.running = false;
                         disconnected = true;
+                        self.goal_tool_receiver = None;
                         events.push(AgentEvent::Error(error));
                     }
                 }
@@ -419,14 +437,18 @@ impl AgentCore {
                 self.receiver = Some(rx);
             }
         }
+        events.extend(self.poll_goal_tool_requests());
 
         if !self.running {
             if let Some(next) = self.queued.pop_front() {
+                self.goal_continuation_running = false;
                 events.push(AgentEvent::PendingMessages(
                     self.queued.iter().cloned().collect(),
                 ));
                 events.push(AgentEvent::UserMessage(next.clone()));
                 events.extend(self.start_turn(next));
+            } else if self.should_continue_goal() {
+                events.extend(self.start_goal_continuation());
             }
         }
 
@@ -435,6 +457,8 @@ impl AgentCore {
 
     fn start_turn(&mut self, message: String) -> Vec<AgentEvent> {
         self.session.append(EntryKind::User { content: message });
+        self.turn_started_at = Some(SystemTime::now());
+        self.turn_goal_tokens = 0;
         let save_event = self.save_session_event();
 
         if self.config.provider != "openai" && self.config.provider != "jucode" {
@@ -455,6 +479,10 @@ impl AgentCore {
             return events;
         }
 
+        self.spawn_current_context_turn(save_event)
+    }
+
+    fn spawn_current_context_turn(&mut self, save_event: Vec<AgentEvent>) -> Vec<AgentEvent> {
         let base_prompt = match self.config.system_prompt() {
             Ok(prompt) => prompt,
             Err(error) => {
@@ -512,6 +540,8 @@ impl AgentCore {
             },
         );
 
+        let (goal_tool_tx, goal_tool_rx) = mpsc::channel();
+        self.goal_tool_receiver = Some(goal_tool_rx);
         let Ok(client) = OpenAiClient::from_config(OpenAiClientConfig {
             model: self.config.model.clone(),
             reasoning_effort: self.config.reasoning_effort.clone(),
@@ -526,6 +556,7 @@ impl AgentCore {
             api_key: self.auth.key_for(&self.config.provider),
             api_key_env: &self.config.api_key_env,
             retry_attempts: self.config.retry_attempts,
+            goal_tool_tx: Some(goal_tool_tx),
         }) else {
             let mut events = save_event;
             events.push(AgentEvent::Error(
@@ -604,6 +635,148 @@ impl AgentCore {
             AgentEvent::Status("streaming".to_string()),
         ]);
         events
+    }
+
+    fn start_goal_continuation(&mut self) -> Vec<AgentEvent> {
+        let Some(goal) = self.session.goal().cloned() else {
+            return Vec::new();
+        };
+        let message = format!(
+            "<goal_context>\nContinue working toward the active session goal.\n\nObjective: {}\n</goal_context>",
+            goal.objective
+        );
+        self.session.append_goal_context(message);
+        self.goal_continuation_running = true;
+        let mut events = vec![AgentEvent::Info(format!(
+            "Continuing goal: {}",
+            goal.objective
+        ))];
+        events.extend(self.start_turn_from_existing_context());
+        events
+    }
+
+    fn start_turn_from_existing_context(&mut self) -> Vec<AgentEvent> {
+        self.turn_started_at = Some(SystemTime::now());
+        self.turn_goal_tokens = 0;
+        let save_event = self.save_session_event();
+
+        if self.config.provider != "openai" && self.config.provider != "jucode" {
+            let mut events = save_event;
+            events.push(AgentEvent::Error(format!(
+                "unsupported provider '{}'. Supported providers: openai, jucode.",
+                self.config.provider
+            )));
+            return events;
+        }
+
+        if self.config.provider == "jucode" && !is_jucode_supported_model(&self.config.model) {
+            let mut events = save_event;
+            events.push(AgentEvent::Error(format!(
+                "{} is not supported by JuCode CLI. Run /model and choose a GPT or Claude model.",
+                self.config.model
+            )));
+            return events;
+        }
+
+        self.spawn_current_context_turn(save_event)
+    }
+
+    fn finish_goal_turn(&mut self) -> Vec<AgentEvent> {
+        let elapsed_seconds = self
+            .turn_started_at
+            .take()
+            .and_then(|started| started.elapsed().ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let tokens = std::mem::take(&mut self.turn_goal_tokens);
+        let mut events = Vec::new();
+        if let Some(goal) = self.session.account_goal_usage(elapsed_seconds, tokens) {
+            events.push(AgentEvent::Goal(Some(goal_view(&goal))));
+            events.extend(self.save_session_event());
+        }
+        self.goal_continuation_running = false;
+        events
+    }
+
+    fn poll_goal_tool_requests(&mut self) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        let Some(rx) = self.goal_tool_receiver.take() else {
+            return events;
+        };
+        while let Ok(request) = rx.try_recv() {
+            let (response, event) =
+                self.handle_goal_tool_request(&request.name, &request.arguments);
+            let _ = request.response_tx.send(response);
+            if let Some(event) = event {
+                events.push(event);
+            }
+            events.extend(self.save_session_event());
+        }
+        self.goal_tool_receiver = Some(rx);
+        events
+    }
+
+    fn handle_goal_tool_request(
+        &mut self,
+        name: &str,
+        arguments: &str,
+    ) -> (ToolGoalResponse, Option<AgentEvent>) {
+        let args = serde_json::from_str::<Value>(arguments)
+            .unwrap_or_else(|error| json!({ "error": format!("invalid JSON arguments: {error}") }));
+        let result = match name {
+            "get_goal" => Ok(self.session.goal().cloned()),
+            "create_goal" => {
+                let objective = args
+                    .get("objective")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let token_budget = args.get("token_budget").and_then(Value::as_u64);
+                self.session.create_goal(objective, token_budget).map(Some)
+            }
+            "update_goal" => {
+                let status = match args.get("status").and_then(Value::as_str) {
+                    Some("complete") => Ok(ThreadGoalStatus::Complete),
+                    Some("blocked") => Ok(ThreadGoalStatus::Blocked),
+                    Some(_) => {
+                        Err("update_goal can only set status to complete or blocked".to_string())
+                    }
+                    None => Err("update_goal requires status".to_string()),
+                };
+                status.and_then(|status| self.session.set_goal_status(status).map(Some))
+            }
+            _ => Err(format!("unknown goal tool: {name}")),
+        };
+        match result {
+            Ok(goal) => {
+                let output = json!({ "goal": goal.as_ref().map(goal_tool_json) }).to_string();
+                (
+                    ToolGoalResponse {
+                        output,
+                        is_error: false,
+                    },
+                    Some(AgentEvent::Goal(goal.as_ref().map(goal_view))),
+                )
+            }
+            Err(error) => {
+                let output = json!({ "error": error }).to_string();
+                (
+                    ToolGoalResponse {
+                        output,
+                        is_error: true,
+                    },
+                    None,
+                )
+            }
+        }
+    }
+
+    fn should_continue_goal(&self) -> bool {
+        if self.goal_continuation_running || self.running || !self.queued.is_empty() {
+            return false;
+        }
+        self.session
+            .goal()
+            .is_some_and(|goal| goal.status == ThreadGoalStatus::Active)
     }
 
     fn save_session_event(&mut self) -> Vec<AgentEvent> {
@@ -777,6 +950,39 @@ impl AgentCore {
             self.total_input_tokens,
             self.total_output_tokens,
         ))]
+    }
+
+    fn goal_command_events(&mut self, arg: &str) -> Vec<AgentEvent> {
+        let trimmed = arg.trim();
+        if trimmed.is_empty() {
+            return vec![AgentEvent::Goal(self.session.goal().map(goal_view))];
+        }
+
+        let result = match trimmed.to_ascii_lowercase().as_str() {
+            "pause" => self.session.set_goal_status(ThreadGoalStatus::Paused),
+            "resume" => self.session.set_goal_status(ThreadGoalStatus::Active),
+            "blocked" => self.session.set_goal_status(ThreadGoalStatus::Blocked),
+            "complete" => self.session.set_goal_status(ThreadGoalStatus::Complete),
+            "clear" => {
+                let cleared = self.session.clear_goal();
+                let mut events = vec![AgentEvent::Goal(None)];
+                if cleared {
+                    events.extend(self.save_session_event());
+                    events.push(AgentEvent::Status("goal cleared".to_string()));
+                }
+                return events;
+            }
+            _ => self.session.set_goal_objective(trimmed, None),
+        };
+
+        match result {
+            Ok(goal) => {
+                let mut events = vec![AgentEvent::Goal(Some(goal_view(&goal)))];
+                events.extend(self.save_session_event());
+                events
+            }
+            Err(error) => vec![AgentEvent::Error(error)],
+        }
     }
 
     fn stats_events(&self) -> Vec<AgentEvent> {
@@ -1072,6 +1278,34 @@ fn format_context_statistics(
         }));
     }
     lines.join("\n")
+}
+
+fn goal_view(goal: &ThreadGoal) -> GoalView {
+    GoalView {
+        objective: goal.objective.clone(),
+        status: goal.status.as_str().to_string(),
+        token_budget: goal.token_budget,
+        tokens_used: goal.tokens_used,
+        time_used_seconds: goal.time_used_seconds,
+        created_at: goal.created_at,
+        updated_at: goal.updated_at,
+    }
+}
+
+fn goal_tool_json(goal: &ThreadGoal) -> Value {
+    let remaining_tokens = goal
+        .token_budget
+        .map(|budget| budget.saturating_sub(goal.tokens_used));
+    json!({
+        "objective": goal.objective,
+        "status": goal.status.as_str(),
+        "tokenBudget": goal.token_budget,
+        "tokensUsed": goal.tokens_used,
+        "remainingTokens": remaining_tokens,
+        "timeUsedSeconds": goal.time_used_seconds,
+        "createdAt": goal.created_at,
+        "updatedAt": goal.updated_at,
+    })
 }
 
 fn format_session_summary(summary: SessionSummary) -> String {

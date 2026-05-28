@@ -138,7 +138,7 @@ impl From<CommandView> for CommandCandidate {
 fn default_commands() -> Vec<CommandCandidate> {
     [
         "/help", "/login", "/new", "/model", "/tree", "/resume", "/context", "/doctor", "/pin",
-        "/quit",
+        "/goal", "/quit",
     ]
     .iter()
     .map(|command| CommandCandidate {
@@ -146,6 +146,70 @@ fn default_commands() -> Vec<CommandCandidate> {
         marker: None,
     })
     .collect()
+}
+
+fn format_goal_summary(goal: Option<jucode_agent_core::GoalView>) -> String {
+    let Some(goal) = goal else {
+        return "Goal\nNo goal set.\nCommands: /goal <objective>".to_string();
+    };
+    let mut lines = vec![
+        "Goal".to_string(),
+        format!("Status: {}", goal.status.replace('_', " ")),
+        format!("Objective: {}", goal.objective),
+        format!(
+            "Time used: {}",
+            format_elapsed_seconds(goal.time_used_seconds)
+        ),
+        format!("Tokens used: {}", format_compact_number(goal.tokens_used)),
+    ];
+    if let Some(token_budget) = goal.token_budget {
+        lines.push(format!(
+            "Token budget: {}",
+            format_compact_number(token_budget)
+        ));
+    }
+    let commands = match goal.status.as_str() {
+        "active" => "Commands: /goal pause, /goal complete, /goal blocked, /goal clear",
+        "paused" | "blocked" | "usage_limited" => {
+            "Commands: /goal resume, /goal complete, /goal clear"
+        }
+        _ => "Commands: /goal <objective>, /goal clear",
+    };
+    lines.push(String::new());
+    lines.push(commands.to_string());
+    lines.join("\n")
+}
+
+fn format_elapsed_seconds(seconds: u64) -> String {
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    let remaining_minutes = minutes % 60;
+    if hours >= 24 {
+        let days = hours / 24;
+        let remaining_hours = hours % 24;
+        return format!("{days}d {remaining_hours}h {remaining_minutes}m");
+    }
+    if remaining_minutes == 0 {
+        format!("{hours}h")
+    } else {
+        format!("{hours}h {remaining_minutes}m")
+    }
+}
+
+fn format_compact_number(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
 }
 
 pub trait TuiRuntime {
@@ -1053,6 +1117,10 @@ impl<R: TuiRuntime> TuiApp<R> {
                 AgentEvent::CommandList(commands) => {
                     self.commands = commands.into_iter().map(CommandCandidate::from).collect();
                     self.clamp_completion_index();
+                    true
+                }
+                AgentEvent::Goal(goal) => {
+                    self.chat.push(ChatLine::System(format_goal_summary(goal)));
                     true
                 }
                 AgentEvent::Transcript(items) => {

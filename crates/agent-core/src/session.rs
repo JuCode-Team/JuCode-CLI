@@ -10,6 +10,7 @@ use std::{
 };
 
 const ROOT_BRANCH: &str = "root";
+const MAX_GOAL_OBJECTIVE_CHARS: usize = 4_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EntryId(u64);
@@ -40,6 +41,9 @@ pub enum EntryKind {
         name: String,
         content: String,
     },
+    GoalContext {
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +65,28 @@ pub struct SessionStore {
     updated_at: u64,
     persisted_entries: usize,
     needs_snapshot: bool,
+    goal: Option<ThreadGoal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadGoalStatus {
+    Active,
+    Paused,
+    Blocked,
+    UsageLimited,
+    BudgetLimited,
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadGoal {
+    pub objective: String,
+    pub status: ThreadGoalStatus,
+    pub token_budget: Option<u64>,
+    pub tokens_used: u64,
+    pub time_used_seconds: u64,
+    pub created_at: u64,
+    pub updated_at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +148,110 @@ impl SessionStore {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    pub fn goal(&self) -> Option<&ThreadGoal> {
+        self.goal.as_ref()
+    }
+
+    pub fn set_goal_objective(
+        &mut self,
+        objective: &str,
+        token_budget: Option<u64>,
+    ) -> Result<ThreadGoal, String> {
+        let objective = validate_goal_objective(objective)?;
+        let now = now_secs();
+        let goal = match self.goal.take() {
+            Some(mut goal) => {
+                goal.objective = objective;
+                goal.status = ThreadGoalStatus::Active;
+                goal.token_budget = token_budget;
+                goal.updated_at = now;
+                goal
+            }
+            None => ThreadGoal {
+                objective,
+                status: ThreadGoalStatus::Active,
+                token_budget,
+                tokens_used: 0,
+                time_used_seconds: 0,
+                created_at: now,
+                updated_at: now,
+            },
+        };
+        self.goal = Some(goal.clone());
+        self.mark_state_changed();
+        Ok(goal)
+    }
+
+    pub fn create_goal(
+        &mut self,
+        objective: &str,
+        token_budget: Option<u64>,
+    ) -> Result<ThreadGoal, String> {
+        if self.goal.is_some() {
+            return Err(
+                "cannot create a new goal because this session already has a goal".to_string(),
+            );
+        }
+        self.set_goal_objective(objective, token_budget)
+    }
+
+    pub fn set_goal_status(&mut self, status: ThreadGoalStatus) -> Result<ThreadGoal, String> {
+        let Some(mut goal) = self.goal.take() else {
+            return Err("cannot update goal because this session has no goal".to_string());
+        };
+        goal.status = status;
+        goal.updated_at = now_secs();
+        self.goal = Some(goal.clone());
+        self.mark_state_changed();
+        Ok(goal)
+    }
+
+    pub fn clear_goal(&mut self) -> bool {
+        let cleared = self.goal.take().is_some();
+        if cleared {
+            self.mark_state_changed();
+        }
+        cleared
+    }
+
+    pub fn account_goal_usage(&mut self, elapsed_seconds: u64, tokens: u64) -> Option<ThreadGoal> {
+        if elapsed_seconds == 0 && tokens == 0 {
+            return self.goal.clone();
+        }
+        let Some(mut goal) = self.goal.take() else {
+            return None;
+        };
+        if !matches!(
+            goal.status,
+            ThreadGoalStatus::Active | ThreadGoalStatus::BudgetLimited
+        ) {
+            self.goal = Some(goal.clone());
+            return Some(goal);
+        }
+        goal.time_used_seconds = goal.time_used_seconds.saturating_add(elapsed_seconds);
+        goal.tokens_used = goal.tokens_used.saturating_add(tokens);
+        if goal.status == ThreadGoalStatus::Active
+            && goal
+                .token_budget
+                .is_some_and(|budget| goal.tokens_used >= budget)
+        {
+            goal.status = ThreadGoalStatus::BudgetLimited;
+        }
+        goal.updated_at = now_secs();
+        self.goal = Some(goal.clone());
+        self.mark_state_changed();
+        Some(goal)
+    }
+
+    pub fn append_goal_context(&mut self, content: String) {
+        self.append(EntryKind::GoalContext { content });
+    }
+
+    fn mark_state_changed(&mut self) {
+        self.updated_at = now_secs();
+        self.needs_snapshot = true;
     }
 
     #[cfg(test)]
@@ -377,6 +507,7 @@ impl SessionStore {
                     output: output.clone(),
                 }),
                 EntryKind::PinnedSkill { .. } => None,
+                EntryKind::GoalContext { .. } => None,
             })
             .collect()
     }
@@ -548,7 +679,8 @@ impl SessionStore {
             "updated_at": self.updated_at,
             "leaf_id": self.leaf_id.map(|id| id.0),
             "next_id": self.next_id,
-            "branch_heads": self.branch_heads_json()
+            "branch_heads": self.branch_heads_json(),
+            "goal": self.goal.as_ref().map(goal_to_json)
         })
     }
 
@@ -562,6 +694,7 @@ impl SessionStore {
             "next_id": self.next_id,
             "branch_heads": self.branch_heads_json(),
             "entries_count": self.entries.len(),
+            "goal": self.goal.as_ref().map(goal_to_json),
             "journal": format!("{}.jsonl", self.session_id)
         })
     }
@@ -629,6 +762,7 @@ impl SessionStore {
             updated_at: value.get("updated_at").and_then(Value::as_u64).unwrap_or(0),
             persisted_entries: 0,
             needs_snapshot: true,
+            goal: value.get("goal").and_then(goal_from_json),
         };
         if store.branch_heads.is_empty() {
             store.rebuild_branch_heads();
@@ -690,6 +824,9 @@ impl SessionStore {
         }
         if let Some(next_id) = value.get("next_id").and_then(Value::as_u64) {
             self.next_id = next_id;
+        }
+        if value.get("goal").is_some() {
+            self.goal = value.get("goal").and_then(goal_from_json);
         }
         self.leaf_id = value
             .get("leaf_id")
@@ -764,6 +901,10 @@ fn context_item_for_entry(entry: &SessionEntry) -> Option<Value> {
                 "text": format!("Pinned skill for future turns: {name}\n\n{content}")
             }]
         })),
+        EntryKind::GoalContext { content } => Some(json!({
+            "role": "user",
+            "content": [{ "type": "input_text", "text": content }]
+        })),
     }
 }
 
@@ -782,6 +923,7 @@ fn count_context_entry(kind: &EntryKind, counts: &mut ContextEntryCounts) {
         }
         EntryKind::ToolOutput { .. } => counts.tool_outputs += 1,
         EntryKind::PinnedSkill { .. } => counts.pinned_skills += 1,
+        EntryKind::GoalContext { .. } => counts.users += 1,
     }
 }
 
@@ -803,6 +945,7 @@ fn context_entry_label(entry: &SessionEntry) -> String {
         },
         EntryKind::ToolOutput { name, .. } => format!("tool output:{name}"),
         EntryKind::PinnedSkill { name, .. } => format!("pinned skill:{name}"),
+        EntryKind::GoalContext { .. } => "goal context".to_string(),
     }
 }
 
@@ -834,6 +977,7 @@ fn summarize_compacted_entries<'a>(entries: impl Iterator<Item = &'a SessionEntr
             EntryKind::PinnedSkill { name, .. } => {
                 tool_calls.push(format!("pinned skill:{name}"));
             }
+            EntryKind::GoalContext { .. } => {}
             EntryKind::Branch { .. } => {}
         }
     }
@@ -907,6 +1051,7 @@ fn entry_to_json(entry: &SessionEntry) -> Value {
         EntryKind::PinnedSkill { name, content } => {
             json!({ "type": "pinned_skill", "name": name, "content": content })
         }
+        EntryKind::GoalContext { content } => json!({ "type": "goal_context", "content": content }),
     };
     json!({
         "id": entry.id.0,
@@ -937,6 +1082,9 @@ fn entry_from_json(value: &Value) -> Option<SessionEntry> {
         },
         "pinned_skill" => EntryKind::PinnedSkill {
             name: kind_value.get("name")?.as_str()?.to_string(),
+            content: kind_value.get("content")?.as_str()?.to_string(),
+        },
+        "goal_context" => EntryKind::GoalContext {
             content: kind_value.get("content")?.as_str()?.to_string(),
         },
         _ => return None,
@@ -977,6 +1125,87 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn validate_goal_objective(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("goal objective must not be empty".to_string());
+    }
+    if value.chars().count() > MAX_GOAL_OBJECTIVE_CHARS {
+        return Err(format!(
+            "goal objective must be at most {MAX_GOAL_OBJECTIVE_CHARS} characters"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+impl ThreadGoalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Blocked => "blocked",
+            Self::UsageLimited => "usage_limited",
+            Self::BudgetLimited => "budget_limited",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+impl TryFrom<&str> for ThreadGoalStatus {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "active" => Ok(Self::Active),
+            "paused" => Ok(Self::Paused),
+            "blocked" => Ok(Self::Blocked),
+            "usage_limited" => Ok(Self::UsageLimited),
+            "budget_limited" => Ok(Self::BudgetLimited),
+            "complete" => Ok(Self::Complete),
+            other => Err(format!("unknown goal status: {other}")),
+        }
+    }
+}
+
+fn goal_to_json(goal: &ThreadGoal) -> Value {
+    json!({
+        "objective": goal.objective,
+        "status": goal.status.as_str(),
+        "token_budget": goal.token_budget,
+        "tokens_used": goal.tokens_used,
+        "time_used_seconds": goal.time_used_seconds,
+        "created_at": goal.created_at,
+        "updated_at": goal.updated_at,
+    })
+}
+
+fn goal_from_json(value: &Value) -> Option<ThreadGoal> {
+    if value.is_null() {
+        return None;
+    }
+    let objective = value.get("objective")?.as_str()?.to_string();
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .and_then(|value| ThreadGoalStatus::try_from(value).ok())
+        .unwrap_or(ThreadGoalStatus::Active);
+    Some(ThreadGoal {
+        objective,
+        status,
+        token_budget: value.get("token_budget").and_then(Value::as_u64),
+        tokens_used: value
+            .get("tokens_used")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        time_used_seconds: value
+            .get("time_used_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        created_at: value.get("created_at").and_then(Value::as_u64).unwrap_or(0),
+        updated_at: value.get("updated_at").and_then(Value::as_u64).unwrap_or(0),
+    })
 }
 
 pub fn extract_response_text(item: &Value) -> String {
@@ -1189,6 +1418,51 @@ mod tests {
 
         assert!(context[0].to_string().contains("Pinned skill"));
         assert!(session.transcript_items().is_empty());
+    }
+
+    #[test]
+    fn goal_context_is_context_but_not_transcript() {
+        let mut session = SessionStore::new();
+        session.append_goal_context("<goal_context>Continue.</goal_context>".to_string());
+
+        let context = session.context_items();
+
+        assert!(context[0].to_string().contains("goal_context"));
+        assert!(session.transcript_items().is_empty());
+    }
+
+    #[test]
+    fn goal_persists_through_journal_state() {
+        let root = test_dir("goal-journal");
+        let profile = root.join("profile");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut session = SessionStore::new();
+        let session_id = session.session_id().to_string();
+
+        session
+            .set_goal_objective("finish goal support", Some(100))
+            .unwrap();
+        session.save_for_cwd(&profile, &cwd).unwrap();
+        let loaded = SessionStore::load_for_cwd(&profile, &cwd, &session_id).unwrap();
+
+        let goal = loaded.goal().unwrap();
+        assert_eq!(goal.objective, "finish goal support");
+        assert_eq!(goal.token_budget, Some(100));
+        assert_eq!(goal.status, ThreadGoalStatus::Active);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn goal_accounting_applies_budget_limit() {
+        let mut session = SessionStore::new();
+        session.set_goal_objective("finish", Some(10)).unwrap();
+
+        let goal = session.account_goal_usage(5, 12).unwrap();
+
+        assert_eq!(goal.tokens_used, 12);
+        assert_eq!(goal.time_used_seconds, 5);
+        assert_eq!(goal.status, ThreadGoalStatus::BudgetLimited);
     }
 
     #[test]
