@@ -68,6 +68,9 @@ pub fn login(web_url: &str, api_url: &str) -> Result<OAuthLoginResult, String> {
         }
     };
     stream
+        .set_nonblocking(false)
+        .map_err(|error| error.to_string())?;
+    stream
         .set_read_timeout(Some(CALLBACK_TIMEOUT))
         .map_err(|error| error.to_string())?;
     let mut reader = BufReader::new(stream);

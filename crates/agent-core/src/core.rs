@@ -11,6 +11,7 @@ use crate::{
     session::{
         ContextStatistics, EntryKind, SessionStore, SessionSummary, ThreadGoal, ThreadGoalStatus,
     },
+    update::{self, UpdateNotice},
 };
 use serde_json::{json, Value};
 use std::{
@@ -64,6 +65,7 @@ pub struct AgentCore {
     running: bool,
     receiver: Option<Receiver<WorkerEvent>>,
     goal_tool_receiver: Option<Receiver<GoalToolRequest>>,
+    update_receiver: Option<Receiver<UpdateNotice>>,
     total_input_tokens: u64,
     total_output_tokens: u64,
     turn_started_at: Option<SystemTime>,
@@ -83,6 +85,7 @@ impl AgentCore {
             running: false,
             receiver: None,
             goal_tool_receiver: None,
+            update_receiver: None,
             total_input_tokens: 0,
             total_output_tokens: 0,
             turn_started_at: None,
@@ -105,6 +108,12 @@ impl AgentCore {
             self.model_status_event(),
             self.command_list_event(),
         ]
+    }
+
+    pub fn start_update_check(&mut self) {
+        if self.update_receiver.is_none() {
+            self.update_receiver = Some(update::spawn_update_check(env!("CARGO_PKG_VERSION")));
+        }
     }
 
     pub fn model_status_event(&self) -> AgentEvent {
@@ -439,6 +448,13 @@ impl AgentCore {
             }
             if !disconnected {
                 self.receiver = Some(rx);
+            }
+        }
+        if let Some(rx) = self.update_receiver.take() {
+            match rx.try_recv() {
+                Ok(notice) => events.push(AgentEvent::Info(notice.message())),
+                Err(mpsc::TryRecvError::Empty) => self.update_receiver = Some(rx),
+                Err(mpsc::TryRecvError::Disconnected) => {}
             }
         }
         events.extend(self.poll_goal_tool_requests());

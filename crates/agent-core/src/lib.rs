@@ -7,6 +7,7 @@ mod oauth;
 mod prompt;
 mod session;
 mod tools;
+mod update;
 
 pub use core::AgentCore;
 pub use event::{

@@ -42,7 +42,9 @@ fn main() -> io::Result<()> {
         args.remove(0);
         return run_headless(args);
     }
-    TuiApp::new(Runtime(AgentCore::new()?)).run()
+    let mut core = AgentCore::new()?;
+    core.start_update_check();
+    TuiApp::new(Runtime(core)).run()
 }
 
 fn run_headless(args: Vec<String>) -> io::Result<()> {
