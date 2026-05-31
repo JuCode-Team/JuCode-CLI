@@ -662,7 +662,7 @@ impl AgentCore {
             return Vec::new();
         };
         let message = format!(
-            "<goal_context>\nContinue working toward the active session goal.\n\nObjective: {}\n</goal_context>",
+            "<goal_context>\nContinue working toward the active session goal.\n\nObjective: {}\n\nBefore doing more work, decide whether the objective is already satisfied. If all required work is done, call update_goal with status \"complete\" and stop. If the objective lacks a verifiable stopping condition, ask the user to clarify instead of continuing indefinitely. If progress cannot continue without user input or an external change, call update_goal with status \"blocked\".\n</goal_context>",
             goal.objective
         );
         self.session.append_goal_context(message);
