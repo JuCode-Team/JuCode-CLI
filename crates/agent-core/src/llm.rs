@@ -3,14 +3,12 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     env,
-    error::Error as StdError,
-    io::{self, BufRead, BufReader},
+    io::{BufRead, BufReader},
     path::Path,
     sync::mpsc::{self, Sender},
     time::Duration,
 };
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SUBAGENT_OUTPUT_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +26,8 @@ pub struct OpenAiClient {
     base_url: String,
     max_output_tokens: u64,
     retry_attempts: usize,
+    connect_timeout: Duration,
+    read_timeout: Duration,
     allow_subagents: bool,
     provider_kind: ProviderKind,
     goal_tool_tx: Option<Sender<GoalToolRequest>>,
@@ -43,6 +43,8 @@ pub struct OpenAiClientConfig<'a> {
     pub api_key: Option<&'a str>,
     pub api_key_env: &'a str,
     pub retry_attempts: usize,
+    pub connect_timeout: Duration,
+    pub read_timeout: Duration,
     pub goal_tool_tx: Option<Sender<GoalToolRequest>>,
 }
 
@@ -61,7 +63,12 @@ pub struct ToolGoalResponse {
 
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
+    /// HTTP request is being sent; the connection is being established.
     CallStart,
+    /// Response headers received; the model is now working (reasoning/answering).
+    Connected,
+    /// Streamed reasoning/thinking text (only for providers that return it).
+    ReasoningDelta(String),
     Delta(String),
     Retrying {
         attempt: usize,
@@ -85,6 +92,7 @@ pub enum StreamEvent {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+        reasoning_tokens: u64,
     },
 }
 
@@ -109,6 +117,8 @@ impl OpenAiClient {
             base_url: config.base_url,
             max_output_tokens: config.max_output_tokens,
             retry_attempts: config.retry_attempts,
+            connect_timeout: config.connect_timeout,
+            read_timeout: config.read_timeout,
             allow_subagents: true,
             provider_kind,
             goal_tool_tx: config.goal_tool_tx,
@@ -206,90 +216,170 @@ impl OpenAiClient {
         }
     }
 
+    /// One-shot summarization used for context compaction. No tools, no thinking;
+    /// returns the summary text. Errors (including empty output) let the caller fall
+    /// back to sending the full context.
+    pub fn summarize(&self, conversation: &str) -> Result<String, String> {
+        let system = "You compress earlier conversation history so it can replace the raw turns while letting the work continue. Write a dense summary that preserves: the user's goals and explicit requests, decisions made, important facts and constraints discovered, files and tools touched with their outcomes, and any unfinished threads. Prefer tight prose or bullet points. Output only the summary.";
+        let user = format!("Summarize this earlier conversation:\n\n{conversation}");
+        let summary = match self.provider_kind {
+            ProviderKind::OpenAiResponses => {
+                let body = json!({
+                    "model": self.model,
+                    "instructions": system,
+                    "reasoning": { "effort": "low" },
+                    "input": [{ "role": "user", "content": [{ "type": "input_text", "text": user }] }],
+                    "stream": true
+                });
+                let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
+                let response = self.send_with_retry(&url, &body, &mut |_| Ok(()))?;
+                self.collect_text(response, false)?
+            }
+            ProviderKind::AnthropicMessages => {
+                let body = json!({
+                    "model": self.model,
+                    "system": system,
+                    "max_tokens": self.max_output_tokens.max(1),
+                    "messages": [{ "role": "user", "content": [{ "type": "text", "text": user }] }],
+                    "stream": true
+                });
+                let url = anthropic_messages_url(&self.base_url);
+                let response = self.send_with_retry(&url, &body, &mut |_| Ok(()))?;
+                self.collect_text(response, true)?
+            }
+        };
+        let summary = summary.trim().to_string();
+        if summary.is_empty() {
+            return Err("summarization produced no output".to_string());
+        }
+        Ok(summary)
+    }
+
+    fn collect_text(&self, response: ureq::Response, anthropic: bool) -> Result<String, String> {
+        let content_type = response
+            .header("content-type")
+            .unwrap_or_default()
+            .to_string();
+        let mut text = String::new();
+        let mut accumulate = |event: StreamEvent| {
+            if let StreamEvent::Delta(delta) = event {
+                text.push_str(&delta);
+            }
+            Ok(())
+        };
+        if content_type.contains("application/json") {
+            let body = response.into_string().map_err(|error| error.to_string())?;
+            let value = serde_json::from_str::<Value>(&body).map_err(|error| error.to_string())?;
+            if anthropic {
+                emit_anthropic_message(&value, &mut accumulate)?;
+            } else if let Some(items) = value.get("output").and_then(Value::as_array) {
+                for item in items {
+                    text.push_str(&extract_response_text(item));
+                }
+            }
+            return Ok(text);
+        }
+        if anthropic {
+            read_anthropic_sse_output(response.into_reader(), accumulate)?;
+        } else {
+            read_sse_output(response.into_reader(), accumulate)?;
+        }
+        Ok(text)
+    }
+
     fn create_response_streaming(
         &self,
         input: Vec<Value>,
         mut emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<Vec<Value>, String> {
+        // Request a reasoning summary so the thinking phase can stream content.
+        // With effort "none" the model does not reason, so no summary is requested.
+        let reasoning = if self.reasoning_effort == "none" {
+            json!({ "effort": self.reasoning_effort })
+        } else {
+            json!({ "effort": self.reasoning_effort, "summary": "auto" })
+        };
         let body = json!({
             "model": self.model,
             "instructions": self.system_prompt,
-            "reasoning": {
-                "effort": self.reasoning_effort
-            },
-            "input": input,
+            "reasoning": reasoning,
+            "input": sanitize_openai_input(input),
             "tools": self.tool_definitions(),
             "tool_choice": "auto",
             "stream": true
         });
 
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(CONNECT_TIMEOUT)
-            .timeout_read(CONNECT_TIMEOUT)
-            .build();
-
-        let mut response = None;
         let max_attempts = self.retry_attempts.saturating_add(1).max(1);
         for attempt in 1..=max_attempts {
-            let result = agent
-                .post(&url)
-                .set("Authorization", &format!("Bearer {}", self.api_key))
-                .set("Accept", "text/event-stream")
-                .set("Content-Type", "application/json")
-                .send_json(body.clone());
-
-            match result {
-                Ok(value) => {
-                    response = Some(value);
-                    break;
+            let response = self.send_with_retry(&url, &body, &mut emit)?;
+            emit(StreamEvent::Connected)?;
+            let content_type = response
+                .header("content-type")
+                .unwrap_or_default()
+                .to_string();
+            if !content_type.contains("text/event-stream")
+                && !content_type.contains("application/json")
+            {
+                let body = response.into_string().map_err(|error| error.to_string())?;
+                let snippet = truncate_error_body(&body);
+                return Err(format!(
+                    "OpenAI API returned non-JSON response from {url} (content-type: {content_type}). Check base_url; OpenAI-compatible endpoints usually end with /v1. Body starts: {snippet}"
+                ));
+            }
+            if content_type.contains("application/json") {
+                let body = response.into_string().map_err(|error| error.to_string())?;
+                let value =
+                    serde_json::from_str::<Value>(&body).map_err(|error| error.to_string())?;
+                let output_items = value
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for item in &output_items {
+                    let text = extract_response_text(item);
+                    if !text.is_empty() {
+                        emit(StreamEvent::Delta(text))?;
+                    }
+                    emit(StreamEvent::ResponseItem(item.clone()))?;
                 }
-                Err(error) if attempt < max_attempts && is_timeout_error(&error) => {
+                if let Some((input_tokens, output_tokens, reasoning_tokens)) = extract_usage(&value)
+                {
+                    emit(StreamEvent::Usage {
+                        input_tokens,
+                        output_tokens,
+                        reasoning_tokens,
+                    })?;
+                }
+                return Ok(output_items);
+            }
+            // Stream live text but buffer session-mutating events so a mid-stream
+            // failure can be retried (re-read from scratch) without duplicating
+            // response items in the session.
+            let mut buffered: Vec<StreamEvent> = Vec::new();
+            let read = read_sse_output(response.into_reader(), |event| match event {
+                StreamEvent::Delta(_) | StreamEvent::ReasoningDelta(_) => emit(event),
+                other => {
+                    buffered.push(other);
+                    Ok(())
+                }
+            });
+            match read {
+                Ok(output_items) => {
+                    for event in buffered {
+                        emit(event)?;
+                    }
+                    return Ok(output_items);
+                }
+                Err(error) if attempt < max_attempts && is_stream_decode_error(&error) => {
                     emit(StreamEvent::Retrying {
                         attempt: attempt + 1,
                     })?;
                 }
-                Err(error) => return handle_response_error(error),
+                Err(error) => return Err(error),
             }
         }
-
-        let response = response.expect("response must be set or returned as error");
-        let content_type = response
-            .header("content-type")
-            .unwrap_or_default()
-            .to_string();
-        if !content_type.contains("text/event-stream") && !content_type.contains("application/json")
-        {
-            let body = response.into_string().map_err(|error| error.to_string())?;
-            let snippet = truncate_error_body(&body);
-            return Err(format!(
-                "OpenAI API returned non-JSON response from {url} (content-type: {content_type}). Check base_url; OpenAI-compatible endpoints usually end with /v1. Body starts: {snippet}"
-            ));
-        }
-        if content_type.contains("application/json") {
-            let body = response.into_string().map_err(|error| error.to_string())?;
-            let value = serde_json::from_str::<Value>(&body).map_err(|error| error.to_string())?;
-            let output_items = value
-                .get("output")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            for item in &output_items {
-                let text = extract_response_text(item);
-                if !text.is_empty() {
-                    emit(StreamEvent::Delta(text))?;
-                }
-                emit(StreamEvent::ResponseItem(item.clone()))?;
-            }
-            if let Some((input_tokens, output_tokens)) = extract_usage(&value) {
-                emit(StreamEvent::Usage {
-                    input_tokens,
-                    output_tokens,
-                })?;
-            }
-            return Ok(output_items);
-        }
-        read_sse_output(response.into_reader(), emit)
+        unreachable!("streaming retry loop always returns")
     }
 
     fn create_anthropic_message_streaming(
@@ -297,38 +387,95 @@ impl OpenAiClient {
         input: Vec<Value>,
         mut emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<Vec<Value>, String> {
-        let body = json!({
+        // Cap the thinking budget so it stays below max_tokens.
+        let thinking_budget = anthropic_thinking_budget(&self.reasoning_effort)
+            .map(|budget| budget.min(self.max_output_tokens.saturating_sub(1024).max(1024)));
+        let mut body = json!({
             "model": self.model,
             "system": self.system_prompt,
             "max_tokens": self.max_output_tokens.max(1),
-            "messages": responses_input_to_anthropic_messages(&input),
+            "messages": responses_input_to_anthropic_messages(&input, thinking_budget.is_some()),
             "tools": self.anthropic_tool_definitions(),
             "tool_choice": { "type": "auto" },
             "stream": true
         });
+        if let Some(budget) = thinking_budget {
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+        }
 
         let url = anthropic_messages_url(&self.base_url);
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(CONNECT_TIMEOUT)
-            .timeout_read(CONNECT_TIMEOUT)
-            .build();
+        let max_attempts = self.retry_attempts.saturating_add(1).max(1);
+        for attempt in 1..=max_attempts {
+            let response = self.send_with_retry(&url, &body, &mut emit)?;
+            emit(StreamEvent::Connected)?;
+            let content_type = response
+                .header("content-type")
+                .unwrap_or_default()
+                .to_string();
+            if !content_type.contains("text/event-stream")
+                && !content_type.contains("application/json")
+            {
+                let body = response.into_string().map_err(|error| error.to_string())?;
+                let snippet = truncate_error_body(&body);
+                return Err(format!(
+                    "Anthropic API returned non-JSON response from {url} (content-type: {content_type}). Body starts: {snippet}"
+                ));
+            }
+            if content_type.contains("application/json") {
+                let body = response.into_string().map_err(|error| error.to_string())?;
+                let value =
+                    serde_json::from_str::<Value>(&body).map_err(|error| error.to_string())?;
+                return emit_anthropic_message(&value, &mut emit);
+            }
+            let mut buffered: Vec<StreamEvent> = Vec::new();
+            let read = read_anthropic_sse_output(response.into_reader(), |event| match event {
+                StreamEvent::Delta(_) | StreamEvent::ReasoningDelta(_) => emit(event),
+                other => {
+                    buffered.push(other);
+                    Ok(())
+                }
+            });
+            match read {
+                Ok(output_items) => {
+                    for event in buffered {
+                        emit(event)?;
+                    }
+                    return Ok(output_items);
+                }
+                Err(error) if attempt < max_attempts && is_stream_decode_error(&error) => {
+                    emit(StreamEvent::Retrying {
+                        attempt: attempt + 1,
+                    })?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("streaming retry loop always returns")
+    }
 
-        let mut response = None;
+    /// Send the request with the configured timeouts, retrying on transport errors
+    /// and 5xx responses. 4xx responses are returned immediately without retry.
+    fn send_with_retry(
+        &self,
+        url: &str,
+        body: &Value,
+        emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
+    ) -> Result<ureq::Response, String> {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(self.connect_timeout)
+            .timeout_read(self.read_timeout)
+            .build();
         let max_attempts = self.retry_attempts.saturating_add(1).max(1);
         for attempt in 1..=max_attempts {
             let result = agent
-                .post(&url)
+                .post(url)
                 .set("Authorization", &format!("Bearer {}", self.api_key))
                 .set("Accept", "text/event-stream")
                 .set("Content-Type", "application/json")
                 .send_json(body.clone());
-
             match result {
-                Ok(value) => {
-                    response = Some(value);
-                    break;
-                }
-                Err(error) if attempt < max_attempts && is_timeout_error(&error) => {
+                Ok(response) => return Ok(response),
+                Err(error) if attempt < max_attempts && is_retryable_error(&error) => {
                     emit(StreamEvent::Retrying {
                         attempt: attempt + 1,
                     })?;
@@ -336,26 +483,7 @@ impl OpenAiClient {
                 Err(error) => return handle_response_error(error),
             }
         }
-
-        let response = response.expect("response must be set or returned as error");
-        let content_type = response
-            .header("content-type")
-            .unwrap_or_default()
-            .to_string();
-        if !content_type.contains("text/event-stream") && !content_type.contains("application/json")
-        {
-            let body = response.into_string().map_err(|error| error.to_string())?;
-            let snippet = truncate_error_body(&body);
-            return Err(format!(
-                "Anthropic API returned non-JSON response from {url} (content-type: {content_type}). Body starts: {snippet}"
-            ));
-        }
-        if content_type.contains("application/json") {
-            let body = response.into_string().map_err(|error| error.to_string())?;
-            let value = serde_json::from_str::<Value>(&body).map_err(|error| error.to_string())?;
-            return emit_anthropic_message(&value, &mut emit);
-        }
-        read_anthropic_sse_output(response.into_reader(), emit)
+        unreachable!("retry loop always returns a response or error")
     }
 
     fn tool_definitions(&self) -> Vec<Value> {
@@ -426,6 +554,8 @@ impl OpenAiClient {
             base_url: self.base_url.clone(),
             max_output_tokens: self.max_output_tokens,
             retry_attempts: self.retry_attempts,
+            connect_timeout: self.connect_timeout,
+            read_timeout: self.read_timeout,
             allow_subagents: false,
             provider_kind: ProviderKind::from_model(model),
             goal_tool_tx: None,
@@ -445,6 +575,7 @@ impl OpenAiClient {
                 StreamEvent::Usage {
                     input_tokens: input,
                     output_tokens: output,
+                    ..
                 } => {
                     input_tokens += input;
                     output_tokens += output;
@@ -642,7 +773,7 @@ fn is_anthropic_model(model: &str) -> bool {
     model.starts_with("claude-")
 }
 
-fn responses_input_to_anthropic_messages(input: &[Value]) -> Vec<Value> {
+fn responses_input_to_anthropic_messages(input: &[Value], include_thinking: bool) -> Vec<Value> {
     let mut messages = Vec::new();
     for item in input {
         if item.get("role").and_then(Value::as_str) == Some("user") {
@@ -658,6 +789,19 @@ fn responses_input_to_anthropic_messages(input: &[Value]) -> Vec<Value> {
         }
 
         match item.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "thinking" => {
+                let thinking = item.get("thinking").and_then(Value::as_str).unwrap_or_default();
+                let signature = item.get("signature").and_then(Value::as_str).unwrap_or_default();
+                // Extended thinking requires the signature to be replayed verbatim, and
+                // thinking blocks may only be sent when thinking is enabled this turn.
+                if include_thinking && !signature.is_empty() {
+                    push_anthropic_content(
+                        &mut messages,
+                        "assistant",
+                        json!({ "type": "thinking", "thinking": thinking, "signature": signature }),
+                    );
+                }
+            }
             "message" => {
                 let text = response_content_text(item, "output_text");
                 if !text.is_empty() {
@@ -741,18 +885,55 @@ fn response_content_text(item: &Value, preferred_type: &str) -> String {
         .join("")
 }
 
-fn is_timeout_error(error: &ureq::Error) -> bool {
-    if error.to_string().to_ascii_lowercase().contains("timed out") {
-        return true;
+/// Retry on transport errors (timeouts, dropped connections, DNS) and on 5xx
+/// responses. 4xx responses are client errors and are never retried.
+fn is_retryable_error(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::Status(code, _) => *code >= 500,
+        ureq::Error::Transport(_) => true,
     }
-    let ureq::Error::Transport(error) = error else {
-        return false;
-    };
-    error.kind() == ureq::ErrorKind::Io
-        && error
-            .source()
-            .and_then(|source| source.downcast_ref::<io::Error>())
-            .is_some_and(|error| error.kind() == io::ErrorKind::TimedOut)
+}
+
+/// True for transport-level failures that occur while reading the streamed body
+/// (e.g. a dropped/garbled chunked connection). Re-sending the request is safe and
+/// usually succeeds; data errors (bad JSON, `response.failed`) won't match.
+fn is_stream_decode_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "decoding chunk",
+        "while decoding",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection closed",
+        "connection aborted",
+        "broken pipe",
+        "unexpected eof",
+        "eof while",
+        "io error",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn sanitize_openai_input(input: Vec<Value>) -> Vec<Value> {
+    // Anthropic-only "thinking" items are not valid OpenAI Responses input.
+    input
+        .into_iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) != Some("thinking"))
+        .collect()
+}
+
+/// Maps a reasoning effort to an Anthropic extended-thinking token budget.
+/// Returns None when reasoning should be disabled.
+fn anthropic_thinking_budget(effort: &str) -> Option<u64> {
+    match effort {
+        "low" => Some(4_000),
+        "medium" => Some(10_000),
+        "high" => Some(20_000),
+        "xhigh" => Some(32_000),
+        _ => None,
+    }
 }
 
 fn read_sse_output(
@@ -808,6 +989,11 @@ fn handle_sse_data(
                 emit(StreamEvent::Delta(delta.to_string()))?;
             }
         }
+        "response.reasoning_summary_text.delta" => {
+            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                emit(StreamEvent::ReasoningDelta(delta.to_string()))?;
+            }
+        }
         "response.output_item.done" => {
             if let Some(item) = event.get("item") {
                 emit(StreamEvent::ResponseItem(item.clone()))?;
@@ -816,10 +1002,13 @@ fn handle_sse_data(
         }
         "response.completed" if output_items.is_empty() => {
             if let Some(response) = event.get("response") {
-                if let Some((input_tokens, output_tokens)) = extract_usage(response) {
+                if let Some((input_tokens, output_tokens, reasoning_tokens)) =
+                    extract_usage(response)
+                {
                     emit(StreamEvent::Usage {
                         input_tokens,
                         output_tokens,
+                        reasoning_tokens,
                     })?;
                 }
             }
@@ -837,10 +1026,13 @@ fn handle_sse_data(
         }
         "response.completed" => {
             if let Some(response) = event.get("response") {
-                if let Some((input_tokens, output_tokens)) = extract_usage(response) {
+                if let Some((input_tokens, output_tokens, reasoning_tokens)) =
+                    extract_usage(response)
+                {
                     emit(StreamEvent::Usage {
                         input_tokens,
                         output_tokens,
+                        reasoning_tokens,
                     })?;
                 }
             }
@@ -868,6 +1060,7 @@ struct AnthropicBlock {
     name: String,
     text: String,
     arguments: String,
+    signature: String,
 }
 
 fn read_anthropic_sse_output(
@@ -948,6 +1141,11 @@ fn handle_anthropic_sse_data(
                         .unwrap_or_default()
                         .to_string(),
                     arguments: String::new(),
+                    signature: block
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
                 },
             );
         }
@@ -964,6 +1162,17 @@ fn handle_anthropic_sse_data(
                         if let Some(text) = delta.get("text").and_then(Value::as_str) {
                             block.text.push_str(text);
                             emit(StreamEvent::Delta(text.to_string()))?;
+                        }
+                    }
+                    "thinking_delta" => {
+                        if let Some(thinking) = delta.get("thinking").and_then(Value::as_str) {
+                            block.text.push_str(thinking);
+                            emit(StreamEvent::ReasoningDelta(thinking.to_string()))?;
+                        }
+                    }
+                    "signature_delta" => {
+                        if let Some(signature) = delta.get("signature").and_then(Value::as_str) {
+                            block.signature.push_str(signature);
                         }
                     }
                     "input_json_delta" => {
@@ -995,6 +1204,7 @@ fn handle_anthropic_sse_data(
             emit(StreamEvent::Usage {
                 input_tokens: state.input_tokens,
                 output_tokens: state.output_tokens,
+                reasoning_tokens: 0,
             })?;
             return Ok(true);
         }
@@ -1034,6 +1244,7 @@ fn emit_anthropic_message(
                 .get("output_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
+            reasoning_tokens: 0,
         })?;
     }
     Ok(output_items)
@@ -1045,6 +1256,13 @@ fn anthropic_block_to_response_item(block: AnthropicBlock) -> Option<Value> {
             "type": "message",
             "role": "assistant",
             "content": [{ "type": "output_text", "text": block.text }]
+        })),
+        // A thinking block can only be replayed to Anthropic with its signature,
+        // so drop it when the signature is missing rather than break later turns.
+        "thinking" if !block.signature.is_empty() => Some(json!({
+            "type": "thinking",
+            "thinking": block.text,
+            "signature": block.signature
         })),
         "tool_use" => Some(json!({
             "type": "function_call",
@@ -1067,6 +1285,18 @@ fn anthropic_content_block_to_response_item(block: &Value) -> Option<Value> {
             "role": "assistant",
             "content": [{ "type": "output_text", "text": block.get("text").and_then(Value::as_str).unwrap_or_default() }]
         })),
+        "thinking" => {
+            let signature = block.get("signature").and_then(Value::as_str).unwrap_or_default();
+            if signature.is_empty() {
+                None
+            } else {
+                Some(json!({
+                    "type": "thinking",
+                    "thinking": block.get("thinking").and_then(Value::as_str).unwrap_or_default(),
+                    "signature": signature
+                }))
+            }
+        }
         "tool_use" => Some(json!({
             "type": "function_call",
             "call_id": block.get("id").and_then(Value::as_str).unwrap_or_default(),
@@ -1086,11 +1316,16 @@ fn normalized_arguments(arguments: &str) -> String {
     }
 }
 
-fn extract_usage(value: &Value) -> Option<(u64, u64)> {
+fn extract_usage(value: &Value) -> Option<(u64, u64, u64)> {
     let usage = value.get("usage")?;
     let input_tokens = usage.get("input_tokens").and_then(Value::as_u64)?;
     let output_tokens = usage.get("output_tokens").and_then(Value::as_u64)?;
-    Some((input_tokens, output_tokens))
+    let reasoning_tokens = usage
+        .get("output_tokens_details")
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Some((input_tokens, output_tokens, reasoning_tokens))
 }
 
 fn truncate_error_body(body: &str) -> String {
@@ -1127,13 +1362,107 @@ mod tests {
             }),
         ];
 
-        let messages = responses_input_to_anthropic_messages(&input);
+        let messages = responses_input_to_anthropic_messages(&input, false);
 
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[1]["content"][0]["type"], "tool_use");
         assert_eq!(messages[1]["content"][0]["input"]["path"], "Cargo.toml");
         assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+    }
+
+    #[test]
+    fn replays_thinking_blocks_only_when_enabled() {
+        let input = vec![
+            json!({ "type": "thinking", "thinking": "reasoning", "signature": "sig-1" }),
+            json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read",
+                "arguments": "{}"
+            }),
+        ];
+
+        let with_thinking = responses_input_to_anthropic_messages(&input, true);
+        assert_eq!(with_thinking[0]["content"][0]["type"], "thinking");
+        assert_eq!(with_thinking[0]["content"][0]["signature"], "sig-1");
+        assert_eq!(with_thinking[0]["content"][1]["type"], "tool_use");
+
+        let without_thinking = responses_input_to_anthropic_messages(&input, false);
+        assert_eq!(without_thinking[0]["content"][0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn parses_anthropic_thinking_stream_into_reasoning_and_item() {
+        let sse = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"step one\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-xyz\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mut reasoning = String::new();
+        let items = read_anthropic_sse_output(sse.as_bytes(), |event| {
+            if let StreamEvent::ReasoningDelta(delta) = event {
+                reasoning.push_str(&delta);
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(reasoning, "step one");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "thinking");
+        assert_eq!(items[0]["signature"], "sig-xyz");
+    }
+
+    #[test]
+    fn openai_reasoning_summary_delta_emits_reasoning_event() {
+        let sse = concat!(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking...\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":7,\"output_tokens_details\":{\"reasoning_tokens\":4}}}}\n\n",
+        );
+        let mut reasoning = String::new();
+        let mut reasoning_tokens = 0;
+        let _ = read_sse_output(sse.as_bytes(), |event| {
+            match event {
+                StreamEvent::ReasoningDelta(delta) => reasoning.push_str(&delta),
+                StreamEvent::Usage {
+                    reasoning_tokens: tokens,
+                    ..
+                } => reasoning_tokens = tokens,
+                _ => {}
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(reasoning, "thinking...");
+        assert_eq!(reasoning_tokens, 4);
+    }
+
+    #[test]
+    fn stream_decode_errors_are_retryable_but_data_errors_are_not() {
+        assert!(is_stream_decode_error("Error while decoding chunks"));
+        assert!(is_stream_decode_error("connection reset by peer"));
+        assert!(is_stream_decode_error("the operation timed out"));
+        assert!(!is_stream_decode_error(
+            "{\"type\":\"response.failed\",\"response\":{}}"
+        ));
+        assert!(!is_stream_decode_error("expected value at line 1 column 1"));
+    }
+
+    #[test]
+    fn retry_policy_skips_4xx_and_allows_5xx() {
+        assert!(!is_retryable_error(&ureq::Error::Status(
+            400,
+            ureq::Response::new(400, "Bad Request", "").unwrap()
+        )));
+        assert!(is_retryable_error(&ureq::Error::Status(
+            500,
+            ureq::Response::new(500, "Server Error", "").unwrap()
+        )));
     }
 
     #[test]

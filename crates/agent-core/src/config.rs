@@ -23,6 +23,11 @@ For user-facing work, preserve the existing product language and design system. 
 
 Communicate directly and concisely. Report behavior-level changes, important risks, verification results, and any remaining gaps."#;
 const PROMPT_FILE_NAME: &str = "prompt.txt";
+const DEFAULT_RETRY_ATTEMPTS: usize = 5;
+const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_READ_TIMEOUT_SECONDS: u64 = 300;
+/// Estimated context tokens above which older turns are compacted. 0 disables it.
+const DEFAULT_COMPACTION_THRESHOLD_TOKENS: u64 = 150_000;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -35,6 +40,9 @@ pub struct Config {
     pub jucode_api_url: String,
     pub api_key_env: String,
     pub retry_attempts: usize,
+    pub connect_timeout_seconds: u64,
+    pub read_timeout_seconds: u64,
+    pub compaction_threshold_tokens: u64,
     pub include_project_instructions: bool,
     pub extensions: Vec<ExtensionConfig>,
     path: PathBuf,
@@ -75,7 +83,10 @@ impl Config {
                 jucode_web_url: "https://api.jucode.cn".to_string(),
                 jucode_api_url: "https://api.jucode.cn".to_string(),
                 api_key_env: "OPENAI_API_KEY".to_string(),
-                retry_attempts: 3,
+                retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+                connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,
+                read_timeout_seconds: DEFAULT_READ_TIMEOUT_SECONDS,
+                compaction_threshold_tokens: DEFAULT_COMPACTION_THRESHOLD_TOKENS,
                 include_project_instructions: true,
                 extensions: Vec::new(),
                 path,
@@ -125,7 +136,22 @@ impl Config {
                 default_jucode_api_url,
             )),
             api_key_env: read_api_key_env(&value),
-            retry_attempts: read_usize(&value, "retry_attempts", 3),
+            retry_attempts: read_usize(&value, "retry_attempts", DEFAULT_RETRY_ATTEMPTS),
+            connect_timeout_seconds: read_u64(
+                &value,
+                "connect_timeout_seconds",
+                DEFAULT_CONNECT_TIMEOUT_SECONDS,
+            ),
+            read_timeout_seconds: read_u64(
+                &value,
+                "read_timeout_seconds",
+                DEFAULT_READ_TIMEOUT_SECONDS,
+            ),
+            compaction_threshold_tokens: read_u64(
+                &value,
+                "compaction_threshold_tokens",
+                DEFAULT_COMPACTION_THRESHOLD_TOKENS,
+            ),
             include_project_instructions: read_bool(&value, "include_project_instructions", true),
             extensions: read_extensions(&value),
             path,
@@ -149,6 +175,9 @@ impl Config {
             "jucode_api_url": normalize_base_url(&self.jucode_api_url),
             "api_key_env": self.api_key_env,
             "retry_attempts": self.retry_attempts,
+            "connect_timeout_seconds": self.connect_timeout_seconds,
+            "read_timeout_seconds": self.read_timeout_seconds,
+            "compaction_threshold_tokens": self.compaction_threshold_tokens,
             "include_project_instructions": self.include_project_instructions,
             "extensions": self.extensions.iter().map(extension_config_value).collect::<Vec<_>>()
         });
@@ -248,6 +277,10 @@ fn read_usize(value: &Value, key: &str, default: usize) -> usize {
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(default)
+}
+
+fn read_u64(value: &Value, key: &str, default: u64) -> u64 {
+    value.get(key).and_then(Value::as_u64).unwrap_or(default)
 }
 
 fn read_bool(value: &Value, key: &str, default: bool) -> bool {

@@ -68,7 +68,17 @@ pub enum AgentEvent {
     },
     PendingMessages(Vec<String>),
     UserMessage(String),
+    /// Pre-fill the input box (e.g. with a checked-out user message).
+    FillInput(String),
+    Connecting,
+    CompactionStart,
+    CompactionEnd,
+    CompactionFailed(String),
+    ContextUsage {
+        tokens: u64,
+    },
     ThinkingStart,
+    ReasoningDelta(String),
     AssistantStart,
     AssistantDelta(String),
     Retrying {
@@ -92,6 +102,7 @@ pub enum AgentEvent {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+        reasoning_tokens: u64,
     },
     TreeView(Vec<TreeNodeView>),
     ResumeView(Vec<SessionListItemView>),

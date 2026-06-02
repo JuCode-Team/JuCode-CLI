@@ -9,7 +9,8 @@ use crate::{
         skill_message, skill_pin_message, PromptContext,
     },
     session::{
-        ContextStatistics, EntryKind, SessionStore, SessionSummary, ThreadGoal, ThreadGoalStatus,
+        compaction_summary_item, ContextStatistics, EntryKind, SessionStore, SessionSummary,
+        ThreadGoal, ThreadGoalStatus,
     },
     update::{self, UpdateNotice},
 };
@@ -21,12 +22,24 @@ use std::{
     process::Command,
     sync::mpsc::{self, Receiver},
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+/// Recent context (in estimated tokens) kept verbatim when compacting; older
+/// turns are folded into the summary.
+const COMPACTION_KEEP_RECENT_TOKENS: usize = 20_000;
 
 #[derive(Debug)]
 enum WorkerEvent {
+    CompactionStart,
+    CompactionDone {
+        summary: String,
+        replaced_through: u64,
+    },
+    CompactionFailed(String),
     CallStart,
+    Connected,
+    ReasoningDelta(String),
     Delta(String),
     Retrying {
         attempt: usize,
@@ -50,6 +63,7 @@ enum WorkerEvent {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+        reasoning_tokens: u64,
     },
     Done,
     Error(String),
@@ -223,16 +237,17 @@ impl AgentCore {
                 if label.is_empty() {
                     vec![AgentEvent::TreeView(self.session.tree_view())]
                 } else {
+                    let fill = self.session.user_content(label);
                     match self.session.checkout(label) {
                         Ok(()) => {
                             let save_event = self.save_session_event();
-                            vec![
-                                AgentEvent::Transcript(self.session.transcript_items()),
-                                AgentEvent::Status(format!("checked out {label}")),
-                            ]
-                            .into_iter()
-                            .chain(save_event)
-                            .collect()
+                            let mut events =
+                                vec![AgentEvent::Transcript(self.session.transcript_items())];
+                            if let Some(content) = fill {
+                                events.push(AgentEvent::FillInput(content));
+                            }
+                            events.push(AgentEvent::Status(format!("checked out {label}")));
+                            events.into_iter().chain(save_event).collect()
                         }
                         Err(error) => vec![AgentEvent::Error(error)],
                     }
@@ -365,7 +380,26 @@ impl AgentCore {
         if let Some(rx) = self.receiver.take() {
             while let Ok(event) = rx.try_recv() {
                 match event {
-                    WorkerEvent::CallStart => events.push(AgentEvent::ThinkingStart),
+                    WorkerEvent::CompactionStart => events.push(AgentEvent::CompactionStart),
+                    WorkerEvent::CompactionDone {
+                        summary,
+                        replaced_through,
+                    } => {
+                        self.session.apply_compaction(summary, replaced_through);
+                        events.extend(self.save_session_event());
+                        events.push(AgentEvent::CompactionEnd);
+                        events.push(AgentEvent::ContextUsage {
+                            tokens: self.session.estimated_context_tokens() as u64,
+                        });
+                    }
+                    WorkerEvent::CompactionFailed(error) => {
+                        events.push(AgentEvent::CompactionFailed(error));
+                    }
+                    WorkerEvent::CallStart => events.push(AgentEvent::Connecting),
+                    WorkerEvent::Connected => events.push(AgentEvent::ThinkingStart),
+                    WorkerEvent::ReasoningDelta(delta) => {
+                        events.push(AgentEvent::ReasoningDelta(delta))
+                    }
                     WorkerEvent::Delta(delta) => events.push(AgentEvent::AssistantDelta(delta)),
                     WorkerEvent::Retrying { attempt } => {
                         events.push(AgentEvent::Retrying { attempt });
@@ -410,6 +444,7 @@ impl AgentCore {
                     WorkerEvent::Usage {
                         input_tokens,
                         output_tokens,
+                        reasoning_tokens,
                     } => {
                         self.total_input_tokens += input_tokens;
                         self.total_output_tokens += output_tokens;
@@ -419,6 +454,7 @@ impl AgentCore {
                         events.push(AgentEvent::Usage {
                             input_tokens,
                             output_tokens,
+                            reasoning_tokens,
                         });
                     }
                     WorkerEvent::Done => {
@@ -576,6 +612,8 @@ impl AgentCore {
             api_key: self.auth.key_for(&self.config.provider),
             api_key_env: &self.config.api_key_env,
             retry_attempts: self.config.retry_attempts,
+            connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
+            read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: Some(goal_tool_tx),
         }) else {
             let mut events = save_event;
@@ -585,23 +623,50 @@ impl AgentCore {
             return events;
         };
 
-        let model_config = self.config.current_model_config();
-        let input = self
-            .session
-            .context_projection_with_budget(
-                (model_config.context_window as usize).saturating_mul(3) / 4,
-                20_000,
-            )
-            .items;
+        let request_items = self.session.request_context_items();
+        let compaction_threshold = self.config.compaction_threshold_tokens as usize;
+        let compaction = if compaction_threshold > 0
+            && self.session.estimated_context_tokens() > compaction_threshold
+        {
+            self.session.plan_compaction(COMPACTION_KEEP_RECENT_TOKENS)
+        } else {
+            None
+        };
+        let mut events = save_event;
+        events.push(AgentEvent::ContextUsage {
+            tokens: self.session.estimated_context_tokens() as u64,
+        });
         let cwd = self.cwd.clone();
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
         self.running = true;
 
         thread::spawn(move || {
+            let input = if let Some(plan) = compaction {
+                let _ = tx.send(WorkerEvent::CompactionStart);
+                match client.summarize(&plan.folded_text) {
+                    Ok(summary) => {
+                        let _ = tx.send(WorkerEvent::CompactionDone {
+                            summary: summary.clone(),
+                            replaced_through: plan.replaced_through,
+                        });
+                        let mut items = vec![compaction_summary_item(&summary)];
+                        items.extend(plan.kept_items);
+                        items
+                    }
+                    Err(error) => {
+                        let _ = tx.send(WorkerEvent::CompactionFailed(error));
+                        request_items
+                    }
+                }
+            } else {
+                request_items
+            };
             let result = client.run_turn_events(input, &cwd, |event| {
                 let mapped = match event {
                     StreamEvent::CallStart => WorkerEvent::CallStart,
+                    StreamEvent::Connected => WorkerEvent::Connected,
+                    StreamEvent::ReasoningDelta(delta) => WorkerEvent::ReasoningDelta(delta),
                     StreamEvent::Delta(delta) => WorkerEvent::Delta(delta),
                     StreamEvent::Retrying { attempt } => WorkerEvent::Retrying { attempt },
                     StreamEvent::ResponseItem(item) => WorkerEvent::ResponseItem(item),
@@ -631,9 +696,11 @@ impl AgentCore {
                     StreamEvent::Usage {
                         input_tokens,
                         output_tokens,
+                        reasoning_tokens,
                     } => WorkerEvent::Usage {
                         input_tokens,
                         output_tokens,
+                        reasoning_tokens,
                     },
                 };
                 tx.send(mapped).map_err(|error| error.to_string())
@@ -649,7 +716,6 @@ impl AgentCore {
             }
         });
 
-        let mut events = save_event;
         events.extend([
             AgentEvent::AssistantStart,
             AgentEvent::Status("streaming".to_string()),

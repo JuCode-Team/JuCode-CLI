@@ -44,6 +44,23 @@ pub enum EntryKind {
     GoalContext {
         content: String,
     },
+    /// Marks that all branch entries up to and including `replaced_through` have
+    /// been folded into `summary`. Projections emit the summary in place of those
+    /// entries and keep everything after it verbatim.
+    Compaction {
+        summary: String,
+        replaced_through: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct CompactionPlan {
+    /// Rendered text of the prior summary plus the turns being folded.
+    pub folded_text: String,
+    /// Recent context items kept verbatim after the fold point.
+    pub kept_items: Vec<Value>,
+    /// Id of the last entry folded into the new summary.
+    pub replaced_through: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +276,15 @@ impl SessionStore {
         self.leaf_id
     }
 
+    /// User message content for an entry label (e.g. "e3"), if it names a user node.
+    pub fn user_content(&self, label: &str) -> Option<String> {
+        let id = parse_entry_id(label)?;
+        match &self.entry(id)?.kind {
+            EntryKind::User { content } => Some(content.clone()),
+            _ => None,
+        }
+    }
+
     pub fn append(&mut self, kind: EntryKind) -> EntryId {
         let id = EntryId(self.next_id);
         self.next_id += 1;
@@ -364,6 +390,146 @@ impl SessionStore {
         path
     }
 
+    /// Latest persisted compaction summary on the active branch and the branch
+    /// index after which entries are kept verbatim.
+    fn compaction_view<'a>(&self, branch: &[&'a SessionEntry]) -> (Option<String>, usize) {
+        let mut summary = None;
+        let mut keep_after = 0;
+        for entry in branch {
+            if let EntryKind::Compaction {
+                summary: text,
+                replaced_through,
+            } = &entry.kind
+            {
+                summary = Some(text.clone());
+                let target = EntryId(*replaced_through);
+                keep_after = branch
+                    .iter()
+                    .position(|candidate| candidate.id == target)
+                    .map(|position| position + 1)
+                    .unwrap_or(0);
+            }
+        }
+        (summary, keep_after)
+    }
+
+    /// Context items actually sent to the model: the latest compaction summary (if
+    /// any) followed by every non-folded, non-compaction entry on the branch.
+    pub fn request_context_items(&self) -> Vec<Value> {
+        let branch = self.branch();
+        let (summary, keep_after) = self.compaction_view(&branch);
+        let mut items = Vec::new();
+        if let Some(summary) = &summary {
+            items.push(compaction_summary_item(summary));
+        }
+        for (index, entry) in branch.iter().enumerate() {
+            if index < keep_after || matches!(entry.kind, EntryKind::Compaction { .. }) {
+                continue;
+            }
+            if let Some(item) = context_item_for_entry(entry) {
+                items.push(item);
+            }
+        }
+        sanitize_tool_pairs(items)
+    }
+
+    pub fn estimated_context_tokens(&self) -> usize {
+        estimate_items_tokens(self.request_context_items().iter())
+    }
+
+    /// Plan a compaction that folds older turns (keeping roughly the most recent
+    /// `keep_recent_tokens` of context verbatim) into a single summary. Returns
+    /// None when there is nothing older to fold.
+    pub fn plan_compaction(&self, keep_recent_tokens: usize) -> Option<CompactionPlan> {
+        let branch = self.branch();
+        let (summary, keep_after) = self.compaction_view(&branch);
+        let kept: Vec<&SessionEntry> = branch
+            .iter()
+            .enumerate()
+            .filter(|(index, entry)| {
+                *index >= keep_after && !matches!(entry.kind, EntryKind::Compaction { .. })
+            })
+            .map(|(_, entry)| *entry)
+            .collect();
+
+        // Walk from the newest kept entry, keeping recent turns within the budget;
+        // everything older is folded.
+        let mut fold_end = kept.len();
+        let mut tail_tokens = 0usize;
+        for index in (0..kept.len()).rev() {
+            let tokens = context_item_for_entry(kept[index])
+                .map(|item| estimate_item_tokens(&item))
+                .unwrap_or(0);
+            if fold_end != kept.len() && tail_tokens + tokens > keep_recent_tokens {
+                break;
+            }
+            tail_tokens += tokens;
+            fold_end = index;
+        }
+
+        // Never split a tool group: if the kept tail would start with a
+        // function_call_output whose function_call is being folded, fold that
+        // output too (so it goes into the summary instead of becoming an orphan).
+        let folded_calls: HashSet<&str> = kept[..fold_end]
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::ResponseItem { item }
+                    if item.get("type").and_then(Value::as_str) == Some("function_call") =>
+                {
+                    item.get("call_id").and_then(Value::as_str)
+                }
+                _ => None,
+            })
+            .collect();
+        while fold_end < kept.len() {
+            let orphan_output = matches!(
+                &kept[fold_end].kind,
+                EntryKind::ToolOutput { call_id, .. } if folded_calls.contains(call_id.as_str())
+            );
+            if orphan_output {
+                fold_end += 1;
+            } else {
+                break;
+            }
+        }
+
+        let fold = &kept[..fold_end];
+        let replaced_through = fold.last()?.id.0;
+
+        let mut folded_text = String::new();
+        if let Some(summary) = &summary {
+            folded_text.push_str("Earlier summary:\n");
+            folded_text.push_str(summary);
+            folded_text.push_str("\n\n");
+        }
+        for entry in fold {
+            if let Some(rendered) = render_entry_for_summary(entry) {
+                folded_text.push_str(&rendered);
+                folded_text.push('\n');
+            }
+        }
+
+        let kept_items = sanitize_tool_pairs(
+            kept[fold_end..]
+                .iter()
+                .filter_map(|entry| context_item_for_entry(entry))
+                .collect(),
+        );
+
+        Some(CompactionPlan {
+            folded_text,
+            kept_items,
+            replaced_through,
+        })
+    }
+
+    pub fn apply_compaction(&mut self, summary: String, replaced_through: u64) -> EntryId {
+        self.append(EntryKind::Compaction {
+            summary,
+            replaced_through,
+        })
+    }
+
     #[cfg(test)]
     pub fn context_projection(&self) -> ContextProjection {
         self.context_projection_with_budget(usize::MAX, usize::MAX)
@@ -375,13 +541,27 @@ impl SessionStore {
         keep_recent_tokens: usize,
     ) -> ContextProjection {
         let branch = self.branch();
+        let (persisted_summary, keep_after) = self.compaction_view(&branch);
         let mut entries = branch
             .iter()
-            .filter_map(|entry| context_item_for_entry(entry).map(|item| (*entry, item)))
+            .enumerate()
+            .filter(|(index, entry)| {
+                *index >= keep_after && !matches!(entry.kind, EntryKind::Compaction { .. })
+            })
+            .filter_map(|(_, entry)| context_item_for_entry(entry).map(|item| (*entry, item)))
             .collect::<Vec<_>>();
-        let full_tokens = estimate_items_tokens(entries.iter().map(|(_, item)| item));
-        let compacted = full_tokens > max_tokens && entries.len() > 4;
-        let items = if compacted {
+        let summary_item = persisted_summary
+            .as_deref()
+            .map(compaction_summary_item);
+        let summary_tokens = summary_item
+            .as_ref()
+            .map(estimate_item_tokens)
+            .unwrap_or(0);
+        let full_tokens =
+            summary_tokens + estimate_items_tokens(entries.iter().map(|(_, item)| item));
+        let heuristic = full_tokens > max_tokens && entries.len() > 4;
+        let compacted = heuristic || persisted_summary.is_some();
+        let items = if heuristic {
             let mut tail = Vec::new();
             let mut tail_tokens = 0usize;
             while let Some((entry, item)) = entries.pop() {
@@ -409,6 +589,14 @@ impl SessionStore {
                 .into_iter()
                 .map(|(_, item)| item)
                 .collect::<Vec<_>>()
+        };
+        let items = match summary_item {
+            Some(summary_item) => {
+                let mut combined = vec![summary_item];
+                combined.extend(items);
+                combined
+            }
+            None => items,
         };
         ContextProjection {
             branch_entries: branch.len(),
@@ -508,6 +696,7 @@ impl SessionStore {
                 }),
                 EntryKind::PinnedSkill { .. } => None,
                 EntryKind::GoalContext { .. } => None,
+                EntryKind::Compaction { .. } => None,
             })
             .collect()
     }
@@ -879,9 +1068,80 @@ fn write_json_line(file: &mut fs::File, value: &Value) -> io::Result<()> {
     file.write_all(b"\n")
 }
 
+/// Drop tool-call items that would be invalid input: a `function_call_output`
+/// without its `function_call`, or a `function_call` without its output. The
+/// Responses API rejects either, and context assembly (compaction, checkout to a
+/// mid-turn point, partial saves) can otherwise leave such orphans.
+fn sanitize_tool_pairs(items: Vec<Value>) -> Vec<Value> {
+    let mut calls = HashSet::new();
+    let mut outputs = HashSet::new();
+    for item in &items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                if let Some(id) = item.get("call_id").and_then(Value::as_str) {
+                    calls.insert(id.to_string());
+                }
+            }
+            Some("function_call_output") => {
+                if let Some(id) = item.get("call_id").and_then(Value::as_str) {
+                    outputs.insert(id.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    items
+        .into_iter()
+        .filter(|item| {
+            let call_id = item.get("call_id").and_then(Value::as_str);
+            match item.get("type").and_then(Value::as_str) {
+                Some("function_call") => call_id.is_some_and(|id| outputs.contains(id)),
+                Some("function_call_output") => call_id.is_some_and(|id| calls.contains(id)),
+                _ => true,
+            }
+        })
+        .collect()
+}
+
+pub fn compaction_summary_item(summary: &str) -> Value {
+    json!({
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": format!("[Earlier conversation compacted to a summary for context efficiency]\n\n{summary}")
+        }]
+    })
+}
+
+fn render_entry_for_summary(entry: &SessionEntry) -> Option<String> {
+    match &entry.kind {
+        EntryKind::User { content } => Some(format!("User: {content}")),
+        EntryKind::ResponseItem { item } => {
+            if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+                let args = item.get("arguments").and_then(Value::as_str).unwrap_or("");
+                Some(format!("Assistant tool call {name}: {args}"))
+            } else {
+                let text = extract_response_text(item);
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(format!("Assistant: {text}"))
+                }
+            }
+        }
+        EntryKind::ToolOutput { name, output, .. } => {
+            Some(format!("Tool {name} output: {output}"))
+        }
+        EntryKind::PinnedSkill { name, .. } => Some(format!("(pinned skill: {name})")),
+        EntryKind::GoalContext { content } => Some(format!("Goal context: {content}")),
+        EntryKind::Branch { .. } | EntryKind::Compaction { .. } => None,
+    }
+}
+
 fn context_item_for_entry(entry: &SessionEntry) -> Option<Value> {
     match &entry.kind {
-        EntryKind::Branch { .. } => None,
+        EntryKind::Branch { .. } | EntryKind::Compaction { .. } => None,
         EntryKind::User { content } => Some(json!({
             "role": "user",
             "content": [{ "type": "input_text", "text": content }]
@@ -924,6 +1184,7 @@ fn count_context_entry(kind: &EntryKind, counts: &mut ContextEntryCounts) {
         EntryKind::ToolOutput { .. } => counts.tool_outputs += 1,
         EntryKind::PinnedSkill { .. } => counts.pinned_skills += 1,
         EntryKind::GoalContext { .. } => counts.users += 1,
+        EntryKind::Compaction { .. } => {}
     }
 }
 
@@ -946,6 +1207,7 @@ fn context_entry_label(entry: &SessionEntry) -> String {
         EntryKind::ToolOutput { name, .. } => format!("tool output:{name}"),
         EntryKind::PinnedSkill { name, .. } => format!("pinned skill:{name}"),
         EntryKind::GoalContext { .. } => "goal context".to_string(),
+        EntryKind::Compaction { .. } => "compaction".to_string(),
     }
 }
 
@@ -978,7 +1240,7 @@ fn summarize_compacted_entries<'a>(entries: impl Iterator<Item = &'a SessionEntr
                 tool_calls.push(format!("pinned skill:{name}"));
             }
             EntryKind::GoalContext { .. } => {}
-            EntryKind::Branch { .. } => {}
+            EntryKind::Branch { .. } | EntryKind::Compaction { .. } => {}
         }
     }
     tool_calls.sort();
@@ -1052,6 +1314,14 @@ fn entry_to_json(entry: &SessionEntry) -> Value {
             json!({ "type": "pinned_skill", "name": name, "content": content })
         }
         EntryKind::GoalContext { content } => json!({ "type": "goal_context", "content": content }),
+        EntryKind::Compaction {
+            summary,
+            replaced_through,
+        } => json!({
+            "type": "compaction",
+            "summary": summary,
+            "replaced_through": replaced_through
+        }),
     };
     json!({
         "id": entry.id.0,
@@ -1086,6 +1356,10 @@ fn entry_from_json(value: &Value) -> Option<SessionEntry> {
         },
         "goal_context" => EntryKind::GoalContext {
             content: kind_value.get("content")?.as_str()?.to_string(),
+        },
+        "compaction" => EntryKind::Compaction {
+            summary: kind_value.get("summary")?.as_str()?.to_string(),
+            replaced_through: kind_value.get("replaced_through")?.as_u64()?,
         },
         _ => return None,
     };
@@ -1299,6 +1573,144 @@ mod tests {
             .to_string()
             .contains("CONVERSATION HISTORY SUMMARY"));
         assert!(projection.items.len() < session.context_projection().items.len());
+    }
+
+    #[test]
+    fn persisted_compaction_folds_older_turns_and_keeps_recent() {
+        let mut session = SessionStore::new();
+        for index in 0..6 {
+            session.append(EntryKind::User {
+                content: format!("turn {index} {}", "x".repeat(200)),
+            });
+        }
+        let before_items = session.request_context_items().len();
+        let before_tokens = session.estimated_context_tokens();
+
+        let plan = session
+            .plan_compaction(80)
+            .expect("older turns should be foldable");
+        assert!(plan.folded_text.contains("User: turn 0"));
+        session.apply_compaction("ROLLED UP SUMMARY".to_string(), plan.replaced_through);
+
+        let items = session.request_context_items();
+        assert!(items[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ROLLED UP SUMMARY"));
+        assert!(items.len() < before_items);
+        assert!(session.estimated_context_tokens() < before_tokens);
+    }
+
+    #[test]
+    fn user_content_resolves_only_user_nodes() {
+        let mut session = SessionStore::new();
+        let user = session.append(EntryKind::User {
+            content: "please resend".to_string(),
+        });
+        let response = session.append(EntryKind::ResponseItem {
+            item: json!({ "type": "message" }),
+        });
+
+        assert_eq!(
+            session.user_content(&user.display()).as_deref(),
+            Some("please resend")
+        );
+        assert_eq!(session.user_content(&response.display()), None);
+        assert_eq!(session.user_content("nope"), None);
+    }
+
+    #[test]
+    fn sanitize_drops_orphan_tool_call_items() {
+        let items = vec![
+            json!({ "type": "function_call", "call_id": "a", "name": "read", "arguments": "{}" }),
+            json!({ "type": "function_call_output", "call_id": "a", "output": "ok" }),
+            json!({ "type": "function_call_output", "call_id": "b", "output": "orphan" }),
+            json!({ "type": "function_call", "call_id": "c", "name": "read", "arguments": "{}" }),
+            json!({ "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }),
+        ];
+
+        let out = sanitize_tool_pairs(items);
+
+        assert_eq!(out.len(), 3);
+        assert!(out
+            .iter()
+            .any(|item| item["type"] == "function_call" && item["call_id"] == "a"));
+        assert!(out
+            .iter()
+            .any(|item| item["type"] == "function_call_output" && item["call_id"] == "a"));
+        assert!(!out.iter().any(|item| item["call_id"] == "b"));
+        assert!(!out.iter().any(|item| item["call_id"] == "c"));
+    }
+
+    fn tool_pairs_balanced(items: &[Value]) -> bool {
+        let calls: std::collections::HashSet<&str> = items
+            .iter()
+            .filter(|item| item["type"] == "function_call")
+            .filter_map(|item| item["call_id"].as_str())
+            .collect();
+        items
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .all(|item| item["call_id"].as_str().is_some_and(|id| calls.contains(id)))
+    }
+
+    #[test]
+    fn compaction_never_splits_parallel_tool_groups() {
+        let mut session = SessionStore::new();
+        for turn in 0..4 {
+            session.append(EntryKind::User {
+                content: format!("turn {turn} {}", "x".repeat(60)),
+            });
+            session.append(EntryKind::ResponseItem {
+                item: json!({ "type": "function_call", "call_id": format!("a{turn}"), "name": "read", "arguments": "{}" }),
+            });
+            session.append(EntryKind::ResponseItem {
+                item: json!({ "type": "function_call", "call_id": format!("b{turn}"), "name": "read", "arguments": "{}" }),
+            });
+            session.append(EntryKind::ToolOutput {
+                call_id: format!("a{turn}"),
+                name: "read".to_string(),
+                output: "x".repeat(60),
+            });
+            session.append(EntryKind::ToolOutput {
+                call_id: format!("b{turn}"),
+                name: "read".to_string(),
+                output: "x".repeat(60),
+            });
+            session.append(EntryKind::ResponseItem {
+                item: json!({ "type": "message", "content": [{ "type": "output_text", "text": "ok" }] }),
+            });
+        }
+
+        // Across many keep-recent budgets the fold boundary must never leave a
+        // function_call_output without its function_call.
+        for keep in [10usize, 30, 60, 120, 240, 400] {
+            if let Some(plan) = session.plan_compaction(keep) {
+                assert!(
+                    tool_pairs_balanced(&plan.kept_items),
+                    "keep_recent={keep} produced an orphan tool output"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn persisted_compaction_survives_journal_round_trip() {
+        let mut session = SessionStore::new();
+        session.append(EntryKind::User {
+            content: "older".to_string(),
+        });
+        let replaced = session.append(EntryKind::User {
+            content: "boundary".to_string(),
+        });
+        session.append(EntryKind::User {
+            content: "recent".to_string(),
+        });
+        session.apply_compaction("SUMMARY".to_string(), replaced.0);
+
+        let value = entry_to_json(session.branch().last().unwrap());
+        let restored = entry_from_json(&value).expect("compaction entry round-trips");
+        assert!(matches!(restored.kind, EntryKind::Compaction { .. }));
     }
 
     #[test]

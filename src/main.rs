@@ -124,7 +124,20 @@ fn event_json(event: AgentEvent) -> Value {
             json!({ "type": "pending_messages", "messages": messages })
         }
         AgentEvent::UserMessage(content) => json!({ "type": "user_message", "content": content }),
+        AgentEvent::FillInput(content) => json!({ "type": "fill_input", "content": content }),
+        AgentEvent::Connecting => json!({ "type": "connecting" }),
+        AgentEvent::CompactionStart => json!({ "type": "compaction_start" }),
+        AgentEvent::CompactionEnd => json!({ "type": "compaction_end" }),
+        AgentEvent::CompactionFailed(error) => {
+            json!({ "type": "compaction_failed", "error": error })
+        }
+        AgentEvent::ContextUsage { tokens } => {
+            json!({ "type": "context_usage", "tokens": tokens })
+        }
         AgentEvent::ThinkingStart => json!({ "type": "thinking_start" }),
+        AgentEvent::ReasoningDelta(delta) => {
+            json!({ "type": "reasoning_delta", "delta": delta })
+        }
         AgentEvent::AssistantStart => json!({ "type": "assistant_start" }),
         AgentEvent::AssistantDelta(delta) => {
             json!({ "type": "assistant_delta", "delta": delta })
@@ -155,8 +168,9 @@ fn event_json(event: AgentEvent) -> Value {
         AgentEvent::Usage {
             input_tokens,
             output_tokens,
+            reasoning_tokens,
         } => {
-            json!({ "type": "usage", "input_tokens": input_tokens, "output_tokens": output_tokens })
+            json!({ "type": "usage", "input_tokens": input_tokens, "output_tokens": output_tokens, "reasoning_tokens": reasoning_tokens })
         }
         AgentEvent::TreeView(nodes) => json!({
             "type": "tree_view",

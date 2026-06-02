@@ -29,6 +29,8 @@ const PASTE_BURST_IDLE_TIMEOUT: Duration = Duration::from_millis(8);
 const PASTE_BURST_IDLE_TIMEOUT: Duration = Duration::from_millis(60);
 const CURSOR_MARKER: &str = "\x1b_jucode:cursor\x07";
 const VISIBLE_CURSOR: &str = "|";
+const SELECT_START: &str = "\x1b[7m";
+const SELECT_END: &str = "\x1b[27m";
 const HIDE_CURSOR: &str = "\x1b[?25l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
 const SHOW_HARDWARE_CURSOR: bool = false;
@@ -60,6 +62,10 @@ enum ChatLine {
     },
     User(String),
     Assistant(String),
+    Reasoning {
+        text: String,
+        collapsed: bool,
+    },
     Tool {
         call_id: Option<String>,
         name: String,
@@ -75,6 +81,7 @@ enum UiKind {
     Brand,
     User,
     Assistant,
+    ToolHeader,
     Tool,
     System,
     Error,
@@ -124,6 +131,7 @@ struct BottomStatus<'a> {
     reasoning_effort: &'a str,
     input_tokens: u64,
     output_tokens: u64,
+    context_tokens: u64,
     context_window: u64,
 }
 
@@ -273,6 +281,8 @@ pub struct TuiApp<R> {
     paste_burst: PasteBurst,
     chat: Vec<ChatLine>,
     live_assistant: Option<String>,
+    reasoning_index: Option<usize>,
+    thinking_tokens: u64,
     status: String,
     provider: String,
     model: String,
@@ -282,6 +292,7 @@ pub struct TuiApp<R> {
     reasoning_efforts: Vec<String>,
     total_input_tokens: u64,
     total_output_tokens: u64,
+    current_context_tokens: u64,
     activity: ActivityState,
     commands: Vec<CommandCandidate>,
     completion_index: usize,
@@ -292,32 +303,37 @@ pub struct TuiApp<R> {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct InputBuffer {
-    chunks: Vec<InputChunk>,
+    cells: Vec<Cell>,
+    cursor: usize,
+    anchor: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum InputChunk {
-    Text(String),
+enum Cell {
+    Char(char),
     LargePaste(String),
 }
 
 impl InputBuffer {
     fn text(&self) -> String {
-        self.chunks
-            .iter()
-            .map(|chunk| match chunk {
-                InputChunk::Text(text) | InputChunk::LargePaste(text) => text.as_str(),
-            })
-            .collect()
+        let mut text = String::new();
+        for cell in &self.cells {
+            match cell {
+                Cell::Char(ch) => text.push(*ch),
+                Cell::LargePaste(paste) => text.push_str(paste),
+            }
+        }
+        text
     }
 
+    #[cfg(test)]
     fn display_text(&self) -> String {
         let mut display = String::new();
-        for chunk in &self.chunks {
-            match chunk {
-                InputChunk::Text(text) => display.push_str(text),
-                InputChunk::LargePaste(text) => {
-                    let char_count = text.chars().count();
+        for cell in &self.cells {
+            match cell {
+                Cell::Char(ch) => display.push(*ch),
+                Cell::LargePaste(paste) => {
+                    let char_count = paste.chars().count();
                     display.push_str(&format!("[Pasted: {char_count} chars]"));
                 }
             }
@@ -325,48 +341,291 @@ impl InputBuffer {
         display
     }
 
+    /// Display string for the UI. The hardware cursor marker is embedded at the
+    /// cursor position; the cell under the cursor is rendered as a reverse-video
+    /// block (an overwrite-style caret) and any active selection is reverse-video
+    /// highlighted. Selection styling is closed and reopened around newlines so
+    /// every logical line stays balanced.
+    fn render(&self, show_cursor: bool) -> String {
+        let selection = if show_cursor { self.selection() } else { None };
+        let mut out = String::new();
+        let mut in_selection = false;
+        for index in 0..=self.cells.len() {
+            if let Some((_, end)) = selection {
+                if in_selection && index == end {
+                    out.push_str(SELECT_END);
+                    in_selection = false;
+                }
+            }
+            if show_cursor && index == self.cursor {
+                out.push_str(CURSOR_MARKER);
+            }
+            if let Some((start, end)) = selection {
+                if index == start && start != end {
+                    out.push_str(SELECT_START);
+                    in_selection = true;
+                }
+            }
+            // Block caret on the cell under the cursor (only when nothing is selected,
+            // so it does not double up with the selection highlight).
+            let block_caret = show_cursor && selection.is_none() && index == self.cursor;
+            let Some(cell) = self.cells.get(index) else {
+                if block_caret {
+                    out.push_str(SELECT_START);
+                    out.push(' ');
+                    out.push_str(SELECT_END);
+                }
+                continue;
+            };
+            match cell {
+                Cell::Char('\n') => {
+                    if block_caret {
+                        out.push_str(SELECT_START);
+                        out.push(' ');
+                        out.push_str(SELECT_END);
+                    }
+                    if in_selection {
+                        out.push_str(SELECT_END);
+                    }
+                    out.push('\n');
+                    if in_selection {
+                        out.push_str(SELECT_START);
+                    }
+                }
+                Cell::Char(ch) => {
+                    if block_caret {
+                        out.push_str(SELECT_START);
+                        out.push(*ch);
+                        out.push_str(SELECT_END);
+                    } else {
+                        out.push(*ch);
+                    }
+                }
+                Cell::LargePaste(paste) => {
+                    let char_count = paste.chars().count();
+                    let placeholder = format!("[Pasted: {char_count} chars]");
+                    if block_caret {
+                        out.push_str(SELECT_START);
+                        out.push_str(&placeholder);
+                        out.push_str(SELECT_END);
+                    } else {
+                        out.push_str(&placeholder);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Normalized selection range `[start, end)` over cell indices, or `None` when empty.
+    fn selection(&self) -> Option<(usize, usize)> {
+        let anchor = self.anchor?;
+        if anchor == self.cursor {
+            None
+        } else {
+            Some((anchor.min(self.cursor), anchor.max(self.cursor)))
+        }
+    }
+
+    fn has_selection(&self) -> bool {
+        self.selection().is_some()
+    }
+
     fn clear(&mut self) {
-        self.chunks.clear();
+        self.cells.clear();
+        self.cursor = 0;
+        self.anchor = None;
     }
 
     fn push_char(&mut self, ch: char) {
-        self.push_text(&ch.to_string());
+        self.delete_selection();
+        self.cells.insert(self.cursor, Cell::Char(ch));
+        self.cursor += 1;
     }
 
     fn push_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
-        match self.chunks.last_mut() {
-            Some(InputChunk::Text(existing)) => existing.push_str(text),
-            _ => self.chunks.push(InputChunk::Text(text.to_string())),
+        self.delete_selection();
+        for ch in text.chars() {
+            self.cells.insert(self.cursor, Cell::Char(ch));
+            self.cursor += 1;
         }
     }
 
     fn push_paste(&mut self, text: &str) {
         let text = normalize_pasted_text(text);
         if text.chars().count() > PASTE_PLACEHOLDER_CHARS {
-            self.chunks.push(InputChunk::LargePaste(text));
+            self.delete_selection();
+            self.cells.insert(self.cursor, Cell::LargePaste(text));
+            self.cursor += 1;
         } else {
             self.push_text(&text);
         }
     }
 
+    /// Backspace: delete the selection if any, otherwise the cell before the cursor.
     fn pop(&mut self) {
-        let Some(chunk) = self.chunks.last_mut() else {
+        if self.delete_selection() {
             return;
+        }
+        if self.cursor == 0 {
+            return;
+        }
+        self.cursor -= 1;
+        self.cells.remove(self.cursor);
+    }
+
+    /// Delete key: delete the selection if any, otherwise the cell at the cursor.
+    fn delete_forward(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        if self.cursor < self.cells.len() {
+            self.cells.remove(self.cursor);
+        }
+    }
+
+    /// Remove the selected range and collapse the cursor to its start.
+    fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection() else {
+            self.anchor = None;
+            return false;
         };
-        match chunk {
-            InputChunk::Text(text) => {
-                text.pop();
-                if text.is_empty() {
-                    self.chunks.pop();
-                }
+        self.cells.drain(start..end);
+        self.cursor = start;
+        self.anchor = None;
+        true
+    }
+
+    fn set_cursor(&mut self, position: usize, extend: bool) {
+        if extend {
+            if self.anchor.is_none() {
+                self.anchor = Some(self.cursor);
             }
-            InputChunk::LargePaste(_) => {
-                self.chunks.pop();
+        } else {
+            self.anchor = None;
+        }
+        self.cursor = position.min(self.cells.len());
+        if self.anchor == Some(self.cursor) {
+            self.anchor = None;
+        }
+    }
+
+    fn move_left(&mut self, extend: bool) {
+        if !extend {
+            if let Some((start, _)) = self.selection() {
+                self.cursor = start;
+                self.anchor = None;
+                return;
             }
         }
+        self.set_cursor(self.cursor.saturating_sub(1), extend);
+    }
+
+    fn move_right(&mut self, extend: bool) {
+        if !extend {
+            if let Some((_, end)) = self.selection() {
+                self.cursor = end;
+                self.anchor = None;
+                return;
+            }
+        }
+        self.set_cursor(self.cursor + 1, extend);
+    }
+
+    fn move_home(&mut self, extend: bool) {
+        self.set_cursor(self.line_start(self.cursor), extend);
+    }
+
+    fn move_end(&mut self, extend: bool) {
+        self.set_cursor(self.line_end(self.cursor), extend);
+    }
+
+    fn move_document_start(&mut self, extend: bool) {
+        self.set_cursor(0, extend);
+    }
+
+    fn move_document_end(&mut self, extend: bool) {
+        self.set_cursor(self.cells.len(), extend);
+    }
+
+    fn move_up(&mut self, extend: bool) {
+        let start = self.line_start(self.cursor);
+        if start == 0 {
+            self.set_cursor(0, extend);
+            return;
+        }
+        let column = self.cursor - start;
+        let prev_newline = start - 1;
+        let prev_start = self.line_start(prev_newline);
+        let prev_len = prev_newline - prev_start;
+        self.set_cursor(prev_start + column.min(prev_len), extend);
+    }
+
+    fn move_down(&mut self, extend: bool) {
+        let start = self.line_start(self.cursor);
+        let end = self.line_end(self.cursor);
+        if end >= self.cells.len() {
+            self.set_cursor(self.cells.len(), extend);
+            return;
+        }
+        let column = self.cursor - start;
+        let next_start = end + 1;
+        let next_end = self.line_end(next_start);
+        let next_len = next_end - next_start;
+        self.set_cursor(next_start + column.min(next_len), extend);
+    }
+
+    fn move_word_left(&mut self, extend: bool) {
+        let mut position = self.cursor;
+        while position > 0 && self.is_word_separator(position - 1) {
+            position -= 1;
+        }
+        while position > 0 && !self.is_word_separator(position - 1) {
+            position -= 1;
+        }
+        self.set_cursor(position, extend);
+    }
+
+    fn move_word_right(&mut self, extend: bool) {
+        let len = self.cells.len();
+        let mut position = self.cursor;
+        while position < len && self.is_word_separator(position) {
+            position += 1;
+        }
+        while position < len && !self.is_word_separator(position) {
+            position += 1;
+        }
+        self.set_cursor(position, extend);
+    }
+
+    fn is_word_separator(&self, index: usize) -> bool {
+        matches!(self.cells.get(index), Some(Cell::Char(ch)) if ch.is_whitespace())
+    }
+
+    /// Index of the first cell on the line containing `position`.
+    fn line_start(&self, position: usize) -> usize {
+        let mut start = 0;
+        for index in 0..position {
+            if matches!(self.cells.get(index), Some(Cell::Char('\n'))) {
+                start = index + 1;
+            }
+        }
+        start
+    }
+
+    /// Index of the newline (or buffer end) terminating the line containing `position`.
+    fn line_end(&self, position: usize) -> usize {
+        let mut index = position;
+        while index < self.cells.len() {
+            if matches!(self.cells[index], Cell::Char('\n')) {
+                break;
+            }
+            index += 1;
+        }
+        index
     }
 }
 
@@ -573,6 +832,8 @@ enum TreePromptAction {
 enum ActivityKind {
     Idle,
     Connecting,
+    Compacting,
+    Thinking,
     Reconnecting { attempt: usize },
     Output,
     Tool,
@@ -655,6 +916,8 @@ impl<R: TuiRuntime> TuiApp<R> {
             paste_burst: PasteBurst::default(),
             chat: Vec::new(),
             live_assistant: None,
+            reasoning_index: None,
+            thinking_tokens: 0,
             status: "ready".to_string(),
             provider: "unknown".to_string(),
             model: "unknown".to_string(),
@@ -664,6 +927,7 @@ impl<R: TuiRuntime> TuiApp<R> {
             reasoning_efforts: vec!["medium".to_string()],
             total_input_tokens: 0,
             total_output_tokens: 0,
+            current_context_tokens: 0,
             activity: ActivityState::idle(),
             commands: default_commands(),
             completion_index: 0,
@@ -772,6 +1036,10 @@ impl<R: TuiRuntime> TuiApp<R> {
                 if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 if ch.is_ascii() {
+                    if self.input.has_selection() {
+                        self.input.delete_selection();
+                        self.clamp_completion_index();
+                    }
                     match self.paste_burst.on_plain_ascii_char(ch, now) {
                         PasteCharDecision::RetainFirstChar => {}
                         PasteCharDecision::BeginBufferFromPending
@@ -799,6 +1067,8 @@ impl<R: TuiRuntime> TuiApp<R> {
                     if count > 0 {
                         self.completion_index = (self.completion_index + count - 1) % count;
                     }
+                } else {
+                    self.input.move_up(modifiers.contains(KeyModifiers::SHIFT));
                 }
                 false
             }
@@ -809,7 +1079,55 @@ impl<R: TuiRuntime> TuiApp<R> {
                     if count > 0 {
                         self.completion_index = (self.completion_index + 1) % count;
                     }
+                } else {
+                    self.input.move_down(modifiers.contains(KeyModifiers::SHIFT));
                 }
+                false
+            }
+            KeyCode::Left => {
+                self.flush_paste_burst_before_non_plain_input();
+                let extend = modifiers.contains(KeyModifiers::SHIFT);
+                if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                    self.input.move_word_left(extend);
+                } else {
+                    self.input.move_left(extend);
+                }
+                false
+            }
+            KeyCode::Right => {
+                self.flush_paste_burst_before_non_plain_input();
+                let extend = modifiers.contains(KeyModifiers::SHIFT);
+                if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                    self.input.move_word_right(extend);
+                } else {
+                    self.input.move_right(extend);
+                }
+                false
+            }
+            KeyCode::Home => {
+                self.flush_paste_burst_before_non_plain_input();
+                let extend = modifiers.contains(KeyModifiers::SHIFT);
+                if modifiers.contains(KeyModifiers::CONTROL) {
+                    self.input.move_document_start(extend);
+                } else {
+                    self.input.move_home(extend);
+                }
+                false
+            }
+            KeyCode::End => {
+                self.flush_paste_burst_before_non_plain_input();
+                let extend = modifiers.contains(KeyModifiers::SHIFT);
+                if modifiers.contains(KeyModifiers::CONTROL) {
+                    self.input.move_document_end(extend);
+                } else {
+                    self.input.move_end(extend);
+                }
+                false
+            }
+            KeyCode::Delete => {
+                self.flush_paste_burst_before_non_plain_input();
+                self.input.delete_forward();
+                self.clamp_completion_index();
                 false
             }
             KeyCode::Tab => {
@@ -1106,24 +1424,72 @@ impl<R: TuiRuntime> TuiApp<R> {
                     self.chat.push(ChatLine::User(message));
                     true
                 }
-                AgentEvent::ThinkingStart => {
+                AgentEvent::FillInput(content) => {
+                    self.input.clear();
+                    self.input.push_text(&content);
+                    self.completion_index = 0;
+                    true
+                }
+                AgentEvent::Connecting => {
+                    self.begin_reasoning_turn_if_idle();
                     self.activity.start_connecting();
                     true
                 }
+                AgentEvent::CompactionStart => {
+                    self.activity.start_compacting();
+                    self.chat.push(ChatLine::System(
+                        "Compacting earlier conversation to free up context…".to_string(),
+                    ));
+                    true
+                }
+                AgentEvent::CompactionEnd => {
+                    self.chat
+                        .push(ChatLine::System("Context compacted.".to_string()));
+                    true
+                }
+                AgentEvent::CompactionFailed(error) => {
+                    self.chat.push(ChatLine::System(format!(
+                        "Context compaction failed ({error}); continuing with full context."
+                    )));
+                    true
+                }
+                AgentEvent::ContextUsage { tokens } => {
+                    let changed = self.current_context_tokens != tokens;
+                    self.current_context_tokens = tokens;
+                    changed
+                }
+                AgentEvent::ThinkingStart => {
+                    self.begin_reasoning_turn_if_idle();
+                    self.activity.start_thinking();
+                    true
+                }
+                AgentEvent::ReasoningDelta(delta) => {
+                    self.activity.start_thinking();
+                    self.append_thinking_delta(&delta);
+                    true
+                }
                 AgentEvent::Retrying { attempt } => {
+                    // The request is re-sent from scratch, so drop any partial
+                    // streamed output to avoid duplicating it on the retry.
+                    self.live_assistant = None;
+                    self.discard_partial_reasoning();
+                    self.thinking_tokens = 0;
                     self.activity.start_reconnecting(attempt);
                     true
                 }
                 AgentEvent::AssistantStart => {
+                    self.collapse_live_thinking();
                     self.live_assistant = Some(String::new());
                     true
                 }
                 AgentEvent::AssistantDelta(delta) => {
+                    self.collapse_live_thinking();
                     self.activity.add_output_delta(&delta);
                     self.append_assistant_delta(&delta);
                     true
                 }
                 AgentEvent::ToolStart { call_id, name } => {
+                    self.collapse_live_thinking();
                     self.activity.start_tool(name.clone());
                     self.upsert_tool(call_id, name, String::new(), true);
                     true
@@ -1133,6 +1499,7 @@ impl<R: TuiRuntime> TuiApp<R> {
                     name,
                     output,
                 } => {
+                    self.collapse_live_thinking();
                     self.activity.start_tool(name.clone());
                     self.upsert_tool(call_id, name, output, true);
                     true
@@ -1143,6 +1510,7 @@ impl<R: TuiRuntime> TuiApp<R> {
                     output,
                     ..
                 } => {
+                    self.collapse_live_thinking();
                     self.activity.start_connecting();
                     self.upsert_tool(call_id, name, output, false);
                     true
@@ -1150,9 +1518,11 @@ impl<R: TuiRuntime> TuiApp<R> {
                 AgentEvent::Usage {
                     input_tokens,
                     output_tokens,
+                    reasoning_tokens,
                 } => {
                     self.total_input_tokens += input_tokens;
                     self.total_output_tokens += output_tokens;
+                    self.record_reasoning_tokens(reasoning_tokens);
                     true
                 }
                 AgentEvent::TreeView(nodes) => {
@@ -1188,6 +1558,7 @@ impl<R: TuiRuntime> TuiApp<R> {
                     true
                 }
                 AgentEvent::Error(error) => {
+                    self.collapse_live_thinking();
                     self.commit_live_assistant();
                     self.activity.finish();
                     self.chat.push(ChatLine::Error(error));
@@ -1202,7 +1573,13 @@ impl<R: TuiRuntime> TuiApp<R> {
     fn apply_status(&mut self, status: String) -> bool {
         let mut changed = self.status != status;
         if status == "ready" || status.starts_with("queued:") {
+            // The reasoning message (collapsed) stays in the transcript, but the
+            // above-input status indicator is reset once the reply is done.
+            self.collapse_live_thinking();
             changed |= self.commit_live_assistant();
+            changed |= self.thinking_tokens != 0;
+            self.thinking_tokens = 0;
+            self.reasoning_index = None;
         }
         if status == "ready" {
             let was_active = self.activity.is_active();
@@ -1221,6 +1598,64 @@ impl<R: TuiRuntime> TuiApp<R> {
         }
     }
 
+    /// Stream reasoning into a transcript message. A delta after the current
+    /// reasoning message was collapsed starts a new one (e.g. a new phase after a
+    /// tool call).
+    fn append_thinking_delta(&mut self, delta: &str) {
+        if let Some(index) = self.reasoning_index {
+            if let Some(ChatLine::Reasoning {
+                text,
+                collapsed: false,
+            }) = self.chat.get_mut(index)
+            {
+                text.push_str(delta);
+                return;
+            }
+        }
+        self.chat.push(ChatLine::Reasoning {
+            text: delta.to_string(),
+            collapsed: false,
+        });
+        self.reasoning_index = Some(self.chat.len() - 1);
+    }
+
+    fn begin_reasoning_turn_if_idle(&mut self) {
+        if self.status == "ready" || !self.activity.is_active() {
+            self.reset_thinking();
+        }
+    }
+
+    /// Forget the current reasoning message and clear the token indicator (next turn).
+    fn reset_thinking(&mut self) {
+        self.reasoning_index = None;
+        self.thinking_tokens = 0;
+    }
+
+    /// Reasoning finished: collapse its transcript message to a short preview.
+    fn collapse_live_thinking(&mut self) {
+        if let Some(index) = self.reasoning_index.take() {
+            if let Some(ChatLine::Reasoning { collapsed, .. }) = self.chat.get_mut(index) {
+                *collapsed = true;
+            }
+        }
+    }
+
+    /// Drop a partial reasoning message before a retry re-streams it.
+    fn discard_partial_reasoning(&mut self) {
+        if let Some(index) = self.reasoning_index.take() {
+            if matches!(
+                self.chat.get(index),
+                Some(ChatLine::Reasoning { collapsed: false, .. })
+            ) {
+                if index + 1 == self.chat.len() {
+                    self.chat.pop();
+                } else if let Some(ChatLine::Reasoning { text, .. }) = self.chat.get_mut(index) {
+                    text.clear();
+                }
+            }
+        }
+    }
+
     fn commit_live_assistant(&mut self) -> bool {
         let Some(text) = self.live_assistant.take() else {
             return false;
@@ -1230,6 +1665,14 @@ impl<R: TuiRuntime> TuiApp<R> {
             return true;
         }
         true
+    }
+
+    /// Record reasoning tokens from the response usage, shown in the thinking
+    /// status line above the input (not in the chat history).
+    fn record_reasoning_tokens(&mut self, reasoning_tokens: u64) {
+        if reasoning_tokens > 0 {
+            self.thinking_tokens = reasoning_tokens;
+        }
     }
 
     fn upsert_tool(&mut self, call_id: String, name: String, output: String, running: bool) {
@@ -1263,6 +1706,7 @@ impl<R: TuiRuntime> TuiApp<R> {
 
     fn replace_transcript(&mut self, items: Vec<TranscriptItem>) {
         self.commit_live_assistant();
+        self.reset_thinking();
         self.chat = items
             .into_iter()
             .map(|item| match item {
@@ -1301,18 +1745,14 @@ impl<R: TuiRuntime> TuiApp<R> {
 
     fn build_document(&self, width: usize, now: Instant) -> UiDocument {
         let command_matches = self.command_matches();
-        let input_display = self.input.display_text();
+        let input_display = self.input.render(!self.activity.is_active());
         UiBuilder::new()
-            .chat(&self.chat)
-            .live_assistant(self.live_assistant.as_deref())
+            .chat_with_width(&self.chat, width)
+            .thinking_indicator(self.activity.is_thinking(), self.thinking_tokens)
+            .live_assistant(self.live_assistant.as_deref(), width)
             .picker(self.picker_view.as_ref())
             .pending_messages(&self.pending_messages)
-            .input(
-                &input_display,
-                &command_matches,
-                self.completion_index,
-                !self.activity.is_active(),
-            )
+            .input(&input_display, &command_matches, self.completion_index)
             .progress(&self.activity, now, width)
             .bottom_status(
                 BottomStatus {
@@ -1321,6 +1761,7 @@ impl<R: TuiRuntime> TuiApp<R> {
                     reasoning_effort: &self.reasoning_effort,
                     input_tokens: self.total_input_tokens,
                     output_tokens: self.total_output_tokens,
+                    context_tokens: self.current_context_tokens,
                     context_window: self.context_window,
                 },
                 width,
@@ -1411,6 +1852,28 @@ impl ActivityState {
         self.kind = ActivityKind::Connecting;
     }
 
+    fn start_thinking(&mut self) {
+        let now = Instant::now();
+        if self.turn_started_at.is_none() {
+            self.turn_started_at = Some(now);
+        }
+        if !matches!(self.kind, ActivityKind::Thinking) {
+            self.phase_started_at = Some(now);
+        }
+        self.kind = ActivityKind::Thinking;
+    }
+
+    fn start_compacting(&mut self) {
+        let now = Instant::now();
+        if self.turn_started_at.is_none() {
+            self.turn_started_at = Some(now);
+        }
+        if !matches!(self.kind, ActivityKind::Compacting) {
+            self.phase_started_at = Some(now);
+        }
+        self.kind = ActivityKind::Compacting;
+    }
+
     fn start_reconnecting(&mut self, attempt: usize) {
         let now = Instant::now();
         if self.turn_started_at.is_none() {
@@ -1451,6 +1914,10 @@ impl ActivityState {
         !matches!(self.kind, ActivityKind::Idle)
     }
 
+    fn is_thinking(&self) -> bool {
+        matches!(self.kind, ActivityKind::Thinking)
+    }
+
     fn advance_animation(&mut self) {
         self.animation_tick = self.animation_tick.wrapping_add(1);
     }
@@ -1469,6 +1936,27 @@ impl ActivityState {
                 ),
                 preset: SpinnerPreset::Line,
                 label: format!("connecting {:.1}s", elapsed.as_secs_f32()),
+                step: 1,
+            }),
+            ActivityKind::Thinking => Some(ProgressState {
+                color: gradient_color(
+                    elapsed.as_secs_f32() / 30.0,
+                    (160, 130, 230),
+                    (140, 110, 220),
+                    (120, 90, 210),
+                ),
+                preset: SpinnerPreset::Pulse,
+                label: format!("thinking {:.1}s", elapsed.as_secs_f32()),
+                step: 1,
+            }),
+            ActivityKind::Compacting => Some(ProgressState {
+                color: (90, 200, 220),
+                preset: SpinnerPreset::Pulse,
+                label: format!(
+                    "compacting context [{}] {:.1}s",
+                    indeterminate_bar(self.animation_tick, 14),
+                    elapsed.as_secs_f32()
+                ),
                 step: 1,
             }),
             ActivityKind::Reconnecting { attempt } => Some(ProgressState {
@@ -1525,11 +2013,7 @@ enum SpinnerPreset {
 impl PickerState {
     fn checkout(nodes: Vec<TreeNodeView>) -> Self {
         let all_rows = build_tree_rows(&nodes);
-        let expanded = all_rows
-            .iter()
-            .filter(|row| row.depth == 0)
-            .map(|row| row.id.clone())
-            .collect::<HashSet<_>>();
+        let expanded = adaptive_expanded_rows(&all_rows);
         let rows = visible_tree_rows(&all_rows, &expanded);
         let selected = rows.iter().position(|row| row.active).unwrap_or(0);
         Self {
@@ -1825,7 +2309,12 @@ impl UiBuilder {
         }
     }
 
-    fn chat(mut self, chat: &[ChatLine]) -> Self {
+    #[cfg(test)]
+    fn chat(self, chat: &[ChatLine]) -> Self {
+        self.chat_with_width(chat, usize::MAX)
+    }
+
+    fn chat_with_width(mut self, chat: &[ChatLine], width: usize) -> Self {
         for item in chat {
             match item {
                 ChatLine::Startup {
@@ -1844,17 +2333,32 @@ impl UiBuilder {
                     *context_window,
                 ),
                 ChatLine::User(text) => self.push_history(UiKind::User, text),
-                ChatLine::Assistant(text) => self.push_history(UiKind::Assistant, text),
+                ChatLine::Assistant(text) => {
+                    for line in render_markdown(text, width, color_code(UiKind::Assistant)) {
+                        self.history_line(UiKind::Assistant, line);
+                    }
+                }
+                ChatLine::Reasoning { text, collapsed } => {
+                    self.history_line(UiKind::Status, "* thinking".to_string());
+                    let rendered = render_markdown(text, width, color_code(UiKind::Status));
+                    let shown = if *collapsed {
+                        THINKING_COLLAPSED_LINES.min(rendered.len())
+                    } else {
+                        rendered.len()
+                    };
+                    for line in &rendered[..shown] {
+                        self.history_line(UiKind::Status, format!("  {line}"));
+                    }
+                    if *collapsed && rendered.len() > shown {
+                        self.history_line(UiKind::Status, "  …".to_string());
+                    }
+                }
                 ChatLine::Tool {
                     name,
                     output,
                     running,
                     ..
-                } => {
-                    let suffix = if *running { " running" } else { "" };
-                    self.history_line(UiKind::Tool, format!("* tool:{name}{suffix}"));
-                    self.push_tool_preview(&tool_output_preview(name, output, *running), "  ");
-                }
+                } => self.push_tool_block(name, output, *running, width),
                 ChatLine::System(text) => self.push_history(UiKind::System, text),
                 ChatLine::Error(text) => self.push_history(UiKind::Error, text),
             }
@@ -1863,11 +2367,29 @@ impl UiBuilder {
         self
     }
 
-    fn live_assistant(mut self, text: Option<&str>) -> Self {
+    fn live_assistant(mut self, text: Option<&str>, width: usize) -> Self {
         if let Some(text) = text.filter(|value| !value.is_empty()) {
-            self.push_control_block(UiKind::Assistant, text);
+            for line in render_markdown(text, width, color_code(UiKind::Assistant)) {
+                self.control_line(UiKind::Assistant, line);
+            }
             self.control_line(UiKind::System, String::new());
         }
+        self
+    }
+
+    /// A compact reasoning-token indicator shown directly above the input. The
+    /// reasoning text itself lives in the transcript, not here.
+    fn thinking_indicator(mut self, thinking: bool, tokens: u64) -> Self {
+        if !thinking && tokens == 0 {
+            return self;
+        }
+        let label = if tokens > 0 {
+            format!("thinking · {tokens} reasoning tokens")
+        } else {
+            "thinking…".to_string()
+        };
+        self.control_line(UiKind::Status, label);
+        self.control_line(UiKind::System, String::new());
         self
     }
 
@@ -1969,24 +2491,13 @@ impl UiBuilder {
         input: &str,
         command_matches: &[CommandCandidate],
         selected_index: usize,
-        show_cursor: bool,
     ) -> Self {
-        let cursor = if show_cursor {
-            format!("{CURSOR_MARKER}{VISIBLE_CURSOR}")
-        } else {
-            String::new()
-        };
         let lines = input.split('\n').collect::<Vec<_>>();
         for (index, line) in lines.iter().enumerate() {
             let prefix = if index == 0 { "> " } else { "  " };
-            let cursor = if index + 1 == lines.len() {
-                cursor.as_str()
-            } else {
-                ""
-            };
-            self.control_line(UiKind::Input, format!("{prefix}{line}{cursor}"));
+            self.control_line(UiKind::Input, format!("{prefix}{line}"));
         }
-        if input.starts_with('/') && !command_matches.is_empty() {
+        if !command_matches.is_empty() {
             for (index, candidate) in command_matches.iter().enumerate() {
                 let kind = if index == selected_index {
                     UiKind::Selected
@@ -2020,11 +2531,10 @@ impl UiBuilder {
     }
 
     fn bottom_status(mut self, status: BottomStatus<'_>, width: usize) -> Self {
-        let total = status.input_tokens + status.output_tokens;
         let percent = if status.context_window == 0 {
             0.0
         } else {
-            (total as f64 / status.context_window as f64 * 100.0).min(100.0)
+            (status.context_tokens as f64 / status.context_window as f64 * 100.0).min(100.0)
         };
         let plain_left = format!(
             "{} / {} ({})",
@@ -2124,15 +2634,16 @@ impl UiBuilder {
         }
     }
 
-    fn push_control_block(&mut self, kind: UiKind, text: &str) {
-        if text.is_empty() {
-            self.control_line(kind, String::new());
+    fn push_tool_block(&mut self, name: &str, output: &str, running: bool, width: usize) {
+        let preview = tool_output_preview(name, output, running);
+        let header = format_tool_header(name, running, &preview, width);
+        self.history_line(UiKind::ToolHeader, header);
+
+        if preview == compact_tool_preview(name, output, running) {
             return;
         }
 
-        for line in text.lines() {
-            self.control_line(kind, line.to_string());
-        }
+        self.push_tool_preview(&preview, "  ");
     }
 
     fn history_line(&mut self, kind: UiKind, text: String) {
@@ -2530,6 +3041,36 @@ fn build_tree_rows(nodes: &[TreeNodeView]) -> Vec<PickerRow> {
     rows
 }
 
+/// Soft cap on rows revealed by default; deeper levels are revealed only while the
+/// total visible-row count stays within it.
+const TREE_VISIBLE_ROW_BUDGET: usize = 16;
+/// Hard cap on how deep the default reveal goes, regardless of budget.
+const TREE_MAX_REVEAL_DEPTH: usize = 6;
+
+/// Picks how many levels to reveal by default. Sparse (mostly linear) histories
+/// expand many levels; wide (heavily branched) ones stop earlier — chosen by
+/// growing the revealed depth while the visible-row count stays within budget.
+fn adaptive_expanded_rows(all_rows: &[PickerRow]) -> HashSet<String> {
+    let max_depth = all_rows.iter().map(|row| row.depth).max().unwrap_or(0);
+    // Always reveal two levels when the tree has any depth, then grow greedily.
+    let mut reveal_depth = max_depth.min(1);
+    let mut depth = 2;
+    while depth <= max_depth.min(TREE_MAX_REVEAL_DEPTH) {
+        let visible = all_rows.iter().filter(|row| row.depth <= depth).count();
+        if visible <= TREE_VISIBLE_ROW_BUDGET {
+            reveal_depth = depth;
+            depth += 1;
+        } else {
+            break;
+        }
+    }
+    all_rows
+        .iter()
+        .filter(|row| row.depth < reveal_depth)
+        .map(|row| row.id.clone())
+        .collect()
+}
+
 fn push_tree_rows(
     parent_id: Option<&str>,
     depth: usize,
@@ -2612,6 +3153,7 @@ fn wrap_line(line: &UiLine, width: usize, output: &mut Vec<UiLine>) {
     let mut current = String::new();
     let mut current_width = 0;
     let mut rest = line.text.as_str();
+    let mut reverse_active = false;
 
     while !rest.is_empty() {
         if let Some(next) = rest.strip_prefix(CURSOR_MARKER) {
@@ -2620,6 +3162,11 @@ fn wrap_line(line: &UiLine, width: usize, output: &mut Vec<UiLine>) {
             continue;
         }
         if let Some((sequence, next)) = split_ansi_sequence(rest) {
+            if sequence == SELECT_START {
+                reverse_active = true;
+            } else if sequence == SELECT_END || sequence == RESET {
+                reverse_active = false;
+            }
             current.push_str(sequence);
             rest = next;
             continue;
@@ -2630,11 +3177,17 @@ fn wrap_line(line: &UiLine, width: usize, output: &mut Vec<UiLine>) {
         };
         let ch_width = ch.width().unwrap_or(0);
         if current_width > 0 && current_width + ch_width > width {
+            if reverse_active {
+                current.push_str(SELECT_END);
+            }
             output.push(UiLine {
                 kind: line.kind,
                 text: current,
             });
             current = String::new();
+            if reverse_active {
+                current.push_str(SELECT_START);
+            }
             current_width = 0;
         }
         current.push(ch);
@@ -2667,7 +3220,7 @@ fn extract_cursor(lines: &mut [UiLine]) -> Option<CursorTarget> {
             continue;
         };
         let before = &line.text[..index];
-        let column = UnicodeWidthStr::width(before);
+        let column = visible_width(before);
         line.text
             .replace_range(index..index + CURSOR_MARKER.len(), "");
         return Some(CursorTarget { row, column });
@@ -2676,10 +3229,322 @@ fn extract_cursor(lines: &mut [UiLine]) -> Option<CursorTarget> {
 }
 
 fn render_ansi_line(line: &UiLine) -> String {
-    if line.text.contains(ANSI_ESCAPE) {
+    // Input lines carry reverse-video toggles (block caret/selection) and Assistant
+    // lines carry markdown styling (bold/italic/code). Wrap both in the kind color +
+    // RESET regardless, so surrounding text keeps its color and the inline toggles
+    // compose with it.
+    let always_color = matches!(
+        line.kind,
+        UiKind::Input | UiKind::Assistant | UiKind::Status
+    );
+    if !always_color && line.text.contains(ANSI_ESCAPE) {
         return line.text.clone();
     }
     format!("{}{}{}", color_code(line.kind), line.text, RESET)
+}
+
+const MD_BOLD_ON: &str = "\x1b[1m";
+const MD_BOLD_OFF: &str = "\x1b[22m";
+const MD_ITALIC_ON: &str = "\x1b[3m";
+const MD_ITALIC_OFF: &str = "\x1b[23m";
+const MD_CODE_ON: &str = "\x1b[38;5;117m"; // light blue inline-code text
+const MD_CODE_OFF: &str = "\x1b[39m"; // restore default foreground
+const MD_DIM_ON: &str = "\x1b[90m";
+const MD_DIM_OFF: &str = "\x1b[39m";
+
+#[derive(Clone, Copy)]
+enum MdAlign {
+    Left,
+    Right,
+    Center,
+}
+
+/// Render markdown into terminal lines: headings/bold/italic/inline-code become
+/// ANSI styling, and pipe tables become aligned box-drawn tables. `base` is the
+/// line's foreground color (so inline-code can restore it); the full color is still
+/// applied later by `render_ansi_line`.
+fn render_markdown(text: &str, width: usize, base: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        // Fenced code block: render verbatim (no inline markdown) until the closing
+        // fence, or until the end of the text while still streaming.
+        if let Some(rest) = line.trim_start().strip_prefix("```") {
+            let _lang = rest.trim();
+            let mut code = Vec::new();
+            let mut end = index + 1;
+            let mut closed = false;
+            while end < lines.len() {
+                if lines[end].trim_start().starts_with("```") {
+                    closed = true;
+                    break;
+                }
+                code.push(lines[end]);
+                end += 1;
+            }
+            out.extend(render_code_block(&code));
+            index = if closed { end + 1 } else { end };
+            continue;
+        }
+        if index + 1 < lines.len() && line.contains('|') && is_table_separator(lines[index + 1]) {
+            let header = parse_table_row(line);
+            let aligns = parse_table_aligns(lines[index + 1], header.len());
+            let mut rows = vec![header];
+            let mut end = index + 2;
+            while end < lines.len() && lines[end].contains('|') && !is_table_separator(lines[end]) {
+                rows.push(parse_table_row(lines[end]));
+                end += 1;
+            }
+            out.extend(render_table(&rows, &aligns, width, base));
+            index = end;
+            continue;
+        }
+        out.push(render_markdown_line(line, base));
+        index += 1;
+    }
+    out
+}
+
+/// Render code-block lines verbatim with a dim left gutter; no inline markdown.
+fn render_code_block(code: &[&str]) -> Vec<String> {
+    code.iter()
+        .map(|line| format!("{MD_DIM_ON}│ {line}{MD_DIM_OFF}"))
+        .collect()
+}
+
+fn render_markdown_line(line: &str, base: &str) -> String {
+    let trimmed = line.trim_start();
+    let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
+    if (1..=6).contains(&hashes) {
+        let after = &trimmed[hashes..];
+        if after.is_empty() || after.starts_with(' ') {
+            return format!(
+                "{MD_BOLD_ON}{}{MD_BOLD_OFF}",
+                render_inline(after.trim_start(), base)
+            );
+        }
+    }
+    render_inline(line, base)
+}
+
+fn render_inline(text: &str, base: &str) -> String {
+    // Code spans first so emphasis markers inside them stay literal. Inline code is
+    // recolored, then restored to the line's base color.
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('`') {
+        out.push_str(&render_emphasis(&rest[..start]));
+        let after = &rest[start + 1..];
+        if let Some(end) = after.find('`') {
+            out.push_str(MD_CODE_ON);
+            out.push_str(&after[..end]);
+            out.push_str(base);
+            rest = &after[end + 1..];
+        } else {
+            out.push('`');
+            rest = after;
+        }
+    }
+    out.push_str(&render_emphasis(rest));
+    out
+}
+
+fn render_emphasis(text: &str) -> String {
+    let text = replace_pair(text, "**", MD_BOLD_ON, MD_BOLD_OFF);
+    let text = replace_pair(&text, "__", MD_BOLD_ON, MD_BOLD_OFF);
+    replace_pair(&text, "*", MD_ITALIC_ON, MD_ITALIC_OFF)
+}
+
+/// Replace balanced `delim`-wrapped spans with `on`/`off`; unbalanced markers stay
+/// literal.
+fn replace_pair(text: &str, delim: &str, on: &str, off: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    loop {
+        let Some(start) = rest.find(delim) else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..start]);
+        let after = &rest[start + delim.len()..];
+        match after.find(delim) {
+            Some(end) if end > 0 => {
+                out.push_str(on);
+                out.push_str(&after[..end]);
+                out.push_str(off);
+                rest = &after[end + delim.len()..];
+            }
+            _ => {
+                out.push_str(delim);
+                rest = after;
+            }
+        }
+    }
+}
+
+fn is_table_separator(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && trimmed.contains('-')
+        && trimmed.contains('|')
+        && trimmed.chars().all(|ch| matches!(ch, '|' | '-' | ':' | ' '))
+}
+
+fn parse_table_row(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    let trimmed = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let trimmed = trimmed.strip_suffix('|').unwrap_or(trimmed);
+    trimmed.split('|').map(|cell| cell.trim().to_string()).collect()
+}
+
+fn parse_table_aligns(line: &str, columns: usize) -> Vec<MdAlign> {
+    let cells = parse_table_row(line);
+    (0..columns)
+        .map(|index| {
+            let cell = cells.get(index).map(|cell| cell.trim()).unwrap_or("");
+            match (cell.starts_with(':'), cell.ends_with(':')) {
+                (true, true) => MdAlign::Center,
+                (false, true) => MdAlign::Right,
+                _ => MdAlign::Left,
+            }
+        })
+        .collect()
+}
+
+fn render_table(rows: &[Vec<String>], aligns: &[MdAlign], width: usize, base: &str) -> Vec<String> {
+    let columns = rows
+        .iter()
+        .map(|row| row.len())
+        .max()
+        .unwrap_or(0)
+        .max(aligns.len());
+    if columns == 0 {
+        return Vec::new();
+    }
+
+    // Style each cell (header bold) and measure its visible width.
+    let styled: Vec<Vec<(String, usize)>> = rows
+        .iter()
+        .enumerate()
+        .map(|(row_index, row)| {
+            (0..columns)
+                .map(|col| {
+                    let raw = row.get(col).map(String::as_str).unwrap_or("");
+                    let mut cell = render_inline(raw, base);
+                    if row_index == 0 {
+                        cell = format!("{MD_BOLD_ON}{cell}{MD_BOLD_OFF}");
+                    }
+                    let visible = visible_width(&cell);
+                    (cell, visible)
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut col_widths = vec![1usize; columns];
+    for row in &styled {
+        for (col, (_, visible)) in row.iter().enumerate() {
+            col_widths[col] = col_widths[col].max(*visible).max(1);
+        }
+    }
+
+    // Keep the table within the terminal width by shrinking the widest columns.
+    if width != usize::MAX {
+        let overhead = columns * 3 + 1;
+        let available = width.saturating_sub(overhead);
+        while col_widths.iter().sum::<usize>() > available && col_widths.iter().any(|w| *w > 1) {
+            let widest = col_widths
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, w)| **w)
+                .map(|(index, _)| index);
+            match widest {
+                Some(index) => col_widths[index] -= 1,
+                None => break,
+            }
+        }
+    }
+
+    let mut out = vec![table_border('┌', '┬', '┐', &col_widths)];
+    for (row_index, row) in styled.iter().enumerate() {
+        let mut line = String::from("│");
+        for (col, (cell, visible)) in row.iter().enumerate() {
+            let target = col_widths[col];
+            let (content, content_width) = if *visible > target {
+                let truncated = truncate_visible(cell, target);
+                let measured = visible_width(&truncated);
+                (truncated, measured)
+            } else {
+                (cell.clone(), *visible)
+            };
+            let pad = target.saturating_sub(content_width);
+            let (left, right) = match aligns.get(col).copied().unwrap_or(MdAlign::Left) {
+                MdAlign::Left => (0, pad),
+                MdAlign::Right => (pad, 0),
+                MdAlign::Center => (pad / 2, pad - pad / 2),
+            };
+            line.push(' ');
+            line.push_str(&" ".repeat(left));
+            line.push_str(&content);
+            line.push_str(&" ".repeat(right));
+            line.push_str(" │");
+        }
+        out.push(line);
+        if row_index == 0 {
+            out.push(table_border('├', '┼', '┤', &col_widths));
+        }
+    }
+    out.push(table_border('└', '┴', '┘', &col_widths));
+    out
+}
+
+fn table_border(left: char, middle: char, right: char, col_widths: &[usize]) -> String {
+    let mut out = String::new();
+    out.push(left);
+    for (index, width) in col_widths.iter().enumerate() {
+        if index > 0 {
+            out.push(middle);
+        }
+        out.push_str(&"─".repeat(width + 2));
+    }
+    out.push(right);
+    out
+}
+
+/// Truncate an already-styled string to `max` visible columns, keeping ANSI
+/// sequences, appending an ellipsis, and closing any open styles.
+fn truncate_visible(styled: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let budget = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut visible = 0;
+    let mut rest = styled;
+    while !rest.is_empty() {
+        if let Some((sequence, next)) = split_ansi_sequence(rest) {
+            out.push_str(sequence);
+            rest = next;
+            continue;
+        }
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        let ch_width = ch.width().unwrap_or(0);
+        if visible + ch_width > budget {
+            break;
+        }
+        out.push(ch);
+        visible += ch_width;
+        rest = &rest[ch.len_utf8()..];
+    }
+    out.push('…');
+    out.push_str(MD_BOLD_OFF);
+    out.push_str(MD_ITALIC_OFF);
+    out.push_str(MD_CODE_OFF);
+    out
 }
 
 fn tool_output_preview(name: &str, output: &str, running: bool) -> String {
@@ -2693,6 +3558,44 @@ fn tool_output_preview(name: &str, output: &str, running: bool) -> String {
         return diff_preview(&diff);
     }
     limited_preview(output)
+}
+
+fn compact_tool_preview(name: &str, output: &str, running: bool) -> String {
+    let preview = tool_output_preview(name, output, running);
+    preview.lines().next().unwrap_or_default().to_string()
+}
+
+fn format_tool_header(name: &str, running: bool, preview: &str, width: usize) -> String {
+    let suffix = if running { " running" } else { "" };
+    let prefix = format!("* tool:{name}{suffix}");
+    let compact = preview.lines().next().unwrap_or_default().to_string();
+    if compact.is_empty() {
+        return prefix;
+    }
+
+    let separator = "  ";
+    let available = width
+        .saturating_sub(visible_width(&prefix))
+        .saturating_sub(visible_width(separator));
+    if available == 0 {
+        return prefix;
+    }
+
+    let compact_width = visible_width(&compact);
+    if visible_width(&prefix)
+        .saturating_add(visible_width(separator))
+        .saturating_add(compact_width)
+        <= width
+    {
+        return format!("{prefix}{separator}{compact}");
+    }
+
+    let truncated = truncate_with_ellipsis(&compact, available);
+    if truncated.is_empty() {
+        prefix
+    } else {
+        format!("{prefix}{separator}{truncated}")
+    }
 }
 
 fn projected_tool_output(name: &str, output: &str) -> Option<String> {
@@ -2712,7 +3615,7 @@ fn projected_tool_output(name: &str, output: &str) -> Option<String> {
                 .get("truncated")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let suffix = if truncated { " truncated" } else { "" };
+            let suffix = if truncated { " …" } else { "" };
             Some(format!(
                 "read {}: {lines} lines from line {offset}{suffix}",
                 display_path_name(path)
@@ -2838,7 +3741,7 @@ fn diff_preview(diff: &str) -> String {
     }
 
     if truncated {
-        preview.push("... diff truncated in UI".to_string());
+        preview.push("…".to_string());
     }
 
     preview.join("\n")
@@ -3050,7 +3953,7 @@ fn limited_preview(output: &str) -> String {
         if !preview.is_empty() {
             preview.push('\n');
         }
-        preview.push_str("... tool output truncated in UI");
+        preview.push('…');
     }
 
     preview
@@ -3180,6 +4083,24 @@ fn format_status_line(left: &str, right: &str, width: usize) -> String {
     format!("{} {right}", truncate_to_width(left, left_width))
 }
 
+/// Display width of `text`, skipping ANSI escape sequences (CSI/SGR).
+fn visible_width(text: &str) -> usize {
+    let mut width = 0;
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some((_, next)) = split_ansi_sequence(rest) {
+            rest = next;
+            continue;
+        }
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        width += ch.width().unwrap_or(0);
+        rest = &rest[ch.len_utf8()..];
+    }
+    width
+}
+
 fn truncate_to_width(text: &str, max_width: usize) -> String {
     let mut output = String::new();
     let mut width = 0;
@@ -3194,11 +4115,55 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
     output
 }
 
+fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if visible_width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+
+    let ellipsis_width = visible_width("…");
+    let mut output = String::new();
+    let mut width = 0;
+    for ch in text.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if width + ch_width + ellipsis_width > max_width {
+            break;
+        }
+        output.push(ch);
+        width += ch_width;
+    }
+    output.push('…');
+    output
+}
+
+/// An indeterminate progress bar that fills and drains across `width` cells,
+/// animated by the frame tick (compaction has no known total to measure against).
+fn indeterminate_bar(tick: usize, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let cycle = width.saturating_mul(2).max(1);
+    let phase = tick % cycle;
+    let head = if phase < width { phase } else { cycle - phase };
+    (0..width)
+        .map(|index| if index <= head { '=' } else { ' ' })
+        .collect()
+}
+
+/// Lines of reasoning text kept visible after reasoning completes.
+const THINKING_COLLAPSED_LINES: usize = 3;
+
 fn color_code(kind: UiKind) -> &'static str {
     match kind {
         UiKind::Brand => "\x1b[34m",
         UiKind::User => "\x1b[36m",
         UiKind::Assistant => "\x1b[37m",
+        UiKind::ToolHeader => "\x1b[37m",
         UiKind::Tool | UiKind::System | UiKind::Status => "\x1b[90m",
         UiKind::Error => "\x1b[31m",
         UiKind::Selected => "\x1b[97m",
@@ -3344,6 +4309,147 @@ mod tests {
             )
         );
         assert_eq!(input.text(), format!("prefix {pasted} suffix"));
+    }
+
+    fn typed(text: &str) -> InputBuffer {
+        let mut input = InputBuffer::default();
+        input.push_text(text);
+        input
+    }
+
+    #[test]
+    fn cursor_moves_and_inserts_in_the_middle() {
+        let mut input = typed("helloworld");
+        for _ in 0..5 {
+            input.move_left(false);
+        }
+        assert_eq!(input.cursor, 5);
+        input.push_char(' ');
+        assert_eq!(input.text(), "hello world");
+        assert_eq!(input.cursor, 6);
+    }
+
+    #[test]
+    fn home_end_jump_within_line() {
+        let mut input = typed("first\nsecond");
+        input.move_home(false);
+        assert_eq!(input.cursor, 6); // start of "second"
+        input.move_end(false);
+        assert_eq!(input.cursor, input.cells.len());
+        input.move_document_start(false);
+        assert_eq!(input.cursor, 0);
+        input.move_document_end(false);
+        assert_eq!(input.cursor, input.cells.len());
+    }
+
+    #[test]
+    fn up_down_preserve_column() {
+        let mut input = typed("abcd\nxy\nlongline");
+        input.move_document_start(false);
+        input.move_right(false);
+        input.move_right(false);
+        input.move_right(false); // column 3 on line 0
+        input.move_down(false);
+        assert_eq!(input.cursor, 5 + 2); // clamped to end of "xy"
+        input.move_down(false);
+        // column was clamped to 2 on "xy", so it stays 2 on "longline"
+        assert_eq!(input.cursor, 8 + 2);
+    }
+
+    #[test]
+    fn shift_selection_then_backspace_deletes_range() {
+        let mut input = typed("hello world");
+        input.move_home(false);
+        for _ in 0..5 {
+            input.move_right(true); // select "hello"
+        }
+        assert_eq!(input.selection(), Some((0, 5)));
+        input.pop();
+        assert_eq!(input.text(), " world");
+        assert_eq!(input.cursor, 0);
+        assert!(input.selection().is_none());
+    }
+
+    #[test]
+    fn typing_replaces_selection() {
+        let mut input = typed("abc");
+        input.move_document_start(false);
+        input.move_right(true);
+        input.move_right(true); // select "ab"
+        input.push_char('X');
+        assert_eq!(input.text(), "Xc");
+        assert_eq!(input.cursor, 1);
+    }
+
+    #[test]
+    fn word_movement_skips_to_boundaries() {
+        let mut input = typed("foo bar baz");
+        input.move_document_start(false);
+        input.move_word_right(false);
+        assert_eq!(input.cursor, 3); // after "foo"
+        input.move_word_right(false);
+        assert_eq!(input.cursor, 7); // after "bar"
+        input.move_word_left(false);
+        assert_eq!(input.cursor, 4); // start of "bar"
+    }
+
+    #[test]
+    fn block_caret_highlights_char_under_cursor() {
+        let mut input = typed("abc");
+        input.move_left(false); // cursor at index 2, on 'c'
+        assert_eq!(
+            input.render(true),
+            format!("ab{CURSOR_MARKER}{SELECT_START}c{SELECT_END}")
+        );
+    }
+
+    #[test]
+    fn block_caret_at_end_renders_trailing_block() {
+        let input = typed("ab"); // cursor at end
+        assert_eq!(
+            input.render(true),
+            format!("ab{CURSOR_MARKER}{SELECT_START} {SELECT_END}")
+        );
+    }
+
+    #[test]
+    fn render_embeds_cursor_and_highlights_selection() {
+        let mut input = typed("abc");
+        input.move_document_start(false);
+        input.move_right(true);
+        input.move_right(true); // select "ab", cursor at end of selection
+        let rendered = input.render(true);
+        // Selection is highlighted; no separate block caret while selecting.
+        assert_eq!(
+            rendered,
+            format!("{SELECT_START}ab{SELECT_END}{CURSOR_MARKER}c")
+        );
+        assert_eq!(input.render(false), "abc");
+    }
+
+    #[test]
+    fn delete_forward_removes_char_at_cursor() {
+        let mut input = typed("abc");
+        input.move_document_start(false);
+        input.delete_forward();
+        assert_eq!(input.text(), "bc");
+        assert_eq!(input.cursor, 0);
+    }
+
+    #[test]
+    fn paste_placeholder_is_atomic_for_cursor() {
+        let mut input = InputBuffer::default();
+        let pasted = "x".repeat(PASTE_PLACEHOLDER_CHARS + 1);
+        input.push_text("a");
+        input.push_paste(&pasted);
+        input.push_text("b");
+        // a | paste | b  -> 3 cells, cursor at 3
+        assert_eq!(input.cells.len(), 3);
+        input.move_left(false); // before "b"
+        input.move_left(false); // before the paste (atomic)
+        assert_eq!(input.cursor, 1);
+        input.pop(); // removes "a"
+        assert_eq!(input.text(), format!("{pasted}b"));
     }
 
     #[test]
@@ -3496,13 +4602,10 @@ mod tests {
 
     #[test]
     fn input_renders_multiple_lines() {
-        let document = UiBuilder::new().input("one\ntwo", &[], 0, true).finish();
+        let document = UiBuilder::new().input("one\ntwo", &[], 0).finish();
 
         assert_eq!(document.controls[0].text, "> one");
-        assert_eq!(
-            document.controls[1].text,
-            format!("  two{CURSOR_MARKER}{VISIBLE_CURSOR}")
-        );
+        assert_eq!(document.controls[1].text, "  two");
     }
 
     #[test]
@@ -3537,7 +4640,7 @@ mod tests {
     fn command_completion_renders_below_input_with_selected_color() {
         let document = UiBuilder::new()
             .input(
-                "/",
+                &format!("/{CURSOR_MARKER}{VISIBLE_CURSOR}"),
                 &[
                     CommandCandidate {
                         command: "/help".to_string(),
@@ -3549,7 +4652,6 @@ mod tests {
                     },
                 ],
                 1,
-                true,
             )
             .finish();
 
@@ -3568,7 +4670,7 @@ mod tests {
     #[test]
     fn model_and_tokens_render_below_input_without_ready_status() {
         let document = UiBuilder::new()
-            .input("hello", &[], 0, true)
+            .input(&format!("hello{CURSOR_MARKER}{VISIBLE_CURSOR}"), &[], 0)
             .bottom_status(
                 BottomStatus {
                     provider: "openai",
@@ -3576,6 +4678,7 @@ mod tests {
                     reasoning_effort: "medium",
                     input_tokens: 12,
                     output_tokens: 34,
+                    context_tokens: 0,
                     context_window: 400_000,
                 },
                 64,
@@ -3604,7 +4707,7 @@ mod tests {
     #[test]
     fn colored_status_line_does_not_wrap_at_visible_width() {
         let document = UiBuilder::new()
-            .input("", &[], 0, true)
+            .input("", &[], 0)
             .bottom_status(
                 BottomStatus {
                     provider: "jucode",
@@ -3612,6 +4715,7 @@ mod tests {
                     reasoning_effort: "high",
                     input_tokens: 1620,
                     output_tokens: 13,
+                    context_tokens: 1633,
                     context_window: 400_000,
                 },
                 64,
@@ -3630,7 +4734,7 @@ mod tests {
 
     #[test]
     fn input_can_render_without_hardware_cursor_marker() {
-        let document = UiBuilder::new().input("hello", &[], 0, false).finish();
+        let document = UiBuilder::new().input("hello", &[], 0).finish();
 
         assert_eq!(document.controls[0].text, "> hello");
     }
@@ -3694,6 +4798,239 @@ mod tests {
     }
 
     #[test]
+    fn connecting_event_then_thinking_event_switch_states() {
+        let mut app = TuiApp::new(TestRuntime::default());
+        app.apply_events(vec![AgentEvent::Connecting]);
+        assert!(matches!(app.activity.kind, ActivityKind::Connecting));
+        app.apply_events(vec![AgentEvent::ThinkingStart]);
+        assert!(matches!(app.activity.kind, ActivityKind::Thinking));
+    }
+
+    fn reasoning_entry(app: &TuiApp<TestRuntime>) -> Option<(String, bool)> {
+        app.chat.iter().find_map(|line| match line {
+            ChatLine::Reasoning { text, collapsed } => Some((text.clone(), *collapsed)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn reasoning_streams_into_transcript_then_collapses() {
+        let mut app = TuiApp::new(TestRuntime::default());
+        app.apply_events(vec![
+            AgentEvent::Connecting,
+            AgentEvent::ThinkingStart,
+            AgentEvent::ReasoningDelta("Let me think".to_string()),
+            AgentEvent::ReasoningDelta(" about it.".to_string()),
+        ]);
+        // Reasoning is a transcript message, streaming, not collapsed yet.
+        assert_eq!(
+            reasoning_entry(&app),
+            Some(("Let me think about it.".to_string(), false))
+        );
+        assert!(matches!(app.activity.kind, ActivityKind::Thinking));
+
+        app.apply_events(vec![AgentEvent::AssistantDelta("Answer".to_string())]);
+        // Kept as a message, now collapsed.
+        assert_eq!(
+            reasoning_entry(&app),
+            Some(("Let me think about it.".to_string(), true))
+        );
+        assert!(matches!(app.activity.kind, ActivityKind::Output));
+    }
+
+    #[test]
+    fn reasoning_tokens_show_above_input_not_in_transcript() {
+        let mut app = TuiApp::new(TestRuntime::default());
+        app.apply_events(vec![
+            AgentEvent::ThinkingStart,
+            AgentEvent::ReasoningDelta("thinking".to_string()),
+            AgentEvent::AssistantDelta("hi".to_string()),
+            AgentEvent::Usage {
+                input_tokens: 5,
+                output_tokens: 2,
+                reasoning_tokens: 88,
+            },
+        ]);
+        assert_eq!(app.thinking_tokens, 88);
+        let document = app.build_document(80, Instant::now());
+        // Token count is in the above-input indicator (controls), not the transcript.
+        assert!(document
+            .controls
+            .iter()
+            .any(|line| line.text.contains("88 reasoning tokens")));
+        assert!(!document
+            .history
+            .iter()
+            .any(|line| line.text.contains("reasoning tokens")));
+    }
+
+    #[test]
+    fn markdown_heading_renders_bold() {
+        let base = color_code(UiKind::Assistant);
+        assert_eq!(
+            render_markdown("## Section title", usize::MAX, base),
+            vec![format!("{MD_BOLD_ON}Section title{MD_BOLD_OFF}")]
+        );
+    }
+
+    #[test]
+    fn markdown_bold_and_italic_render_inline() {
+        let base = color_code(UiKind::Assistant);
+        assert_eq!(
+            render_markdown("a **bold** and *em* word", usize::MAX, base),
+            vec![format!(
+                "a {MD_BOLD_ON}bold{MD_BOLD_OFF} and {MD_ITALIC_ON}em{MD_ITALIC_OFF} word"
+            )]
+        );
+    }
+
+    #[test]
+    fn markdown_inline_code_recolors_and_restores_base() {
+        let base = color_code(UiKind::Assistant);
+        // Inline code uses a foreground color (not a background), restored to base.
+        assert_eq!(
+            render_markdown("run `a*b*c` now", usize::MAX, base),
+            vec![format!("run {MD_CODE_ON}a*b*c{base} now")]
+        );
+    }
+
+    #[test]
+    fn markdown_fenced_code_block_renders_verbatim_with_gutter() {
+        let md = "before\n```rust\nlet x = **2**;\nfoo();\n```\nafter";
+        let base = color_code(UiKind::Assistant);
+        assert_eq!(
+            render_markdown(md, usize::MAX, base),
+            vec![
+                "before".to_string(),
+                format!("{MD_DIM_ON}│ let x = **2**;{MD_DIM_OFF}"),
+                format!("{MD_DIM_ON}│ foo();{MD_DIM_OFF}"),
+                "after".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_unbalanced_markers_stay_literal() {
+        let base = color_code(UiKind::Assistant);
+        assert_eq!(
+            render_markdown("2 * 3 = 6", usize::MAX, base),
+            vec!["2 * 3 = 6"]
+        );
+    }
+
+    #[test]
+    fn markdown_table_renders_aligned_box() {
+        let table = "| Name | Qty |\n|:-----|----:|\n| apple | 3 |\n| fig | 22 |";
+        let lines = render_markdown(table, usize::MAX, color_code(UiKind::Assistant));
+        let plain: Vec<String> = lines.iter().map(|line| strip_ansi(line)).collect();
+
+        assert_eq!(
+            plain,
+            vec![
+                "┌───────┬─────┐".to_string(),
+                "│ Name  │ Qty │".to_string(), // left-aligned header
+                "├───────┼─────┤".to_string(),
+                "│ apple │   3 │".to_string(), // Qty right-aligned
+                "│ fig   │  22 │".to_string(),
+                "└───────┴─────┘".to_string(),
+            ]
+        );
+        // Header cells are bold (styling preserved before strip).
+        assert!(lines[1].contains(&format!("{MD_BOLD_ON}Name{MD_BOLD_OFF}")));
+    }
+
+    #[test]
+    fn markdown_table_is_capped_to_width() {
+        let table = "| A | B |\n|---|---|\n| xxxxxxxxxx | yyyyyyyyyy |";
+        let lines = render_markdown(table, 20, color_code(UiKind::Assistant));
+        for line in &lines {
+            assert!(
+                visible_width(line) <= 20,
+                "line exceeds width: {}",
+                strip_ansi(line)
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_message_is_rendered_as_markdown() {
+        let document = UiBuilder::new()
+            .chat(&[ChatLine::Assistant("# Hi **there**".to_string())])
+            .finish();
+        assert!(document
+            .history
+            .iter()
+            .any(|line| line.text.contains(MD_BOLD_ON) && line.text.contains("there")));
+    }
+
+    #[test]
+    fn thinking_indicator_resets_after_reply_completes() {
+        let mut app = TuiApp::new(TestRuntime::default());
+        app.apply_events(vec![
+            AgentEvent::ThinkingStart,
+            AgentEvent::ReasoningDelta("thinking".to_string()),
+            AgentEvent::AssistantDelta("answer".to_string()),
+            AgentEvent::Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                reasoning_tokens: 42,
+            },
+        ]);
+        assert_eq!(app.thinking_tokens, 42);
+
+        app.apply_events(vec![AgentEvent::Status("ready".to_string())]);
+        // Indicator state is cleared; the reasoning message itself stays in chat.
+        assert_eq!(app.thinking_tokens, 0);
+        let document = app.build_document(80, Instant::now());
+        assert!(!document
+            .controls
+            .iter()
+            .any(|line| line.text.contains("reasoning tokens")));
+        assert!(reasoning_entry(&app).is_some());
+    }
+
+    #[test]
+    fn collapsed_reasoning_message_keeps_only_first_lines() {
+        let document = UiBuilder::new()
+            .chat(&[ChatLine::Reasoning {
+                text: "l1\nl2\nl3\nl4\nl5".to_string(),
+                collapsed: true,
+            }])
+            .finish();
+        let body: Vec<&str> = document
+            .history
+            .iter()
+            .filter(|line| line.text.starts_with("  "))
+            .map(|line| line.text.trim())
+            .collect();
+        assert_eq!(body, vec!["l1", "l2", "l3", "…"]);
+    }
+
+    #[test]
+    fn compaction_events_set_progress_notices_and_context_meter() {
+        let mut app = TuiApp::new(TestRuntime::default());
+        app.apply_events(vec![AgentEvent::ContextUsage { tokens: 900_000 }]);
+        assert_eq!(app.current_context_tokens, 900_000);
+
+        app.apply_events(vec![AgentEvent::CompactionStart]);
+        assert!(matches!(app.activity.kind, ActivityKind::Compacting));
+        assert!(app
+            .chat
+            .iter()
+            .any(|line| matches!(line, ChatLine::System(text) if text.contains("Compacting"))));
+
+        app.apply_events(vec![
+            AgentEvent::CompactionEnd,
+            AgentEvent::ContextUsage { tokens: 25_000 },
+        ]);
+        assert!(app
+            .chat
+            .iter()
+            .any(|line| matches!(line, ChatLine::System(text) if text.contains("compacted"))));
+        assert_eq!(app.current_context_tokens, 25_000);
+    }
+
+    #[test]
     fn output_progress_color_warms_as_stream_stalls() {
         let now = Instant::now();
         let mut activity = ActivityState::idle();
@@ -3738,7 +5075,7 @@ mod tests {
 
         assert!(preview.contains("line 0"));
         assert!(!preview.contains("line 19"));
-        assert!(preview.contains("tool output truncated"));
+        assert!(preview.contains('…'));
     }
 
     #[test]
@@ -3797,7 +5134,7 @@ mod tests {
         assert!(preview.contains("+another important line"));
         assert!(!preview.contains("--- a/README.md"));
         assert!(!preview.contains("+++ b/README.md"));
-        assert!(preview.contains("diff truncated"));
+        assert!(preview.contains('…'));
     }
 
     #[test]
@@ -3902,8 +5239,8 @@ mod tests {
     fn projection_keeps_live_assistant_out_of_transcript() {
         let document = UiBuilder::new()
             .chat(&[ChatLine::User("hello".to_string())])
-            .live_assistant(Some("streaming"))
-            .input("", &[], 0, true)
+            .live_assistant(Some("streaming"), 80)
+            .input("", &[], 0)
             .finish();
 
         let projection = ProjectedDocument::from_document(&document, 80);
@@ -4002,51 +5339,8 @@ mod tests {
     }
 
     #[test]
-    fn checkout_tree_defaults_to_two_visible_levels_and_expands_right() {
-        let mut tree = PickerState::checkout(vec![
-            TreeNodeView {
-                id: "e1".to_string(),
-                parent_id: None,
-                label: "first".to_string(),
-                active: false,
-            },
-            TreeNodeView {
-                id: "e2".to_string(),
-                parent_id: Some("e1".to_string()),
-                label: "second".to_string(),
-                active: false,
-            },
-            TreeNodeView {
-                id: "e3".to_string(),
-                parent_id: Some("e2".to_string()),
-                label: "third".to_string(),
-                active: false,
-            },
-        ]);
-
-        assert_eq!(
-            tree.rows
-                .iter()
-                .map(|row| row.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["e1", "e2"]
-        );
-        assert!(tree.rows[0].prefix.contains("──"));
-
-        tree.selected = 1;
-        tree.move_first_child();
-
-        assert_eq!(
-            tree.rows
-                .iter()
-                .map(|row| row.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["e1", "e2", "e3"]
-        );
-    }
-
-    #[test]
-    fn checkout_tree_marks_rows_with_children_as_directories() {
+    fn checkout_tree_expands_sparse_history_fully() {
+        // A mostly-linear history has little branching, so it expands all the way.
         let tree = PickerState::checkout(vec![
             TreeNodeView {
                 id: "e1".to_string(),
@@ -4067,16 +5361,73 @@ mod tests {
                 active: false,
             },
         ]);
+
+        assert_eq!(
+            tree.rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["e1", "e2", "e3"]
+        );
+        assert!(tree.rows[0].prefix.contains("──"));
+    }
+
+    fn wide_tree_nodes() -> Vec<TreeNodeView> {
+        let mut nodes = vec![TreeNodeView {
+            id: "e1".to_string(),
+            parent_id: None,
+            label: "root".to_string(),
+            active: false,
+        }];
+        for index in 2..=20 {
+            nodes.push(TreeNodeView {
+                id: format!("e{index}"),
+                parent_id: Some("e1".to_string()),
+                label: format!("child {index}"),
+                active: false,
+            });
+        }
+        nodes.push(TreeNodeView {
+            id: "c1".to_string(),
+            parent_id: Some("e2".to_string()),
+            label: "grandchild".to_string(),
+            active: false,
+        });
+        nodes
+    }
+
+    #[test]
+    fn checkout_tree_limits_expansion_when_branching_is_wide() {
+        // Wide branching fills the row budget early, so deeper levels stay collapsed.
+        let tree = PickerState::checkout(wide_tree_nodes());
+
+        assert!(!tree.rows.iter().any(|row| row.id == "c1"));
+        assert_eq!(tree.rows.len(), 20); // root + 19 children, grandchild hidden
+    }
+
+    #[test]
+    fn fill_input_event_populates_input_box() {
+        let mut app = TuiApp::new(TestRuntime::default());
+        app.input.push_text("stale");
+        app.apply_events(vec![AgentEvent::FillInput("resend this".to_string())]);
+        assert_eq!(app.input.text(), "resend this");
+    }
+
+    #[test]
+    fn checkout_tree_marks_rows_with_children_as_directories() {
+        // Wide tree: the root is expanded ([-]); a child with hidden descendants
+        // stays collapsed ([+]).
+        let tree = PickerState::checkout(wide_tree_nodes());
         let document = UiBuilder::new().picker(Some(&tree)).finish();
 
         assert!(document
             .controls
             .iter()
-            .any(|line| line.text.contains("[-] first")));
+            .any(|line| line.text.contains("[-] root")));
         assert!(document
             .controls
             .iter()
-            .any(|line| line.kind == UiKind::TreeDirectory && line.text.contains("[+] second")));
+            .any(|line| line.kind == UiKind::TreeDirectory && line.text.contains("[+] child 2")));
     }
 
     #[test]
@@ -4174,6 +5525,7 @@ impl TestUiBuilderExt for UiBuilder {
         for index in 0..history_lines {
             self.history_line(UiKind::Assistant, format!("line {index}"));
         }
-        self.input("", &[], 0, true).finish()
+        self.input(&format!("{CURSOR_MARKER}{VISIBLE_CURSOR}"), &[], 0)
+            .finish()
     }
 }
