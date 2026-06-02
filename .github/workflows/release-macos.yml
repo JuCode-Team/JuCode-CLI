@@ -24,8 +24,6 @@ jobs:
         target:
           - runner: macos-14
             rust_target: aarch64-apple-darwin
-          - runner: macos-13
-            rust_target: x86_64-apple-darwin
 
     steps:
       - uses: actions/checkout@v4
@@ -98,16 +96,15 @@ jobs:
         run: npm run release:sync-version
 
       - name: Stage npm binaries
-        run: npm run release:stage-binaries -- --source-root artifacts-normalized --target aarch64-apple-darwin --target x86_64-apple-darwin
+        run: npm run release:stage-binaries -- --source-root artifacts-normalized --target aarch64-apple-darwin
 
       - name: Pack npm packages
-        run: npm run release:pack -- --target aarch64-apple-darwin --target x86_64-apple-darwin
+        run: npm run release:pack -- --target aarch64-apple-darwin
 
       - name: Name macOS binaries uniquely for the release
         shell: bash
         run: |
           cp artifacts-normalized/aarch64-apple-darwin/jucode jucode-aarch64-apple-darwin
-          cp artifacts-normalized/x86_64-apple-darwin/jucode jucode-x86_64-apple-darwin
 
       - name: Upload macOS assets to GitHub release
         uses: softprops/action-gh-release@v2
@@ -115,11 +112,8 @@ jobs:
           tag_name: ${{ steps.release_meta.outputs.tag }}
           files: |
             jucode-aarch64-apple-darwin
-            jucode-x86_64-apple-darwin
             dist/npm/*darwin*.tgz
 
       - name: Publish macOS npm packages
         if: ${{ env.NODE_AUTH_TOKEN != '' }}
-        run: |
-          npm publish ./npm/cli-darwin-arm64 --access public
-          npm publish ./npm/cli-darwin-x64 --access public
+        run: npm publish ./npm/cli-darwin-arm64 --access public

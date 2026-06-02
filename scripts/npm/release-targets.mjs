@@ -28,7 +28,7 @@ export const releaseTargets = [
 // Which targets each workflow builds/publishes. macOS lives in its own workflow so
 // its slower runners never block the linux/windows release.
 export const nativeReleaseTargets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"];
-export const macosReleaseTargets = ["aarch64-apple-darwin", "x86_64-apple-darwin"];
+export const macosReleaseTargets = ["aarch64-apple-darwin"];
 
 export const rootPackageDirectory = "cli";
 export const rootPackageName = "@jucode/cli";
