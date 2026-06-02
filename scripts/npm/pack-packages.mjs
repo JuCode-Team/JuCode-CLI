@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { releaseTargets, rootPackageDirectory } from "./release-targets.mjs";
@@ -40,6 +40,10 @@ for (const target of selectedTargets) {
   const binaryPath = path.join(repoRoot, "npm", target.directory, "bin", target.binaryName);
   if (!existsSync(binaryPath)) {
     throw new Error(`Missing staged binary for ${target.rustTarget}: ${binaryPath}`);
+  }
+
+  if (target.binaryName !== "jucode.exe" && (statSync(binaryPath).mode & 0o111) === 0) {
+    throw new Error(`Staged binary is not executable for ${target.rustTarget}: ${binaryPath}`);
   }
 }
 

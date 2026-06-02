@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { releaseTargets } from "./release-targets.mjs";
@@ -55,5 +55,8 @@ for (const target of targets) {
 
   const destinationPath = path.join(destinationDirectory, target.binaryName);
   copyFileSync(sourcePath, destinationPath);
+  if (target.binaryName !== "jucode.exe") {
+    chmodSync(destinationPath, 0o755);
+  }
   console.log(`Staged ${target.rustTarget} -> npm/${target.directory}/bin/${target.binaryName}`);
 }
