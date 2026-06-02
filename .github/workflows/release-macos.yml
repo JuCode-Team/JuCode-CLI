@@ -1,5 +1,8 @@
-name: Release CLI
+name: Release CLI (macOS)
 
+# macOS lives in its own workflow so its slower runners never block the
+# linux/windows release. Triggered by the same v* tags (and manual dispatch);
+# runs in parallel with "Release CLI".
 on:
   push:
     tags:
@@ -12,19 +15,17 @@ on:
         type: string
 
 jobs:
-  build-native:
+  build-macos:
     name: Build ${{ matrix.target.rust_target }}
     runs-on: ${{ matrix.target.runner }}
     strategy:
       fail-fast: false
       matrix:
         target:
-          - runner: windows-latest
-            rust_target: x86_64-pc-windows-msvc
-            binary_name: jucode.exe
-          - runner: ubuntu-latest
-            rust_target: x86_64-unknown-linux-gnu
-            binary_name: jucode
+          - runner: macos-14
+            rust_target: aarch64-apple-darwin
+          - runner: macos-13
+            rust_target: x86_64-apple-darwin
 
     steps:
       - uses: actions/checkout@v4
@@ -40,16 +41,16 @@ jobs:
         shell: bash
         run: |
           mkdir -p artifacts/${{ matrix.target.rust_target }}
-          cp target/${{ matrix.target.rust_target }}/release/${{ matrix.target.binary_name }} artifacts/${{ matrix.target.rust_target }}/${{ matrix.target.binary_name }}
+          cp target/${{ matrix.target.rust_target }}/release/jucode artifacts/${{ matrix.target.rust_target }}/jucode
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target.rust_target }}
-          path: artifacts/${{ matrix.target.rust_target }}/${{ matrix.target.binary_name }}
+          path: artifacts/${{ matrix.target.rust_target }}/jucode
 
-  release:
-    name: Publish release assets
-    needs: build-native
+  release-macos:
+    name: Publish macOS release assets
+    needs: build-macos
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -97,22 +98,28 @@ jobs:
         run: npm run release:sync-version
 
       - name: Stage npm binaries
-        run: npm run release:stage-binaries -- --source-root artifacts-normalized --target x86_64-unknown-linux-gnu --target x86_64-pc-windows-msvc
+        run: npm run release:stage-binaries -- --source-root artifacts-normalized --target aarch64-apple-darwin --target x86_64-apple-darwin
 
       - name: Pack npm packages
-        run: npm run release:pack -- --target x86_64-unknown-linux-gnu --target x86_64-pc-windows-msvc
+        run: npm run release:pack -- --target aarch64-apple-darwin --target x86_64-apple-darwin
 
-      - name: Create GitHub release
+      - name: Name macOS binaries uniquely for the release
+        shell: bash
+        run: |
+          cp artifacts-normalized/aarch64-apple-darwin/jucode jucode-aarch64-apple-darwin
+          cp artifacts-normalized/x86_64-apple-darwin/jucode jucode-x86_64-apple-darwin
+
+      - name: Upload macOS assets to GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.release_meta.outputs.tag }}
           files: |
-            artifacts-normalized/**/jucode*
-            dist/npm/*.tgz
+            jucode-aarch64-apple-darwin
+            jucode-x86_64-apple-darwin
+            dist/npm/*darwin*.tgz
 
-      - name: Publish npm packages
+      - name: Publish macOS npm packages
         if: ${{ env.NODE_AUTH_TOKEN != '' }}
         run: |
-          npm publish ./npm/cli-linux-x64 --access public
-          npm publish ./npm/cli-win32-x64 --access public
-          npm publish ./npm/cli --access public
+          npm publish ./npm/cli-darwin-arm64 --access public
+          npm publish ./npm/cli-darwin-x64 --access public

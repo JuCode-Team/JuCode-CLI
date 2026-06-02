@@ -14,7 +14,9 @@
   ],
   "optionalDependencies": {
     "@jucode/cli-linux-x64": "0.1.4",
-    "@jucode/cli-win32-x64": "0.1.4"
+    "@jucode/cli-win32-x64": "0.1.4",
+    "@jucode/cli-darwin-arm64": "0.1.4",
+    "@jucode/cli-darwin-x64": "0.1.4"
   },
   "engines": {
     "node": ">=18"
