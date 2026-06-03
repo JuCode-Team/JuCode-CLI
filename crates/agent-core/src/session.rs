@@ -237,9 +237,7 @@ impl SessionStore {
         if elapsed_seconds == 0 && tokens == 0 {
             return self.goal.clone();
         }
-        let Some(mut goal) = self.goal.take() else {
-            return None;
-        };
+        let mut goal = self.goal.take()?;
         if !matches!(
             goal.status,
             ThreadGoalStatus::Active | ThreadGoalStatus::BudgetLimited
@@ -392,7 +390,7 @@ impl SessionStore {
 
     /// Latest persisted compaction summary on the active branch and the branch
     /// index after which entries are kept verbatim.
-    fn compaction_view<'a>(&self, branch: &[&'a SessionEntry]) -> (Option<String>, usize) {
+    fn compaction_view(&self, branch: &[&SessionEntry]) -> (Option<String>, usize) {
         let mut summary = None;
         let mut keep_after = 0;
         for entry in branch {
@@ -631,7 +629,7 @@ impl SessionStore {
             });
         }
 
-        top_items.sort_by(|left, right| right.estimated_tokens.cmp(&left.estimated_tokens));
+        top_items.sort_by_key(|item| std::cmp::Reverse(item.estimated_tokens));
         top_items.truncate(5);
 
         ContextStatistics {

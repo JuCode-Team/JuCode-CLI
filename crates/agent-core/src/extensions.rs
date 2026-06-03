@@ -380,7 +380,7 @@ esac
 
         let extension = ExtensionConfig {
             name: "test".to_string(),
-            command: script.display().to_string(),
+            command: extension_command(&script),
             lazy: false,
         };
         let registry = ExtensionRegistry::load(&[extension], &root, &root);
@@ -441,7 +441,7 @@ esac
 
         let extension = ExtensionConfig {
             name: "lazy-test".to_string(),
-            command: script.display().to_string(),
+            command: extension_command(&script),
             lazy: true,
         };
         let registry = ExtensionRegistry::load(&[extension], &root, &root);
@@ -472,5 +472,13 @@ esac
         assert!(output.contains("lazy hello"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn extension_command(script: &Path) -> String {
+        if cfg!(windows) {
+            script.display().to_string()
+        } else {
+            format!("sh {}", script.display())
+        }
     }
 }

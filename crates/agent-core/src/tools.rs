@@ -343,7 +343,7 @@ fn read_file(args: &Value, cwd: &Path) -> Value {
             break;
         }
 
-        content.push_str(&line);
+        content.push_str(line);
         lines_read += 1;
     }
     mark_read(&path);
@@ -424,7 +424,7 @@ fn edit_file(args: &Value, cwd: &Path) -> Value {
     }
     output.push_str(&original[cursor..]);
 
-    let _ = create_checkpoint(cwd, "auto-edit", &[path.clone()]);
+    let _ = create_checkpoint(cwd, "auto-edit", std::slice::from_ref(&path));
     match fs::write(&path, &output) {
         Ok(()) => {
             mark_read(&path);
@@ -456,7 +456,7 @@ fn write_file(args: &Value, cwd: &Path) -> Value {
         }
     }
 
-    let _ = create_checkpoint(cwd, "auto-write", &[path.clone()]);
+    let _ = create_checkpoint(cwd, "auto-write", std::slice::from_ref(&path));
     match fs::write(&path, content) {
         Ok(()) => {
             mark_read(&path);
@@ -1047,7 +1047,7 @@ fn decode_text_bytes(bytes: &[u8]) -> Option<(String, &'static str)> {
 }
 
 fn decode_utf16(bytes: &[u8], little_endian: bool) -> Option<String> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let units = bytes
