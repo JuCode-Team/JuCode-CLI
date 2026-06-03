@@ -550,13 +550,8 @@ impl SessionStore {
             })
             .filter_map(|(_, entry)| context_item_for_entry(entry).map(|item| (*entry, item)))
             .collect::<Vec<_>>();
-        let summary_item = persisted_summary
-            .as_deref()
-            .map(compaction_summary_item);
-        let summary_tokens = summary_item
-            .as_ref()
-            .map(estimate_item_tokens)
-            .unwrap_or(0);
+        let summary_item = persisted_summary.as_deref().map(compaction_summary_item);
+        let summary_tokens = summary_item.as_ref().map(estimate_item_tokens).unwrap_or(0);
         let full_tokens =
             summary_tokens + estimate_items_tokens(entries.iter().map(|(_, item)| item));
         let heuristic = full_tokens > max_tokens && entries.len() > 4;
@@ -1130,9 +1125,7 @@ fn render_entry_for_summary(entry: &SessionEntry) -> Option<String> {
                 }
             }
         }
-        EntryKind::ToolOutput { name, output, .. } => {
-            Some(format!("Tool {name} output: {output}"))
-        }
+        EntryKind::ToolOutput { name, output, .. } => Some(format!("Tool {name} output: {output}")),
         EntryKind::PinnedSkill { name, .. } => Some(format!("(pinned skill: {name})")),
         EntryKind::GoalContext { content } => Some(format!("Goal context: {content}")),
         EntryKind::Branch { .. } | EntryKind::Compaction { .. } => None,
@@ -1651,7 +1644,11 @@ mod tests {
         items
             .iter()
             .filter(|item| item["type"] == "function_call_output")
-            .all(|item| item["call_id"].as_str().is_some_and(|id| calls.contains(id)))
+            .all(|item| {
+                item["call_id"]
+                    .as_str()
+                    .is_some_and(|id| calls.contains(id))
+            })
     }
 
     #[test]

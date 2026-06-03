@@ -790,8 +790,14 @@ fn responses_input_to_anthropic_messages(input: &[Value], include_thinking: bool
 
         match item.get("type").and_then(Value::as_str).unwrap_or_default() {
             "thinking" => {
-                let thinking = item.get("thinking").and_then(Value::as_str).unwrap_or_default();
-                let signature = item.get("signature").and_then(Value::as_str).unwrap_or_default();
+                let thinking = item
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let signature = item
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 // Extended thinking requires the signature to be replayed verbatim, and
                 // thinking blocks may only be sent when thinking is enabled this turn.
                 if include_thinking && !signature.is_empty() {
@@ -1286,7 +1292,10 @@ fn anthropic_content_block_to_response_item(block: &Value) -> Option<Value> {
             "content": [{ "type": "output_text", "text": block.get("text").and_then(Value::as_str).unwrap_or_default() }]
         })),
         "thinking" => {
-            let signature = block.get("signature").and_then(Value::as_str).unwrap_or_default();
+            let signature = block
+                .get("signature")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if signature.is_empty() {
                 None
             } else {
