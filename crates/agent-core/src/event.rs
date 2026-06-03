@@ -72,6 +72,9 @@ pub enum AgentEvent {
     FillInput(String),
     Connecting,
     CompactionStart,
+    CompactionProgress {
+        output_tokens: u64,
+    },
     CompactionEnd,
     CompactionFailed(String),
     ContextUsage {

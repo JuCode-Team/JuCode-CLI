@@ -28,12 +28,15 @@ const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_READ_TIMEOUT_SECONDS: u64 = 300;
 /// Estimated context tokens above which older turns are compacted. 0 disables it.
 const DEFAULT_COMPACTION_THRESHOLD_TOKENS: u64 = 150_000;
+const DEFAULT_COMPACT_REASONING_EFFORT: &str = "low";
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub provider: String,
     pub model: String,
     pub reasoning_effort: String,
+    pub compact_model: String,
+    pub compact_reasoning_effort: String,
     pub models: Vec<ModelConfig>,
     pub base_url: String,
     pub jucode_web_url: String,
@@ -78,6 +81,8 @@ impl Config {
                 provider: "openai".to_string(),
                 model: "gpt-5".to_string(),
                 reasoning_effort: "medium".to_string(),
+                compact_model: "gpt-5".to_string(),
+                compact_reasoning_effort: DEFAULT_COMPACT_REASONING_EFFORT.to_string(),
                 models: default_model_configs(),
                 base_url: "https://api.openai.com/v1".to_string(),
                 jucode_web_url: "https://api.jucode.cn".to_string(),
@@ -102,7 +107,16 @@ impl Config {
         if !models.iter().any(|entry| entry.name == model) {
             models.insert(0, default_model_config(&model));
         }
-        let reasoning_effort = read_reasoning_effort(&value, &model, &models);
+        let reasoning_effort =
+            read_reasoning_effort(&value, "reasoning_effort", "medium", &model, &models);
+        let compact_model = read_string(&value, "compact_model", &model);
+        let compact_reasoning_effort = read_reasoning_effort(
+            &value,
+            "compact_reasoning_effort",
+            DEFAULT_COMPACT_REASONING_EFFORT,
+            &compact_model,
+            &models,
+        );
         let legacy_jucode_url = read_string(&value, "jucode_base_url", "");
         let default_jucode_web_url =
             if legacy_jucode_url.is_empty() || legacy_jucode_url == "http://localhost:8090" {
@@ -119,6 +133,8 @@ impl Config {
             provider: read_string(&value, "provider", "openai"),
             model,
             reasoning_effort,
+            compact_model,
+            compact_reasoning_effort,
             models,
             base_url: normalize_base_url(&read_string(
                 &value,
@@ -169,6 +185,8 @@ impl Config {
             "provider": self.provider,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
+            "compact_model": self.compact_model,
+            "compact_reasoning_effort": self.compact_reasoning_effort,
             "models": self.models.iter().map(model_config_value).collect::<Vec<_>>(),
             "base_url": normalize_base_url(&self.base_url),
             "jucode_web_url": normalize_base_url(&self.jucode_web_url),
@@ -196,11 +214,19 @@ impl Config {
     }
 
     pub fn current_model_config(&self) -> ModelConfig {
+        self.model_config(&self.model)
+    }
+
+    pub fn compact_model_config(&self) -> ModelConfig {
+        self.model_config(&self.compact_model)
+    }
+
+    fn model_config(&self, model: &str) -> ModelConfig {
         self.models
             .iter()
-            .find(|entry| entry.name == self.model)
+            .find(|entry| entry.name == model)
             .cloned()
-            .unwrap_or_else(|| default_model_config(&self.model))
+            .unwrap_or_else(|| default_model_config(model))
     }
 
     pub fn system_prompt(&self) -> io::Result<String> {
@@ -301,8 +327,14 @@ fn read_api_key_env(value: &Value) -> String {
     }
 }
 
-fn read_reasoning_effort(value: &Value, model: &str, models: &[ModelConfig]) -> String {
-    let effort = read_string(value, "reasoning_effort", "medium");
+fn read_reasoning_effort(
+    value: &Value,
+    key: &str,
+    default: &str,
+    model: &str,
+    models: &[ModelConfig],
+) -> String {
+    let effort = read_string(value, key, default);
     let supported = models
         .iter()
         .find(|entry| entry.name == model)
@@ -519,4 +551,48 @@ fn jucode_dir() -> io::Result<PathBuf> {
         .or_else(|| env::var_os("HOME"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
     Ok(PathBuf::from(home).join(".jucode"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_model_config_uses_compact_model() {
+        let config = Config {
+            provider: "openai".to_string(),
+            model: "chat-model".to_string(),
+            reasoning_effort: "medium".to_string(),
+            compact_model: "compact-model".to_string(),
+            compact_reasoning_effort: "low".to_string(),
+            models: vec![
+                ModelConfig {
+                    name: "chat-model".to_string(),
+                    context_window: 100,
+                    max_output_tokens: 10,
+                    reasoning_efforts: vec!["medium".to_string()],
+                },
+                ModelConfig {
+                    name: "compact-model".to_string(),
+                    context_window: 200,
+                    max_output_tokens: 20,
+                    reasoning_efforts: vec!["low".to_string()],
+                },
+            ],
+            base_url: "https://api.openai.com/v1".to_string(),
+            jucode_web_url: "https://api.jucode.cn".to_string(),
+            jucode_api_url: "https://api.jucode.cn".to_string(),
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            retry_attempts: DEFAULT_RETRY_ATTEMPTS,
+            connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,
+            read_timeout_seconds: DEFAULT_READ_TIMEOUT_SECONDS,
+            compaction_threshold_tokens: DEFAULT_COMPACTION_THRESHOLD_TOKENS,
+            include_project_instructions: true,
+            extensions: Vec::new(),
+            path: PathBuf::from("config.json"),
+        };
+
+        assert_eq!(config.current_model_config().max_output_tokens, 10);
+        assert_eq!(config.compact_model_config().max_output_tokens, 20);
+    }
 }

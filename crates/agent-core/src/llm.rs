@@ -219,21 +219,30 @@ impl OpenAiClient {
     /// One-shot summarization used for context compaction. No tools, no thinking;
     /// returns the summary text. Errors (including empty output) let the caller fall
     /// back to sending the full context.
-    pub fn summarize(&self, conversation: &str) -> Result<String, String> {
+    pub fn summarize_with_progress(
+        &self,
+        conversation: &str,
+        mut emit_output_tokens: impl FnMut(u64) -> Result<(), String>,
+    ) -> Result<String, String> {
         let system = "You compress earlier conversation history so it can replace the raw turns while letting the work continue. Write a dense summary that preserves: the user's goals and explicit requests, decisions made, important facts and constraints discovered, files and tools touched with their outcomes, and any unfinished threads. Prefer tight prose or bullet points. Output only the summary.";
         let user = format!("Summarize this earlier conversation:\n\n{conversation}");
+        let mut output_tokens = 0u64;
+        let mut record_delta = |delta: &str| {
+            output_tokens = output_tokens.saturating_add(estimate_text_tokens(delta));
+            emit_output_tokens(output_tokens)
+        };
         let summary = match self.provider_kind {
             ProviderKind::OpenAiResponses => {
                 let body = json!({
                     "model": self.model,
                     "instructions": system,
-                    "reasoning": { "effort": "low" },
+                    "reasoning": { "effort": self.reasoning_effort },
                     "input": [{ "role": "user", "content": [{ "type": "input_text", "text": user }] }],
                     "stream": true
                 });
                 let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
                 let response = self.send_with_retry(&url, &body, &mut |_| Ok(()))?;
-                self.collect_text(response, false)?
+                self.collect_text(response, false, &mut record_delta)?
             }
             ProviderKind::AnthropicMessages => {
                 let body = json!({
@@ -245,7 +254,7 @@ impl OpenAiClient {
                 });
                 let url = anthropic_messages_url(&self.base_url);
                 let response = self.send_with_retry(&url, &body, &mut |_| Ok(()))?;
-                self.collect_text(response, true)?
+                self.collect_text(response, true, &mut record_delta)?
             }
         };
         let summary = summary.trim().to_string();
@@ -255,7 +264,12 @@ impl OpenAiClient {
         Ok(summary)
     }
 
-    fn collect_text(&self, response: ureq::Response, anthropic: bool) -> Result<String, String> {
+    fn collect_text(
+        &self,
+        response: ureq::Response,
+        anthropic: bool,
+        emit_text: &mut impl FnMut(&str) -> Result<(), String>,
+    ) -> Result<String, String> {
         let content_type = response
             .header("content-type")
             .unwrap_or_default()
@@ -263,6 +277,7 @@ impl OpenAiClient {
         let mut text = String::new();
         let mut accumulate = |event: StreamEvent| {
             if let StreamEvent::Delta(delta) = event {
+                emit_text(&delta)?;
                 text.push_str(&delta);
             }
             Ok(())
@@ -274,7 +289,11 @@ impl OpenAiClient {
                 emit_anthropic_message(&value, &mut accumulate)?;
             } else if let Some(items) = value.get("output").and_then(Value::as_array) {
                 for item in items {
-                    text.push_str(&extract_response_text(item));
+                    let delta = extract_response_text(item);
+                    if !delta.is_empty() {
+                        emit_text(&delta)?;
+                        text.push_str(&delta);
+                    }
                 }
             }
             return Ok(text);
@@ -755,6 +774,14 @@ fn handle_response_error<T>(error: ureq::Error) -> Result<T, String> {
         }
         error => Err(error.to_string()),
     }
+}
+
+fn estimate_text_tokens(text: &str) -> u64 {
+    if text.is_empty() {
+        return 0;
+    }
+    let chars = text.chars().count() as u64;
+    u64::max(1, chars.div_ceil(4))
 }
 
 fn anthropic_messages_url(base_url: &str) -> String {

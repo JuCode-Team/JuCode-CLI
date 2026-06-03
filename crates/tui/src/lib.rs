@@ -165,7 +165,7 @@ impl From<CommandView> for CommandCandidate {
 fn default_commands() -> Vec<CommandCandidate> {
     [
         "/help", "/login", "/new", "/model", "/tree", "/resume", "/context", "/doctor", "/pin",
-        "/goal", "/quit",
+        "/goal", "/compact", "/quit",
     ]
     .iter()
     .map(|command| CommandCandidate {
@@ -924,6 +924,10 @@ impl<R: TuiRuntime> TuiApp<R> {
                     self.mark_history_dirty();
                     true
                 }
+                AgentEvent::CompactionProgress { output_tokens } => {
+                    self.activity.set_compaction_output_tokens(output_tokens);
+                    true
+                }
                 AgentEvent::CompactionEnd => {
                     self.chat
                         .push(ChatLine::System("Context compacted.".to_string()));
@@ -1391,11 +1395,21 @@ impl ActivityState {
         let now = Instant::now();
         if self.turn_started_at.is_none() {
             self.turn_started_at = Some(now);
+            self.estimated_output_tokens = 0;
+            self.last_delta_at = None;
         }
         if !matches!(self.kind, ActivityKind::Compacting) {
             self.phase_started_at = Some(now);
         }
         self.kind = ActivityKind::Compacting;
+    }
+
+    fn set_compaction_output_tokens(&mut self, output_tokens: u64) {
+        if !matches!(self.kind, ActivityKind::Compacting) {
+            self.start_compacting();
+        }
+        self.estimated_output_tokens = output_tokens;
+        self.last_delta_at = Some(Instant::now());
     }
 
     fn start_reconnecting(&mut self, attempt: usize) {
@@ -1477,8 +1491,9 @@ impl ActivityState {
                 color: (90, 200, 220),
                 preset: SpinnerPreset::Pulse,
                 label: format!(
-                    "compacting context [{}] {:.1}s",
+                    "compacting context [{}] {} tok {:.1}s",
                     indeterminate_bar(self.animation_tick, 14),
+                    self.estimated_output_tokens,
                     elapsed.as_secs_f32()
                 ),
                 step: 1,

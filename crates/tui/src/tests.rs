@@ -648,6 +648,9 @@ fn compaction_events_set_progress_notices_and_context_meter() {
         .iter()
         .any(|line| matches!(line, ChatLine::System(text) if text.contains("Compacting"))));
 
+    app.apply_events(vec![AgentEvent::CompactionProgress { output_tokens: 42 }]);
+    assert_eq!(app.activity.estimated_output_tokens, 42);
+
     app.apply_events(vec![
         AgentEvent::CompactionEnd,
         AgentEvent::ContextUsage { tokens: 25_000 },

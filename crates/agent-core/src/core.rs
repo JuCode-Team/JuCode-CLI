@@ -32,6 +32,9 @@ const COMPACTION_KEEP_RECENT_TOKENS: usize = 20_000;
 #[derive(Debug)]
 enum WorkerEvent {
     CompactionStart,
+    CompactionProgress {
+        output_tokens: u64,
+    },
     CompactionDone {
         summary: String,
         replaced_through: u64,
@@ -154,7 +157,7 @@ impl AgentCore {
     fn command_list_event(&self) -> AgentEvent {
         let mut commands = [
             "/help", "/login", "/new", "/model", "/tree", "/resume", "/context", "/doctor", "/pin",
-            "/goal", "/quit",
+            "/goal", "/compact", "/quit",
         ]
         .iter()
         .map(|command| CommandView {
@@ -213,7 +216,7 @@ impl AgentCore {
         let events = match command {
             "/quit" | "/exit" => return (true, Vec::new()),
             "/help" | "/" => vec![AgentEvent::Info(
-                "/help /login [web-url] [api-url] /new /model [model] [effort] /tree /resume [session-id] /context /goal [objective|pause|resume|blocked|complete|clear] /doctor /pin <skill> /quit"
+                "/help /login [web-url] [api-url] /new /model [model] [effort] /tree /resume [session-id] /context /goal [objective|pause|resume|blocked|complete|clear] /doctor /pin <skill> /compact /quit"
                     .to_string(),
             )],
             "/login" => self.login_events(input[command.len()..].trim()),
@@ -297,6 +300,7 @@ impl AgentCore {
             "/goal" => self.goal_command_events(input[command.len()..].trim()),
             "/doctor" => self.doctor_events(),
             "/pin" => self.pin_skill_events(input[command.len()..].trim()),
+            "/compact" => self.compact_command_events(),
             _ => vec![AgentEvent::Error(format!("unknown command: {command}"))],
         };
         (false, events)
@@ -381,6 +385,9 @@ impl AgentCore {
             while let Ok(event) = rx.try_recv() {
                 match event {
                     WorkerEvent::CompactionStart => events.push(AgentEvent::CompactionStart),
+                    WorkerEvent::CompactionProgress { output_tokens } => {
+                        events.push(AgentEvent::CompactionProgress { output_tokens });
+                    }
                     WorkerEvent::CompactionDone {
                         summary,
                         replaced_through,
@@ -636,32 +643,50 @@ impl AgentCore {
         events.push(AgentEvent::ContextUsage {
             tokens: self.session.estimated_context_tokens() as u64,
         });
+        let compaction_client = if compaction.is_some() {
+            match self.compaction_client() {
+                Ok(client) => Some(client),
+                Err(error) => {
+                    events.push(AgentEvent::CompactionFailed(error));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let cwd = self.cwd.clone();
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
         self.running = true;
 
         thread::spawn(move || {
-            let input = if let Some(plan) = compaction {
-                let _ = tx.send(WorkerEvent::CompactionStart);
-                match client.summarize(&plan.folded_text) {
-                    Ok(summary) => {
-                        let _ = tx.send(WorkerEvent::CompactionDone {
-                            summary: summary.clone(),
-                            replaced_through: plan.replaced_through,
-                        });
-                        let mut items = vec![compaction_summary_item(&summary)];
-                        items.extend(plan.kept_items);
-                        items
+            let input =
+                if let (Some(plan), Some(compaction_client)) = (compaction, compaction_client) {
+                    let _ = tx.send(WorkerEvent::CompactionStart);
+                    match compaction_client.summarize_with_progress(
+                        &plan.folded_text,
+                        |output_tokens| {
+                            tx.send(WorkerEvent::CompactionProgress { output_tokens })
+                                .map_err(|error| error.to_string())
+                        },
+                    ) {
+                        Ok(summary) => {
+                            let _ = tx.send(WorkerEvent::CompactionDone {
+                                summary: summary.clone(),
+                                replaced_through: plan.replaced_through,
+                            });
+                            let mut items = vec![compaction_summary_item(&summary)];
+                            items.extend(plan.kept_items);
+                            items
+                        }
+                        Err(error) => {
+                            let _ = tx.send(WorkerEvent::CompactionFailed(error));
+                            request_items
+                        }
                     }
-                    Err(error) => {
-                        let _ = tx.send(WorkerEvent::CompactionFailed(error));
-                        request_items
-                    }
-                }
-            } else {
-                request_items
-            };
+                } else {
+                    request_items
+                };
             let result = client.run_turn_events(input, &cwd, |event| {
                 let mapped = match event {
                     StreamEvent::CallStart => WorkerEvent::CallStart,
@@ -721,6 +746,89 @@ impl AgentCore {
             AgentEvent::Status("streaming".to_string()),
         ]);
         events
+    }
+
+    fn compact_command_events(&mut self) -> Vec<AgentEvent> {
+        if self.running {
+            return vec![AgentEvent::Error(
+                "cannot compact while a response is running".to_string(),
+            )];
+        }
+        if self.config.provider != "openai" && self.config.provider != "jucode" {
+            return vec![AgentEvent::Error(format!(
+                "unsupported provider '{}'. Supported providers: openai, jucode.",
+                self.config.provider
+            ))];
+        }
+        if self.config.provider == "jucode"
+            && !is_jucode_supported_model(&self.config.compact_model)
+        {
+            return vec![AgentEvent::Error(format!(
+                "{} is not supported by JuCode CLI. Configure compact_model to a GPT or Claude model.",
+                self.config.compact_model
+            ))];
+        }
+
+        let Some(plan) = self.session.plan_compaction(COMPACTION_KEEP_RECENT_TOKENS) else {
+            return vec![AgentEvent::Info(
+                "nothing old enough to compact".to_string(),
+            )];
+        };
+        let client = match self.compaction_client() {
+            Ok(client) => client,
+            Err(error) => return vec![AgentEvent::Error(error)],
+        };
+
+        self.turn_started_at = None;
+        self.turn_goal_tokens = 0;
+        self.goal_continuation_running = false;
+        let (tx, rx) = mpsc::channel();
+        self.receiver = Some(rx);
+        self.running = true;
+
+        thread::spawn(move || {
+            let _ = tx.send(WorkerEvent::CompactionStart);
+            match client.summarize_with_progress(&plan.folded_text, |output_tokens| {
+                tx.send(WorkerEvent::CompactionProgress { output_tokens })
+                    .map_err(|error| error.to_string())
+            }) {
+                Ok(summary) => {
+                    let _ = tx.send(WorkerEvent::CompactionDone {
+                        summary,
+                        replaced_through: plan.replaced_through,
+                    });
+                    let _ = tx.send(WorkerEvent::Done);
+                }
+                Err(error) => {
+                    let _ = tx.send(WorkerEvent::CompactionFailed(error));
+                    let _ = tx.send(WorkerEvent::Done);
+                }
+            }
+        });
+
+        vec![
+            AgentEvent::ContextUsage {
+                tokens: self.session.estimated_context_tokens() as u64,
+            },
+            AgentEvent::Status("compacting".to_string()),
+        ]
+    }
+
+    fn compaction_client(&self) -> Result<OpenAiClient, String> {
+        OpenAiClient::from_config(OpenAiClientConfig {
+            model: self.config.compact_model.clone(),
+            reasoning_effort: self.config.compact_reasoning_effort.clone(),
+            system_prompt: String::new(),
+            extensions: ExtensionRegistry::load(&[], &self.cwd, self.config.profile_dir()),
+            base_url: self.config.base_url.clone(),
+            max_output_tokens: self.config.compact_model_config().max_output_tokens,
+            api_key: self.auth.key_for(&self.config.provider),
+            api_key_env: &self.config.api_key_env,
+            retry_attempts: self.config.retry_attempts,
+            connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
+            read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
+            goal_tool_tx: None,
+        })
     }
 
     fn start_goal_continuation(&mut self) -> Vec<AgentEvent> {

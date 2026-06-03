@@ -127,6 +127,9 @@ fn event_json(event: AgentEvent) -> Value {
         AgentEvent::FillInput(content) => json!({ "type": "fill_input", "content": content }),
         AgentEvent::Connecting => json!({ "type": "connecting" }),
         AgentEvent::CompactionStart => json!({ "type": "compaction_start" }),
+        AgentEvent::CompactionProgress { output_tokens } => {
+            json!({ "type": "compaction_progress", "output_tokens": output_tokens })
+        }
         AgentEvent::CompactionEnd => json!({ "type": "compaction_end" }),
         AgentEvent::CompactionFailed(error) => {
             json!({ "type": "compaction_failed", "error": error })
