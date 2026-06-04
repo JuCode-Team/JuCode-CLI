@@ -4,7 +4,6 @@ use crate::markdown::{
     MD_ITALIC_ON,
 };
 use crate::tool_preview::tool_output_preview;
-use crate::ui_builder::colored_reasoning_effort;
 use crossterm::event::{KeyCode, KeyModifiers};
 use jucode_agent_core::{ModelOptionView, SessionListItemView, TreeNodeView};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -232,8 +231,27 @@ fn single_typed_char_flushes_after_burst_window() {
 fn input_renders_multiple_lines() {
     let document = UiBuilder::new().input("one\ntwo", &[], 0).finish();
 
-    assert_eq!(document.controls[0].text, "> one");
-    assert_eq!(document.controls[1].text, "  two");
+    assert_eq!(document.controls[0].kind, UiKind::Input);
+    assert_eq!(document.controls[0].text, "");
+    assert_eq!(document.controls[1].kind, UiKind::Input);
+    assert_eq!(document.controls[1].text, "> one");
+    assert_eq!(document.controls[2].kind, UiKind::Input);
+    assert_eq!(document.controls[2].text, "  two");
+    assert_eq!(document.controls[3].kind, UiKind::Input);
+    assert_eq!(document.controls[3].text, "");
+}
+
+#[test]
+fn single_line_input_renders_text_on_middle_row() {
+    let document = UiBuilder::new().input("hello", &[], 0).finish();
+
+    assert_eq!(document.controls.len(), 3);
+    assert_eq!(document.controls[0].kind, UiKind::Input);
+    assert_eq!(document.controls[0].text, "");
+    assert_eq!(document.controls[1].kind, UiKind::Input);
+    assert_eq!(document.controls[1].text, "> hello");
+    assert_eq!(document.controls[2].kind, UiKind::Input);
+    assert_eq!(document.controls[2].text, "");
 }
 
 #[test]
@@ -262,7 +280,7 @@ fn cursor_row_is_relative_to_whole_frame() {
 
     let cursor = frame.cursor.expect("cursor marker should be found");
     assert_eq!(cursor.row, 3);
-    assert_eq!(cursor.column, 8);
+    assert_eq!(cursor.column, 8 + CONTENT_LEFT_PADDING);
 }
 
 #[test]
@@ -284,16 +302,20 @@ fn command_completion_renders_below_input_with_selected_color() {
         )
         .finish();
 
-    assert_eq!(document.controls.len(), 3);
+    assert_eq!(document.controls.len(), 5);
     assert_eq!(document.controls[0].kind, UiKind::Input);
+    assert_eq!(document.controls[0].text, "");
+    assert_eq!(document.controls[1].kind, UiKind::Input);
     assert_eq!(
-        document.controls[0].text,
+        document.controls[1].text,
         format!("> /{CURSOR_MARKER}{VISIBLE_CURSOR}")
     );
-    assert_eq!(document.controls[1].kind, UiKind::Status);
-    assert_eq!(document.controls[1].text, "  /help");
-    assert_eq!(document.controls[2].kind, UiKind::Selected);
-    assert_eq!(document.controls[2].text, "  /review SKILL");
+    assert_eq!(document.controls[2].kind, UiKind::Input);
+    assert_eq!(document.controls[2].text, "");
+    assert_eq!(document.controls[3].kind, UiKind::Status);
+    assert_eq!(document.controls[3].text, "  /help");
+    assert_eq!(document.controls[4].kind, UiKind::Selected);
+    assert_eq!(document.controls[4].text, "  /review SKILL");
 }
 
 #[test]
@@ -305,32 +327,82 @@ fn model_and_tokens_render_below_input_without_ready_status() {
                 provider: "openai",
                 model: "gpt-5",
                 reasoning_effort: "medium",
-                input_tokens: 12,
-                output_tokens: 34,
-                context_tokens: 0,
+                context_tokens: 12_345,
                 context_window: 400_000,
             },
-            64,
+            padded_content_width(64),
         )
         .finish();
 
-    assert_eq!(document.controls.len(), 2);
+    assert_eq!(document.controls.len(), 4);
     assert_eq!(
-        document.controls[0].text,
+        document.controls[1].text,
         format!("> hello{CURSOR_MARKER}{VISIBLE_CURSOR}")
     );
-    assert!(document.controls[1].text.starts_with("openai / gpt-5 ("));
-    assert!(document.controls[1]
-        .text
-        .contains(&colored_reasoning_effort("medium")));
-    assert!(document.controls[1]
-        .text
-        .ends_with("tokens 12/34 | context 0.0%"));
-    assert!(!document.controls[1].text.contains("ready"));
+    let status = strip_ansi(&document.controls[3].text);
+    assert!(status.starts_with("openai / gpt-5 (medium)"));
+    assert!(status.ends_with("tokens 12345/400000 | context 3.1%"));
+    assert!(!status.contains("ready"));
     assert_eq!(
-        UnicodeWidthStr::width(strip_ansi(&document.controls[1].text).as_str()),
-        64
+        UnicodeWidthStr::width(strip_ansi(&document.controls[3].text).as_str()),
+        padded_content_width(64)
     );
+}
+
+#[test]
+fn input_background_extends_across_frame_width() {
+    let document = UiBuilder::new()
+        .input(&format!("hi{CURSOR_MARKER}{VISIBLE_CURSOR}"), &[], 0)
+        .finish();
+
+    let frame = RenderedFrame::build(&document, 40);
+    let input_line = frame
+        .lines
+        .iter()
+        .find(|line| strip_ansi(line).contains("> hi"))
+        .expect("input line should render");
+
+    assert!(input_line.contains("\x1b[38;2;224;226;232;48;2;48;52;62m"));
+    assert_eq!(UnicodeWidthStr::width(strip_ansi(input_line).as_str()), 40);
+}
+
+#[test]
+fn native_cursor_tracks_middle_input_row() {
+    let document = UiBuilder::new()
+        .input(&format!("hello{CURSOR_MARKER}{VISIBLE_CURSOR}"), &[], 0)
+        .finish();
+
+    let frame = RenderedFrame::build(&document, 40);
+    let cursor = frame.cursor.expect("cursor marker should be found");
+
+    assert_eq!(frame.lines.len(), 3);
+    assert!(strip_ansi(&frame.lines[cursor.row]).starts_with("  > hello|"));
+    assert_eq!(
+        UnicodeWidthStr::width(strip_ansi(&frame.lines[cursor.row]).as_str()),
+        40
+    );
+    assert_eq!(cursor.row, 1);
+    assert_eq!(cursor.column, CONTENT_LEFT_PADDING + 2 + "hello".len());
+}
+
+#[test]
+fn progress_renders_above_input() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.apply_events(vec![AgentEvent::Connecting]);
+
+    let document = app.build_document(80, Instant::now());
+    let progress_index = document
+        .controls
+        .iter()
+        .position(|line| line.text.contains("connecting"))
+        .expect("progress line should render");
+    let input_index = document
+        .controls
+        .iter()
+        .position(|line| line.kind == UiKind::Input)
+        .expect("input line should render");
+
+    assert!(progress_index < input_index);
 }
 
 #[test]
@@ -342,30 +414,21 @@ fn colored_status_line_does_not_wrap_at_visible_width() {
                 provider: "jucode",
                 model: "claude-opus-4.7",
                 reasoning_effort: "high",
-                input_tokens: 1620,
-                output_tokens: 13,
                 context_tokens: 1633,
                 context_window: 400_000,
             },
-            64,
+            padded_content_width(64),
         )
         .finish();
 
     let frame = RenderedFrame::build(&document, 64);
 
-    assert_eq!(frame.lines.len(), 2);
-    assert!(strip_ansi(&frame.lines[1]).contains("tokens 1620/13 | context 0.4%"));
+    assert_eq!(frame.lines.len(), 4);
+    assert!(strip_ansi(&frame.lines[3]).contains("tokens 1633/400000 | context 0.4%"));
     assert_eq!(
-        UnicodeWidthStr::width(strip_ansi(&frame.lines[1]).as_str()),
+        UnicodeWidthStr::width(strip_ansi(&frame.lines[3]).as_str()),
         64
     );
-}
-
-#[test]
-fn input_can_render_without_hardware_cursor_marker() {
-    let document = UiBuilder::new().input("hello", &[], 0).finish();
-
-    assert_eq!(document.controls[0].text, "> hello");
 }
 
 #[test]
@@ -417,26 +480,26 @@ fn connecting_progress_uses_continuous_color_gradient() {
     activity.turn_started_at = Some(now - Duration::from_secs(11));
     activity.phase_started_at = Some(now - Duration::from_secs(11));
 
-    assert_eq!(activity.progress(now).unwrap().color, (255, 60, 60));
+    assert_eq!(activity.progress(now, 0).unwrap().color, (255, 60, 60));
 
     activity.phase_started_at = Some(now - Duration::from_secs(5));
-    assert_eq!(activity.progress(now).unwrap().color, (255, 210, 0));
+    assert_eq!(activity.progress(now, 0).unwrap().color, (255, 210, 0));
 
     activity.phase_started_at = Some(now - Duration::from_secs(1));
-    assert_eq!(activity.progress(now).unwrap().color, (255, 246, 204));
+    assert_eq!(activity.progress(now, 0).unwrap().color, (255, 246, 204));
 }
 
 #[test]
 fn connecting_event_then_thinking_event_switch_states() {
     let mut app = TuiApp::new(TestRuntime::default());
     app.apply_events(vec![AgentEvent::Connecting]);
-    assert!(matches!(app.activity.kind, ActivityKind::Connecting));
+    assert!(matches!(app.state.activity.kind, ActivityKind::Connecting));
     app.apply_events(vec![AgentEvent::ThinkingStart]);
-    assert!(matches!(app.activity.kind, ActivityKind::Thinking));
+    assert!(matches!(app.state.activity.kind, ActivityKind::Thinking));
 }
 
 fn reasoning_entry(app: &TuiApp<TestRuntime>) -> Option<(String, bool)> {
-    app.chat.iter().find_map(|line| match line {
+    app.state.chat.iter().find_map(|line| match line {
         ChatLine::Reasoning { text, collapsed } => Some((text.clone(), *collapsed)),
         _ => None,
     })
@@ -456,7 +519,7 @@ fn reasoning_streams_into_transcript_then_collapses() {
         reasoning_entry(&app),
         Some(("Let me think about it.".to_string(), false))
     );
-    assert!(matches!(app.activity.kind, ActivityKind::Thinking));
+    assert!(matches!(app.state.activity.kind, ActivityKind::Thinking));
 
     app.apply_events(vec![AgentEvent::AssistantDelta("Answer".to_string())]);
     // Kept as a message, now collapsed.
@@ -464,33 +527,32 @@ fn reasoning_streams_into_transcript_then_collapses() {
         reasoning_entry(&app),
         Some(("Let me think about it.".to_string(), true))
     );
-    assert!(matches!(app.activity.kind, ActivityKind::Output));
+    assert!(matches!(app.state.activity.kind, ActivityKind::Output));
 }
 
 #[test]
-fn reasoning_tokens_show_above_input_not_in_transcript() {
+fn reasoning_tokens_show_in_thinking_progress_not_transcript() {
     let mut app = TuiApp::new(TestRuntime::default());
     app.apply_events(vec![
         AgentEvent::ThinkingStart,
         AgentEvent::ReasoningDelta("thinking".to_string()),
-        AgentEvent::AssistantDelta("hi".to_string()),
         AgentEvent::Usage {
             input_tokens: 5,
             output_tokens: 2,
             reasoning_tokens: 88,
         },
     ]);
-    assert_eq!(app.thinking_tokens, 88);
+    assert_eq!(app.state.thinking_tokens, 88);
     let document = app.build_document(80, Instant::now());
-    // Token count is in the above-input indicator (controls), not the transcript.
+    // Token count is in the progress line, not the transcript.
     assert!(document
         .controls
         .iter()
-        .any(|line| line.text.contains("88 reasoning tokens")));
+        .any(|line| line.text.contains("thinking") && line.text.contains("(88 tokens)")));
     assert!(!document
         .history
         .iter()
-        .any(|line| line.text.contains("reasoning tokens")));
+        .any(|line| line.text.contains("88 tokens")));
 }
 
 #[test]
@@ -593,7 +655,7 @@ fn assistant_message_is_rendered_as_markdown() {
 }
 
 #[test]
-fn thinking_indicator_resets_after_reply_completes() {
+fn thinking_tokens_reset_after_reply_completes() {
     let mut app = TuiApp::new(TestRuntime::default());
     app.apply_events(vec![
         AgentEvent::ThinkingStart,
@@ -605,16 +667,16 @@ fn thinking_indicator_resets_after_reply_completes() {
             reasoning_tokens: 42,
         },
     ]);
-    assert_eq!(app.thinking_tokens, 42);
+    assert_eq!(app.state.thinking_tokens, 42);
 
     app.apply_events(vec![AgentEvent::Status("ready".to_string())]);
-    // Indicator state is cleared; the reasoning message itself stays in chat.
-    assert_eq!(app.thinking_tokens, 0);
+    // Progress token state is cleared; the reasoning message itself stays in chat.
+    assert_eq!(app.state.thinking_tokens, 0);
     let document = app.build_document(80, Instant::now());
     assert!(!document
         .controls
         .iter()
-        .any(|line| line.text.contains("reasoning tokens")));
+        .any(|line| line.text.contains("42 tokens")));
     assert!(reasoning_entry(&app).is_some());
 }
 
@@ -639,27 +701,29 @@ fn collapsed_reasoning_message_keeps_only_first_lines() {
 fn compaction_events_set_progress_notices_and_context_meter() {
     let mut app = TuiApp::new(TestRuntime::default());
     app.apply_events(vec![AgentEvent::ContextUsage { tokens: 900_000 }]);
-    assert_eq!(app.current_context_tokens, 900_000);
+    assert_eq!(app.state.current_context_tokens, 900_000);
 
     app.apply_events(vec![AgentEvent::CompactionStart]);
-    assert!(matches!(app.activity.kind, ActivityKind::Compacting));
+    assert!(matches!(app.state.activity.kind, ActivityKind::Compacting));
     assert!(app
+        .state
         .chat
         .iter()
         .any(|line| matches!(line, ChatLine::System(text) if text.contains("Compacting"))));
 
     app.apply_events(vec![AgentEvent::CompactionProgress { output_tokens: 42 }]);
-    assert_eq!(app.activity.estimated_output_tokens, 42);
+    assert_eq!(app.state.activity.estimated_output_tokens, 42);
 
     app.apply_events(vec![
         AgentEvent::CompactionEnd,
         AgentEvent::ContextUsage { tokens: 25_000 },
     ]);
     assert!(app
+        .state
         .chat
         .iter()
         .any(|line| matches!(line, ChatLine::System(text) if text.contains("compacted"))));
-    assert_eq!(app.current_context_tokens, 25_000);
+    assert_eq!(app.state.current_context_tokens, 25_000);
 }
 
 #[test]
@@ -672,9 +736,9 @@ fn output_progress_color_warms_as_stream_stalls() {
     activity.estimated_output_tokens = 12;
 
     activity.last_delta_at = Some(now);
-    let fresh = activity.progress(now).unwrap().color;
+    let fresh = activity.progress(now, 0).unwrap().color;
     activity.last_delta_at = Some(now - Duration::from_secs(3));
-    let stalled = activity.progress(now).unwrap().color;
+    let stalled = activity.progress(now, 0).unwrap().color;
 
     assert_eq!(fresh, (70, 220, 110));
     assert!(stalled.0 > fresh.0);
@@ -703,7 +767,7 @@ fn tool_output_preview_truncates_long_output() {
         .map(|index| format!("line {index}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let preview = tool_output_preview("edit", &output, false);
+    let preview = tool_output_preview("custom", &output, false);
 
     assert!(preview.contains("line 0"));
     assert!(!preview.contains("line 19"));
@@ -718,29 +782,14 @@ fn tool_output_preview_prefers_diff_field() {
     })
     .to_string();
 
-    let preview = tool_output_preview("edit", &output, false);
+    let preview = tool_output_preview("str_replace", &output, false);
     let visible_preview = strip_ansi(&preview);
 
-    assert!(preview.contains("diff a"));
-    assert!(preview.contains("@@ -1 +1 @@"));
-    assert!(visible_preview.contains("-old"));
-    assert!(visible_preview.contains("+new"));
+    assert!(preview.contains("* Edited a (+1 -1)"));
+    assert!(visible_preview.contains("1 -  old"));
+    assert!(visible_preview.contains("1 +  new"));
+    assert!(!preview.contains("diff --git a/a b/a"));
     assert!(!visible_preview.contains("raw"));
-}
-
-#[test]
-fn tool_output_preview_highlights_single_line_replacements() {
-    let output = serde_json::json!({
-            "diff": "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-JuCode is slow today\n+JuCode is fast today\n"
-        })
-        .to_string();
-
-    let preview = tool_output_preview("edit", &output, false);
-
-    assert!(preview.contains(&format!("-JuCode is {INVERSE_ON}slow{INVERSE_OFF} today")));
-    assert!(preview.contains(&format!("+JuCode is {INVERSE_ON}fast{INVERSE_OFF} today")));
-    assert!(strip_ansi(&preview).contains("-JuCode is slow today"));
-    assert!(strip_ansi(&preview).contains("+JuCode is fast today"));
 }
 
 #[test]
@@ -760,13 +809,14 @@ fn tool_output_preview_keeps_additions_after_large_removals() {
 
     let preview = tool_output_preview("edit", &output, false);
 
-    assert!(preview.contains("diff README.md"));
-    assert!(preview.contains("-old line 0"));
-    assert!(preview.contains("+new important line"));
-    assert!(preview.contains("+another important line"));
+    assert!(preview.contains("* Edited README.md (+2 -30)"));
+    assert!(preview.contains("     1 -  old line 0"));
+    assert!(preview.contains("    30 -  old line 29"));
+    assert!(preview.contains("     1 +  new important line"));
+    assert!(preview.contains("     2 +  another important line"));
     assert!(!preview.contains("--- a/README.md"));
     assert!(!preview.contains("+++ b/README.md"));
-    assert!(preview.contains('…'));
+    assert!(!preview.contains('…'));
 }
 
 #[test]
@@ -804,10 +854,26 @@ fn tool_output_preview_projects_bash_latest_logs() {
     .to_string();
 
     let preview = tool_output_preview("bash", &output, false);
+    let plain_preview = strip_ansi(&preview);
 
-    assert!(preview.contains("bash: cargo test (exit 0)"));
-    assert!(preview.contains("stdout:"));
-    assert!(preview.contains("three"));
+    assert!(plain_preview.contains("cargo test  exit 0"));
+    assert!(plain_preview.contains("stdout:"));
+    assert!(plain_preview.contains("three"));
+}
+
+#[test]
+fn chat_history_inserts_separator_between_turns() {
+    let document = UiBuilder::new()
+        .chat(&[
+            ChatLine::User("first".to_string()),
+            ChatLine::Assistant("second".to_string()),
+        ])
+        .finish();
+
+    assert!(document
+        .history
+        .iter()
+        .any(|line| line.kind == UiKind::Separator && line.text.starts_with('─')));
 }
 
 #[test]
@@ -817,21 +883,24 @@ fn tool_preview_colors_diff_lines() {
             call_id: None,
             name: "edit".to_string(),
             output: serde_json::json!({
-                "diff": "diff --git a/a b/a\n-old\n+new\n"
+                "diff": "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n"
             })
             .to_string(),
             running: false,
         }])
         .finish();
 
+    assert!(
+        document
+            .history
+            .iter()
+            .any(|line| line.kind == UiKind::DiffRemove
+                && strip_ansi(&line.text).contains("1 -  old"))
+    );
     assert!(document
         .history
         .iter()
-        .any(|line| line.kind == UiKind::DiffRemove && line.text.contains("-old")));
-    assert!(document
-        .history
-        .iter()
-        .any(|line| line.kind == UiKind::DiffAdd && line.text.contains("+new")));
+        .any(|line| line.kind == UiKind::DiffAdd && strip_ansi(&line.text).contains("1 +  new")));
 }
 
 #[test]
@@ -843,7 +912,7 @@ fn rendered_frame_keeps_full_history_for_native_scrollback() {
 
     assert!(output.contains("line 0"));
     assert!(output.contains("line 19"));
-    assert_eq!(frame.lines.len(), 22);
+    assert_eq!(frame.lines.len(), 24);
 }
 
 #[test]
@@ -877,9 +946,9 @@ fn cursor_row_accounts_for_full_history() {
     let frame = RenderedFrame::build(&document, 80);
     let cursor = frame.cursor.expect("cursor marker should be found");
 
-    assert_eq!(frame.lines.len(), 22);
-    assert_eq!(cursor.row, 21);
-    assert_eq!(cursor.column, 2);
+    assert_eq!(frame.lines.len(), 24);
+    assert_eq!(cursor.row, 22);
+    assert_eq!(cursor.column, 2 + CONTENT_LEFT_PADDING);
 }
 
 #[test]
@@ -904,7 +973,7 @@ fn checkout_tree_enter_maps_to_checkout_command() {
 fn checkout_tree_fork_and_delete_are_interactive_commands() {
     let mut app = TuiApp::new(TestRuntime::default());
     let now = Instant::now();
-    app.picker_view = Some(PickerState::checkout(vec![TreeNodeView {
+    app.state.picker_view = Some(PickerState::checkout(vec![TreeNodeView {
         id: "e3".to_string(),
         parent_id: None,
         label: "selected prompt".to_string(),
@@ -1045,7 +1114,8 @@ fn checkout_tree_marks_rows_with_children_as_directories() {
 fn resume_picker_enter_maps_to_resume_command_without_delete() {
     let tree = PickerState::resume(vec![SessionListItemView {
         id: "s123".to_string(),
-        label: "s123 | entries 3 | leaf e2 | updated 1".to_string(),
+        label: "Fix resume list".to_string(),
+        detail: "working · summarize current task".to_string(),
         active: false,
     }]);
 
@@ -1105,14 +1175,16 @@ fn model_picker_renders_effort_hint() {
         "none".to_string(),
     );
     let document = UiBuilder::new().picker(Some(&picker)).finish();
-
-    assert!(document.controls.iter().any(|line| line
-        .text
-        .contains(&format!("thinking: {}", colored_reasoning_effort("none")))));
-    assert!(document
+    let controls = document
         .controls
         .iter()
-        .any(|line| line.text.contains("gpt-5.2") && line.text.contains(" *")));
+        .map(|line| strip_ansi(&line.text))
+        .collect::<Vec<_>>();
+
+    assert!(controls.iter().any(|text| text.contains("thinking: none")));
+    assert!(controls
+        .iter()
+        .any(|text| text.contains("gpt-5.2") && text.contains(" *")));
 }
 
 #[test]

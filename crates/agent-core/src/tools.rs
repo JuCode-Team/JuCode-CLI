@@ -15,14 +15,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const DEFAULT_READ_LIMIT: usize = 400;
-const DEFAULT_LIST_LIMIT: usize = 500;
-const DEFAULT_RIPGREP_LIMIT: usize = 100;
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 60;
-const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
-const MAX_MODEL_OUTPUT_BYTES: usize = 24 * 1024;
 const MAX_IMAGE_READ_BYTES: u64 = 1024 * 1024;
 const COMMAND_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
+const HASHLINE_ALPHABET: &[u8; 16] = b"ZPMQVRWSNKTXJBYH";
 
 pub struct ToolExecutionResult {
     pub output: String,
@@ -45,7 +41,7 @@ pub fn definitions() -> Vec<Value> {
                 "properties": {
                     "path": { "type": "string", "description": "Relative or absolute file path." },
                     "offset": { "type": "number", "description": "1-indexed line to start reading from. Defaults to 1." },
-                    "limit": { "type": "number", "description": "Maximum lines to read. Defaults to 400." }
+                    "limit": { "type": "number", "description": "Optional maximum lines to read. Defaults to no line limit." }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -53,8 +49,8 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "type": "function",
-            "name": "edit",
-            "description": "Apply one or more exact targeted text replacements to a UTF-8 file. Each oldText must match exactly once in the original file.",
+            "name": "str_replace",
+            "description": "Apply one or more exact targeted text replacements to a UTF-8 file. The file must be read first, and each oldText must match exactly once in the current file.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -79,8 +75,42 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "type": "function",
+            "name": "hashline_edit",
+            "description": "Patch one UTF-8 file using LINE#HASH anchors from the most recent read output. Supports replace, append, and prepend line edits.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Relative or absolute file path." },
+                    "edits": {
+                        "type": "array",
+                        "description": "Hashline edits over this file. Anchors are copied from read().hashlines.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "op": { "type": "string", "enum": ["replace", "append", "prepend"], "description": "replace a line/range, append after pos, or prepend before pos." },
+                                "pos": { "type": "string", "description": "LINE#HASH anchor. Required for replace; optional for append/prepend." },
+                                "end": { "type": "string", "description": "Inclusive LINE#HASH range end for replace." },
+                                "lines": {
+                                    "description": "Literal replacement/insertion lines. No LINE#HASH prefixes and no diff +/- prefixes.",
+                                    "oneOf": [
+                                        { "type": "array", "items": { "type": "string" } },
+                                        { "type": "string" }
+                                    ]
+                                }
+                            },
+                            "required": ["op", "lines"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["path", "edits"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
             "name": "write",
-            "description": "Write UTF-8 text to a file. Creates parent directories and overwrites the full file.",
+            "description": "Overwrite a UTF-8 file with full content. The file must be read first.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -123,19 +153,6 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "type": "function",
-            "name": "apply_patch",
-            "description": "Apply a unified diff patch to files in the current workspace. Use this for multi-file edits, file creation, deletion, and precise code changes.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "patch": { "type": "string", "description": "Unified diff patch content accepted by git apply." }
-                },
-                "required": ["patch"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "type": "function",
             "name": "diff",
             "description": "Show workspace changes in git diff format. Optionally restrict to one path.",
             "parameters": {
@@ -154,7 +171,7 @@ pub fn definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Directory to list. Defaults to current workspace." },
-                    "limit": { "type": "number", "description": "Maximum entries to return. Defaults to 500." }
+                    "limit": { "type": "number", "description": "Optional maximum entries to return. Defaults to no entry limit." }
                 },
                 "additionalProperties": false
             }
@@ -172,7 +189,7 @@ pub fn definitions() -> Vec<Value> {
                     "ignoreCase": { "type": "boolean", "description": "Case-insensitive search. Defaults to false." },
                     "literal": { "type": "boolean", "description": "Treat pattern as a literal string. Defaults to false." },
                     "contextLines": { "type": "number", "description": "Lines before and after each match. Defaults to 0." },
-                    "limit": { "type": "number", "description": "Maximum output lines. Defaults to 100." }
+                    "limit": { "type": "number", "description": "Optional maximum output lines. Defaults to no output line limit." }
                 },
                 "required": ["pattern"],
                 "additionalProperties": false
@@ -236,7 +253,8 @@ pub fn run_tool_with_events(
 
     let result = match name {
         "read" => read_file(&args, cwd),
-        "edit" => edit_file(&args, cwd),
+        "str_replace" | "edit" => str_replace_file(&args, cwd),
+        "hashline_edit" => hashline_edit_file(&args, cwd),
         "write" => write_file(&args, cwd),
         "bash" | "execute" => bash(&args, cwd, &mut emit),
         "write_stdin" => write_stdin(&args),
@@ -276,9 +294,7 @@ fn read_file(args: &Value, cwd: &Path) -> Value {
 
     let path = resolve_path(cwd, path);
     let offset = optional_usize(args, "offset").unwrap_or(1).max(1);
-    let limit = optional_usize(args, "limit")
-        .unwrap_or(DEFAULT_READ_LIMIT)
-        .max(1);
+    let limit = optional_usize(args, "limit").map(|limit| limit.max(1));
 
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
@@ -329,6 +345,7 @@ fn read_file(args: &Value, cwd: &Path) -> Value {
     };
 
     let mut content = String::new();
+    let mut hashlines = String::new();
     let mut lines_read = 0usize;
     let mut truncated = false;
     let mut line_number = 0usize;
@@ -338,12 +355,17 @@ fn read_file(args: &Value, cwd: &Path) -> Value {
         if line_number < offset {
             continue;
         }
-        if lines_read >= limit || content.len() + line.len() > MAX_TOOL_OUTPUT_BYTES {
+        if limit.is_some_and(|limit| lines_read >= limit) {
             truncated = true;
             break;
         }
 
         content.push_str(line);
+        let display_line = line.strip_suffix('\n').unwrap_or(line);
+        hashlines.push_str(&format_hashline(line_number, display_line));
+        if line.ends_with('\n') {
+            hashlines.push('\n');
+        }
         lines_read += 1;
     }
     mark_read(&path);
@@ -356,10 +378,11 @@ fn read_file(args: &Value, cwd: &Path) -> Value {
         "lines_read": lines_read,
         "truncated": truncated,
         "content": content,
+        "hashlines": hashlines,
     })
 }
 
-fn edit_file(args: &Value, cwd: &Path) -> Value {
+fn str_replace_file(args: &Value, cwd: &Path) -> Value {
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return json!({ "error": "missing path" });
     };
@@ -440,6 +463,91 @@ fn edit_file(args: &Value, cwd: &Path) -> Value {
     }
 }
 
+#[derive(Clone)]
+struct HashlineAnchor {
+    line: usize,
+    hash: String,
+}
+
+struct HashlineEdit {
+    op: String,
+    pos: Option<HashlineAnchor>,
+    end: Option<HashlineAnchor>,
+    lines: Vec<String>,
+}
+
+struct HashlineSpan {
+    start: usize,
+    end: usize,
+    replacement: String,
+}
+
+fn hashline_edit_file(args: &Value, cwd: &Path) -> Value {
+    let Some(path) = args.get("path").and_then(Value::as_str) else {
+        return json!({ "error": "missing path" });
+    };
+    let Some(raw_edits) = args.get("edits").and_then(Value::as_array) else {
+        return json!({ "error": "missing edits" });
+    };
+    if raw_edits.is_empty() {
+        return json!({ "error": "edits must not be empty" });
+    }
+
+    let path = resolve_path(cwd, path);
+    if !has_read(&path) {
+        return json!({
+            "path": path.display().to_string(),
+            "error": "hashline_edit requires reading this file first and copying LINE#HASH anchors from read().hashlines"
+        });
+    }
+
+    let original = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            return json!({ "path": path.display().to_string(), "error": error.to_string() })
+        }
+    };
+
+    let edits = match parse_hashline_edits(raw_edits) {
+        Ok(edits) => edits,
+        Err(error) => return json!({ "path": path.display().to_string(), "error": error }),
+    };
+
+    let line_index = LineIndex::new(&original);
+    if let Err(error) = validate_hashline_anchors(&edits, &line_index) {
+        return json!({ "path": path.display().to_string(), "error": error });
+    }
+
+    let spans = match resolve_hashline_spans(&edits, &original, &line_index) {
+        Ok(spans) => spans,
+        Err(error) => return json!({ "path": path.display().to_string(), "error": error }),
+    };
+
+    let mut output = original.clone();
+    for span in spans.iter().rev() {
+        output.replace_range(span.start..span.end, &span.replacement);
+    }
+
+    let _ = create_checkpoint(cwd, "auto-hashline-edit", std::slice::from_ref(&path));
+    match fs::write(&path, &output) {
+        Ok(()) => {
+            mark_read(&path);
+            let diff = unified_diff_for_file(cwd, &path, &original, &output);
+            let changed = changed_line_range(&original, &output);
+            let anchors =
+                changed.and_then(|(first, last)| post_edit_anchor_block(&output, first, last));
+            json!({
+                "path": path.display().to_string(),
+                "edits": edits.len(),
+                "written_bytes": output.len(),
+                "diff": diff.unwrap_or_default(),
+                "anchors": anchors.unwrap_or_default(),
+            })
+        }
+        Err(error) => json!({ "path": path.display().to_string(), "error": error.to_string() }),
+    }
+}
+
 fn write_file(args: &Value, cwd: &Path) -> Value {
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return json!({ "error": "missing path" });
@@ -449,6 +557,12 @@ fn write_file(args: &Value, cwd: &Path) -> Value {
     };
 
     let path = resolve_path(cwd, path);
+    if !has_read(&path) {
+        return json!({
+            "path": path.display().to_string(),
+            "error": "write requires reading this file first before overwriting it"
+        });
+    }
     let original = fs::read_to_string(&path).unwrap_or_default();
     if let Some(parent) = path.parent() {
         if let Err(error) = fs::create_dir_all(parent) {
@@ -469,6 +583,514 @@ fn write_file(args: &Value, cwd: &Path) -> Value {
         }
         Err(error) => json!({ "path": path.display().to_string(), "error": error.to_string() }),
     }
+}
+
+fn parse_hashline_edits(raw_edits: &[Value]) -> Result<Vec<HashlineEdit>, String> {
+    let mut edits = Vec::new();
+    for edit in raw_edits {
+        let op = edit
+            .get("op")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "each hashline edit requires op".to_string())?;
+        if !matches!(op, "replace" | "append" | "prepend") {
+            return Err(format!(
+                "[E_BAD_OP] Unknown edit op \"{op}\". Expected replace, append, or prepend."
+            ));
+        }
+
+        let pos = edit
+            .get("pos")
+            .and_then(Value::as_str)
+            .map(parse_hashline_anchor)
+            .transpose()?;
+        let end = edit
+            .get("end")
+            .and_then(Value::as_str)
+            .map(parse_hashline_anchor)
+            .transpose()?;
+        let lines = parse_hashline_lines(edit.get("lines"))?;
+
+        if op == "replace" && pos.is_none() {
+            return Err("[E_BAD_OP] Replace requires a pos anchor.".to_string());
+        }
+        if op != "replace" && end.is_some() {
+            return Err(format!("[E_BAD_OP] {op} does not support an end anchor."));
+        }
+        if op != "replace" && lines.is_empty() {
+            return Err(format!("[E_BAD_OP] {op} requires at least one line."));
+        }
+
+        edits.push(HashlineEdit {
+            op: op.to_string(),
+            pos,
+            end,
+            lines,
+        });
+    }
+    Ok(edits)
+}
+
+fn parse_hashline_lines(value: Option<&Value>) -> Result<Vec<String>, String> {
+    let Some(value) = value else {
+        return Err("each hashline edit requires lines".to_string());
+    };
+    let lines = if let Some(text) = value.as_str() {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        normalized
+            .strip_suffix('\n')
+            .unwrap_or(&normalized)
+            .split('\n')
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    } else if let Some(values) = value.as_array() {
+        values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "lines array must contain only strings".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        return Err("lines must be a string or an array of strings".to_string());
+    };
+    for line in &lines {
+        if is_hashline_display_prefix(line) || is_diff_payload_prefix(line) {
+            return Err(format!(
+                "[E_INVALID_PATCH] lines must contain literal file content, not LINE#HASH or diff prefixes. Offending line: {line:?}"
+            ));
+        }
+    }
+    Ok(lines)
+}
+
+fn parse_hashline_anchor(ref_text: &str) -> Result<HashlineAnchor, String> {
+    let core = ref_text
+        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '>' || ch == '+' || ch == '-')
+        .trim_end();
+    let Some(hash_pos) = core.find('#') else {
+        return Err(format!(
+            "[E_BAD_REF] Invalid line reference {ref_text:?}. Expected LINE#HASH."
+        ));
+    };
+    let line = core[..hash_pos].trim().parse::<usize>().map_err(|_| {
+        format!("[E_BAD_REF] Invalid line reference {ref_text:?}. Expected numeric LINE#HASH.")
+    })?;
+    if line == 0 {
+        return Err(format!(
+            "[E_BAD_REF] Line number must be >= 1 in {ref_text:?}."
+        ));
+    }
+    let hash_part = core[hash_pos + 1..]
+        .split_once(':')
+        .map(|(hash, _)| hash)
+        .unwrap_or(&core[hash_pos + 1..])
+        .trim();
+    if hash_part.len() != 2
+        || !hash_part
+            .as_bytes()
+            .iter()
+            .all(|byte| HASHLINE_ALPHABET.contains(byte))
+    {
+        return Err(format!(
+            "[E_BAD_REF] Invalid line reference {ref_text:?}: hash must be exactly 2 characters from {}.",
+            String::from_utf8_lossy(HASHLINE_ALPHABET)
+        ));
+    }
+    Ok(HashlineAnchor {
+        line,
+        hash: hash_part.to_string(),
+    })
+}
+
+struct LineIndex {
+    lines: Vec<String>,
+    starts: Vec<usize>,
+    has_terminal_newline: bool,
+}
+
+impl LineIndex {
+    fn new(content: &str) -> Self {
+        let lines = content.split('\n').map(str::to_string).collect::<Vec<_>>();
+        let mut starts = Vec::with_capacity(lines.len());
+        let mut offset = 0usize;
+        for (index, line) in lines.iter().enumerate() {
+            starts.push(offset);
+            offset += line.len();
+            if index < lines.len() - 1 {
+                offset += 1;
+            }
+        }
+        Self {
+            lines,
+            starts,
+            has_terminal_newline: content.ends_with('\n'),
+        }
+    }
+}
+
+fn validate_hashline_anchors(edits: &[HashlineEdit], line_index: &LineIndex) -> Result<(), String> {
+    let mut mismatches = Vec::new();
+    for edit in edits {
+        for anchor in [&edit.pos, &edit.end].into_iter().flatten() {
+            if anchor.line == 0 || anchor.line > line_index.lines.len() {
+                return Err(format!(
+                    "[E_RANGE_OOB] Line {} does not exist (file has {} lines).",
+                    anchor.line,
+                    line_index.lines.len()
+                ));
+            }
+            let actual = compute_line_hash(anchor.line, &line_index.lines[anchor.line - 1]);
+            if actual != anchor.hash {
+                mismatches.push((anchor.line, anchor.hash.clone(), actual));
+            }
+        }
+    }
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+    Err(format_hashline_mismatch(&mismatches, &line_index.lines))
+}
+
+fn resolve_hashline_spans(
+    edits: &[HashlineEdit],
+    content: &str,
+    line_index: &LineIndex,
+) -> Result<Vec<HashlineSpan>, String> {
+    let mut spans = Vec::new();
+    for edit in edits {
+        let span = match edit.op.as_str() {
+            "replace" => resolve_hashline_replace(edit, content, line_index)?,
+            "append" => resolve_hashline_append(edit, content, line_index)?,
+            "prepend" => resolve_hashline_prepend(edit, content, line_index)?,
+            _ => return Err(format!("[E_BAD_OP] Unknown edit op {}.", edit.op)),
+        };
+        spans.push(span);
+    }
+    spans.sort_by_key(|span| (span.start, span.end));
+    for pair in spans.windows(2) {
+        if pair[0].end > pair[1].start {
+            return Err("[E_EDIT_CONFLICT] hashline edits must not overlap.".to_string());
+        }
+        if pair[0].start == pair[1].start && pair[0].end == pair[1].end {
+            return Err(
+                "[E_EDIT_CONFLICT] hashline edits target the same insertion boundary.".to_string(),
+            );
+        }
+    }
+    Ok(spans)
+}
+
+fn resolve_hashline_replace(
+    edit: &HashlineEdit,
+    content: &str,
+    line_index: &LineIndex,
+) -> Result<HashlineSpan, String> {
+    let pos = edit.pos.as_ref().expect("replace pos validated");
+    let end = edit.end.as_ref().unwrap_or(pos);
+    if pos.line > end.line {
+        return Err(format!(
+            "[E_BAD_OP] Range start line {} must be <= end line {}.",
+            pos.line, end.line
+        ));
+    }
+    let replacement = edit.lines.join("\n");
+    let start = line_index.starts[pos.line - 1];
+    let end_offset = if edit.lines.is_empty() {
+        if pos.line == 1 && end.line == line_index.lines.len() {
+            content.len()
+        } else if end.line < line_index.lines.len() {
+            line_index.starts[end.line]
+        } else {
+            line_index.starts[pos.line - 1].saturating_sub(1)
+        }
+    } else {
+        line_index.starts[end.line - 1] + line_index.lines[end.line - 1].len()
+    };
+    Ok(HashlineSpan {
+        start,
+        end: end_offset,
+        replacement,
+    })
+}
+
+fn resolve_hashline_append(
+    edit: &HashlineEdit,
+    content: &str,
+    line_index: &LineIndex,
+) -> Result<HashlineSpan, String> {
+    let inserted = edit.lines.join("\n");
+    if content.is_empty() {
+        return Ok(HashlineSpan {
+            start: 0,
+            end: 0,
+            replacement: inserted,
+        });
+    }
+    if let Some(pos) = &edit.pos {
+        let sentinel_append = line_index.has_terminal_newline && pos.line == line_index.lines.len();
+        let offset = if sentinel_append {
+            content.len()
+        } else {
+            line_index.starts[pos.line - 1] + line_index.lines[pos.line - 1].len()
+        };
+        Ok(HashlineSpan {
+            start: offset,
+            end: offset,
+            replacement: if sentinel_append {
+                format!("{inserted}\n")
+            } else {
+                format!("\n{inserted}")
+            },
+        })
+    } else {
+        Ok(HashlineSpan {
+            start: content.len(),
+            end: content.len(),
+            replacement: if line_index.has_terminal_newline {
+                format!("{inserted}\n")
+            } else {
+                format!("\n{inserted}")
+            },
+        })
+    }
+}
+
+fn resolve_hashline_prepend(
+    edit: &HashlineEdit,
+    content: &str,
+    line_index: &LineIndex,
+) -> Result<HashlineSpan, String> {
+    let inserted = edit.lines.join("\n");
+    let start = edit
+        .pos
+        .as_ref()
+        .map(|pos| line_index.starts[pos.line - 1])
+        .unwrap_or(0);
+    Ok(HashlineSpan {
+        start,
+        end: start,
+        replacement: if content.is_empty() {
+            inserted
+        } else {
+            format!("{inserted}\n")
+        },
+    })
+}
+
+fn format_hashline_mismatch(mismatches: &[(usize, String, String)], lines: &[String]) -> String {
+    let mut retry_lines = HashSet::new();
+    for (line, _, _) in mismatches {
+        let start = line.saturating_sub(2).max(1);
+        let end = (*line + 2).min(lines.len());
+        for retry in start..=end {
+            retry_lines.insert(retry);
+        }
+    }
+    let mut sorted = retry_lines.into_iter().collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let mut out = vec![format!(
+        "[E_STALE_ANCHOR] {} stale anchor{}. Retry with the >>> LINE#HASH lines below.",
+        mismatches.len(),
+        if mismatches.len() == 1 { "" } else { "s" }
+    )];
+    for line in sorted {
+        let content = &lines[line - 1];
+        out.push(format!(
+            ">>> {}#{}:{}",
+            line,
+            compute_line_hash(line, content),
+            content
+        ));
+    }
+    out.join("\n")
+}
+
+fn is_hashline_display_prefix(line: &str) -> bool {
+    let trimmed = line
+        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '>' || ch == '+')
+        .trim_start();
+    let Some((line_part, rest)) = trimmed.split_once('#') else {
+        return false;
+    };
+    if !line_part.trim().chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    let Some((hash, _)) = rest.split_once(':') else {
+        return false;
+    };
+    hash.trim().len() == 2
+        && hash
+            .trim()
+            .as_bytes()
+            .iter()
+            .all(|byte| HASHLINE_ALPHABET.contains(byte))
+}
+
+fn is_diff_payload_prefix(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('-') else {
+        return false;
+    };
+    let trimmed = rest.trim_start();
+    let digit_count = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    digit_count > 0 && trimmed[digit_count..].starts_with("    ")
+}
+
+fn format_hashline(line_number: usize, line: &str) -> String {
+    format!(
+        "{line_number}#{}:{line}",
+        compute_line_hash(line_number, line)
+    )
+}
+
+fn compute_line_hash(line_number: usize, line: &str) -> String {
+    let normalized = line.trim_end_matches('\r').trim_end();
+    let seed = if normalized.chars().any(|ch| ch.is_alphanumeric()) {
+        0
+    } else {
+        line_number as u32
+    };
+    let value = xxh32(normalized.as_bytes(), seed) & 0xff;
+    let high = ((value >> 4) & 0x0f) as usize;
+    let low = (value & 0x0f) as usize;
+    let mut hash = String::with_capacity(2);
+    hash.push(HASHLINE_ALPHABET[high] as char);
+    hash.push(HASHLINE_ALPHABET[low] as char);
+    hash
+}
+
+fn xxh32(input: &[u8], seed: u32) -> u32 {
+    const PRIME32_1: u32 = 0x9E3779B1;
+    const PRIME32_2: u32 = 0x85EBCA77;
+    const PRIME32_3: u32 = 0xC2B2AE3D;
+    const PRIME32_4: u32 = 0x27D4EB2F;
+    const PRIME32_5: u32 = 0x165667B1;
+
+    let mut index = 0usize;
+    let mut hash;
+    if input.len() >= 16 {
+        let mut v1 = seed.wrapping_add(PRIME32_1).wrapping_add(PRIME32_2);
+        let mut v2 = seed.wrapping_add(PRIME32_2);
+        let mut v3 = seed;
+        let mut v4 = seed.wrapping_sub(PRIME32_1);
+        while index <= input.len() - 16 {
+            v1 = xxh32_round(v1, read_u32_le(input, index));
+            index += 4;
+            v2 = xxh32_round(v2, read_u32_le(input, index));
+            index += 4;
+            v3 = xxh32_round(v3, read_u32_le(input, index));
+            index += 4;
+            v4 = xxh32_round(v4, read_u32_le(input, index));
+            index += 4;
+        }
+        hash = v1
+            .rotate_left(1)
+            .wrapping_add(v2.rotate_left(7))
+            .wrapping_add(v3.rotate_left(12))
+            .wrapping_add(v4.rotate_left(18));
+    } else {
+        hash = seed.wrapping_add(PRIME32_5);
+    }
+
+    hash = hash.wrapping_add(input.len() as u32);
+    while index + 4 <= input.len() {
+        hash = hash
+            .wrapping_add(read_u32_le(input, index).wrapping_mul(PRIME32_3))
+            .rotate_left(17)
+            .wrapping_mul(PRIME32_4);
+        index += 4;
+    }
+    while index < input.len() {
+        hash = hash
+            .wrapping_add(u32::from(input[index]).wrapping_mul(PRIME32_5))
+            .rotate_left(11)
+            .wrapping_mul(PRIME32_1);
+        index += 1;
+    }
+
+    hash ^= hash >> 15;
+    hash = hash.wrapping_mul(PRIME32_2);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(PRIME32_3);
+    hash ^= hash >> 16;
+    hash
+}
+
+fn xxh32_round(acc: u32, lane: u32) -> u32 {
+    const PRIME32_1: u32 = 0x9E3779B1;
+    const PRIME32_2: u32 = 0x85EBCA77;
+    acc.wrapping_add(lane.wrapping_mul(PRIME32_2))
+        .rotate_left(13)
+        .wrapping_mul(PRIME32_1)
+}
+
+fn read_u32_le(input: &[u8], index: usize) -> u32 {
+    u32::from_le_bytes([
+        input[index],
+        input[index + 1],
+        input[index + 2],
+        input[index + 3],
+    ])
+}
+
+fn changed_line_range(original: &str, updated: &str) -> Option<(usize, usize)> {
+    if original == updated {
+        return None;
+    }
+    let original_bytes = original.as_bytes();
+    let updated_bytes = updated.as_bytes();
+    let min_len = original_bytes.len().min(updated_bytes.len());
+    let mut first_diff = 0usize;
+    while first_diff < min_len && original_bytes[first_diff] == updated_bytes[first_diff] {
+        first_diff += 1;
+    }
+
+    let mut original_tail = original_bytes.len();
+    let mut updated_tail = updated_bytes.len();
+    while original_tail > first_diff
+        && updated_tail > first_diff
+        && original_bytes[original_tail - 1] == updated_bytes[updated_tail - 1]
+    {
+        original_tail -= 1;
+        updated_tail -= 1;
+    }
+
+    let first = byte_index_to_line(updated, first_diff);
+    let last = if updated_tail <= first_diff {
+        first
+    } else {
+        byte_index_to_line(updated, updated_tail.saturating_sub(1))
+    };
+    Some((first, last.max(first)))
+}
+
+fn byte_index_to_line(text: &str, byte_index: usize) -> usize {
+    let end = byte_index.min(text.len());
+    text[..end].bytes().filter(|byte| *byte == b'\n').count() + 1
+}
+
+fn post_edit_anchor_block(content: &str, first: usize, last: usize) -> Option<String> {
+    let lines = content.split('\n').map(str::to_string).collect::<Vec<_>>();
+    let visible_line_count = if content.ends_with('\n') {
+        lines.len().saturating_sub(1)
+    } else {
+        lines.len()
+    };
+    if visible_line_count == 0 {
+        return None;
+    }
+    let start = first.saturating_sub(2).max(1);
+    let end = (last + 2).min(visible_line_count);
+    if end < start || end - start + 1 > 12 {
+        return None;
+    }
+    let mut out = Vec::new();
+    out.push(format!("--- Anchors {start}-{end} ---"));
+    for line_number in start..=end {
+        out.push(format_hashline(line_number, &lines[line_number - 1]));
+    }
+    Some(out.join("\n"))
 }
 
 fn bash(
@@ -713,76 +1335,8 @@ fn shell_sessions() -> &'static Mutex<HashMap<u64, ShellSession>> {
 }
 
 pub fn project_model_output(name: &str, output: &str, cwd: &Path) -> String {
-    if output.len() <= MAX_MODEL_OUTPUT_BYTES {
-        return output.to_string();
-    }
-    let saved_path = save_truncated_result(name, output, cwd).ok();
-    let tail_budget = 2048usize.min(MAX_MODEL_OUTPUT_BYTES / 8);
-    let head_budget = MAX_MODEL_OUTPUT_BYTES.saturating_sub(tail_budget);
-    let head = safe_prefix(output, head_budget);
-    let tail = safe_suffix(output, tail_budget);
-    let dropped = output.len().saturating_sub(head.len() + tail.len());
-    let note = saved_path
-        .map(|path| format!(" Full result saved at: {path}."))
-        .unwrap_or_default();
-    format!("{head}\n\n[...truncated {dropped} bytes for model context.{note}]\n\n{tail}")
-}
-
-fn save_truncated_result(name: &str, output: &str, cwd: &Path) -> io::Result<String> {
-    let dir = cwd.join(".jucode").join("truncated-results");
-    fs::create_dir_all(&dir)?;
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let filename = format!("{nanos}-{}.txt", sanitize_filename(name));
-    let path = dir.join(filename);
-    fs::write(&path, output)?;
-    Ok(path
-        .strip_prefix(cwd)
-        .unwrap_or(&path)
-        .to_string_lossy()
-        .replace('\\', "/"))
-}
-
-fn sanitize_filename(name: &str) -> String {
-    let mut value = name
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .take(48)
-        .collect::<String>();
-    if value.is_empty() {
-        value.push_str("tool");
-    }
-    value
-}
-
-fn safe_prefix(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_string();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_string()
-}
-
-fn safe_suffix(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_string();
-    }
-    let mut start = value.len().saturating_sub(max_bytes);
-    while start < value.len() && !value.is_char_boundary(start) {
-        start += 1;
-    }
-    value[start..].to_string()
+    let _ = (name, cwd);
+    output.to_string()
 }
 
 fn apply_patch(
@@ -855,9 +1409,7 @@ fn list_dir(args: &Value, cwd: &Path) -> Value {
         .and_then(Value::as_str)
         .map(|path| resolve_path(cwd, path))
         .unwrap_or_else(|| cwd.to_path_buf());
-    let limit = optional_usize(args, "limit")
-        .unwrap_or(DEFAULT_LIST_LIMIT)
-        .max(1);
+    let limit = optional_usize(args, "limit").map(|limit| limit.max(1));
 
     let entries = match fs::read_dir(&path) {
         Ok(entries) => entries,
@@ -882,8 +1434,10 @@ fn list_dir(args: &Value, cwd: &Path) -> Value {
         names.push(name);
     }
     names.sort();
-    let truncated = names.len() > limit;
-    names.truncate(limit);
+    let truncated = limit.is_some_and(|limit| names.len() > limit);
+    if let Some(limit) = limit {
+        names.truncate(limit);
+    }
 
     json!({
         "path": path.display().to_string(),
@@ -901,9 +1455,7 @@ fn ripgrep(args: &Value, cwd: &Path) -> Value {
         .and_then(Value::as_str)
         .map(|path| resolve_path(cwd, path))
         .unwrap_or_else(|| cwd.to_path_buf());
-    let limit = optional_usize(args, "limit")
-        .unwrap_or(DEFAULT_RIPGREP_LIMIT)
-        .max(1);
+    let limit = optional_usize(args, "limit").map(|limit| limit.max(1));
     let context_lines = optional_usize(args, "contextLines").unwrap_or(0);
 
     let mut command_args = vec![
@@ -940,7 +1492,7 @@ fn ripgrep(args: &Value, cwd: &Path) -> Value {
     let arg_refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
     let result = run_command("rg", &arg_refs, cwd, Duration::from_secs(30));
     let mut value = command_result_json("rg", result);
-    if let Some(stdout) = value.get("stdout").and_then(Value::as_str) {
+    if let (Some(stdout), Some(limit)) = (value.get("stdout").and_then(Value::as_str), limit) {
         let lines = stdout.lines().take(limit).collect::<Vec<_>>();
         let truncated = stdout.lines().count() > limit;
         value["stdout"] = json!(lines.join("\n"));
@@ -1375,8 +1927,6 @@ fn unified_diff_for_file(cwd: &Path, path: &Path, original: &str, updated: &str)
     }
 
     let label = diff_label(cwd, path);
-    let old_label = format!("a/{label}");
-    let new_label = format!("b/{label}");
     let old_arg = old_path.display().to_string();
     let new_arg = new_path.display().to_string();
     let result = run_command(
@@ -1385,10 +1935,6 @@ fn unified_diff_for_file(cwd: &Path, path: &Path, original: &str, updated: &str)
             "diff",
             "--no-index",
             "--no-ext-diff",
-            "--label",
-            &old_label,
-            "--label",
-            &new_label,
             "--",
             &old_arg,
             &new_arg,
@@ -1401,7 +1947,7 @@ fn unified_diff_for_file(cwd: &Path, path: &Path, original: &str, updated: &str)
 
     if let Ok(result) = result {
         if !result.stdout.trim().is_empty() {
-            return Some(result.stdout);
+            return Some(relabel_no_index_diff(&result.stdout, &label));
         }
     }
     Some(simple_unified_diff(&label, original, updated))
@@ -1442,6 +1988,23 @@ fn diff_path_arg(cwd: &Path, path: &Path) -> String {
     path.strip_prefix(cwd).unwrap_or(path).display().to_string()
 }
 
+fn relabel_no_index_diff(diff: &str, label: &str) -> String {
+    let mut output = String::new();
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            output.push_str(&format!("diff --git a/{label} b/{label}\n"));
+        } else if line.starts_with("--- ") {
+            output.push_str(&format!("--- a/{label}\n"));
+        } else if line.starts_with("+++ ") {
+            output.push_str(&format!("+++ b/{label}\n"));
+        } else {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    output
+}
+
 fn simple_unified_diff(label: &str, original: &str, updated: &str) -> String {
     let old_lines = original.lines().collect::<Vec<_>>();
     let new_lines = updated.lines().collect::<Vec<_>>();
@@ -1450,17 +2013,96 @@ fn simple_unified_diff(label: &str, original: &str, updated: &str) -> String {
         old_lines.len(),
         new_lines.len()
     );
-    for line in old_lines {
-        diff.push('-');
-        diff.push_str(line);
-        diff.push('\n');
-    }
-    for line in new_lines {
-        diff.push('+');
+    for op in line_diff_ops(&old_lines, &new_lines) {
+        let (prefix, line) = match op {
+            DiffOp::Context(line) => (' ', line),
+            DiffOp::Remove(line) => ('-', line),
+            DiffOp::Add(line) => ('+', line),
+        };
+        diff.push(prefix);
         diff.push_str(line);
         diff.push('\n');
     }
     diff
+}
+
+enum DiffOp<'a> {
+    Context(&'a str),
+    Remove(&'a str),
+    Add(&'a str),
+}
+
+fn line_diff_ops<'a>(old_lines: &[&'a str], new_lines: &[&'a str]) -> Vec<DiffOp<'a>> {
+    let mut prefix = 0usize;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix] == new_lines[prefix]
+    {
+        prefix += 1;
+    }
+
+    let mut suffix = 0usize;
+    while suffix < old_lines.len().saturating_sub(prefix)
+        && suffix < new_lines.len().saturating_sub(prefix)
+        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let old_mid = &old_lines[prefix..old_lines.len() - suffix];
+    let new_mid = &new_lines[prefix..new_lines.len() - suffix];
+    let mut ops = Vec::new();
+    ops.extend(old_lines[..prefix].iter().copied().map(DiffOp::Context));
+    ops.extend(line_diff_middle(old_mid, new_mid));
+    ops.extend(
+        old_lines[old_lines.len() - suffix..]
+            .iter()
+            .copied()
+            .map(DiffOp::Context),
+    );
+    ops
+}
+
+fn line_diff_middle<'a>(old_lines: &[&'a str], new_lines: &[&'a str]) -> Vec<DiffOp<'a>> {
+    if old_lines.is_empty() {
+        return new_lines.iter().copied().map(DiffOp::Add).collect();
+    }
+    if new_lines.is_empty() {
+        return old_lines.iter().copied().map(DiffOp::Remove).collect();
+    }
+
+    let cols = new_lines.len() + 1;
+    let mut lcs = vec![0usize; (old_lines.len() + 1) * cols];
+    for old_index in (0..old_lines.len()).rev() {
+        for new_index in (0..new_lines.len()).rev() {
+            let index = old_index * cols + new_index;
+            lcs[index] = if old_lines[old_index] == new_lines[new_index] {
+                lcs[(old_index + 1) * cols + new_index + 1] + 1
+            } else {
+                lcs[(old_index + 1) * cols + new_index].max(lcs[old_index * cols + new_index + 1])
+            };
+        }
+    }
+
+    let mut ops = Vec::new();
+    let mut old_index = 0usize;
+    let mut new_index = 0usize;
+    while old_index < old_lines.len() && new_index < new_lines.len() {
+        if old_lines[old_index] == new_lines[new_index] {
+            ops.push(DiffOp::Context(old_lines[old_index]));
+            old_index += 1;
+            new_index += 1;
+        } else if lcs[(old_index + 1) * cols + new_index] >= lcs[old_index * cols + new_index + 1] {
+            ops.push(DiffOp::Remove(old_lines[old_index]));
+            old_index += 1;
+        } else {
+            ops.push(DiffOp::Add(new_lines[new_index]));
+            new_index += 1;
+        }
+    }
+    ops.extend(old_lines[old_index..].iter().copied().map(DiffOp::Remove));
+    ops.extend(new_lines[new_index..].iter().copied().map(DiffOp::Add));
+    ops
 }
 
 fn command_display(program: &str, args: &[&str]) -> String {
@@ -1493,12 +2135,7 @@ fn read_output_file(path: &Path) -> (String, bool) {
     let Ok(bytes) = fs::read(path) else {
         return (String::new(), false);
     };
-    let truncated = bytes.len() > MAX_TOOL_OUTPUT_BYTES;
-    let start = bytes.len().saturating_sub(MAX_TOOL_OUTPUT_BYTES);
-    (
-        String::from_utf8_lossy(&bytes[start..]).to_string(),
-        truncated,
-    )
+    (String::from_utf8_lossy(&bytes).to_string(), false)
 }
 
 fn shell_command(command: &str) -> (&'static str, Vec<&str>) {
@@ -1574,6 +2211,25 @@ mod tests {
     }
 
     #[test]
+    fn read_defaults_to_no_line_limit() {
+        let dir = test_dir("read-no-limit");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        let content = (1..=550)
+            .map(|line| format!("line-{line}\n"))
+            .collect::<String>();
+        fs::write(&path, &content).unwrap();
+
+        let result = run_tool("read", &json!({ "path": path }).to_string(), &dir);
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["lines_read"], 550);
+        assert_eq!(value["truncated"], false);
+        assert_eq!(value["content"], content);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn edit_requires_unique_old_text() {
         let dir = test_dir("edit");
         let path = dir.join("sample.txt");
@@ -1621,8 +2277,12 @@ mod tests {
             fs::read_to_string(&path).unwrap().replace("\r\n", "\n"),
             "alpha\ngamma\n"
         );
-        assert!(value["diff"].as_str().unwrap().contains("-beta"));
-        assert!(value["diff"].as_str().unwrap().contains("+gamma"));
+        let diff = value["diff"].as_str().unwrap();
+        assert!(diff.contains("-beta"));
+        assert!(diff.contains("+gamma"));
+        assert!(diff.contains(" alpha"));
+        assert!(!diff.contains("-alpha"));
+        assert!(!diff.contains("+alpha"));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1632,6 +2292,7 @@ mod tests {
         let path = dir.join("sample.txt");
         fs::create_dir_all(&dir).unwrap();
         fs::write(&path, "before\n").unwrap();
+        let _ = run_tool("read", &json!({ "path": path }).to_string(), &dir);
 
         let result = run_tool(
             "write",
@@ -1644,6 +2305,119 @@ mod tests {
         assert!(value["diff"].as_str().unwrap().contains("+++ b/"));
         assert!(value["diff"].as_str().unwrap().contains("-before"));
         assert!(value["diff"].as_str().unwrap().contains("+after"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_requires_read_first() {
+        let dir = test_dir("write-read-first");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "before\n").unwrap();
+
+        let result = run_tool(
+            "write",
+            &json!({ "path": path, "content": "after\n" }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert!(value["error"]
+            .as_str()
+            .unwrap()
+            .contains("requires reading"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hashline_edit_applies_anchor_replacement() {
+        let dir = test_dir("hashline-edit");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+
+        let read = run_tool("read", &json!({ "path": path }).to_string(), &dir);
+        let read = serde_json::from_str::<Value>(&read).unwrap();
+        let beta_anchor = read["hashlines"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .find(|line| line.ends_with(":beta"))
+            .unwrap()
+            .split_once(':')
+            .unwrap()
+            .0
+            .to_string();
+
+        let result = run_tool(
+            "hashline_edit",
+            &json!({
+                "path": path,
+                "edits": [{ "op": "replace", "pos": beta_anchor, "lines": ["BETA"] }]
+            })
+            .to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().replace("\r\n", "\n"),
+            "alpha\nBETA\ngamma\n"
+        );
+        assert!(value["anchors"].as_str().unwrap().contains("2#"));
+        assert!(value["diff"].as_str().unwrap().contains("-beta"));
+        assert!(value["diff"].as_str().unwrap().contains("+BETA"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hashline_hash_matches_reference_encoding() {
+        assert_eq!(compute_line_hash(1, "alpha"), "JN");
+        assert_eq!(compute_line_hash(2, "beta"), "NK");
+        assert_eq!(compute_line_hash(3, "gamma"), "WB");
+        assert_eq!(compute_line_hash(4, ""), "RW");
+        assert_eq!(compute_line_hash(5, "  "), "BT");
+        assert_eq!(compute_line_hash(6, "{"), "KM");
+    }
+
+    #[test]
+    fn hashline_edit_rejects_stale_anchor() {
+        let dir = test_dir("hashline-stale");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "alpha\nbeta\n").unwrap();
+
+        let read = run_tool("read", &json!({ "path": path }).to_string(), &dir);
+        let read = serde_json::from_str::<Value>(&read).unwrap();
+        let beta_anchor = read["hashlines"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .find(|line| line.ends_with(":beta"))
+            .unwrap()
+            .split_once(':')
+            .unwrap()
+            .0
+            .to_string();
+        fs::write(&path, "alpha\nchanged\n").unwrap();
+
+        let result = run_tool(
+            "hashline_edit",
+            &json!({
+                "path": path,
+                "edits": [{ "op": "replace", "pos": beta_anchor, "lines": ["BETA"] }]
+            })
+            .to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert!(value["error"]
+            .as_str()
+            .unwrap()
+            .contains("[E_STALE_ANCHOR]"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nchanged\n");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1662,6 +2436,41 @@ mod tests {
     }
 
     #[test]
+    fn ls_defaults_to_no_entry_limit() {
+        let dir = test_dir("ls-no-limit");
+        fs::create_dir_all(&dir).unwrap();
+        for index in 0..550 {
+            fs::write(dir.join(format!("{index:03}.txt")), "").unwrap();
+        }
+
+        let result = run_tool("ls", &json!({ "path": dir }).to_string(), &env::temp_dir());
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["entries"].as_array().unwrap().len(), 550);
+        assert_eq!(value["truncated"], false);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ripgrep_defaults_to_no_output_line_limit() {
+        let dir = test_dir("rg-no-limit");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "needle\n".repeat(150)).unwrap();
+
+        let result = run_tool(
+            "ripgrep",
+            &json!({ "pattern": "needle", "path": path }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["stdout"].as_str().unwrap().lines().count(), 150);
+        assert_eq!(value["truncated"], false);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn definitions_expose_expected_tools() {
         let names = definitions()
             .into_iter()
@@ -1672,11 +2481,11 @@ mod tests {
             names,
             [
                 "read",
-                "edit",
+                "str_replace",
+                "hashline_edit",
                 "write",
                 "bash",
                 "write_stdin",
-                "apply_patch",
                 "diff",
                 "ls",
                 "ripgrep",
@@ -1776,20 +2585,37 @@ mod tests {
     }
 
     #[test]
-    fn long_tool_result_gets_model_projection_and_saved_copy() {
-        let dir = test_dir("tool-projection");
+    fn bash_returns_full_stdout_without_tail_truncation() {
+        let dir = test_dir("bash-no-tail-limit");
         fs::create_dir_all(&dir).unwrap();
-        let result = tool_result(
-            "test_tool",
-            json!({ "content": "x".repeat(MAX_MODEL_OUTPUT_BYTES + 4096) }),
+        let command = if cfg!(windows) {
+            "1..9000 | ForEach-Object { 'line' }"
+        } else {
+            "yes line | head -n 9000"
+        };
+
+        let result = run_tool(
+            "bash",
+            &json!({ "command": command, "timeout": 5 }).to_string(),
             &dir,
         );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
 
-        assert!(result.output.len() > result.model_output.len());
-        assert!(result
-            .model_output
-            .contains("Full result saved at: .jucode/truncated-results/"));
-        assert!(dir.join(".jucode").join("truncated-results").exists());
+        assert_eq!(value["exit_code"], 0);
+        assert_eq!(value["stdout"].as_str().unwrap().lines().count(), 9000);
+        assert_eq!(value["truncated"], false);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn long_tool_result_is_sent_to_model_untruncated() {
+        let dir = test_dir("tool-projection");
+        fs::create_dir_all(&dir).unwrap();
+        let content = "x".repeat(128 * 1024);
+        let result = tool_result("test_tool", json!({ "content": content }), &dir);
+
+        assert_eq!(result.output, result.model_output);
+        assert!(!dir.join(".jucode").join("truncated-results").exists());
         let _ = fs::remove_dir_all(dir);
     }
 

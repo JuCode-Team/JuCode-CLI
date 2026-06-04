@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const TOOL_GUIDANCE: &str = "prefer read/ls/ripgrep for exploration; use bash for commands and verification; use edit/apply_patch for scoped file changes.";
+const TOOL_GUIDANCE: &str = "prefer read/ls/ripgrep for exploration; use bash for commands and verification; read a file before changing it; use str_replace, write, or hashline_edit for file edits.";
 const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]

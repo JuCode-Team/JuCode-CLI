@@ -18,7 +18,15 @@ pub struct OAuthLoginResult {
     pub web_url: String,
     pub api_url: String,
     pub api_key: String,
-    pub models: Vec<String>,
+    pub models: Vec<OAuthModel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthModel {
+    pub id: String,
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub reasoning_efforts: Option<Vec<String>>,
 }
 
 pub fn login(web_url: &str, api_url: &str) -> Result<OAuthLoginResult, String> {
@@ -126,21 +134,57 @@ fn exchange_code(
         .ok_or_else(|| "OAuth token response did not include api_key".to_string())
 }
 
-fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
+fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<OAuthModel>, String> {
     let url = format!("{}/v1/models", base_url);
     let value = json_response(
         ureq::get(&url)
             .set("Authorization", &format!("Bearer {api_key}"))
             .call(),
     )?;
-    Ok(value
+    Ok(parse_models_response(&value))
+}
+
+fn parse_models_response(value: &Value) -> Vec<OAuthModel> {
+    value
         .get("data")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|item| item.get("id").and_then(Value::as_str))
-        .map(str::to_string)
-        .collect())
+        .filter_map(parse_model)
+        .collect()
+}
+
+fn parse_model(item: &Value) -> Option<OAuthModel> {
+    let id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    Some(OAuthModel {
+        id,
+        context_window: read_u64_field(item, &["context_window", "context_length"]),
+        max_output_tokens: read_u64_field(item, &["max_output_tokens", "max_output"]),
+        reasoning_efforts: item
+            .get("reasoning_efforts")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|values| !values.is_empty()),
+    })
+}
+
+fn read_u64_field(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .filter_map(|key| value.get(*key))
+        .find_map(Value::as_u64)
 }
 
 fn json_response(response: Result<ureq::Response, ureq::Error>) -> Result<Value, String> {
@@ -252,4 +296,46 @@ fn url_decode(value: &str) -> String {
         index += 1;
     }
     String::from_utf8_lossy(&output).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_model_metadata_from_models_response() {
+        let value = json!({
+            "data": [{
+                "id": "gpt-5.5",
+                "context_window": 1050000,
+                "max_output_tokens": 128000,
+                "reasoning_efforts": ["low", "medium"]
+            }]
+        });
+
+        assert_eq!(
+            parse_models_response(&value),
+            vec![OAuthModel {
+                id: "gpt-5.5".to_string(),
+                context_window: Some(1_050_000),
+                max_output_tokens: Some(128_000),
+                reasoning_efforts: Some(vec!["low".to_string(), "medium".to_string()])
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_legacy_id_only_models_response() {
+        let value = json!({ "data": [{ "id": "gpt-5.4-mini" }] });
+
+        assert_eq!(
+            parse_models_response(&value),
+            vec![OAuthModel {
+                id: "gpt-5.4-mini".to_string(),
+                context_window: None,
+                max_output_tokens: None,
+                reasoning_efforts: None
+            }]
+        );
+    }
 }

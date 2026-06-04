@@ -3,7 +3,7 @@ use crate::{
     event::{AgentEvent, CommandView, GoalView, ModelOptionView, SessionListItemView},
     extensions::ExtensionRegistry,
     llm::{GoalToolRequest, OpenAiClient, OpenAiClientConfig, StreamEvent, ToolGoalResponse},
-    oauth,
+    oauth::{self, OAuthModel},
     prompt::{
         build_system_prompt, discover_project_instructions, discover_skills, skill_commands,
         skill_message, skill_pin_message, PromptContext,
@@ -20,7 +20,11 @@ use std::{
     env, io,
     path::PathBuf,
     process::Command,
-    sync::mpsc::{self, Receiver},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+        Arc,
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -28,6 +32,8 @@ use std::{
 /// Recent context (in estimated tokens) kept verbatim when compacting; older
 /// turns are folded into the summary.
 const COMPACTION_KEEP_RECENT_TOKENS: usize = 20_000;
+const RESUME_SUMMARY_IDLE_SECONDS: u64 = 5 * 60;
+const RESUME_SUMMARY_MODEL: &str = "gpt-5.4-mini";
 
 #[derive(Debug)]
 enum WorkerEvent {
@@ -40,6 +46,12 @@ enum WorkerEvent {
         replaced_through: u64,
     },
     CompactionFailed(String),
+    ResumeSummaryDone {
+        summary: String,
+        status: ThreadGoalStatus,
+        summarized_at: u64,
+    },
+    ResumeSummaryFailed(String),
     CallStart,
     Connected,
     ReasoningDelta(String),
@@ -88,6 +100,8 @@ pub struct AgentCore {
     turn_started_at: Option<SystemTime>,
     turn_goal_tokens: u64,
     goal_continuation_running: bool,
+    resume_summary_running: bool,
+    interrupt_flag: Arc<AtomicBool>,
 }
 
 impl AgentCore {
@@ -108,6 +122,8 @@ impl AgentCore {
             turn_started_at: None,
             turn_goal_tokens: 0,
             goal_continuation_running: false,
+            resume_summary_running: false,
+            interrupt_flag: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -204,6 +220,23 @@ impl AgentCore {
         ];
         events.extend(self.start_turn(next));
         events
+    }
+
+    pub fn interrupt(&mut self) -> Vec<AgentEvent> {
+        if !self.running {
+            return Vec::new();
+        }
+        self.interrupt_flag.store(true, Ordering::SeqCst);
+        self.receiver = None;
+        self.running = false;
+        self.goal_tool_receiver = None;
+        self.goal_continuation_running = false;
+        self.turn_started_at = None;
+        self.turn_goal_tokens = 0;
+        vec![
+            AgentEvent::Info("request interrupted".to_string()),
+            AgentEvent::Status("interrupted".to_string()),
+        ]
     }
 
     pub fn handle_command(&mut self, input: &str) -> (bool, Vec<AgentEvent>) {
@@ -343,6 +376,7 @@ impl AgentCore {
         });
         let mut events = vec![AgentEvent::Status(format!("pinned skill {}", skill.name))];
         events.extend(self.save_session_event());
+        events.push(self.context_usage_event());
         events
     }
 
@@ -395,12 +429,31 @@ impl AgentCore {
                         self.session.apply_compaction(summary, replaced_through);
                         events.extend(self.save_session_event());
                         events.push(AgentEvent::CompactionEnd);
-                        events.push(AgentEvent::ContextUsage {
-                            tokens: self.session.estimated_context_tokens() as u64,
-                        });
+                        events.push(self.context_usage_event());
                     }
                     WorkerEvent::CompactionFailed(error) => {
                         events.push(AgentEvent::CompactionFailed(error));
+                    }
+                    WorkerEvent::ResumeSummaryDone {
+                        summary,
+                        status,
+                        summarized_at,
+                    } => {
+                        self.resume_summary_running = false;
+                        self.session
+                            .set_resume_summary(Some(summary), Some(status), summarized_at);
+                        events.extend(self.save_session_event());
+                    }
+                    WorkerEvent::ResumeSummaryFailed(_error) => {
+                        self.resume_summary_running = false;
+                        self.session.set_resume_summary(
+                            None,
+                            self.session
+                                .goal()
+                                .map(|goal| normalize_resume_status(goal.status)),
+                            now_secs(),
+                        );
+                        events.extend(self.save_session_event());
                     }
                     WorkerEvent::CallStart => events.push(AgentEvent::Connecting),
                     WorkerEvent::Connected => events.push(AgentEvent::ThinkingStart),
@@ -414,6 +467,7 @@ impl AgentCore {
                     WorkerEvent::ResponseItem(item) => {
                         self.session.append(EntryKind::ResponseItem { item });
                         events.extend(self.save_session_event());
+                        events.push(self.context_usage_event());
                     }
                     WorkerEvent::ToolStart { call_id, name } => {
                         events.push(AgentEvent::ToolStart { call_id, name });
@@ -441,6 +495,7 @@ impl AgentCore {
                             output: output.clone(),
                         });
                         events.extend(self.save_session_event());
+                        events.push(self.context_usage_event());
                         events.push(AgentEvent::ToolOutput {
                             call_id,
                             name,
@@ -469,6 +524,7 @@ impl AgentCore {
                         self.running = false;
                         disconnected = true;
                         self.goal_tool_receiver = None;
+                        events.push(self.context_usage_event());
                         if !self.queued.is_empty() {
                             events.push(AgentEvent::PendingMessages(
                                 self.queued.iter().cloned().collect(),
@@ -501,6 +557,9 @@ impl AgentCore {
             }
         }
         events.extend(self.poll_goal_tool_requests());
+        if self.should_generate_resume_summary() {
+            self.start_resume_summary();
+        }
 
         if !self.running {
             if let Some(next) = self.queued.pop_front() {
@@ -587,11 +646,11 @@ impl AgentCore {
                 cwd: self.cwd.clone(),
                 tools: vec![
                     "read",
-                    "edit",
+                    "str_replace",
+                    "hashline_edit",
                     "write",
                     "bash",
                     "write_stdin",
-                    "apply_patch",
                     "diff",
                     "ls",
                     "ripgrep",
@@ -631,17 +690,21 @@ impl AgentCore {
         };
 
         let request_items = self.session.request_context_items();
+        let estimated_context_tokens = self.session.estimated_context_tokens();
         let compaction_threshold = self.config.compaction_threshold_tokens as usize;
-        let compaction = if compaction_threshold > 0
-            && self.session.estimated_context_tokens() > compaction_threshold
-        {
+        let model_context_budget = target_context_budget(&self.config.current_model_config());
+        let compaction = if should_auto_compact(
+            estimated_context_tokens,
+            model_context_budget,
+            compaction_threshold,
+        ) {
             self.session.plan_compaction(COMPACTION_KEEP_RECENT_TOKENS)
         } else {
             None
         };
         let mut events = save_event;
         events.push(AgentEvent::ContextUsage {
-            tokens: self.session.estimated_context_tokens() as u64,
+            tokens: estimated_context_tokens as u64,
         });
         let compaction_client = if compaction.is_some() {
             match self.compaction_client() {
@@ -656,6 +719,8 @@ impl AgentCore {
         };
         let cwd = self.cwd.clone();
         let (tx, rx) = mpsc::channel();
+        self.interrupt_flag = Arc::new(AtomicBool::new(false));
+        let interrupt_flag = Arc::clone(&self.interrupt_flag);
         self.receiver = Some(rx);
         self.running = true;
 
@@ -688,6 +753,9 @@ impl AgentCore {
                     request_items
                 };
             let result = client.run_turn_events(input, &cwd, |event| {
+                if interrupt_flag.load(Ordering::SeqCst) {
+                    return Err("interrupted".to_string());
+                }
                 let mapped = match event {
                     StreamEvent::CallStart => WorkerEvent::CallStart,
                     StreamEvent::Connected => WorkerEvent::Connected,
@@ -733,10 +801,14 @@ impl AgentCore {
 
             match result {
                 Ok(()) => {
-                    let _ = tx.send(WorkerEvent::Done);
+                    if !interrupt_flag.load(Ordering::SeqCst) {
+                        let _ = tx.send(WorkerEvent::Done);
+                    }
                 }
                 Err(error) => {
-                    let _ = tx.send(WorkerEvent::Error(error));
+                    if !interrupt_flag.load(Ordering::SeqCst) && error != "interrupted" {
+                        let _ = tx.send(WorkerEvent::Error(error));
+                    }
                 }
             }
         });
@@ -783,6 +855,7 @@ impl AgentCore {
         self.turn_goal_tokens = 0;
         self.goal_continuation_running = false;
         let (tx, rx) = mpsc::channel();
+        self.interrupt_flag = Arc::new(AtomicBool::new(false));
         self.receiver = Some(rx);
         self.running = true;
 
@@ -807,9 +880,7 @@ impl AgentCore {
         });
 
         vec![
-            AgentEvent::ContextUsage {
-                tokens: self.session.estimated_context_tokens() as u64,
-            },
+            self.context_usage_event(),
             AgentEvent::Status("compacting".to_string()),
         ]
     }
@@ -822,6 +893,37 @@ impl AgentCore {
             extensions: ExtensionRegistry::load(&[], &self.cwd, self.config.profile_dir()),
             base_url: self.config.base_url.clone(),
             max_output_tokens: self.config.compact_model_config().max_output_tokens,
+            api_key: self.auth.key_for(&self.config.provider),
+            api_key_env: &self.config.api_key_env,
+            retry_attempts: self.config.retry_attempts,
+            connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
+            read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
+            goal_tool_tx: None,
+        })
+    }
+
+    fn resume_summary_client(&self) -> Result<OpenAiClient, String> {
+        let model = self
+            .config
+            .models
+            .iter()
+            .find(|entry| entry.name == RESUME_SUMMARY_MODEL)
+            .map(|entry| entry.name.clone())
+            .unwrap_or_else(|| self.config.compact_model.clone());
+        let max_output_tokens = self
+            .config
+            .models
+            .iter()
+            .find(|entry| entry.name == model)
+            .map(|entry| entry.max_output_tokens)
+            .unwrap_or_else(|| self.config.compact_model_config().max_output_tokens);
+        OpenAiClient::from_config(OpenAiClientConfig {
+            model,
+            reasoning_effort: self.config.compact_reasoning_effort.clone(),
+            system_prompt: String::new(),
+            extensions: ExtensionRegistry::load(&[], &self.cwd, self.config.profile_dir()),
+            base_url: self.config.base_url.clone(),
+            max_output_tokens,
             api_key: self.auth.key_for(&self.config.provider),
             api_key_env: &self.config.api_key_env,
             retry_attempts: self.config.retry_attempts,
@@ -973,12 +1075,70 @@ impl AgentCore {
             .is_some_and(|goal| goal.status == ThreadGoalStatus::Active)
     }
 
+    fn should_generate_resume_summary(&self) -> bool {
+        if self.running || self.resume_summary_running || !self.queued.is_empty() {
+            return false;
+        }
+        let idle_for = now_secs().saturating_sub(self.session.updated_at());
+        if idle_for < RESUME_SUMMARY_IDLE_SECONDS {
+            return false;
+        }
+        self.session
+            .resume_summary_updated_at()
+            .is_none_or(|updated| updated < self.session.updated_at())
+    }
+
+    fn start_resume_summary(&mut self) {
+        let input = self.session.resume_summary_input();
+        if input.trim().is_empty() {
+            self.session.set_resume_summary(
+                None,
+                self.session
+                    .goal()
+                    .map(|goal| normalize_resume_status(goal.status)),
+                now_secs(),
+            );
+            return;
+        }
+        let status = self
+            .session
+            .goal()
+            .map(|goal| normalize_resume_status(goal.status))
+            .unwrap_or(ThreadGoalStatus::Active);
+        let client = match self.resume_summary_client() {
+            Ok(client) => client,
+            Err(_) => return,
+        };
+        let (tx, rx) = mpsc::channel();
+        self.receiver = Some(rx);
+        self.resume_summary_running = true;
+        thread::spawn(move || {
+            let system = "Summarize the current latest task in one sentence. Focus only on the most recent work. Start with either 'Working:' or 'Completed:'. Mention the concrete task or result, not background context. Ignore older finished tasks unless they matter to the current state. Keep it concise. Output only that one sentence.";
+            let user = format!("Recent session activity:\n\n{input}");
+            let result = client.summarize_text(system, &user, |_| Ok(()));
+            let _ = match result {
+                Ok(summary) => tx.send(WorkerEvent::ResumeSummaryDone {
+                    summary,
+                    status,
+                    summarized_at: now_secs(),
+                }),
+                Err(error) => tx.send(WorkerEvent::ResumeSummaryFailed(error)),
+            };
+        });
+    }
+
     fn save_session_event(&mut self) -> Vec<AgentEvent> {
         match self.session.save_for_cwd(&self.profile_dir, &self.cwd) {
             Ok(()) => Vec::new(),
             Err(error) => vec![AgentEvent::Error(format!(
                 "failed to save session: {error}"
             ))],
+        }
+    }
+
+    fn context_usage_event(&self) -> AgentEvent {
+        AgentEvent::ContextUsage {
+            tokens: self.session.estimated_context_tokens() as u64,
         }
     }
 
@@ -996,6 +1156,8 @@ impl AgentCore {
         vec![
             AgentEvent::Transcript(self.session.transcript_items()),
             AgentEvent::PendingMessages(Vec::new()),
+            self.model_status_event(),
+            self.context_usage_event(),
             AgentEvent::Status(format!("new session {session_id}")),
         ]
         .into_iter()
@@ -1029,7 +1191,7 @@ impl AgentCore {
                 let models = result
                     .models
                     .iter()
-                    .filter(|model| is_jucode_supported_model(model))
+                    .filter(|model| is_jucode_supported_model(&model.id))
                     .cloned()
                     .collect::<Vec<_>>();
                 self.config.provider = "jucode".to_string();
@@ -1037,40 +1199,27 @@ impl AgentCore {
                 self.config.jucode_api_url = result.api_url.clone();
                 self.config.base_url = format!("{}/v1", result.api_url);
                 for model in &models {
-                    if !self.config.models.iter().any(|entry| entry.name == *model) {
-                        let (context_window, max_output_tokens, reasoning_efforts) =
-                            if model.starts_with("claude-") {
-                                (200_000, 8_192, vec!["none".to_string()])
-                            } else {
-                                (
-                                    400_000,
-                                    128_000,
-                                    vec![
-                                        "none".to_string(),
-                                        "low".to_string(),
-                                        "medium".to_string(),
-                                        "high".to_string(),
-                                        "xhigh".to_string(),
-                                    ],
-                                )
-                            };
-                        self.config.models.push(ModelConfig {
-                            name: model.clone(),
-                            context_window,
-                            max_output_tokens,
-                            reasoning_efforts,
-                        });
+                    let model_config = jucode_model_config(model);
+                    if let Some(existing) = self
+                        .config
+                        .models
+                        .iter_mut()
+                        .find(|entry| entry.name == model.id)
+                    {
+                        *existing = model_config;
+                    } else {
+                        self.config.models.push(model_config);
                     }
                 }
                 if let Some(model) = models.first() {
-                    self.config.model = model.clone();
-                    let supported = self.reasoning_efforts_for_model(model);
+                    self.config.model = model.id.clone();
+                    let supported = self.reasoning_efforts_for_model(&model.id);
                     if !supported
                         .iter()
                         .any(|effort| effort == &self.config.reasoning_effort)
                     {
                         self.config.reasoning_effort =
-                            self.default_reasoning_effort_for_model(model);
+                            self.default_reasoning_effort_for_model(&model.id);
                     }
                 }
                 self.auth.set_key_for("jucode", result.api_key);
@@ -1104,9 +1253,11 @@ impl AgentCore {
                     .map(|summary| {
                         let active = summary.id == self.session.session_id();
                         let id = summary.id.clone();
+                        let detail = format_resume_detail(&summary);
                         SessionListItemView {
                             active,
-                            label: format_session_summary(summary),
+                            label: summary.label,
+                            detail,
                             id,
                         }
                     })
@@ -1119,11 +1270,25 @@ impl AgentCore {
     }
 
     fn resume_session_events(&mut self, session_id: &str) -> Vec<AgentEvent> {
+        if self.running {
+            return vec![AgentEvent::Error(
+                "cannot resume a session while a response is running".to_string(),
+            )];
+        }
         match SessionStore::load_for_cwd(&self.profile_dir, &self.cwd, session_id) {
             Ok(session) => {
+                self.queued.clear();
+                self.receiver = None;
+                self.goal_tool_receiver = None;
+                self.goal_continuation_running = false;
+                self.turn_started_at = None;
+                self.turn_goal_tokens = 0;
                 self.session = session;
                 vec![
                     AgentEvent::Transcript(self.session.transcript_items()),
+                    AgentEvent::PendingMessages(Vec::new()),
+                    self.model_status_event(),
+                    self.context_usage_event(),
                     AgentEvent::Status(format!("resumed session {}", self.session.session_id())),
                 ]
             }
@@ -1134,16 +1299,15 @@ impl AgentCore {
     }
 
     fn context_events(&self) -> Vec<AgentEvent> {
-        let model_config = self.config.current_model_config();
-        let stats = self.session.context_statistics(
-            (model_config.context_window as usize).saturating_mul(3) / 4,
-            20_000,
-        );
-        vec![AgentEvent::Info(format_context_statistics(
-            &stats,
-            self.total_input_tokens,
-            self.total_output_tokens,
-        ))]
+        let stats = self.session.context_statistics();
+        vec![
+            AgentEvent::Info(format_context_statistics(
+                &stats,
+                self.total_input_tokens,
+                self.total_output_tokens,
+            )),
+            self.context_usage_event(),
+        ]
     }
 
     fn goal_command_events(&mut self, arg: &str) -> Vec<AgentEvent> {
@@ -1162,6 +1326,7 @@ impl AgentCore {
                 let mut events = vec![AgentEvent::Goal(None)];
                 if cleared {
                     events.extend(self.save_session_event());
+                    events.push(self.context_usage_event());
                     events.push(AgentEvent::Status("goal cleared".to_string()));
                 }
                 return events;
@@ -1173,6 +1338,7 @@ impl AgentCore {
             Ok(goal) => {
                 let mut events = vec![AgentEvent::Goal(Some(goal_view(&goal)))];
                 events.extend(self.save_session_event());
+                events.push(self.context_usage_event());
                 events
             }
             Err(error) => vec![AgentEvent::Error(error)],
@@ -1411,6 +1577,48 @@ fn is_jucode_supported_model(model: &str) -> bool {
     ) || model.starts_with("claude-")
 }
 
+fn jucode_model_config(model: &OAuthModel) -> ModelConfig {
+    let (default_context_window, default_max_output_tokens, default_reasoning_efforts) =
+        if model.id.starts_with("claude-") {
+            (200_000, 8_192, vec!["none".to_string()])
+        } else {
+            (
+                400_000,
+                128_000,
+                vec![
+                    "none".to_string(),
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "high".to_string(),
+                    "xhigh".to_string(),
+                ],
+            )
+        };
+    ModelConfig {
+        name: model.id.clone(),
+        context_window: model.context_window.unwrap_or(default_context_window),
+        max_output_tokens: model.max_output_tokens.unwrap_or(default_max_output_tokens),
+        reasoning_efforts: model
+            .reasoning_efforts
+            .clone()
+            .unwrap_or(default_reasoning_efforts),
+    }
+}
+
+fn normalize_resume_status(status: ThreadGoalStatus) -> ThreadGoalStatus {
+    match status {
+        ThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
+        _ => ThreadGoalStatus::Active,
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 fn command_ok(program: &str, arg: &str) -> &'static str {
     match Command::new(program).arg(arg).output() {
         Ok(output) if output.status.success() => "ok",
@@ -1430,6 +1638,19 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
     let month = mp + if mp < 10 { 3 } else { -9 };
     year += if month <= 2 { 1 } else { 0 };
     (year as i32, month as u32, day as u32)
+}
+
+fn target_context_budget(model_config: &ModelConfig) -> usize {
+    (model_config.context_window as usize).saturating_mul(3) / 4
+}
+
+fn should_auto_compact(
+    estimated_context_tokens: usize,
+    model_context_budget: usize,
+    compaction_threshold: usize,
+) -> bool {
+    estimated_context_tokens > model_context_budget
+        || (compaction_threshold > 0 && estimated_context_tokens > compaction_threshold)
 }
 
 fn format_context_statistics(
@@ -1502,9 +1723,16 @@ fn goal_tool_json(goal: &ThreadGoal) -> Value {
     })
 }
 
-fn format_session_summary(summary: SessionSummary) -> String {
-    format!(
-        "{} | entries {} | leaf {} | updated {}",
-        summary.id, summary.entries, summary.leaf, summary.updated_at
-    )
+fn format_resume_detail(summary: &SessionSummary) -> String {
+    let status = match summary.resume_status.unwrap_or(ThreadGoalStatus::Active) {
+        ThreadGoalStatus::Complete => "completed",
+        _ => "working",
+    };
+    match summary.resume_summary.as_deref() {
+        Some(task) => format!("{status} · {task}"),
+        None => format!(
+            "{status} · updated {} · entries {} · {}",
+            summary.updated_at, summary.entries, summary.leaf
+        ),
+    }
 }

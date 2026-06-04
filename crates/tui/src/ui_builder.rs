@@ -14,6 +14,8 @@ use crate::{
     STARTUP_TEXT, THINKING_COLLAPSED_LINES, VISIBLE_CURSOR,
 };
 
+const TOOL_PREVIEW_INDENT: &str = "  ";
+
 fn rounded_box_border(left: char, right: char, width: usize) -> String {
     format!("{BOX_BORDER}{left}{}{right}{RESET}", "─".repeat(width + 2))
 }
@@ -82,15 +84,19 @@ fn format_status_line(left: &str, right: &str, width: usize) -> String {
 }
 
 pub(crate) fn colored_reasoning_effort(effort: &str) -> String {
+    colored_reasoning_effort_with_base(effort, color_code(UiKind::Status))
+}
+
+fn colored_reasoning_effort_with_base(effort: &str, base_color: &str) -> String {
     let color = match effort {
         "none" | "minimal" => "\x1b[38;2;150;150;150m",
         "low" => "\x1b[38;2;90;190;140m",
         "medium" => "\x1b[38;2;230;200;90m",
         "high" => "\x1b[38;2;245;150;70m",
         "xhigh" => "\x1b[38;2;245;90;90m",
-        _ => color_code(UiKind::Status),
+        _ => base_color,
     };
-    format!("{color}{effort}{RESET}{}", color_code(UiKind::Status))
+    format!("{color}{effort}{RESET}{base_color}")
 }
 
 pub(crate) struct UiBuilder {
@@ -121,7 +127,10 @@ impl UiBuilder {
     }
 
     pub(crate) fn chat_with_width(mut self, chat: &[ChatLine], width: usize) -> Self {
-        for item in chat {
+        for (index, item) in chat.iter().enumerate() {
+            if index > 0 {
+                self.push_separator(width);
+            }
             match item {
                 ChatLine::Startup {
                     version,
@@ -168,7 +177,6 @@ impl UiBuilder {
                 ChatLine::System(text) => self.push_history(UiKind::System, text),
                 ChatLine::Error(text) => self.push_history(UiKind::Error, text),
             }
-            self.history_line(UiKind::System, String::new());
         }
         self
     }
@@ -180,22 +188,6 @@ impl UiBuilder {
             }
             self.control_line(UiKind::System, String::new());
         }
-        self
-    }
-
-    /// A compact reasoning-token indicator shown directly above the input. The
-    /// reasoning text itself lives in the transcript, not here.
-    pub(crate) fn thinking_indicator(mut self, thinking: bool, tokens: u64) -> Self {
-        if !thinking && tokens == 0 {
-            return self;
-        }
-        let label = if tokens > 0 {
-            format!("thinking · {tokens} reasoning tokens")
-        } else {
-            "thinking…".to_string()
-        };
-        self.control_line(UiKind::Status, label);
-        self.control_line(UiKind::System, String::new());
         self
     }
 
@@ -294,11 +286,13 @@ impl UiBuilder {
         command_matches: &[CommandCandidate],
         selected_index: usize,
     ) -> Self {
+        self.control_line(UiKind::Input, String::new());
         let lines = input.split('\n').collect::<Vec<_>>();
         for (index, line) in lines.iter().enumerate() {
             let prefix = if index == 0 { "> " } else { "  " };
             self.control_line(UiKind::Input, format!("{prefix}{line}"));
         }
+        self.control_line(UiKind::Input, String::new());
         if !command_matches.is_empty() {
             for (index, candidate) in command_matches.iter().enumerate() {
                 let kind = if index == selected_index {
@@ -317,8 +311,14 @@ impl UiBuilder {
         self
     }
 
-    pub(crate) fn progress(mut self, activity: &ActivityState, now: Instant, width: usize) -> Self {
-        let Some(progress) = activity.progress(now) else {
+    pub(crate) fn progress(
+        mut self,
+        activity: &ActivityState,
+        thinking_tokens: u64,
+        now: Instant,
+        width: usize,
+    ) -> Self {
+        let Some(progress) = activity.progress(now, thinking_tokens) else {
             return self;
         };
         let indicator = spinner_char(progress.preset, activity.animation_tick, progress.step);
@@ -344,13 +344,19 @@ impl UiBuilder {
         );
         let right = format!(
             "tokens {}/{} | context {percent:.1}%",
-            status.input_tokens, status.output_tokens
+            status.context_tokens, status.context_window
         );
         let line = format_status_line(&plain_left, &right, width).replace(
             &format!("({})", status.reasoning_effort),
-            &format!("({})", colored_reasoning_effort(status.reasoning_effort)),
+            &format!(
+                "({})",
+                colored_reasoning_effort_with_base(
+                    status.reasoning_effort,
+                    color_code(UiKind::BottomStatus)
+                )
+            ),
         );
-        self.control_line(UiKind::Status, line);
+        self.control_line(UiKind::BottomStatus, line);
         self
     }
 
@@ -430,6 +436,11 @@ impl UiBuilder {
         self.history_line(UiKind::Brand, rounded_box_border('╰', '╯', content_width));
     }
 
+    fn push_separator(&mut self, width: usize) {
+        let width = if width == usize::MAX { 80 } else { width }.max(1);
+        self.history_line(UiKind::Separator, "─".repeat(width));
+    }
+
     fn push_tool_preview(&mut self, text: &str, prefix: &str) {
         if text.is_empty() {
             self.history_line(UiKind::Tool, prefix.to_string());
@@ -450,7 +461,7 @@ impl UiBuilder {
             return;
         }
 
-        self.push_tool_preview(&preview, "  ");
+        self.push_tool_preview(&preview, TOOL_PREVIEW_INDENT);
     }
 
     pub(crate) fn history_line(&mut self, kind: UiKind, text: String) {

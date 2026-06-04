@@ -10,6 +10,7 @@ pub struct TreeNodeView {
 pub struct SessionListItemView {
     pub id: String,
     pub label: String,
+    pub detail: String,
     pub active: bool,
 }
 

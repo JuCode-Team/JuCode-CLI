@@ -224,8 +224,19 @@ impl OpenAiClient {
         conversation: &str,
         mut emit_output_tokens: impl FnMut(u64) -> Result<(), String>,
     ) -> Result<String, String> {
-        let system = "You compress earlier conversation history so it can replace the raw turns while letting the work continue. Write a dense summary that preserves: the user's goals and explicit requests, decisions made, important facts and constraints discovered, files and tools touched with their outcomes, and any unfinished threads. Prefer tight prose or bullet points. Output only the summary.";
-        let user = format!("Summarize this earlier conversation:\n\n{conversation}");
+        self.summarize_text(
+            "You compress earlier conversation history so it can replace the raw turns while letting the work continue. Write a dense summary that preserves: the user's goals and explicit requests, decisions made, important facts and constraints discovered, files and tools touched with their outcomes, and any unfinished threads. Prefer tight prose or bullet points. Output only the summary.",
+            &format!("Summarize this earlier conversation:\n\n{conversation}"),
+            &mut emit_output_tokens,
+        )
+    }
+
+    pub fn summarize_text(
+        &self,
+        system: &str,
+        user: &str,
+        mut emit_output_tokens: impl FnMut(u64) -> Result<(), String>,
+    ) -> Result<String, String> {
         let mut output_tokens = 0u64;
         let mut record_delta = |delta: &str| {
             output_tokens = output_tokens.saturating_add(estimate_text_tokens(delta));

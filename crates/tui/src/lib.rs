@@ -3,6 +3,7 @@ pub mod bench_support;
 mod input;
 mod markdown;
 mod picker;
+mod state;
 mod terminal_renderer;
 #[cfg(test)]
 mod tests;
@@ -19,6 +20,7 @@ use crossterm::{
 use input::{paste_burst_render_delay, InputBuffer, PasteBurst, PasteCharDecision, PasteFlush};
 use jucode_agent_core::{AgentEvent, CommandView, TranscriptItem};
 use picker::{PickerState, TreePromptAction};
+use state::TuiState;
 use std::{
     io::{self, Write},
     time::{Duration, Instant},
@@ -45,10 +47,13 @@ const SELECT_END: &str = "\x1b[27m";
 pub(crate) const HIDE_CURSOR: &str = "\x1b[?25l";
 pub(crate) const SHOW_CURSOR: &str = "\x1b[?25h";
 pub(crate) const SHOW_HARDWARE_CURSOR: bool = false;
+pub(crate) const DISABLE_AUTOWRAP: &str = "\x1b[?7l";
+pub(crate) const ENABLE_AUTOWRAP: &str = "\x1b[?7h";
 const DISABLE_SCROLL_ON_OUTPUT: &str = "\x1b[?1010l";
 const ENABLE_SCROLL_ON_OUTPUT: &str = "\x1b[?1010h";
 const ENABLE_BRACKETED_PASTE: &str = "\x1b[?2004h";
 const DISABLE_BRACKETED_PASTE: &str = "\x1b[?2004l";
+pub(crate) const CONTENT_LEFT_PADDING: usize = 2;
 pub(crate) const SYNC_START: &str = "\x1b[?2026h";
 pub(crate) const SYNC_END: &str = "\x1b[?2026l";
 pub(crate) const RESET: &str = "\x1b[0m";
@@ -92,11 +97,13 @@ pub(crate) enum UiKind {
     Brand,
     User,
     Assistant,
+    Separator,
     ToolHeader,
     Tool,
     System,
     Error,
     Status,
+    BottomStatus,
     Selected,
     Input,
     TreeDirectory,
@@ -141,8 +148,6 @@ pub(crate) struct BottomStatus<'a> {
     pub(crate) provider: &'a str,
     pub(crate) model: &'a str,
     pub(crate) reasoning_effort: &'a str,
-    pub(crate) input_tokens: u64,
-    pub(crate) output_tokens: u64,
     pub(crate) context_tokens: u64,
     pub(crate) context_window: u64,
 }
@@ -291,35 +296,7 @@ pub struct TuiApp<R> {
     runtime: R,
     input: InputBuffer,
     paste_burst: PasteBurst,
-    chat: Vec<ChatLine>,
-    history_revision: u64,
-    rendered_history_cache: RenderedHistoryCache,
-    live_assistant: Option<String>,
-    reasoning_index: Option<usize>,
-    thinking_tokens: u64,
-    status: String,
-    provider: String,
-    model: String,
-    reasoning_effort: String,
-    context_window: u64,
-    max_output_tokens: u64,
-    reasoning_efforts: Vec<String>,
-    total_input_tokens: u64,
-    total_output_tokens: u64,
-    current_context_tokens: u64,
-    activity: ActivityState,
-    commands: Vec<CommandCandidate>,
-    completion_index: usize,
-    picker_view: Option<PickerState>,
-    pending_messages: Vec<String>,
-    reset_screen: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-struct RenderedHistoryCache {
-    revision: u64,
-    width: usize,
-    lines: Vec<String>,
+    state: TuiState,
 }
 
 #[derive(Debug, Clone)]
@@ -391,28 +368,7 @@ impl<R: TuiRuntime> TuiApp<R> {
             runtime,
             input: InputBuffer::default(),
             paste_burst: PasteBurst::default(),
-            chat: Vec::new(),
-            history_revision: 0,
-            rendered_history_cache: RenderedHistoryCache::default(),
-            live_assistant: None,
-            reasoning_index: None,
-            thinking_tokens: 0,
-            status: "ready".to_string(),
-            provider: "unknown".to_string(),
-            model: "unknown".to_string(),
-            reasoning_effort: "medium".to_string(),
-            context_window: 128_000,
-            max_output_tokens: 128_000,
-            reasoning_efforts: vec!["medium".to_string()],
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            current_context_tokens: 0,
-            activity: ActivityState::idle(),
-            commands: default_commands(),
-            completion_index: 0,
-            picker_view: None,
-            pending_messages: Vec::new(),
-            reset_screen: false,
+            state: TuiState::default(),
         };
         let events = app.runtime.startup_events();
         app.apply_events(events);
@@ -438,8 +394,8 @@ impl<R: TuiRuntime> TuiApp<R> {
                 frames.request_now(now);
             }
 
-            if self.activity.is_active() && now >= next_progress_at {
-                self.activity.advance_animation();
+            if self.state.activity.is_active() && now >= next_progress_at {
+                self.state.activity.advance_animation();
                 next_progress_at = now + PROGRESS_INTERVAL;
                 frames.request_now(now);
             }
@@ -453,14 +409,14 @@ impl<R: TuiRuntime> TuiApp<R> {
                 let document = self.build_document(width, now);
                 renderer.render(&mut stdout, &document)?;
                 if document.reset_screen {
-                    self.reset_screen = false;
+                    self.state.reset_screen = false;
                 }
                 continue;
             }
 
             let poll_timeout = {
                 let mut timeout = frames.poll_timeout(now, EVENT_POLL_INTERVAL);
-                if self.activity.is_active() {
+                if self.state.activity.is_active() {
                     timeout = timeout.min(next_progress_at.saturating_duration_since(now));
                 }
                 timeout
@@ -500,7 +456,7 @@ impl<R: TuiRuntime> TuiApp<R> {
     fn handle_key_at(&mut self, code: KeyCode, modifiers: KeyModifiers, now: Instant) -> bool {
         self.flush_paste_burst_if_due(now);
 
-        if self.picker_view.is_some() {
+        if self.state.picker_view.is_some() {
             self.flush_paste_burst_before_non_plain_input();
             return self.handle_picker_key(code, modifiers);
         }
@@ -542,9 +498,10 @@ impl<R: TuiRuntime> TuiApp<R> {
             KeyCode::Up => {
                 self.flush_paste_burst_before_non_plain_input();
                 if self.command_completion_active() {
-                    let count = self.command_matches().len();
+                    let count = self.state.command_matches(&self.input).len();
                     if count > 0 {
-                        self.completion_index = (self.completion_index + count - 1) % count;
+                        self.state.completion_index =
+                            (self.state.completion_index + count - 1) % count;
                     }
                 } else {
                     self.input.move_up(modifiers.contains(KeyModifiers::SHIFT));
@@ -554,9 +511,9 @@ impl<R: TuiRuntime> TuiApp<R> {
             KeyCode::Down => {
                 self.flush_paste_burst_before_non_plain_input();
                 if self.command_completion_active() {
-                    let count = self.command_matches().len();
+                    let count = self.state.command_matches(&self.input).len();
                     if count > 0 {
-                        self.completion_index = (self.completion_index + 1) % count;
+                        self.state.completion_index = (self.state.completion_index + 1) % count;
                     }
                 } else {
                     self.input
@@ -624,24 +581,24 @@ impl<R: TuiRuntime> TuiApp<R> {
             }
             KeyCode::Esc => {
                 self.flush_paste_burst_before_non_plain_input();
-                if self.activity.is_active() && !self.pending_messages.is_empty() {
+                if self.state.activity.is_active() && !self.state.pending_messages.is_empty() {
                     let events = self.runtime.steer();
                     self.apply_events(events);
                     return false;
                 }
                 self.input.clear();
-                self.completion_index = 0;
+                self.state.completion_index = 0;
                 false
             }
             KeyCode::Enter => {
                 if modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL) {
                     self.flush_paste_burst_before_non_plain_input();
                     self.input.push_char('\n');
-                    self.completion_index = 0;
+                    self.state.completion_index = 0;
                     return false;
                 }
                 if self.paste_burst.append_newline_if_active(now) {
-                    self.completion_index = 0;
+                    self.state.completion_index = 0;
                     return false;
                 }
                 if self
@@ -649,7 +606,7 @@ impl<R: TuiRuntime> TuiApp<R> {
                     .newline_should_insert_instead_of_submit(now)
                 {
                     self.input.push_char('\n');
-                    self.completion_index = 0;
+                    self.state.completion_index = 0;
                     return false;
                 }
                 self.flush_paste_burst_before_non_plain_input();
@@ -660,7 +617,7 @@ impl<R: TuiRuntime> TuiApp<R> {
 
                 let submitted = self.input.text().trim().to_string();
                 self.input.clear();
-                self.completion_index = 0;
+                self.state.completion_index = 0;
                 if submitted.is_empty() {
                     return false;
                 }
@@ -734,19 +691,20 @@ impl<R: TuiRuntime> TuiApp<R> {
                 true
             }
             KeyCode::Esc => {
-                if let Some(picker) = self.picker_view.as_mut() {
+                if let Some(picker) = self.state.picker_view.as_mut() {
                     picker.cancel_prompt();
                 }
                 false
             }
             KeyCode::Backspace => {
-                if let Some(picker) = self.picker_view.as_mut() {
+                if let Some(picker) = self.state.picker_view.as_mut() {
                     picker.pop_prompt_char();
                 }
                 false
             }
             KeyCode::Enter => {
                 let Some(command) = self
+                    .state
                     .picker_view
                     .as_mut()
                     .and_then(PickerState::take_prompt_command)
@@ -760,7 +718,7 @@ impl<R: TuiRuntime> TuiApp<R> {
             KeyCode::Char(ch)
                 if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                if let Some(picker) = self.picker_view.as_mut() {
+                if let Some(picker) = self.state.picker_view.as_mut() {
                     picker.push_prompt_char(ch);
                 }
                 false
@@ -771,6 +729,7 @@ impl<R: TuiRuntime> TuiApp<R> {
 
     fn handle_picker_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
         if self
+            .state
             .picker_view
             .as_ref()
             .is_some_and(|picker| picker.prompt.is_some())
@@ -785,35 +744,35 @@ impl<R: TuiRuntime> TuiApp<R> {
                 true
             }
             KeyCode::Esc => {
-                self.picker_view = None;
+                self.state.picker_view = None;
                 false
             }
             KeyCode::Up => {
-                if let Some(picker) = self.picker_view.as_mut() {
+                if let Some(picker) = self.state.picker_view.as_mut() {
                     picker.move_previous();
                 }
                 false
             }
             KeyCode::Down => {
-                if let Some(picker) = self.picker_view.as_mut() {
+                if let Some(picker) = self.state.picker_view.as_mut() {
                     picker.move_next();
                 }
                 false
             }
             KeyCode::Left => {
-                if let Some(picker) = self.picker_view.as_mut() {
+                if let Some(picker) = self.state.picker_view.as_mut() {
                     picker.move_parent();
                 }
                 false
             }
             KeyCode::Right => {
-                if let Some(picker) = self.picker_view.as_mut() {
+                if let Some(picker) = self.state.picker_view.as_mut() {
                     picker.move_first_child();
                 }
                 false
             }
             KeyCode::BackTab => {
-                if let Some(picker) = self.picker_view.as_mut() {
+                if let Some(picker) = self.state.picker_view.as_mut() {
                     picker.cycle_effort();
                 }
                 false
@@ -821,27 +780,28 @@ impl<R: TuiRuntime> TuiApp<R> {
             KeyCode::Char('f') | KeyCode::Char('n')
                 if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                if let Some(picker) = self.picker_view.as_mut() {
+                if let Some(picker) = self.state.picker_view.as_mut() {
                     picker.begin_tree_prompt(TreePromptAction::Fork);
                 }
                 false
             }
             KeyCode::Delete => {
-                if let Some(picker) = self.picker_view.as_mut() {
+                if let Some(picker) = self.state.picker_view.as_mut() {
                     picker.begin_tree_prompt(TreePromptAction::Delete);
                 }
                 false
             }
             KeyCode::Enter => {
                 let Some(command) = self
+                    .state
                     .picker_view
                     .as_ref()
                     .and_then(PickerState::selected_command)
                 else {
-                    self.picker_view = None;
+                    self.state.picker_view = None;
                     return false;
                 };
-                self.picker_view = None;
+                self.state.picker_view = None;
                 let (_, events) = self.runtime.handle_command(&command);
                 self.apply_events(events);
                 false
@@ -850,509 +810,39 @@ impl<R: TuiRuntime> TuiApp<R> {
         }
     }
 
-    fn apply_events(&mut self, events: Vec<AgentEvent>) -> bool {
-        let mut changed = false;
-        for event in events {
-            changed |= match event {
-                AgentEvent::Startup {
-                    version,
-                    profile_dir,
-                    config_path,
-                    cwd,
-                    model,
-                    context_window,
-                } => {
-                    self.push_startup(
-                        version,
-                        profile_dir,
-                        config_path,
-                        cwd,
-                        model,
-                        context_window,
-                    );
-                    true
-                }
-                AgentEvent::ModelStatus {
-                    provider,
-                    model,
-                    reasoning_effort,
-                    context_window,
-                    max_output_tokens,
-                    reasoning_efforts,
-                    state,
-                } => {
-                    let changed = self.provider != provider
-                        || self.model != model
-                        || self.reasoning_effort != reasoning_effort
-                        || self.context_window != context_window
-                        || self.max_output_tokens != max_output_tokens
-                        || self.reasoning_efforts != reasoning_efforts;
-                    self.provider = provider;
-                    self.model = model;
-                    self.reasoning_effort = reasoning_effort;
-                    self.context_window = context_window;
-                    self.max_output_tokens = max_output_tokens;
-                    self.reasoning_efforts = reasoning_efforts;
-                    self.apply_status(state) || changed
-                }
-                AgentEvent::PendingMessages(messages) => {
-                    let changed = self.pending_messages != messages;
-                    self.pending_messages = messages;
-                    changed
-                }
-                AgentEvent::UserMessage(message) => {
-                    self.chat.push(ChatLine::User(message));
-                    self.mark_history_dirty();
-                    true
-                }
-                AgentEvent::FillInput(content) => {
-                    self.input.clear();
-                    self.input.push_text(&content);
-                    self.completion_index = 0;
-                    true
-                }
-                AgentEvent::Connecting => {
-                    self.begin_reasoning_turn_if_idle();
-                    self.activity.start_connecting();
-                    true
-                }
-                AgentEvent::CompactionStart => {
-                    self.activity.start_compacting();
-                    self.chat.push(ChatLine::System(
-                        "Compacting earlier conversation to free up context…".to_string(),
-                    ));
-                    self.mark_history_dirty();
-                    true
-                }
-                AgentEvent::CompactionProgress { output_tokens } => {
-                    self.activity.set_compaction_output_tokens(output_tokens);
-                    true
-                }
-                AgentEvent::CompactionEnd => {
-                    self.chat
-                        .push(ChatLine::System("Context compacted.".to_string()));
-                    self.mark_history_dirty();
-                    true
-                }
-                AgentEvent::CompactionFailed(error) => {
-                    self.chat.push(ChatLine::System(format!(
-                        "Context compaction failed ({error}); continuing with full context."
-                    )));
-                    self.mark_history_dirty();
-                    true
-                }
-                AgentEvent::ContextUsage { tokens } => {
-                    let changed = self.current_context_tokens != tokens;
-                    self.current_context_tokens = tokens;
-                    changed
-                }
-                AgentEvent::ThinkingStart => {
-                    self.begin_reasoning_turn_if_idle();
-                    self.activity.start_thinking();
-                    true
-                }
-                AgentEvent::ReasoningDelta(delta) => {
-                    self.activity.start_thinking();
-                    self.append_thinking_delta(&delta);
-                    true
-                }
-                AgentEvent::Retrying { attempt } => {
-                    // The request is re-sent from scratch, so drop any partial
-                    // streamed output to avoid duplicating it on the retry.
-                    self.live_assistant = None;
-                    self.discard_partial_reasoning();
-                    self.thinking_tokens = 0;
-                    self.activity.start_reconnecting(attempt);
-                    true
-                }
-                AgentEvent::AssistantStart => {
-                    self.collapse_live_thinking();
-                    self.live_assistant = Some(String::new());
-                    true
-                }
-                AgentEvent::AssistantDelta(delta) => {
-                    self.collapse_live_thinking();
-                    self.activity.add_output_delta(&delta);
-                    self.append_assistant_delta(&delta);
-                    true
-                }
-                AgentEvent::ToolStart { call_id, name } => {
-                    self.collapse_live_thinking();
-                    self.activity.start_tool(name.clone());
-                    self.upsert_tool(call_id, name, String::new(), true);
-                    true
-                }
-                AgentEvent::ToolUpdate {
-                    call_id,
-                    name,
-                    output,
-                } => {
-                    self.collapse_live_thinking();
-                    self.activity.start_tool(name.clone());
-                    self.upsert_tool(call_id, name, output, true);
-                    true
-                }
-                AgentEvent::ToolOutput {
-                    call_id,
-                    name,
-                    output,
-                    ..
-                } => {
-                    self.collapse_live_thinking();
-                    self.activity.start_connecting();
-                    self.upsert_tool(call_id, name, output, false);
-                    true
-                }
-                AgentEvent::Usage {
-                    input_tokens,
-                    output_tokens,
-                    reasoning_tokens,
-                } => {
-                    self.total_input_tokens += input_tokens;
-                    self.total_output_tokens += output_tokens;
-                    self.record_reasoning_tokens(reasoning_tokens);
-                    true
-                }
-                AgentEvent::TreeView(nodes) => {
-                    self.picker_view = Some(PickerState::checkout(nodes));
-                    true
-                }
-                AgentEvent::ResumeView(sessions) => {
-                    self.picker_view = Some(PickerState::resume(sessions));
-                    true
-                }
-                AgentEvent::ModelView {
-                    models,
-                    active_effort,
-                } => {
-                    self.picker_view = Some(PickerState::model(models, active_effort));
-                    true
-                }
-                AgentEvent::CommandList(commands) => {
-                    self.commands = commands.into_iter().map(CommandCandidate::from).collect();
-                    self.clamp_completion_index();
-                    true
-                }
-                AgentEvent::Goal(goal) => {
-                    self.chat.push(ChatLine::System(format_goal_summary(goal)));
-                    self.mark_history_dirty();
-                    true
-                }
-                AgentEvent::Transcript(items) => {
-                    self.replace_transcript(items);
-                    true
-                }
-                AgentEvent::Info(message) => {
-                    self.chat.push(ChatLine::System(message));
-                    self.mark_history_dirty();
-                    true
-                }
-                AgentEvent::Error(error) => {
-                    self.collapse_live_thinking();
-                    self.commit_live_assistant();
-                    self.activity.finish();
-                    self.chat.push(ChatLine::Error(error));
-                    self.mark_history_dirty();
-                    true
-                }
-                AgentEvent::Status(status) => self.apply_status(status),
-            };
-        }
-        changed
-    }
-
-    fn apply_status(&mut self, status: String) -> bool {
-        let mut changed = self.status != status;
-        if status == "ready" || status.starts_with("queued:") {
-            // The reasoning message (collapsed) stays in the transcript, but the
-            // above-input status indicator is reset once the reply is done.
-            self.collapse_live_thinking();
-            changed |= self.commit_live_assistant();
-            changed |= self.thinking_tokens != 0;
-            self.thinking_tokens = 0;
-            self.reasoning_index = None;
-        }
-        if status == "ready" {
-            let was_active = self.activity.is_active();
-            self.activity.finish();
-            changed |= was_active;
-        }
-        self.status = status;
-        changed
-    }
-
-    fn append_assistant_delta(&mut self, delta: &str) {
-        if let Some(text) = self.live_assistant.as_mut() {
-            text.push_str(delta);
-        } else {
-            self.live_assistant = Some(delta.to_string());
-        }
-    }
-
-    /// Stream reasoning into a transcript message. A delta after the current
-    /// reasoning message was collapsed starts a new one (e.g. a new phase after a
-    /// tool call).
-    fn append_thinking_delta(&mut self, delta: &str) {
-        if let Some(index) = self.reasoning_index {
-            if let Some(ChatLine::Reasoning {
-                text,
-                collapsed: false,
-            }) = self.chat.get_mut(index)
-            {
-                text.push_str(delta);
-                self.mark_history_dirty();
-                return;
-            }
-        }
-        self.chat.push(ChatLine::Reasoning {
-            text: delta.to_string(),
-            collapsed: false,
-        });
-        self.reasoning_index = Some(self.chat.len() - 1);
-        self.mark_history_dirty();
-    }
-
-    fn begin_reasoning_turn_if_idle(&mut self) {
-        if self.status == "ready" || !self.activity.is_active() {
-            self.reset_thinking();
-        }
-    }
-
-    /// Forget the current reasoning message and clear the token indicator (next turn).
-    fn reset_thinking(&mut self) {
-        self.reasoning_index = None;
-        self.thinking_tokens = 0;
-    }
-
-    /// Reasoning finished: collapse its transcript message to a short preview.
-    fn collapse_live_thinking(&mut self) {
-        if let Some(index) = self.reasoning_index.take() {
-            if let Some(ChatLine::Reasoning { collapsed, .. }) = self.chat.get_mut(index) {
-                *collapsed = true;
-                self.mark_history_dirty();
-            }
-        }
-    }
-
-    /// Drop a partial reasoning message before a retry re-streams it.
-    fn discard_partial_reasoning(&mut self) {
-        if let Some(index) = self.reasoning_index.take() {
-            if matches!(
-                self.chat.get(index),
-                Some(ChatLine::Reasoning {
-                    collapsed: false,
-                    ..
-                })
-            ) {
-                if index + 1 == self.chat.len() {
-                    self.chat.pop();
-                    self.mark_history_dirty();
-                } else if let Some(ChatLine::Reasoning { text, .. }) = self.chat.get_mut(index) {
-                    text.clear();
-                    self.mark_history_dirty();
-                }
-            }
-        }
-    }
-
-    fn commit_live_assistant(&mut self) -> bool {
-        let Some(text) = self.live_assistant.take() else {
-            return false;
-        };
-        if !text.trim().is_empty() {
-            self.chat.push(ChatLine::Assistant(text));
-            self.mark_history_dirty();
-            return true;
-        }
-        true
-    }
-
-    /// Record reasoning tokens from the response usage, shown in the thinking
-    /// status line above the input (not in the chat history).
-    fn record_reasoning_tokens(&mut self, reasoning_tokens: u64) {
-        if reasoning_tokens > 0 {
-            self.thinking_tokens = reasoning_tokens;
-        }
-    }
-
-    fn upsert_tool(&mut self, call_id: String, name: String, output: String, running: bool) {
-        if let Some(ChatLine::Tool {
-            name: existing_name,
-            output: existing_output,
-            running: existing_running,
-            ..
-        }) = self.chat.iter_mut().find(|line| {
-            matches!(
-                line,
-                ChatLine::Tool {
-                    call_id: Some(existing),
-                    ..
-                } if existing == &call_id
-            )
-        }) {
-            *existing_name = name;
-            *existing_output = output;
-            *existing_running = running;
-            self.mark_history_dirty();
-            return;
-        }
-
-        self.chat.push(ChatLine::Tool {
-            call_id: Some(call_id),
-            name,
-            output,
-            running,
-        });
-        self.mark_history_dirty();
-    }
-
-    fn replace_transcript(&mut self, items: Vec<TranscriptItem>) {
-        self.commit_live_assistant();
-        self.reset_thinking();
-        self.chat = items
-            .into_iter()
-            .map(|item| match item {
-                TranscriptItem::User(text) => ChatLine::User(text),
-                TranscriptItem::Assistant(text) => ChatLine::Assistant(text),
-                TranscriptItem::Tool { name, output } => ChatLine::Tool {
-                    call_id: None,
-                    name,
-                    output,
-                    running: false,
-                },
-                TranscriptItem::Branch(label) => ChatLine::System(label),
-            })
-            .collect();
-        self.reset_screen = true;
-        self.mark_history_dirty();
-    }
-
-    fn push_startup(
-        &mut self,
-        version: String,
-        profile_dir: String,
-        config_path: String,
-        cwd: String,
-        model: String,
-        context_window: u64,
-    ) {
-        self.chat.push(ChatLine::Startup {
-            version,
-            profile_dir,
-            config_path,
-            cwd,
-            model,
-            context_window,
-        });
-        self.mark_history_dirty();
-    }
-
-    fn mark_history_dirty(&mut self) {
-        self.history_revision = self.history_revision.wrapping_add(1);
-    }
-
     fn build_document(&mut self, width: usize, now: Instant) -> UiDocument {
-        let command_matches = self.command_matches();
-        let input_display = self.input.render(!self.activity.is_active());
-        let rendered_history_lines = self.rendered_history_lines(width);
-        UiBuilder::new()
-            .rendered_history_lines(rendered_history_lines)
-            .thinking_indicator(self.activity.is_thinking(), self.thinking_tokens)
-            .live_assistant(self.live_assistant.as_deref(), width)
-            .picker(self.picker_view.as_ref())
-            .pending_messages(&self.pending_messages)
-            .input(&input_display, &command_matches, self.completion_index)
-            .progress(&self.activity, now, width)
-            .bottom_status(
-                BottomStatus {
-                    provider: &self.provider,
-                    model: &self.model,
-                    reasoning_effort: &self.reasoning_effort,
-                    input_tokens: self.total_input_tokens,
-                    output_tokens: self.total_output_tokens,
-                    context_tokens: self.current_context_tokens,
-                    context_window: self.context_window,
-                },
-                width,
-            )
-            .reset_screen(self.reset_screen)
-            .finish()
-    }
-
-    fn rendered_history_lines(&mut self, width: usize) -> Vec<String> {
-        if self.rendered_history_cache.revision != self.history_revision
-            || self.rendered_history_cache.width != width
-        {
-            let history = UiBuilder::new()
-                .chat_with_width(&self.chat, width)
-                .into_history();
-            self.rendered_history_cache = RenderedHistoryCache {
-                revision: self.history_revision,
-                width,
-                lines: wrap_lines(&history, width)
-                    .into_iter()
-                    .map(|line| render_ansi_line(&line))
-                    .collect(),
-            };
-        }
-        self.rendered_history_cache.lines.clone()
-    }
-
-    fn command_completion_active(&self) -> bool {
-        let input = self.input.text();
-        !input.contains('\n') && input.starts_with('/') && !self.command_matches().is_empty()
-    }
-
-    fn should_complete_on_enter(&self) -> bool {
-        self.command_completion_active()
-    }
-
-    fn command_matches(&self) -> Vec<CommandCandidate> {
-        let input = self.input.text();
-        if !input.starts_with('/') || input.contains('\n') {
-            return Vec::new();
-        }
-        if self
-            .commands
-            .iter()
-            .any(|candidate| candidate.command == input)
-        {
-            return Vec::new();
-        }
-        self.commands
-            .iter()
-            .filter(|candidate| candidate.command.starts_with(input.as_str()))
-            .cloned()
-            .collect()
+        self.state.build_document(&self.input, width, now)
     }
 
     fn clamp_completion_index(&mut self) {
-        let count = self.command_matches().len();
-        if count == 0 {
-            self.completion_index = 0;
-        } else if self.completion_index >= count {
-            self.completion_index = count - 1;
-        }
+        self.state.clamp_completion_index(&self.input);
+    }
+
+    fn command_completion_active(&self) -> bool {
+        self.state.command_completion_active(&self.input)
+    }
+
+    fn should_complete_on_enter(&self) -> bool {
+        self.state.should_complete_on_enter(&self.input)
     }
 
     fn complete_selected_command(&mut self) {
-        let matches = self.command_matches();
-        if let Some(command) = matches.get(self.completion_index) {
-            self.input.clear();
-            self.input.push_text(&command.command);
-            self.input.push_char(' ');
-            self.completion_index = 0;
-        }
+        self.state.complete_selected_command(&mut self.input);
+    }
+
+    fn apply_events(&mut self, events: Vec<AgentEvent>) -> bool {
+        self.state.apply_events(events, &mut self.input)
     }
 
     fn cycle_reasoning_effort(&mut self) {
-        if self.model == "unknown" {
+        if self.state.model == "unknown" {
             return;
         }
-        let next = next_reasoning_effort(&self.reasoning_efforts, &self.reasoning_effort);
+        let next =
+            next_reasoning_effort(&self.state.reasoning_efforts, &self.state.reasoning_effort);
         let (_, events) = self
             .runtime
-            .handle_command(&format!("/model {} {next}", self.model));
+            .handle_command(&format!("/model {} {next}", self.state.model));
         self.apply_events(events);
     }
 }
@@ -1452,15 +942,11 @@ impl ActivityState {
         !matches!(self.kind, ActivityKind::Idle)
     }
 
-    fn is_thinking(&self) -> bool {
-        matches!(self.kind, ActivityKind::Thinking)
-    }
-
     fn advance_animation(&mut self) {
         self.animation_tick = self.animation_tick.wrapping_add(1);
     }
 
-    fn progress(&self, now: Instant) -> Option<ProgressState> {
+    fn progress(&self, now: Instant, thinking_tokens: u64) -> Option<ProgressState> {
         let phase_started_at = self.phase_started_at.or(self.turn_started_at)?;
         let elapsed = now.saturating_duration_since(phase_started_at);
         match self.kind {
@@ -1476,17 +962,24 @@ impl ActivityState {
                 label: format!("connecting {:.1}s", elapsed.as_secs_f32()),
                 step: 1,
             }),
-            ActivityKind::Thinking => Some(ProgressState {
-                color: gradient_color(
-                    elapsed.as_secs_f32() / 30.0,
-                    (160, 130, 230),
-                    (140, 110, 220),
-                    (120, 90, 210),
-                ),
-                preset: SpinnerPreset::Pulse,
-                label: format!("thinking {:.1}s", elapsed.as_secs_f32()),
-                step: 1,
-            }),
+            ActivityKind::Thinking => {
+                let token_suffix = if thinking_tokens > 0 {
+                    format!(" ({thinking_tokens} tokens)")
+                } else {
+                    String::new()
+                };
+                Some(ProgressState {
+                    color: gradient_color(
+                        elapsed.as_secs_f32() / 30.0,
+                        (160, 130, 230),
+                        (140, 110, 220),
+                        (120, 90, 210),
+                    ),
+                    preset: SpinnerPreset::Pulse,
+                    label: format!("thinking {:.1}s{token_suffix}", elapsed.as_secs_f32()),
+                    step: 1,
+                })
+            }
             ActivityKind::Compacting => Some(ProgressState {
                 color: (90, 200, 220),
                 preset: SpinnerPreset::Pulse,
@@ -1564,6 +1057,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = io::stdout().write_all(DISABLE_BRACKETED_PASTE.as_bytes());
+        let _ = io::stdout().write_all(ENABLE_AUTOWRAP.as_bytes());
         let _ = io::stdout().write_all(ENABLE_SCROLL_ON_OUTPUT.as_bytes());
         let _ = execute!(
             io::stdout(),
@@ -1595,6 +1089,10 @@ pub(crate) fn wrap_lines(lines: &[UiLine], width: usize) -> Vec<UiLine> {
         wrap_line(line, width, &mut wrapped);
     }
     wrapped
+}
+
+pub(crate) fn padded_content_width(width: usize) -> usize {
+    width.saturating_sub(CONTENT_LEFT_PADDING).max(1)
 }
 
 fn wrap_line(line: &UiLine, width: usize, output: &mut Vec<UiLine>) {
@@ -1688,7 +1186,7 @@ pub(crate) fn render_ansi_line(line: &UiLine) -> String {
     // compose with it.
     let always_color = matches!(
         line.kind,
-        UiKind::Input | UiKind::Assistant | UiKind::Status
+        UiKind::Input | UiKind::Assistant | UiKind::Status | UiKind::BottomStatus
     );
     if !always_color && line.text.contains(ANSI_ESCAPE) {
         return line.text.clone();
@@ -1818,14 +1316,16 @@ pub(crate) fn color_code(kind: UiKind) -> &'static str {
         UiKind::Brand => "\x1b[34m",
         UiKind::User => "\x1b[36m",
         UiKind::Assistant => "\x1b[37m",
+        UiKind::Separator => "\x1b[38;2;105;108;120m",
         UiKind::ToolHeader => "\x1b[37m",
         UiKind::Tool | UiKind::System | UiKind::Status => "\x1b[90m",
+        UiKind::BottomStatus => "\x1b[97m",
         UiKind::Error => "\x1b[31m",
         UiKind::Selected => "\x1b[97m",
-        UiKind::Input => "\x1b[97m",
+        UiKind::Input => "\x1b[38;2;224;226;232;48;2;48;52;62m",
         UiKind::TreeDirectory => "\x1b[33m",
-        UiKind::DiffAdd => "\x1b[32m",
-        UiKind::DiffRemove => "\x1b[31m",
+        UiKind::DiffAdd => "\x1b[38;2;170;220;170;48;2;28;70;38m",
+        UiKind::DiffRemove => "\x1b[38;2;230;150;145;48;2;85;38;32m",
         UiKind::DiffHeader => "\x1b[36m",
     }
 }

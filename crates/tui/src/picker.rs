@@ -81,7 +81,7 @@ impl PickerState {
                 label: session.label,
                 active: session.active,
                 has_children: false,
-                detail: String::new(),
+                detail: session.detail,
                 reasoning_efforts: Vec::new(),
             })
             .collect::<Vec<_>>();

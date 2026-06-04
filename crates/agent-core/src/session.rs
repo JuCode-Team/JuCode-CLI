@@ -11,6 +11,10 @@ use std::{
 
 const ROOT_BRANCH: &str = "root";
 const MAX_GOAL_OBJECTIVE_CHARS: usize = 4_000;
+const SESSION_LABEL_MAX_CHARS: usize = 72;
+const RESUME_SUMMARY_INPUT_MAX_CHARS: usize = 4_000;
+const RESUME_SUMMARY_RECENT_ENTRIES: usize = 6;
+const RESUME_SUMMARY_TOOL_TEXT_MAX_CHARS: usize = 240;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EntryId(u64);
@@ -83,6 +87,9 @@ pub struct SessionStore {
     persisted_entries: usize,
     needs_snapshot: bool,
     goal: Option<ThreadGoal>,
+    resume_summary: Option<String>,
+    resume_summary_status: Option<ThreadGoalStatus>,
+    resume_summary_updated_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,8 +119,14 @@ pub struct SessionSummary {
     pub updated_at: u64,
     pub entries: usize,
     pub leaf: String,
+    pub label: String,
+    pub resume_summary: Option<String>,
+    pub resume_status: Option<ThreadGoalStatus>,
+    #[allow(dead_code)]
+    pub resume_summary_updated_at: Option<u64>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct ContextProjection {
     pub items: Vec<Value>,
@@ -161,6 +174,44 @@ impl SessionStore {
             updated_at: now_secs(),
             ..Self::default()
         }
+    }
+
+    pub fn latest_user_message(&self) -> Option<&str> {
+        self.branch()
+            .into_iter()
+            .rev()
+            .find_map(|entry| match &entry.kind {
+                EntryKind::User { content } => Some(content.as_str()),
+                _ => None,
+            })
+    }
+
+    pub fn session_label(&self) -> String {
+        self.latest_user_message()
+            .map(|message| truncate_with_limit(message, SESSION_LABEL_MAX_CHARS))
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| self.session_id.clone())
+    }
+
+    pub fn resume_summary_input(&self) -> String {
+        let mut rendered = self
+            .branch()
+            .into_iter()
+            .rev()
+            .filter_map(render_entry_for_resume_summary)
+            .take(RESUME_SUMMARY_RECENT_ENTRIES)
+            .collect::<Vec<_>>();
+        rendered.reverse();
+        let mut text = rendered.join("\n");
+        if text.len() > RESUME_SUMMARY_INPUT_MAX_CHARS {
+            text.truncate(RESUME_SUMMARY_INPUT_MAX_CHARS);
+            text.push('…');
+        }
+        text
+    }
+
+    pub fn updated_at(&self) -> u64 {
+        self.updated_at
     }
 
     pub fn session_id(&self) -> &str {
@@ -264,8 +315,40 @@ impl SessionStore {
         self.append(EntryKind::GoalContext { content });
     }
 
+    pub fn set_resume_summary(
+        &mut self,
+        summary: Option<String>,
+        status: Option<ThreadGoalStatus>,
+        summarized_at: u64,
+    ) {
+        self.resume_summary = summary.filter(|value| !value.trim().is_empty());
+        self.resume_summary_status = status;
+        self.resume_summary_updated_at = Some(summarized_at);
+    }
+
+    #[allow(dead_code)]
+    pub fn resume_summary(&self) -> Option<&str> {
+        self.resume_summary.as_deref()
+    }
+
+    #[allow(dead_code)]
+    pub fn resume_summary_status(&self) -> Option<ThreadGoalStatus> {
+        self.resume_summary_status
+    }
+
+    pub fn resume_summary_updated_at(&self) -> Option<u64> {
+        self.resume_summary_updated_at
+    }
+
+    pub fn clear_resume_summary(&mut self) {
+        self.resume_summary = None;
+        self.resume_summary_status = None;
+        self.resume_summary_updated_at = None;
+    }
+
     fn mark_state_changed(&mut self) {
         self.updated_at = now_secs();
+        self.clear_resume_summary();
         self.needs_snapshot = true;
     }
 
@@ -296,6 +379,7 @@ impl SessionStore {
         self.leaf_id = Some(id);
         self.update_head_for_entry(id);
         self.updated_at = now_secs();
+        self.clear_resume_summary();
         id
     }
 
@@ -307,6 +391,7 @@ impl SessionStore {
         }
         self.leaf_id = id;
         self.updated_at = now_secs();
+        self.clear_resume_summary();
         Ok(())
     }
 
@@ -530,83 +615,25 @@ impl SessionStore {
 
     #[cfg(test)]
     pub fn context_projection(&self) -> ContextProjection {
-        self.context_projection_with_budget(usize::MAX, usize::MAX)
-    }
-
-    pub fn context_projection_with_budget(
-        &self,
-        max_tokens: usize,
-        keep_recent_tokens: usize,
-    ) -> ContextProjection {
-        let branch = self.branch();
-        let (persisted_summary, keep_after) = self.compaction_view(&branch);
-        let mut entries = branch
-            .iter()
-            .enumerate()
-            .filter(|(index, entry)| {
-                *index >= keep_after && !matches!(entry.kind, EntryKind::Compaction { .. })
-            })
-            .filter_map(|(_, entry)| context_item_for_entry(entry).map(|item| (*entry, item)))
-            .collect::<Vec<_>>();
-        let summary_item = persisted_summary.as_deref().map(compaction_summary_item);
-        let summary_tokens = summary_item.as_ref().map(estimate_item_tokens).unwrap_or(0);
-        let full_tokens =
-            summary_tokens + estimate_items_tokens(entries.iter().map(|(_, item)| item));
-        let heuristic = full_tokens > max_tokens && entries.len() > 4;
-        let compacted = heuristic || persisted_summary.is_some();
-        let items = if heuristic {
-            let mut tail = Vec::new();
-            let mut tail_tokens = 0usize;
-            while let Some((entry, item)) = entries.pop() {
-                let tokens = estimate_item_tokens(&item);
-                if !tail.is_empty() && tail_tokens + tokens > keep_recent_tokens {
-                    entries.push((entry, item));
-                    break;
-                }
-                tail_tokens += tokens;
-                tail.push((entry, item));
-            }
-            tail.reverse();
-            let summary = summarize_compacted_entries(entries.iter().map(|(entry, _)| *entry));
-            let mut items = vec![json!({
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": format!("[CONVERSATION HISTORY SUMMARY - older turns compacted for context efficiency]\n\n{summary}")
-                }]
-            })];
-            items.extend(tail.into_iter().map(|(_, item)| item));
-            items
-        } else {
-            entries
-                .into_iter()
-                .map(|(_, item)| item)
-                .collect::<Vec<_>>()
-        };
-        let items = match summary_item {
-            Some(summary_item) => {
-                let mut combined = vec![summary_item];
-                combined.extend(items);
-                combined
-            }
-            None => items,
-        };
+        let items = self.request_context_items();
         ContextProjection {
-            branch_entries: branch.len(),
+            branch_entries: self.branch().len(),
             projected_entries: items.len(),
+            compacted: self
+                .branch()
+                .iter()
+                .any(|entry| matches!(entry.kind, EntryKind::Compaction { .. })),
             items,
-            compacted,
         }
     }
 
-    pub fn context_statistics(
-        &self,
-        max_tokens: usize,
-        keep_recent_tokens: usize,
-    ) -> ContextStatistics {
+    pub fn context_statistics(&self) -> ContextStatistics {
         let branch = self.branch();
-        let projection = self.context_projection_with_budget(max_tokens, keep_recent_tokens);
-        let projected_estimated_tokens = estimate_items_tokens(projection.items.iter());
+        let items = self.request_context_items();
+        let projected_estimated_tokens = estimate_items_tokens(items.iter());
+        let compacted = branch
+            .iter()
+            .any(|entry| matches!(entry.kind, EntryKind::Compaction { .. }));
         let mut counts = ContextEntryCounts::default();
         let mut context_items = 0usize;
         let mut estimated_tokens = 0usize;
@@ -633,10 +660,10 @@ impl SessionStore {
         top_items.truncate(5);
 
         ContextStatistics {
-            branch_entries: projection.branch_entries,
+            branch_entries: branch.len(),
             context_items,
-            projected_items: projection.projected_entries,
-            compacted: projection.compacted,
+            projected_items: items.len(),
+            compacted,
             estimated_tokens,
             projected_estimated_tokens,
             counts,
@@ -868,7 +895,7 @@ impl SessionStore {
 
     fn summary_json(&self) -> Value {
         json!({
-            "version": 2,
+            "version": 3,
             "id": self.session_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -876,6 +903,10 @@ impl SessionStore {
             "next_id": self.next_id,
             "branch_heads": self.branch_heads_json(),
             "entries_count": self.entries.len(),
+            "label": self.session_label(),
+            "resume_summary": self.resume_summary,
+            "resume_status": self.resume_summary_status.map(ThreadGoalStatus::as_str),
+            "resume_summary_updated_at": self.resume_summary_updated_at,
             "goal": self.goal.as_ref().map(goal_to_json),
             "journal": format!("{}.jsonl", self.session_id)
         })
@@ -945,6 +976,17 @@ impl SessionStore {
             persisted_entries: 0,
             needs_snapshot: true,
             goal: value.get("goal").and_then(goal_from_json),
+            resume_summary: value
+                .get("resume_summary")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            resume_summary_status: value
+                .get("resume_status")
+                .and_then(Value::as_str)
+                .and_then(|status| ThreadGoalStatus::try_from(status).ok()),
+            resume_summary_updated_at: value
+                .get("resume_summary_updated_at")
+                .and_then(Value::as_u64),
         };
         if store.branch_heads.is_empty() {
             store.rebuild_branch_heads();
@@ -1010,6 +1052,17 @@ impl SessionStore {
         if value.get("goal").is_some() {
             self.goal = value.get("goal").and_then(goal_from_json);
         }
+        self.resume_summary = value
+            .get("resume_summary")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        self.resume_summary_status = value
+            .get("resume_status")
+            .and_then(Value::as_str)
+            .and_then(|status| ThreadGoalStatus::try_from(status).ok());
+        self.resume_summary_updated_at = value
+            .get("resume_summary_updated_at")
+            .and_then(Value::as_u64);
         self.leaf_id = value
             .get("leaf_id")
             .and_then(Value::as_u64)
@@ -1047,11 +1100,35 @@ impl SessionStore {
             .and_then(Value::as_u64)
             .map(|id| EntryId(id).display())
             .unwrap_or_else(|| "root".to_string());
+        let label = value
+            .get("label")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| id.clone());
+        let resume_summary = value
+            .get("resume_summary")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let resume_status = value
+            .get("resume_status")
+            .and_then(Value::as_str)
+            .and_then(|status| ThreadGoalStatus::try_from(status).ok());
+        let resume_summary_updated_at = value
+            .get("resume_summary_updated_at")
+            .and_then(Value::as_u64);
         Some(SessionSummary {
             id,
             updated_at,
             entries,
             leaf,
+            label,
+            resume_summary,
+            resume_status,
+            resume_summary_updated_at,
         })
     }
 }
@@ -1127,6 +1204,47 @@ fn render_entry_for_summary(entry: &SessionEntry) -> Option<String> {
         EntryKind::PinnedSkill { name, .. } => Some(format!("(pinned skill: {name})")),
         EntryKind::GoalContext { content } => Some(format!("Goal context: {content}")),
         EntryKind::Branch { .. } | EntryKind::Compaction { .. } => None,
+    }
+}
+
+fn render_entry_for_resume_summary(entry: &SessionEntry) -> Option<String> {
+    match &entry.kind {
+        EntryKind::User { content } => Some(format!(
+            "User: {}",
+            single_line_with_limit(content, SESSION_LABEL_MAX_CHARS)
+        )),
+        EntryKind::ResponseItem { item } => {
+            if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+                let args = item.get("arguments").and_then(Value::as_str).unwrap_or("");
+                Some(format!(
+                    "Assistant tool call {name}: {}",
+                    single_line_with_limit(args, RESUME_SUMMARY_TOOL_TEXT_MAX_CHARS)
+                ))
+            } else {
+                let text = extract_response_text(item);
+                let text = text.trim();
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        "Assistant: {}",
+                        single_line_with_limit(text, SESSION_LABEL_MAX_CHARS)
+                    ))
+                }
+            }
+        }
+        EntryKind::ToolOutput { name, output, .. } => Some(format!(
+            "Tool {name} output: {}",
+            single_line_with_limit(output, RESUME_SUMMARY_TOOL_TEXT_MAX_CHARS)
+        )),
+        EntryKind::GoalContext { content } => Some(format!(
+            "Goal context: {}",
+            single_line_with_limit(content, SESSION_LABEL_MAX_CHARS)
+        )),
+        EntryKind::PinnedSkill { .. } | EntryKind::Branch { .. } | EntryKind::Compaction { .. } => {
+            None
+        }
     }
 }
 
@@ -1210,55 +1328,6 @@ fn estimate_item_tokens(item: &Value) -> usize {
     item.to_string().len().saturating_add(3) / 4
 }
 
-fn summarize_compacted_entries<'a>(entries: impl Iterator<Item = &'a SessionEntry>) -> String {
-    let mut user_turns = 0usize;
-    let mut assistant_turns = 0usize;
-    let mut tool_calls = Vec::new();
-    let mut recent_user = None;
-    for entry in entries {
-        match &entry.kind {
-            EntryKind::User { content } => {
-                user_turns += 1;
-                recent_user = Some(truncate_summary_line(content));
-            }
-            EntryKind::ResponseItem { item } => {
-                if !extract_response_text(item).trim().is_empty() {
-                    assistant_turns += 1;
-                }
-            }
-            EntryKind::ToolOutput { name, .. } => tool_calls.push(name.clone()),
-            EntryKind::PinnedSkill { name, .. } => {
-                tool_calls.push(format!("pinned skill:{name}"));
-            }
-            EntryKind::GoalContext { .. } => {}
-            EntryKind::Branch { .. } | EntryKind::Compaction { .. } => {}
-        }
-    }
-    tool_calls.sort();
-    tool_calls.dedup();
-    let mut lines = vec![format!(
-        "Compacted {user_turns} user turn(s) and {assistant_turns} assistant response(s)."
-    )];
-    if !tool_calls.is_empty() {
-        lines.push(format!("Tools used earlier: {}.", tool_calls.join(", ")));
-    }
-    if let Some(recent_user) = recent_user {
-        lines.push(format!("Most recent compacted user request: {recent_user}"));
-    }
-    lines.join("\n")
-}
-
-fn truncate_summary_line(text: &str) -> String {
-    let compact = text.replace('\n', " ");
-    let mut chars = compact.chars();
-    let prefix = chars.by_ref().take(160).collect::<String>();
-    if chars.next().is_some() {
-        format!("{prefix}...")
-    } else {
-        prefix
-    }
-}
-
 fn normalize_branch_label(label: &str) -> Result<String, String> {
     let label = label.trim();
     if label.is_empty() {
@@ -1276,9 +1345,17 @@ fn parse_entry_id(text: &str) -> Option<EntryId> {
 }
 
 fn truncate(text: &str) -> String {
-    let compact = text.replace('\n', " ");
+    truncate_with_limit(text, 72)
+}
+
+fn truncate_with_limit(text: &str, limit: usize) -> String {
+    single_line_with_limit(text, limit)
+}
+
+fn single_line_with_limit(text: &str, limit: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = compact.chars();
-    let prefix = chars.by_ref().take(72).collect::<String>();
+    let prefix = chars.by_ref().take(limit).collect::<String>();
     if chars.next().is_some() {
         format!("{prefix}...")
     } else {
@@ -1543,27 +1620,25 @@ mod tests {
     }
 
     #[test]
-    fn context_projection_compacts_when_budget_is_exceeded() {
+    fn context_projection_reflects_persisted_compaction_only() {
         let mut session = SessionStore::new();
-        for index in 0..10 {
+        for index in 0..6 {
             session.append(EntryKind::User {
-                content: format!("request {index} {}", "x".repeat(200)),
-            });
-            session.append(EntryKind::ResponseItem {
-                item: json!({
-                    "type": "message",
-                    "content": [{ "text": format!("answer {index} {}", "y".repeat(200)) }]
-                }),
+                content: format!("turn {index} {}", "x".repeat(200)),
             });
         }
 
-        let projection = session.context_projection_with_budget(100, 80);
+        let before = session.context_projection();
+        assert!(!before.compacted);
 
-        assert!(projection.compacted);
-        assert!(projection.items[0]
-            .to_string()
-            .contains("CONVERSATION HISTORY SUMMARY"));
-        assert!(projection.items.len() < session.context_projection().items.len());
+        let plan = session
+            .plan_compaction(80)
+            .expect("older turns should be foldable");
+        session.apply_compaction("ROLLED UP SUMMARY".to_string(), plan.replaced_through);
+
+        let after = session.context_projection();
+        assert!(after.compacted);
+        assert!(after.items.len() < before.items.len());
     }
 
     #[test]
@@ -1738,7 +1813,7 @@ mod tests {
             content: "Be careful.".to_string(),
         });
 
-        let stats = session.context_statistics(usize::MAX, usize::MAX);
+        let stats = session.context_statistics();
 
         assert_eq!(stats.branch_entries, 6);
         assert_eq!(stats.context_items, 5);

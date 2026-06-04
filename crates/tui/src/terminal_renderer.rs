@@ -13,8 +13,9 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    extract_cursor, render_ansi_line, split_ansi_sequence, wrap_lines, CursorTarget,
-    ProjectedDocument, RenderedFrame, UiDocument, HIDE_CURSOR, RESET, SHOW_CURSOR,
+    extract_cursor, padded_content_width, render_ansi_line, split_ansi_sequence, wrap_lines,
+    CursorTarget, ProjectedDocument, RenderedFrame, UiDocument, UiKind, UiLine,
+    CONTENT_LEFT_PADDING, DISABLE_AUTOWRAP, ENABLE_AUTOWRAP, HIDE_CURSOR, RESET, SHOW_CURSOR,
     SHOW_HARDWARE_CURSOR, SYNC_END, SYNC_START,
 };
 
@@ -104,7 +105,7 @@ impl TerminalRenderer {
         let mut buffer = render_buffer_start();
         buffer.push_str(clear_screen_sequence(true));
         append_lines_to_buffer(&mut buffer, &frame_lines);
-        buffer.push_str(SYNC_END);
+        buffer.push_str(&render_buffer_end());
         stdout.write_all(buffer.as_bytes())?;
         let (start, end) =
             full_render_window(frame_lines.len(), height, FullRenderMode::VisibleViewport);
@@ -128,7 +129,7 @@ impl TerminalRenderer {
         let (start, end) =
             full_render_window(frame.lines.len(), height, FullRenderMode::VisibleViewport);
         append_lines_to_buffer(&mut buffer, &frame.lines[start..end]);
-        buffer.push_str(SYNC_END);
+        buffer.push_str(&render_buffer_end());
         stdout.write_all(buffer.as_bytes())?;
         self.rebuild_buffers_from_lines(&frame.lines[start..end], width, height);
         Ok(())
@@ -256,16 +257,18 @@ impl TerminalRenderer {
 impl ProjectedDocument {
     pub(crate) fn from_document(document: &UiDocument, width: u16) -> Self {
         let width = width as usize;
+        let content_width = padded_content_width(width);
         let transcript_lines = document.rendered_history_lines.clone().unwrap_or_else(|| {
-            wrap_lines(&document.history, width)
+            wrap_lines(&document.history, content_width)
                 .into_iter()
                 .map(|line| render_ansi_line(&line))
                 .collect::<Vec<_>>()
         });
-        let mut controls = wrap_lines(&document.controls, width);
+        let transcript_lines = pad_projected_lines(transcript_lines);
+        let mut controls = wrap_lines(&document.controls, content_width);
         let cursor = extract_cursor(&mut controls).map(|cursor| CursorTarget {
             row: cursor.row,
-            column: cursor.column,
+            column: cursor.column + CONTENT_LEFT_PADDING,
         });
         let mut active_lines = Vec::new();
         if !transcript_lines.is_empty() && !document.controls.is_empty() {
@@ -276,7 +279,12 @@ impl ProjectedDocument {
             row: controls_start_row + cursor.row,
             column: cursor.column,
         });
-        active_lines.extend(controls.into_iter().map(|line| render_ansi_line(&line)));
+        active_lines.extend(pad_projected_lines(
+            controls
+                .into_iter()
+                .map(|line| render_control_line(&line, content_width))
+                .collect(),
+        ));
 
         Self {
             transcript_lines,
@@ -299,6 +307,30 @@ impl ProjectedDocument {
     }
 }
 
+fn render_control_line(line: &UiLine, width: usize) -> String {
+    let mut line = line.clone();
+    if line.kind == UiKind::Input {
+        let visible = crate::visible_width(&line.text);
+        if visible < width {
+            line.text.push_str(&" ".repeat(width - visible));
+        }
+    }
+    render_ansi_line(&line)
+}
+
+fn pad_projected_lines(lines: Vec<String>) -> Vec<String> {
+    lines
+        .into_iter()
+        .map(|line| {
+            if line.is_empty() {
+                line
+            } else {
+                format!("{}{}", " ".repeat(CONTENT_LEFT_PADDING), line)
+            }
+        })
+        .collect()
+}
+
 fn append_lines_to_buffer(buffer: &mut String, lines: &[String]) {
     for (index, line) in lines.iter().enumerate() {
         if index > 0 {
@@ -319,9 +351,13 @@ fn render_ansi_line_to_buffer(line: &str, row: usize, width: usize, buffer: &mut
     let mut rest = line;
     let mut column = 0usize;
     let mut style = AnsiCellStyle::default();
+    let mut row_background = Color::Reset;
     while !rest.is_empty() && column < width {
         if let Some((sequence, tail)) = split_ansi_sequence(rest) {
             style.apply_sequence(sequence);
+            if style.bg != Color::Reset {
+                row_background = style.bg;
+            }
             rest = tail;
             continue;
         }
@@ -352,6 +388,16 @@ fn render_ansi_line_to_buffer(line: &str, row: usize, width: usize, buffer: &mut
         }
         column += ch_width;
     }
+
+    if row_background != Color::Reset {
+        let row_start = row * width;
+        let row_end = row_start + width;
+        for cell in &mut buffer.content[row_start..row_end] {
+            if cell.bg == Color::Reset {
+                cell.bg = row_background;
+            }
+        }
+    }
 }
 
 fn normalize_trailing_cells(mut buffer: Buffer) -> Buffer {
@@ -361,7 +407,7 @@ fn normalize_trailing_cells(mut buffer: Buffer) -> Buffer {
     buffer
 }
 
-fn write_buffer_diff(stdout: &mut Stdout, previous: &Buffer, next: &Buffer) -> io::Result<()> {
+fn write_buffer_diff<W: Write>(stdout: &mut W, previous: &Buffer, next: &Buffer) -> io::Result<()> {
     stdout.write_all(render_buffer_start().as_bytes())?;
     let width = next.area.width as usize;
     let height = next.area.height as usize;
@@ -375,6 +421,7 @@ fn write_buffer_diff(stdout: &mut Stdout, previous: &Buffer, next: &Buffer) -> i
         let mut x = 0usize;
         while x < width {
             if Some(x) == clear_from {
+                stdout.write_all(RESET.as_bytes())?;
                 queue!(
                     stdout,
                     MoveTo(x as u16, y as u16),
@@ -395,8 +442,7 @@ fn write_buffer_diff(stdout: &mut Stdout, previous: &Buffer, next: &Buffer) -> i
             continue;
         }
     }
-    stdout.write_all(RESET.as_bytes())?;
-    stdout.write_all(SYNC_END.as_bytes())?;
+    stdout.write_all(render_buffer_end().as_bytes())?;
     Ok(())
 }
 
@@ -438,12 +484,12 @@ fn row_clear_from(row: &[RtCell]) -> Option<usize> {
     (clear_from < row.len()).then_some(clear_from)
 }
 
-fn write_cell(stdout: &mut Stdout, cell: &RtCell) -> io::Result<()> {
+fn write_cell<W: Write>(stdout: &mut W, cell: &RtCell) -> io::Result<()> {
     write_style(stdout, cell)?;
     stdout.write_all(cell.symbol().as_bytes())
 }
 
-fn write_style(stdout: &mut Stdout, cell: &RtCell) -> io::Result<()> {
+fn write_style<W: Write>(stdout: &mut W, cell: &RtCell) -> io::Result<()> {
     stdout.write_all(RESET.as_bytes())?;
     write_color(stdout, cell.fg, false)?;
     write_color(stdout, cell.bg, true)?;
@@ -459,7 +505,7 @@ fn write_style(stdout: &mut Stdout, cell: &RtCell) -> io::Result<()> {
     Ok(())
 }
 
-fn write_color(stdout: &mut Stdout, color: Color, background: bool) -> io::Result<()> {
+fn write_color<W: Write>(stdout: &mut W, color: Color, background: bool) -> io::Result<()> {
     match color {
         Color::Reset => {}
         Color::Black => stdout.write_all(if background { b"\x1b[40m" } else { b"\x1b[30m" })?,
@@ -638,7 +684,11 @@ fn parse_extended_color(params: &[u16]) -> Option<(Color, usize)> {
 }
 
 fn render_buffer_start() -> String {
-    format!("{SYNC_START}{HIDE_CURSOR}")
+    format!("{SYNC_START}{HIDE_CURSOR}{DISABLE_AUTOWRAP}")
+}
+
+fn render_buffer_end() -> String {
+    format!("{RESET}{ENABLE_AUTOWRAP}{SYNC_END}")
 }
 
 fn clear_screen_sequence(purge_scrollback: bool) -> &'static str {
@@ -718,6 +768,20 @@ mod tests {
     }
 
     #[test]
+    fn background_color_extends_to_end_of_line() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
+        render_ansi_lines_to_buffer(
+            &["\x1b[38;2;170;220;170;48;2;28;70;38m+x\x1b[0m".to_string()],
+            &mut buffer,
+        );
+
+        assert!(buffer
+            .content
+            .iter()
+            .all(|cell| cell.bg == Color::Rgb(28, 70, 38)));
+    }
+
+    #[test]
     fn terminal_renderer_buffers_only_visible_viewport() {
         let mut renderer = TerminalRenderer::new();
         let frame = RenderedFrame {
@@ -735,5 +799,26 @@ mod tests {
                 "line 9".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn clear_to_end_of_line_resets_background_first() {
+        let previous = Buffer::empty(Rect::new(0, 0, 4, 1));
+        let mut next = Buffer::empty(Rect::new(0, 0, 4, 1));
+        next.content[0].set_symbol("x");
+        next.content[0].bg = Color::Rgb(48, 52, 62);
+
+        let mut output = Vec::new();
+        write_buffer_diff(&mut output, &previous, &next).expect("diff render should write");
+        let text = String::from_utf8(output).expect("terminal output should be utf8");
+
+        let clear_index = text
+            .find("\x1b[K")
+            .or_else(|| text.find("\x1b[0K"))
+            .expect("should clear to end of line");
+        let reset_index = text[..clear_index]
+            .rfind(RESET)
+            .expect("should reset style before clearing");
+        assert!(reset_index < clear_index);
     }
 }

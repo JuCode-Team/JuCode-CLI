@@ -74,13 +74,11 @@ fn build_document(rendered_history_lines: Vec<String>, width: usize, tick: usize
                 provider: "bench",
                 model: "render-frame",
                 reasoning_effort: "none",
-                input_tokens: tick as u64,
-                output_tokens: 0,
                 context_tokens: tick as u64,
                 context_window: 1_000_000,
             },
             width,
         )
-        .progress(&crate::ActivityState::idle(), Instant::now(), width)
+        .progress(&crate::ActivityState::idle(), 0, Instant::now(), width)
         .finish()
 }

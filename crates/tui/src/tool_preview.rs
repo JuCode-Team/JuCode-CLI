@@ -5,12 +5,23 @@ use crate::{
     TOOL_OUTPUT_PREVIEW_BYTES, TOOL_OUTPUT_PREVIEW_LINES,
 };
 
+const STRONG: &str = "\x1b[1;97m";
+const STRONG_OFF: &str = "\x1b[22m";
+const DIM: &str = "\x1b[90m";
+const BASH_COMMAND: &str = "\x1b[38;2;220;224;232;48;2;44;48;58m";
+const RESET_STYLE: &str = "\x1b[0m";
+
 pub(crate) fn tool_output_preview(name: &str, output: &str, running: bool) -> String {
     if name == "bash" && running {
         return limited_preview(output);
     }
     if let Some(preview) = projected_tool_output(name, output) {
         return preview;
+    }
+    if is_edit_tool(name) {
+        if let Some(diff) = diff_from_tool_output(output) {
+            return edit_diff_view(&diff);
+        }
     }
     if let Some(diff) = diff_from_tool_output(output) {
         return diff_preview(&diff);
@@ -24,11 +35,12 @@ pub(crate) fn compact_tool_preview(name: &str, output: &str, running: bool) -> S
 }
 
 pub(crate) fn format_tool_header(name: &str, running: bool, preview: &str, width: usize) -> String {
+    let action = tool_action_label(name);
     let suffix = if running { " running" } else { "" };
-    let prefix = format!("* tool:{name}{suffix}");
+    let prefix = format!("{STRONG}{action}{STRONG_OFF}{DIM}{suffix}");
     let compact = preview.lines().next().unwrap_or_default().to_string();
     if compact.is_empty() {
-        return prefix;
+        return format!("{prefix}{RESET_STYLE}");
     }
 
     let separator = "  ";
@@ -45,14 +57,25 @@ pub(crate) fn format_tool_header(name: &str, running: bool, preview: &str, width
         .saturating_add(compact_width)
         <= width
     {
-        return format!("{prefix}{separator}{compact}");
+        return format!("{prefix}{separator}{compact}{RESET_STYLE}");
     }
 
     let truncated = truncate_with_ellipsis(&compact, available);
     if truncated.is_empty() {
-        prefix
+        format!("{prefix}{RESET_STYLE}")
     } else {
-        format!("{prefix}{separator}{truncated}")
+        format!("{prefix}{separator}{truncated}{RESET_STYLE}")
+    }
+}
+
+fn tool_action_label(name: &str) -> &'static str {
+    match name {
+        "bash" => "Ran",
+        "edit" | "str_replace" | "hashline_edit" | "write" => "Edit",
+        "read" => "Read",
+        "ls" => "Listed",
+        "rg" | "ripgrep" | "search" => "Searched",
+        _ => "Tool",
     }
 }
 
@@ -114,7 +137,7 @@ fn project_bash_output(value: &serde_json::Value) -> String {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     let mut lines = vec![format!(
-        "bash: {command} (exit {exit_code}{})",
+        "{BASH_COMMAND}{command}{RESET_STYLE}{DIM}  exit {exit_code}{}{RESET_STYLE}",
         if timed_out { ", timed out" } else { "" }
     )];
     if !stdout.trim().is_empty() {
@@ -149,6 +172,157 @@ fn diff_from_tool_output(output: &str) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .filter(|diff| !diff.trim().is_empty())
         .map(str::to_string)
+}
+
+fn is_edit_tool(name: &str) -> bool {
+    matches!(name, "edit" | "str_replace" | "hashline_edit" | "write")
+}
+
+fn render_full_diff(diff: &str) -> String {
+    render_intra_line_diff(&diff.lines().collect::<Vec<_>>()).join("\n")
+}
+
+fn edit_diff_view(diff: &str) -> String {
+    let Some(parsed) = parse_unified_diff(diff) else {
+        return render_full_diff(diff);
+    };
+    let mut lines = vec![format!(
+        "* Edited {} (+{} -{})",
+        parsed.path, parsed.additions, parsed.removals
+    )];
+    for line in parsed.lines {
+        lines.push(line.render());
+    }
+    lines.join("\n")
+}
+
+struct ParsedEditDiff {
+    path: String,
+    additions: usize,
+    removals: usize,
+    lines: Vec<EditDiffLine>,
+}
+
+enum EditDiffLine {
+    Context { line: Option<usize>, text: String },
+    Add { line: usize, text: String },
+    Remove { line: usize, text: String },
+    Gap,
+}
+
+impl EditDiffLine {
+    fn render(&self) -> String {
+        match self {
+            EditDiffLine::Context { line, text } => match line {
+                Some(line) => format!("{line:>6}    {text}"),
+                None => format!("{:>6}    {text}", ""),
+            },
+            EditDiffLine::Add { line, text } => format!("{line:>6} +  {text}"),
+            EditDiffLine::Remove { line, text } => format!("{line:>6} -  {text}"),
+            EditDiffLine::Gap => format!("{:>6}    …", ""),
+        }
+    }
+}
+
+fn parse_unified_diff(diff: &str) -> Option<ParsedEditDiff> {
+    let mut path = None;
+    let mut lines = Vec::new();
+    let mut old_line = 0usize;
+    let mut new_line = 0usize;
+    let mut in_hunk = false;
+    let mut additions = 0usize;
+    let mut removals = 0usize;
+
+    for raw in diff.lines() {
+        if raw.starts_with("diff --git ") {
+            path.get_or_insert_with(|| diff_file_path(raw));
+            if in_hunk {
+                lines.push(EditDiffLine::Gap);
+                in_hunk = false;
+            }
+            continue;
+        }
+        if raw.starts_with("--- ") || raw.starts_with("+++ ") || raw.starts_with("index ") {
+            continue;
+        }
+        if raw.starts_with("@@") {
+            let (old_start, new_start) = parse_hunk_header(raw)?;
+            if in_hunk {
+                lines.push(EditDiffLine::Gap);
+            }
+            old_line = old_start;
+            new_line = new_start;
+            in_hunk = true;
+            continue;
+        }
+        if !in_hunk {
+            continue;
+        }
+        if let Some(text) = raw.strip_prefix('+') {
+            additions += 1;
+            lines.push(EditDiffLine::Add {
+                line: new_line,
+                text: text.to_string(),
+            });
+            new_line += 1;
+        } else if let Some(text) = raw.strip_prefix('-') {
+            removals += 1;
+            lines.push(EditDiffLine::Remove {
+                line: old_line,
+                text: text.to_string(),
+            });
+            old_line += 1;
+        } else if let Some(text) = raw.strip_prefix(' ') {
+            lines.push(EditDiffLine::Context {
+                line: Some(new_line),
+                text: text.to_string(),
+            });
+            old_line += 1;
+            new_line += 1;
+        } else if raw == r"\ No newline at end of file" {
+            lines.push(EditDiffLine::Context {
+                line: None,
+                text: raw.to_string(),
+            });
+        }
+    }
+
+    Some(ParsedEditDiff {
+        path: path?,
+        additions,
+        removals,
+        lines,
+    })
+}
+
+fn diff_file_path(line: &str) -> String {
+    let label = diff_file_label(line);
+    label
+        .strip_prefix("diff ")
+        .unwrap_or(label.as_str())
+        .to_string()
+}
+
+fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
+    let mut parts = line.split_whitespace();
+    if parts.next()? != "@@" {
+        return None;
+    }
+    let old = parts.next()?;
+    let new = parts.next()?;
+    if !old.starts_with('-') || !new.starts_with('+') {
+        return None;
+    }
+    Some((parse_hunk_start(&old[1..])?, parse_hunk_start(&new[1..])?))
+}
+
+fn parse_hunk_start(value: &str) -> Option<usize> {
+    value
+        .split_once(',')
+        .map(|(start, _)| start)
+        .unwrap_or(value)
+        .parse()
+        .ok()
 }
 
 fn diff_preview(diff: &str) -> String {
@@ -282,18 +456,24 @@ fn render_intra_line_diff(lines: &[&str]) -> Vec<String> {
     let mut index = 0usize;
 
     while index < lines.len() {
-        if !lines[index].starts_with('-') {
+        if !is_diff_change_line(lines[index]) {
             rendered.push(lines[index].to_string());
             index += 1;
             continue;
         }
 
         let removed_start = index;
-        while index < lines.len() && lines[index].starts_with('-') {
+        while index < lines.len()
+            && is_diff_change_line(lines[index])
+            && lines[index].starts_with('-')
+        {
             index += 1;
         }
         let added_start = index;
-        while index < lines.len() && lines[index].starts_with('+') {
+        while index < lines.len()
+            && is_diff_change_line(lines[index])
+            && lines[index].starts_with('+')
+        {
             index += 1;
         }
 
@@ -419,7 +599,10 @@ fn limited_preview(output: &str) -> String {
 }
 
 pub(crate) fn diff_line_kind(line: &str) -> UiKind {
-    if line.starts_with("+++") || line.starts_with("---") {
+    if let Some(kind) = edit_view_line_kind(line) {
+        return kind;
+    }
+    if line.starts_with("* Edited") || line.starts_with("+++") || line.starts_with("---") {
         UiKind::DiffHeader
     } else if line.starts_with('+') {
         UiKind::DiffAdd
@@ -430,5 +613,21 @@ pub(crate) fn diff_line_kind(line: &str) -> UiKind {
         UiKind::DiffHeader
     } else {
         UiKind::Tool
+    }
+}
+
+fn edit_view_line_kind(line: &str) -> Option<UiKind> {
+    let trimmed = line.trim_start();
+    let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let rest = &trimmed[digits..];
+    if rest.starts_with(" +") {
+        Some(UiKind::DiffAdd)
+    } else if rest.starts_with(" -") {
+        Some(UiKind::DiffRemove)
+    } else {
+        None
     }
 }
