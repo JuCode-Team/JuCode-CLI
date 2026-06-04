@@ -14,7 +14,8 @@ use crate::{
     STARTUP_TEXT, THINKING_COLLAPSED_LINES, VISIBLE_CURSOR,
 };
 
-const TOOL_PREVIEW_INDENT: &str = "  ";
+const TOOL_PREVIEW_INDENT: &str = "";
+const INPUT_PROMPT: &str = "›";
 
 fn rounded_box_border(left: char, right: char, width: usize) -> String {
     format!("{BOX_BORDER}{left}{}{right}{RESET}", "─".repeat(width + 2))
@@ -101,7 +102,7 @@ fn colored_reasoning_effort_with_base(effort: &str, base_color: &str) -> String 
 
 pub(crate) struct UiBuilder {
     history: Vec<UiLine>,
-    rendered_history_lines: Option<Vec<String>>,
+    rendered_history_lines: Option<Vec<UiLine>>,
     controls: Vec<UiLine>,
     reset_screen: bool,
 }
@@ -116,7 +117,7 @@ impl UiBuilder {
         }
     }
 
-    pub(crate) fn rendered_history_lines(mut self, lines: Vec<String>) -> Self {
+    pub(crate) fn rendered_history_lines(mut self, lines: Vec<UiLine>) -> Self {
         self.rendered_history_lines = Some(lines);
         self
     }
@@ -210,7 +211,10 @@ impl UiBuilder {
             };
             self.control_line(
                 UiKind::Input,
-                format!("> {label}: {}{CURSOR_MARKER}{VISIBLE_CURSOR}", prompt.input),
+                format!(
+                    "{INPUT_PROMPT} {label}: {}{CURSOR_MARKER}{VISIBLE_CURSOR}",
+                    prompt.input
+                ),
             );
         }
         if picker.mode == PickerMode::Model && !picker.efforts.is_empty() {
@@ -289,7 +293,11 @@ impl UiBuilder {
         self.control_line(UiKind::Input, String::new());
         let lines = input.split('\n').collect::<Vec<_>>();
         for (index, line) in lines.iter().enumerate() {
-            let prefix = if index == 0 { "> " } else { "  " };
+            let prefix = if index == 0 {
+                format!("{INPUT_PROMPT} ")
+            } else {
+                "  ".to_string()
+            };
             self.control_line(UiKind::Input, format!("{prefix}{line}"));
         }
         self.control_line(UiKind::Input, String::new());
@@ -423,7 +431,7 @@ impl UiBuilder {
         self.history_line(UiKind::Brand, rounded_box_border('╭', '╮', content_width));
         for (index, mascot_line) in mascot.iter().enumerate() {
             self.history_line(
-                UiKind::System,
+                UiKind::Brand,
                 startup_box_line(
                     mascot_line,
                     right_lines[index],

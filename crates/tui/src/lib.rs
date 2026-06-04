@@ -121,7 +121,7 @@ pub(crate) struct UiLine {
 #[derive(Debug, Clone)]
 pub(crate) struct UiDocument {
     history: Vec<UiLine>,
-    rendered_history_lines: Option<Vec<String>>,
+    rendered_history_lines: Option<Vec<UiLine>>,
     controls: Vec<UiLine>,
     pub(crate) reset_screen: bool,
 }

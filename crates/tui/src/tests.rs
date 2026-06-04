@@ -234,7 +234,7 @@ fn input_renders_multiple_lines() {
     assert_eq!(document.controls[0].kind, UiKind::Input);
     assert_eq!(document.controls[0].text, "");
     assert_eq!(document.controls[1].kind, UiKind::Input);
-    assert_eq!(document.controls[1].text, "> one");
+    assert_eq!(document.controls[1].text, "› one");
     assert_eq!(document.controls[2].kind, UiKind::Input);
     assert_eq!(document.controls[2].text, "  two");
     assert_eq!(document.controls[3].kind, UiKind::Input);
@@ -249,7 +249,7 @@ fn single_line_input_renders_text_on_middle_row() {
     assert_eq!(document.controls[0].kind, UiKind::Input);
     assert_eq!(document.controls[0].text, "");
     assert_eq!(document.controls[1].kind, UiKind::Input);
-    assert_eq!(document.controls[1].text, "> hello");
+    assert_eq!(document.controls[1].text, "› hello");
     assert_eq!(document.controls[2].kind, UiKind::Input);
     assert_eq!(document.controls[2].text, "");
 }
@@ -271,7 +271,7 @@ fn cursor_row_is_relative_to_whole_frame() {
             rendered_history_lines: None,
             controls: vec![UiLine {
                 kind: UiKind::Input,
-                text: format!("> prompt{CURSOR_MARKER}"),
+                text: format!("› prompt{CURSOR_MARKER}"),
             }],
             reset_screen: false,
         },
@@ -280,7 +280,7 @@ fn cursor_row_is_relative_to_whole_frame() {
 
     let cursor = frame.cursor.expect("cursor marker should be found");
     assert_eq!(cursor.row, 3);
-    assert_eq!(cursor.column, 8 + CONTENT_LEFT_PADDING);
+    assert_eq!(cursor.column, 8);
 }
 
 #[test]
@@ -308,7 +308,7 @@ fn command_completion_renders_below_input_with_selected_color() {
     assert_eq!(document.controls[1].kind, UiKind::Input);
     assert_eq!(
         document.controls[1].text,
-        format!("> /{CURSOR_MARKER}{VISIBLE_CURSOR}")
+        format!("› /{CURSOR_MARKER}{VISIBLE_CURSOR}")
     );
     assert_eq!(document.controls[2].kind, UiKind::Input);
     assert_eq!(document.controls[2].text, "");
@@ -330,14 +330,14 @@ fn model_and_tokens_render_below_input_without_ready_status() {
                 context_tokens: 12_345,
                 context_window: 400_000,
             },
-            padded_content_width(64),
+            64,
         )
         .finish();
 
     assert_eq!(document.controls.len(), 4);
     assert_eq!(
         document.controls[1].text,
-        format!("> hello{CURSOR_MARKER}{VISIBLE_CURSOR}")
+        format!("› hello{CURSOR_MARKER}{VISIBLE_CURSOR}")
     );
     let status = strip_ansi(&document.controls[3].text);
     assert!(status.starts_with("openai / gpt-5 (medium)"));
@@ -345,7 +345,7 @@ fn model_and_tokens_render_below_input_without_ready_status() {
     assert!(!status.contains("ready"));
     assert_eq!(
         UnicodeWidthStr::width(strip_ansi(&document.controls[3].text).as_str()),
-        padded_content_width(64)
+        64
     );
 }
 
@@ -359,7 +359,7 @@ fn input_background_extends_across_frame_width() {
     let input_line = frame
         .lines
         .iter()
-        .find(|line| strip_ansi(line).contains("> hi"))
+        .find(|line| strip_ansi(line).contains("› hi"))
         .expect("input line should render");
 
     assert!(input_line.contains("\x1b[38;2;224;226;232;48;2;48;52;62m"));
@@ -376,13 +376,13 @@ fn native_cursor_tracks_middle_input_row() {
     let cursor = frame.cursor.expect("cursor marker should be found");
 
     assert_eq!(frame.lines.len(), 3);
-    assert!(strip_ansi(&frame.lines[cursor.row]).starts_with("  > hello|"));
+    assert!(strip_ansi(&frame.lines[cursor.row]).starts_with("› hello|"));
     assert_eq!(
         UnicodeWidthStr::width(strip_ansi(&frame.lines[cursor.row]).as_str()),
         40
     );
     assert_eq!(cursor.row, 1);
-    assert_eq!(cursor.column, CONTENT_LEFT_PADDING + 2 + "hello".len());
+    assert_eq!(cursor.column, 2 + "hello".len());
 }
 
 #[test]
@@ -417,7 +417,7 @@ fn colored_status_line_does_not_wrap_at_visible_width() {
                 context_tokens: 1633,
                 context_window: 400_000,
             },
-            padded_content_width(64),
+            64,
         )
         .finish();
 
@@ -469,6 +469,36 @@ fn startup_renders_inside_box() {
             "{}",
             strip_ansi(&line.text)
         );
+    }
+}
+
+#[test]
+fn projected_startup_box_lines_stay_aligned() {
+    let document = UiBuilder::new()
+        .chat(&[ChatLine::Startup {
+            version: "0.1.2".to_string(),
+            profile_dir: "~/.jucode".to_string(),
+            config_path: "~/.jucode/config.toml".to_string(),
+            cwd: "~/dev/projects/jucode/JuCode-CLI".to_string(),
+            model: "gpt-5.4".to_string(),
+            context_window: 1_100_000,
+        }])
+        .finish();
+
+    let frame = RenderedFrame::build(&document, 80);
+    let plain = frame
+        .lines
+        .iter()
+        .map(|line| strip_ansi(line))
+        .collect::<Vec<_>>();
+    let width = UnicodeWidthStr::width(plain[0].as_str());
+
+    for line in plain.iter().take(8) {
+        assert!(
+            line.starts_with(['╭', '│', '╰']),
+            "startup box line should not be indented: {line:?}"
+        );
+        assert_eq!(UnicodeWidthStr::width(line.as_str()), width);
     }
 }
 
@@ -904,6 +934,53 @@ fn tool_preview_colors_diff_lines() {
 }
 
 #[test]
+fn projection_only_indents_text_not_ui_elements() {
+    let document = UiBuilder::new()
+        .chat(&[
+            ChatLine::Assistant("answer".to_string()),
+            ChatLine::Tool {
+                call_id: None,
+                name: "edit".to_string(),
+                output: serde_json::json!({
+                    "diff": "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n"
+                })
+                .to_string(),
+                running: false,
+            },
+        ])
+        .input("hello", &[], 0)
+        .bottom_status(
+            BottomStatus {
+                provider: "jucode",
+                model: "gpt-5",
+                reasoning_effort: "medium",
+                context_tokens: 10,
+                context_window: 100,
+            },
+            40,
+        )
+        .finish();
+
+    let frame = RenderedFrame::build(&document, 40);
+    let plain = frame
+        .lines
+        .iter()
+        .map(|line| strip_ansi(line))
+        .collect::<Vec<_>>();
+
+    assert!(plain.iter().any(|line| line.starts_with("  answer")));
+    assert!(plain.iter().any(|line| line.starts_with('─')));
+    assert!(plain.iter().any(|line| line.starts_with("Edit")));
+    assert!(plain.iter().any(|line| line.starts_with("     1 -")));
+    assert!(plain.iter().any(|line| line.starts_with("› hello")));
+    let bottom_status = plain
+        .iter()
+        .find(|line| line.contains("tokens 10/100"))
+        .expect("bottom status should render");
+    assert!(!bottom_status.starts_with("  "));
+}
+
+#[test]
 fn rendered_frame_keeps_full_history_for_native_scrollback() {
     let document = UiBuilder::new().finish_with_history_and_input(20);
 
@@ -948,7 +1025,7 @@ fn cursor_row_accounts_for_full_history() {
 
     assert_eq!(frame.lines.len(), 24);
     assert_eq!(cursor.row, 22);
-    assert_eq!(cursor.column, 2 + CONTENT_LEFT_PADDING);
+    assert_eq!(cursor.column, 2);
 }
 
 #[test]

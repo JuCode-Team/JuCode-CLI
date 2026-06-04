@@ -27,7 +27,7 @@ pub(super) struct TuiState {
 pub(super) struct RenderedHistoryCache {
     revision: u64,
     width: usize,
-    lines: Vec<String>,
+    lines: Vec<UiLine>,
 }
 
 impl Default for TuiState {
@@ -65,6 +65,7 @@ impl TuiState {
         now: Instant,
     ) -> UiDocument {
         let content_width = padded_content_width(width);
+        let control_width = width.max(1);
         let command_matches = self.command_matches(input);
         let input_display = input.render(!self.activity.is_active());
         let rendered_history_lines = self.rendered_history_lines(content_width);
@@ -73,7 +74,7 @@ impl TuiState {
             .live_assistant(self.live_assistant.as_deref(), content_width)
             .picker(self.picker_view.as_ref())
             .pending_messages(&self.pending_messages)
-            .progress(&self.activity, self.thinking_tokens, now, content_width)
+            .progress(&self.activity, self.thinking_tokens, now, control_width)
             .input(&input_display, &command_matches, self.completion_index)
             .bottom_status(
                 BottomStatus {
@@ -83,13 +84,13 @@ impl TuiState {
                     context_tokens: self.current_context_tokens,
                     context_window: self.context_window,
                 },
-                content_width,
+                control_width,
             )
             .reset_screen(self.reset_screen)
             .finish()
     }
 
-    pub(super) fn rendered_history_lines(&mut self, width: usize) -> Vec<String> {
+    pub(super) fn rendered_history_lines(&mut self, width: usize) -> Vec<UiLine> {
         if self.rendered_history_cache.revision != self.history_revision
             || self.rendered_history_cache.width != width
         {
@@ -99,10 +100,7 @@ impl TuiState {
             self.rendered_history_cache = RenderedHistoryCache {
                 revision: self.history_revision,
                 width,
-                lines: wrap_lines(&history, width)
-                    .into_iter()
-                    .map(|line| render_ansi_line(&line))
-                    .collect(),
+                lines: wrap_lines(&history, width),
             };
         }
         self.rendered_history_cache.lines.clone()

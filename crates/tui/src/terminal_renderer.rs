@@ -257,19 +257,15 @@ impl TerminalRenderer {
 impl ProjectedDocument {
     pub(crate) fn from_document(document: &UiDocument, width: u16) -> Self {
         let width = width as usize;
-        let content_width = padded_content_width(width);
-        let transcript_lines = document.rendered_history_lines.clone().unwrap_or_else(|| {
-            wrap_lines(&document.history, content_width)
-                .into_iter()
-                .map(|line| render_ansi_line(&line))
-                .collect::<Vec<_>>()
-        });
-        let transcript_lines = pad_projected_lines(transcript_lines);
-        let mut controls = wrap_lines(&document.controls, content_width);
-        let cursor = extract_cursor(&mut controls).map(|cursor| CursorTarget {
-            row: cursor.row,
-            column: cursor.column + CONTENT_LEFT_PADDING,
-        });
+        let history_width = padded_content_width(width);
+        let control_width = width.max(1);
+        let transcript_lines = document
+            .rendered_history_lines
+            .clone()
+            .unwrap_or_else(|| wrap_lines(&document.history, history_width));
+        let transcript_lines = render_projected_lines(transcript_lines, true);
+        let mut controls = wrap_lines(&document.controls, control_width);
+        let cursor = extract_cursor(&mut controls);
         let mut active_lines = Vec::new();
         if !transcript_lines.is_empty() && !document.controls.is_empty() {
             active_lines.push(String::new());
@@ -279,12 +275,12 @@ impl ProjectedDocument {
             row: controls_start_row + cursor.row,
             column: cursor.column,
         });
-        active_lines.extend(pad_projected_lines(
+        active_lines.extend(
             controls
                 .into_iter()
-                .map(|line| render_control_line(&line, content_width))
-                .collect(),
-        ));
+                .map(|line| render_projected_line(render_control_line(&line, control_width), false))
+                .collect::<Vec<_>>(),
+        );
 
         Self {
             transcript_lines,
@@ -307,7 +303,7 @@ impl ProjectedDocument {
     }
 }
 
-fn render_control_line(line: &UiLine, width: usize) -> String {
+fn render_control_line(line: &UiLine, width: usize) -> UiLine {
     let mut line = line.clone();
     if line.kind == UiKind::Input {
         let visible = crate::visible_width(&line.text);
@@ -315,20 +311,33 @@ fn render_control_line(line: &UiLine, width: usize) -> String {
             line.text.push_str(&" ".repeat(width - visible));
         }
     }
-    render_ansi_line(&line)
+    line
 }
 
-fn pad_projected_lines(lines: Vec<String>) -> Vec<String> {
+fn render_projected_lines(lines: Vec<UiLine>, history: bool) -> Vec<String> {
     lines
         .into_iter()
-        .map(|line| {
-            if line.is_empty() {
-                line
-            } else {
-                format!("{}{}", " ".repeat(CONTENT_LEFT_PADDING), line)
-            }
-        })
+        .map(|line| render_projected_line(line, history))
         .collect()
+}
+
+fn render_projected_line(line: UiLine, history: bool) -> String {
+    let rendered = render_ansi_line(&line);
+    if rendered.is_empty() || !should_pad_line(line.kind, history) {
+        rendered
+    } else {
+        format!("{}{}", " ".repeat(CONTENT_LEFT_PADDING), rendered)
+    }
+}
+
+fn should_pad_line(kind: UiKind, history: bool) -> bool {
+    if !history {
+        return matches!(kind, UiKind::Assistant);
+    }
+    matches!(
+        kind,
+        UiKind::User | UiKind::Assistant | UiKind::System | UiKind::Error | UiKind::Status
+    )
 }
 
 fn append_lines_to_buffer(buffer: &mut String, lines: &[String]) {
@@ -684,7 +693,7 @@ fn parse_extended_color(params: &[u16]) -> Option<(Color, usize)> {
 }
 
 fn render_buffer_start() -> String {
-    format!("{SYNC_START}{HIDE_CURSOR}{DISABLE_AUTOWRAP}")
+    format!("{SYNC_START}{RESET}{HIDE_CURSOR}{DISABLE_AUTOWRAP}")
 }
 
 fn render_buffer_end() -> String {

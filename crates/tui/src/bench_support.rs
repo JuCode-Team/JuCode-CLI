@@ -3,12 +3,12 @@ use std::time::Instant;
 use crate::terminal_renderer::TerminalRenderer;
 use crate::ui_builder::UiBuilder;
 use crate::{
-    render_ansi_line, wrap_lines, BottomStatus, ChatLine, UiDocument, CURSOR_MARKER, VISIBLE_CURSOR,
+    wrap_lines, BottomStatus, ChatLine, UiDocument, UiLine, CURSOR_MARKER, VISIBLE_CURSOR,
 };
 
 pub struct RenderFrameBench {
     history: Vec<ChatLine>,
-    cached_history_lines: Vec<String>,
+    cached_history_lines: Vec<UiLine>,
     renderer: TerminalRenderer,
     tick: usize,
 }
@@ -51,17 +51,14 @@ fn build_history(history_items: usize) -> Vec<ChatLine> {
         .collect()
 }
 
-fn render_history_lines(history: &[ChatLine], width: usize) -> Vec<String> {
+fn render_history_lines(history: &[ChatLine], width: usize) -> Vec<UiLine> {
     let history = UiBuilder::new()
         .chat_with_width(history, width)
         .into_history();
     wrap_lines(&history, width)
-        .into_iter()
-        .map(|line| render_ansi_line(&line))
-        .collect()
 }
 
-fn build_document(rendered_history_lines: Vec<String>, width: usize, tick: usize) -> UiDocument {
+fn build_document(rendered_history_lines: Vec<UiLine>, width: usize, tick: usize) -> UiDocument {
     UiBuilder::new()
         .rendered_history_lines(rendered_history_lines)
         .input(
