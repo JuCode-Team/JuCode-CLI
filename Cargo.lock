@@ -469,7 +469,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jucode-agent-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64",
  "getrandom",
@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "jucode-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "jucode-agent-core",
  "jucode-tui",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "jucode-tui"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "crossterm",
  "jucode-agent-core",
