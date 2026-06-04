@@ -399,7 +399,7 @@ impl UiBuilder {
 
     fn push_startup_box(
         &mut self,
-        _version: &str,
+        version: &str,
         _profile_dir: &str,
         _config_path: &str,
         cwd: &str,
@@ -408,7 +408,8 @@ impl UiBuilder {
     ) {
         let mascot = [" \\/", "<'l", " ll", " llama~", " || ||", " '' ''"];
         let title = format!(
-            "Welcome to JuCode ({} · {} context)",
+            "Welcome to JuCode v{} ({} · {} context)",
+            version,
             model,
             format_context_window(context_window)
         );

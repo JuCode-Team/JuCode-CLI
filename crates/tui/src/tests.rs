@@ -449,7 +449,7 @@ fn startup_renders_inside_box() {
     assert!(strip_ansi(&document.history[0].text).starts_with('╭'));
     assert!(strip_ansi(&document.history[1].text).contains(" \\/"));
     assert!(strip_ansi(&document.history[1].text)
-        .contains("Welcome to JuCode (claude-opus-4-7 · 1M context)"));
+        .contains("Welcome to JuCode v0.1.2 (claude-opus-4-7 · 1M context)"));
     assert!(strip_ansi(&document.history[2].text).contains("<'l"));
     assert!(!strip_ansi(&document.history[2].text).contains("cwd:"));
     assert!(strip_ansi(&document.history[3].text).contains(" ll"));
