@@ -6,10 +6,13 @@ use std::{
     io::{BufRead, BufReader},
     path::Path,
     sync::mpsc::{self, Sender},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const MAX_SUBAGENT_OUTPUT_BYTES: usize = 16 * 1024;
+const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 180;
+const DEFAULT_SUBAGENT_MAX_TOOL_CALLS: u64 = 12;
+const DEFAULT_SUBAGENT_MAX_OUTPUT_TOKENS: u64 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderKind {
@@ -29,6 +32,8 @@ pub struct OpenAiClient {
     connect_timeout: Duration,
     read_timeout: Duration,
     allow_subagents: bool,
+    max_tool_calls: Option<u64>,
+    deadline: Option<Instant>,
     provider_kind: ProviderKind,
     goal_tool_tx: Option<Sender<GoalToolRequest>>,
 }
@@ -120,6 +125,8 @@ impl OpenAiClient {
             connect_timeout: config.connect_timeout,
             read_timeout: config.read_timeout,
             allow_subagents: true,
+            max_tool_calls: None,
+            deadline: None,
             provider_kind,
             goal_tool_tx: config.goal_tool_tx,
         })
@@ -131,7 +138,14 @@ impl OpenAiClient {
         cwd: &Path,
         mut emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<(), String> {
+        let mut tool_calls_executed = 0u64;
         loop {
+            if self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return Err("subagent timed out".to_string());
+            }
             emit(StreamEvent::CallStart)?;
             let output_items = match self.provider_kind {
                 ProviderKind::OpenAiResponses => {
@@ -155,6 +169,18 @@ impl OpenAiClient {
             }
 
             for call in function_calls {
+                if let Some(max_tool_calls) = self.max_tool_calls {
+                    if tool_calls_executed >= max_tool_calls {
+                        return Err(format!("subagent exceeded tool budget ({max_tool_calls})"));
+                    }
+                }
+                if self
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    return Err("subagent timed out".to_string());
+                }
+                tool_calls_executed += 1;
                 let name = call
                     .get("name")
                     .and_then(Value::as_str)
@@ -574,7 +600,27 @@ impl OpenAiClient {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or(DEFAULT_SUBAGENT_SYSTEM);
-
+        let max_tool_calls = args
+            .get("max_tool_calls")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_SUBAGENT_MAX_TOOL_CALLS)
+            .clamp(1, DEFAULT_SUBAGENT_MAX_TOOL_CALLS);
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_SUBAGENT_TIMEOUT_SECS)
+            .clamp(10, DEFAULT_SUBAGENT_TIMEOUT_SECS);
+        let max_output_tokens = args
+            .get("max_output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_SUBAGENT_MAX_OUTPUT_TOKENS)
+            .clamp(
+                512,
+                self.max_output_tokens
+                    .min(DEFAULT_SUBAGENT_MAX_OUTPUT_TOKENS)
+                    .max(512),
+            );
+        let started = Instant::now();
         let child = OpenAiClient {
             api_key: self.api_key.clone(),
             model: model.to_string(),
@@ -582,11 +628,13 @@ impl OpenAiClient {
             system_prompt: system.to_string(),
             extensions: self.extensions.clone(),
             base_url: self.base_url.clone(),
-            max_output_tokens: self.max_output_tokens,
+            max_output_tokens,
             retry_attempts: self.retry_attempts,
             connect_timeout: self.connect_timeout,
-            read_timeout: self.read_timeout,
+            read_timeout: self.read_timeout.min(Duration::from_secs(timeout_secs)),
             allow_subagents: false,
+            max_tool_calls: Some(max_tool_calls),
+            deadline: Some(started + Duration::from_secs(timeout_secs)),
             provider_kind: ProviderKind::from_model(model),
             goal_tool_tx: None,
         };
@@ -596,12 +644,16 @@ impl OpenAiClient {
         })];
         let mut output_text = String::new();
         let mut tool_iters = 0u64;
+        let mut tools_used: Vec<String> = Vec::new();
         let mut input_tokens = 0u64;
         let mut output_tokens = 0u64;
         let result = child.run_turn_events(input, cwd, |event| {
             match event {
                 StreamEvent::Delta(delta) => output_text.push_str(&delta),
-                StreamEvent::ToolOutput { .. } => tool_iters += 1,
+                StreamEvent::ToolStart { name, .. } => {
+                    tool_iters += 1;
+                    tools_used.push(name);
+                }
                 StreamEvent::Usage {
                     input_tokens: input,
                     output_tokens: output,
@@ -615,20 +667,25 @@ impl OpenAiClient {
             Ok(())
         });
 
+        let elapsed_ms = started.elapsed().as_millis() as u64;
         let value = match result {
             Ok(()) => json!({
                 "success": true,
-                "output": truncate_subagent_output(&output_text),
-                "tool_iters": tool_iters,
+                "summary": truncate_subagent_output(&output_text),
+                "tool_calls": tool_iters,
+                "tools_used": tools_used,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "elapsed_ms": elapsed_ms,
                 "model": model,
             }),
             Err(error) => json!({
                 "success": false,
                 "error": error,
                 "partial_output": truncate_subagent_output(&output_text),
-                "tool_iters": tool_iters,
+                "tool_calls": tool_iters,
+                "tools_used": tools_used,
+                "elapsed_ms": elapsed_ms,
                 "model": model,
             }),
         };
@@ -685,7 +742,7 @@ impl ProviderKind {
     }
 }
 
-const DEFAULT_SUBAGENT_SYSTEM: &str = "You are a lightweight JuCode subagent. Work on the single task given by the parent agent. Use tools when helpful. Return one concise, self-contained answer with the evidence the parent needs. Do not ask follow-up questions or spawn another subagent.";
+const DEFAULT_SUBAGENT_SYSTEM: &str = "You are a lightweight JuCode subagent. Work on the single task given by the parent agent. Keep the work bounded: inspect only what is needed, avoid broad refactors, and stop when you have enough evidence. Return a concise self-contained answer with: Summary, Evidence, Files/commands checked, and Risks or unknowns. Do not ask follow-up questions and do not spawn another subagent.";
 
 fn subagent_definition() -> Value {
     json!({
@@ -706,6 +763,18 @@ fn subagent_definition() -> Value {
                 "model": {
                     "type": "string",
                     "description": "Optional model override. Defaults to the parent model."
+                },
+                "max_tool_calls": {
+                    "type": "number",
+                    "description": "Optional tool-call budget for this subagent. Defaults to 12 and is capped at 12."
+                },
+                "timeout_secs": {
+                    "type": "number",
+                    "description": "Optional wall-clock timeout. Defaults to 180 seconds and is capped at 180."
+                },
+                "max_output_tokens": {
+                    "type": "number",
+                    "description": "Optional output token cap. Defaults to 4096 and is capped at 4096."
                 }
             },
             "required": ["task"],
