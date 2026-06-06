@@ -16,7 +16,7 @@ JuCode keeps the coding loop compact and direct:
   Subtask delegation is handled through one generic `spawn_subagent` tool instead of many fixed roles.
 
 - **Optional skills**  
-  Skills work as optional instructions. They can be used as discoverable commands for one-off tasks, or pinned with `/pin <skill>` when a skill should remain in the current session context.
+  Skills work as optional instructions. They can be used as discoverable commands for one-off tasks, or pinned with `/pin <skill>` when a skill should remain in the current session context. `/skills list`, `/skills install <id>`, and `/skills sync` connect the CLI to the JuCode marketplace; default marketplace skills are installed automatically after JuCode login.
 
 - **Extension support without MCP context bloat**  
   Extensions can expose tools directly. Lazy extensions expose only `extension_list_tools` and `extension_call`, keeping extension access available without loading unnecessary context.

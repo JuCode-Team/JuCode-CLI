@@ -6,6 +6,7 @@ mod llm;
 mod oauth;
 mod prompt;
 mod session;
+pub mod skills;
 mod tools;
 mod update;
 

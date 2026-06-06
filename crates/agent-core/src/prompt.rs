@@ -212,6 +212,8 @@ fn read_skills_dir(dir: &Path, skills: &mut Vec<SkillPromptItem>) -> io::Result<
                 if let Some(skill) = read_skill_file(&skill_path)? {
                     skills.push(skill);
                 }
+            } else {
+                read_skills_dir(&path, skills)?;
             }
         } else if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
             if let Some(skill) = read_skill_file(&path)? {
@@ -371,6 +373,35 @@ mod tests {
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "review");
         assert_eq!(skills[0].description, "Review code carefully");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discovers_nested_skill_files() {
+        let root = std::env::temp_dir().join(format!(
+            "jucode-nested-skill-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let skill_dir = root
+            .join("profile")
+            .join("skills")
+            .join("bundle")
+            .join("review");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: nested-review\ndescription: Review nested code\n---\nbody\n",
+        )
+        .unwrap();
+
+        let skills = discover_skills(&root.join("profile"), &root.join("cwd")).unwrap();
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "nested-review");
 
         let _ = fs::remove_dir_all(root);
     }

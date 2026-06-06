@@ -12,6 +12,7 @@ use crate::{
         compaction_summary_item, ContextStatistics, EntryKind, SessionStore, SessionSummary,
         ThreadGoal, ThreadGoalStatus,
     },
+    skills,
     update::{self, UpdateNotice},
 };
 use serde_json::{json, Value};
@@ -172,8 +173,8 @@ impl AgentCore {
 
     fn command_list_event(&self) -> AgentEvent {
         let mut commands = [
-            "/help", "/login", "/new", "/model", "/tree", "/resume", "/context", "/doctor", "/pin",
-            "/goal", "/compact", "/quit",
+            "/help", "/login", "/new", "/model", "/tree", "/resume", "/context", "/doctor",
+            "/skills", "/pin", "/goal", "/compact", "/quit",
         ]
         .iter()
         .map(|command| CommandView {
@@ -249,7 +250,7 @@ impl AgentCore {
         let events = match command {
             "/quit" | "/exit" => return (true, Vec::new()),
             "/help" | "/" => vec![AgentEvent::Info(
-                "/help /login [web-url] [api-url] /new /model [model] [effort] /tree /resume [session-id] /context /goal [objective|pause|resume|blocked|complete|clear] /doctor /pin <skill> /compact /quit"
+                "/help /login [web-url] [api-url] /new /model [model] [effort] /tree /resume [session-id] /context /goal [objective|pause|resume|blocked|complete|clear] /doctor /skills [list|install <id>|sync] /pin <skill> /compact /quit"
                     .to_string(),
             )],
             "/login" => self.login_events(input[command.len()..].trim()),
@@ -332,11 +333,114 @@ impl AgentCore {
             "/stats" => self.stats_events(),
             "/goal" => self.goal_command_events(input[command.len()..].trim()),
             "/doctor" => self.doctor_events(),
+            "/skills" => self.skills_events(input[command.len()..].trim()),
             "/pin" => self.pin_skill_events(input[command.len()..].trim()),
             "/compact" => self.compact_command_events(),
             _ => vec![AgentEvent::Error(format!("unknown command: {command}"))],
         };
         (false, events)
+    }
+
+    fn skills_events(&mut self, arg: &str) -> Vec<AgentEvent> {
+        let mut parts = arg.split_whitespace();
+        match parts.next().unwrap_or("list") {
+            "list" => self.list_marketplace_skills_events(),
+            "install" => match parts.next() {
+                Some(id) => self.install_marketplace_skill_events(id),
+                None => vec![AgentEvent::Error("usage: /skills install <id>".to_string())],
+            },
+            "sync" => self.sync_default_skills_events(),
+            other => vec![AgentEvent::Error(format!(
+                "unknown /skills action: {other}; use list, install, or sync"
+            ))],
+        }
+    }
+
+    fn list_marketplace_skills_events(&self) -> Vec<AgentEvent> {
+        match self.fetch_marketplace() {
+            Ok(marketplace) if marketplace.skills.is_empty() => {
+                vec![AgentEvent::Info("skills marketplace is empty".to_string())]
+            }
+            Ok(marketplace) => {
+                let defaults = marketplace
+                    .default_skill_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let mut lines = Vec::new();
+                for skill in marketplace.skills {
+                    let marker = if defaults.contains(skill.id.as_str()) {
+                        " default"
+                    } else {
+                        ""
+                    };
+                    lines.push(format!("{}{} — {}", skill.id, marker, skill.description));
+                }
+                vec![AgentEvent::Info(format!(
+                    "Available marketplace skills:\n{}\n\nInstall with /skills install <id>; sync defaults with /skills sync.",
+                    lines.join("\n")
+                ))]
+            }
+            Err(error) => vec![AgentEvent::Error(format!(
+                "failed to fetch skills marketplace: {error}"
+            ))],
+        }
+    }
+
+    fn install_marketplace_skill_events(&mut self, id: &str) -> Vec<AgentEvent> {
+        match self.fetch_marketplace() {
+            Ok(marketplace) => {
+                let Some(skill) = marketplace.skills.iter().find(|skill| skill.id == id) else {
+                    return vec![AgentEvent::Error(format!(
+                        "marketplace skill not found: {id}"
+                    ))];
+                };
+                match skills::install_marketplace_skill(self.config.profile_dir(), skill) {
+                    Ok(()) => vec![
+                        AgentEvent::Status(format!("installed skill {}", skill.id)),
+                        self.command_list_event(),
+                    ],
+                    Err(error) => vec![AgentEvent::Error(format!(
+                        "failed to install skill {}: {error}",
+                        skill.id
+                    ))],
+                }
+            }
+            Err(error) => vec![AgentEvent::Error(format!(
+                "failed to fetch skills marketplace: {error}"
+            ))],
+        }
+    }
+
+    fn sync_default_skills_events(&mut self) -> Vec<AgentEvent> {
+        match self.fetch_marketplace() {
+            Ok(marketplace) => {
+                match skills::install_default_skills(self.config.profile_dir(), &marketplace) {
+                    Ok(0) => vec![AgentEvent::Info(
+                        "no default marketplace skills configured".to_string(),
+                    )],
+                    Ok(count) => vec![
+                        AgentEvent::Status(format!("synced {count} default skill(s)")),
+                        self.command_list_event(),
+                    ],
+                    Err(error) => vec![AgentEvent::Error(format!(
+                        "failed to sync default skills: {error}"
+                    ))],
+                }
+            }
+            Err(error) => vec![AgentEvent::Error(format!(
+                "failed to fetch skills marketplace: {error}"
+            ))],
+        }
+    }
+
+    fn fetch_marketplace(&self) -> Result<skills::Marketplace, String> {
+        skills::fetch_marketplace(
+            &self.config.jucode_api_url,
+            self.auth
+                .key_for("jucode")
+                .or_else(|| self.auth.key_for(&self.config.provider)),
+        )
     }
 
     fn pin_skill_events(&mut self, name: &str) -> Vec<AgentEvent> {
@@ -1229,6 +1333,7 @@ impl AgentCore {
                             "JuCode account connected; provider switched to jucode".to_string(),
                         ));
                         events.push(self.model_status_event());
+                        events.extend(self.sync_default_skills_events());
                     }
                     Err(error) => {
                         events.push(AgentEvent::Error(format!("failed to save login: {error}")))
