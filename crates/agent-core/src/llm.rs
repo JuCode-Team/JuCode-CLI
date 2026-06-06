@@ -1,10 +1,17 @@
-use crate::{extensions::ExtensionRegistry, session::extract_response_text, tools};
+use crate::{
+    extensions::ExtensionRegistry,
+    session::extract_response_text,
+    subagents::{
+        SubagentManager, SubagentRunResult, SubagentSpawn, MAX_LIVE_SUBAGENTS, MAX_SUBAGENT_DEPTH,
+    },
+    tools,
+};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     env,
     io::{BufRead, BufReader},
-    path::Path,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Sender},
     time::{Duration, Instant},
 };
@@ -36,6 +43,9 @@ pub struct OpenAiClient {
     deadline: Option<Instant>,
     provider_kind: ProviderKind,
     goal_tool_tx: Option<Sender<GoalToolRequest>>,
+    subagent_manager: Option<SubagentManager>,
+    agent_path: String,
+    agent_depth: u64,
 }
 
 pub struct OpenAiClientConfig<'a> {
@@ -51,6 +61,7 @@ pub struct OpenAiClientConfig<'a> {
     pub connect_timeout: Duration,
     pub read_timeout: Duration,
     pub goal_tool_tx: Option<Sender<GoalToolRequest>>,
+    pub subagent_manager: Option<SubagentManager>,
 }
 
 #[derive(Debug)]
@@ -129,6 +140,9 @@ impl OpenAiClient {
             deadline: None,
             provider_kind,
             goal_tool_tx: config.goal_tool_tx,
+            subagent_manager: config.subagent_manager,
+            agent_path: "/root".to_string(),
+            agent_depth: 0,
         })
     }
 
@@ -146,6 +160,7 @@ impl OpenAiClient {
             {
                 return Err("subagent timed out".to_string());
             }
+            self.append_queued_subagent_messages(&mut input);
             emit(StreamEvent::CallStart)?;
             let output_items = match self.provider_kind {
                 ProviderKind::OpenAiResponses => {
@@ -167,6 +182,11 @@ impl OpenAiClient {
             if function_calls.is_empty() {
                 return Ok(());
             }
+            let pending_call_ids = function_calls
+                .iter()
+                .filter_map(|call| call.get("call_id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect::<HashSet<_>>();
 
             for call in function_calls {
                 if let Some(max_tool_calls) = self.max_tool_calls {
@@ -201,8 +221,10 @@ impl OpenAiClient {
                 })?;
                 let result = if let Some(result) = self.run_goal_tool(&name, arguments) {
                     result
-                } else if name == "spawn_subagent" && self.allow_subagents {
-                    self.run_subagent(arguments, cwd)
+                } else if let Some(result) =
+                    self.run_subagent_tool(&name, arguments, cwd, &input, &pending_call_ids)
+                {
+                    result
                 } else {
                     tools::run_tool_with_events(&name, arguments, cwd, |event| {
                         let tools::ToolExecutionEvent::Update(output) = event;
@@ -544,8 +566,8 @@ impl OpenAiClient {
 
     fn tool_definitions(&self) -> Vec<Value> {
         let mut definitions = tools::definitions();
-        if self.allow_subagents {
-            definitions.push(subagent_definition());
+        if self.allow_subagents && self.subagent_manager.is_some() {
+            definitions.extend(subagent_definitions());
         }
         definitions.extend(self.extensions.definitions());
         if self.goal_tool_tx.is_some() {
@@ -571,35 +593,66 @@ impl OpenAiClient {
             .collect()
     }
 
-    fn run_subagent(&self, arguments: &str, cwd: &Path) -> tools::ToolExecutionResult {
-        let args = serde_json::from_str::<Value>(arguments)
-            .unwrap_or_else(|error| json!({ "error": format!("invalid JSON arguments: {error}") }));
-        let Some(task) = args
-            .get("task")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            let output =
-                json!({ "success": false, "error": "spawn_subagent requires task" }).to_string();
-            return tools::ToolExecutionResult {
-                model_output: output.clone(),
-                output,
-                is_error: true,
-            };
+    fn run_subagent_tool(
+        &self,
+        name: &str,
+        arguments: &str,
+        cwd: &Path,
+        input: &[Value],
+        pending_call_ids: &HashSet<String>,
+    ) -> Option<tools::ToolExecutionResult> {
+        if !matches!(
+            name,
+            "spawn_agent" | "wait_agent" | "list_agents" | "send_message" | "close_agent"
+        ) {
+            return None;
+        }
+        let result = match name {
+            "spawn_agent" => self.spawn_agent(arguments, cwd, input, pending_call_ids),
+            "wait_agent" => self.wait_agent(arguments),
+            "list_agents" => self.list_agents(arguments),
+            "send_message" => self.send_message(arguments),
+            "close_agent" => self.close_agent(arguments),
+            _ => unreachable!(),
         };
+        Some(match result {
+            Ok(value) => json_tool_result(value, false),
+            Err(error) => json_tool_result(json!({ "error": error }), true),
+        })
+    }
+
+    fn spawn_agent(
+        &self,
+        arguments: &str,
+        cwd: &Path,
+        input: &[Value],
+        pending_call_ids: &HashSet<String>,
+    ) -> Result<Value, String> {
+        let manager = self
+            .subagent_manager
+            .clone()
+            .ok_or_else(|| "subagent manager is unavailable".to_string())?;
+        if !self.allow_subagents {
+            return Err("agent depth limit reached. Solve the task yourself.".to_string());
+        }
+        let args = serde_json::from_str::<Value>(arguments)
+            .map_err(|error| format!("invalid JSON arguments: {error}"))?;
+        let task_name = required_str(&args, "task_name")?;
+        let message = required_str(&args, "message")?;
         let model = args
             .get("model")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or(&self.model);
-        let system = args
-            .get("system")
+            .unwrap_or(&self.model)
+            .to_string();
+        let reasoning_effort = args
+            .get("reasoning_effort")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or(DEFAULT_SUBAGENT_SYSTEM);
+            .unwrap_or(&self.reasoning_effort)
+            .to_string();
         let max_tool_calls = args
             .get("max_tool_calls")
             .and_then(Value::as_u64)
@@ -620,80 +673,180 @@ impl OpenAiClient {
                     .min(DEFAULT_SUBAGENT_MAX_OUTPUT_TOKENS)
                     .max(512),
             );
+        let fork_turns = args
+            .get("fork_turns")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("all")
+            .to_string();
+        validate_fork_turns(&fork_turns)?;
+        let child_depth = self.agent_depth.saturating_add(1);
+        let slot = manager.reserve_spawn(SubagentSpawn {
+            parent_path: self.agent_path.clone(),
+            task_name: task_name.to_string(),
+            message: message.to_string(),
+            model: model.clone(),
+            reasoning_effort: reasoning_effort.clone(),
+            depth: child_depth,
+        })?;
+        let child_input =
+            build_subagent_input(input, pending_call_ids, &fork_turns, &slot.path, message)?;
         let started = Instant::now();
+        let child_manager = manager.clone();
+        let child_path = slot.path.clone();
+        let child_cwd = PathBuf::from(cwd);
         let child = OpenAiClient {
             api_key: self.api_key.clone(),
-            model: model.to_string(),
-            reasoning_effort: self.reasoning_effort.clone(),
-            system_prompt: system.to_string(),
+            model: model.clone(),
+            reasoning_effort,
+            system_prompt: subagent_system_prompt(&self.system_prompt, &child_path),
             extensions: self.extensions.clone(),
             base_url: self.base_url.clone(),
             max_output_tokens,
             retry_attempts: self.retry_attempts,
             connect_timeout: self.connect_timeout,
             read_timeout: self.read_timeout.min(Duration::from_secs(timeout_secs)),
-            allow_subagents: false,
+            allow_subagents: child_depth < MAX_SUBAGENT_DEPTH,
             max_tool_calls: Some(max_tool_calls),
             deadline: Some(started + Duration::from_secs(timeout_secs)),
-            provider_kind: ProviderKind::from_model(model),
+            provider_kind: ProviderKind::from_model(&model),
             goal_tool_tx: None,
+            subagent_manager: Some(manager.clone()),
+            agent_path: child_path.clone(),
+            agent_depth: child_depth,
         };
-        let input = vec![json!({
-            "role": "user",
-            "content": [{ "type": "input_text", "text": task }]
-        })];
-        let mut output_text = String::new();
-        let mut tool_iters = 0u64;
-        let mut tools_used: Vec<String> = Vec::new();
-        let mut input_tokens = 0u64;
-        let mut output_tokens = 0u64;
-        let result = child.run_turn_events(input, cwd, |event| {
-            match event {
-                StreamEvent::Delta(delta) => output_text.push_str(&delta),
-                StreamEvent::ToolStart { name, .. } => {
-                    tool_iters += 1;
-                    tools_used.push(name);
+
+        std::thread::spawn(move || {
+            child_manager.mark_running(&child_path);
+            let mut output_text = String::new();
+            let mut tool_iters = 0u64;
+            let mut tools_used: Vec<String> = Vec::new();
+            let mut input_tokens = 0u64;
+            let mut output_tokens = 0u64;
+            let result = child.run_turn_events(child_input, &child_cwd, |event| {
+                if slot
+                    .interrupt_flag
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err("interrupted".to_string());
                 }
-                StreamEvent::Usage {
-                    input_tokens: input,
-                    output_tokens: output,
-                    ..
-                } => {
-                    input_tokens += input;
-                    output_tokens += output;
+                match event {
+                    StreamEvent::Delta(delta) => output_text.push_str(&delta),
+                    StreamEvent::ToolStart { name, .. } => {
+                        tool_iters += 1;
+                        tools_used.push(name);
+                    }
+                    StreamEvent::Usage {
+                        input_tokens: input,
+                        output_tokens: output,
+                        ..
+                    } => {
+                        input_tokens += input;
+                        output_tokens += output;
+                    }
+                    _ => {}
                 }
-                _ => {}
+                Ok(())
+            });
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let run_result = SubagentRunResult {
+                summary: truncate_subagent_output(&output_text),
+                partial_output: truncate_subagent_output(&output_text),
+                tool_calls: tool_iters,
+                tools_used,
+                input_tokens,
+                output_tokens,
+                elapsed_ms,
+                model,
+            };
+            match result {
+                Ok(()) => child_manager.finish_ok(&child_path, run_result),
+                Err(error) => child_manager.finish_err(&child_path, error, run_result),
             }
-            Ok(())
         });
 
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        let value = match result {
-            Ok(()) => json!({
-                "success": true,
-                "summary": truncate_subagent_output(&output_text),
-                "tool_calls": tool_iters,
-                "tools_used": tools_used,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "elapsed_ms": elapsed_ms,
-                "model": model,
-            }),
-            Err(error) => json!({
-                "success": false,
-                "error": error,
-                "partial_output": truncate_subagent_output(&output_text),
-                "tool_calls": tool_iters,
-                "tools_used": tools_used,
-                "elapsed_ms": elapsed_ms,
-                "model": model,
-            }),
+        Ok(json!({
+            "task_name": task_name,
+            "path": slot.path,
+            "status": "running",
+        }))
+    }
+
+    fn wait_agent(&self, arguments: &str) -> Result<Value, String> {
+        let manager = self
+            .subagent_manager
+            .clone()
+            .ok_or_else(|| "subagent manager is unavailable".to_string())?;
+        let args = serde_json::from_str::<Value>(arguments)
+            .map_err(|error| format!("invalid JSON arguments: {error}"))?;
+        let targets = args
+            .get("targets")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(30_000)
+            .clamp(100, 30_000);
+        manager.wait_agents(&self.agent_path, targets, timeout_ms)
+    }
+
+    fn list_agents(&self, arguments: &str) -> Result<Value, String> {
+        let manager = self
+            .subagent_manager
+            .clone()
+            .ok_or_else(|| "subagent manager is unavailable".to_string())?;
+        let args = serde_json::from_str::<Value>(arguments)
+            .map_err(|error| format!("invalid JSON arguments: {error}"))?;
+        Ok(manager.list_agents(
+            &self.agent_path,
+            args.get("path_prefix").and_then(Value::as_str),
+        ))
+    }
+
+    fn send_message(&self, arguments: &str) -> Result<Value, String> {
+        let manager = self
+            .subagent_manager
+            .clone()
+            .ok_or_else(|| "subagent manager is unavailable".to_string())?;
+        let args = serde_json::from_str::<Value>(arguments)
+            .map_err(|error| format!("invalid JSON arguments: {error}"))?;
+        let target = required_str(&args, "target")?;
+        let message = required_str(&args, "message")?;
+        manager.send_message(&self.agent_path, target, message)
+    }
+
+    fn close_agent(&self, arguments: &str) -> Result<Value, String> {
+        let manager = self
+            .subagent_manager
+            .clone()
+            .ok_or_else(|| "subagent manager is unavailable".to_string())?;
+        let args = serde_json::from_str::<Value>(arguments)
+            .map_err(|error| format!("invalid JSON arguments: {error}"))?;
+        let target = required_str(&args, "target")?;
+        manager.close_agent(&self.agent_path, target)
+    }
+
+    fn append_queued_subagent_messages(&self, input: &mut Vec<Value>) {
+        let Some(manager) = &self.subagent_manager else {
+            return;
         };
-        let output = value.to_string();
-        tools::ToolExecutionResult {
-            model_output: output.clone(),
-            is_error: value.get("success").and_then(Value::as_bool) != Some(true),
-            output,
+        for message in manager.drain_messages(&self.agent_path) {
+            input.push(json!({
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": format!("<subagent_message>\n{message}\n</subagent_message>")
+                }]
+            }));
         }
     }
 
@@ -742,45 +895,217 @@ impl ProviderKind {
     }
 }
 
-const DEFAULT_SUBAGENT_SYSTEM: &str = "You are a lightweight JuCode subagent. Work on the single task given by the parent agent. Keep the work bounded: inspect only what is needed, avoid broad refactors, and stop when you have enough evidence. Return a concise self-contained answer with: Summary, Evidence, Files/commands checked, and Risks or unknowns. Do not ask follow-up questions and do not spawn another subagent.";
+fn subagent_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "type": "function",
+            "name": "spawn_agent",
+            "description": format!("Start a lightweight background subagent for an independent bounded task. The agent shares the current cwd and tools, inherits the system prompt and skills, and returns immediately. Keep at most {MAX_LIVE_SUBAGENTS} live agents; nesting is capped at depth {MAX_SUBAGENT_DEPTH}."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_name": {
+                        "type": "string",
+                        "description": "Stable lowercase identifier for this child under the current agent path. Use lowercase letters, digits, and underscores."
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Self-contained task for the subagent."
+                    },
+                    "fork_turns": {
+                        "type": "string",
+                        "description": "Context to fork into the subagent: all (default), none, or a positive integer string for the last N user turns."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional model override. Defaults to the parent model."
+                    },
+                    "reasoning_effort": {
+                        "type": "string",
+                        "description": "Optional reasoning effort override. Defaults to the parent effort."
+                    },
+                    "max_tool_calls": {
+                        "type": "number",
+                        "description": "Optional tool-call budget. Defaults to 12 and is capped at 12."
+                    },
+                    "timeout_secs": {
+                        "type": "number",
+                        "description": "Optional wall-clock timeout. Defaults to 180 seconds and is capped at 180."
+                    },
+                    "max_output_tokens": {
+                        "type": "number",
+                        "description": "Optional output token cap. Defaults to 4096 and is capped at 4096."
+                    }
+                },
+                "required": ["task_name", "message"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "wait_agent",
+            "description": "Wait for one or more subagents to finish and return their current status/results. Without targets, returns when any agent finishes or there are no live agents.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "targets": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional agent paths or child names to wait for."
+                    },
+                    "timeout_ms": {
+                        "type": "number",
+                        "description": "Optional wait timeout in milliseconds. Defaults to 30000 and is capped at 30000."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "list_agents",
+            "description": "List known subagents and their statuses for this active turn.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path_prefix": {
+                        "type": "string",
+                        "description": "Optional absolute path or child-name prefix filter."
+                    }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "send_message",
+            "description": "Queue a short message for a running subagent. The subagent receives it before its next model call.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "description": "Agent path or child name." },
+                    "message": { "type": "string", "description": "Message to deliver." }
+                },
+                "required": ["target", "message"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "close_agent",
+            "description": "Interrupt and close a running subagent.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "description": "Agent path or child name." }
+                },
+                "required": ["target"],
+                "additionalProperties": false
+            }
+        }),
+    ]
+}
 
-fn subagent_definition() -> Value {
-    json!({
-        "type": "function",
-        "name": "spawn_subagent",
-        "description": "Spawn one isolated lightweight subagent for an independent coding subtask. Prefer direct tools for small checks; use this for parallel research or when many reads/searches would pollute the main context. The parent sees only the final distilled answer.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "task": {
-                    "type": "string",
-                    "description": "Self-contained task. The subagent only sees this task plus its system prompt."
-                },
-                "system": {
-                    "type": "string",
-                    "description": "Optional short system override. Keep it focused; omit for the default generic coding subagent."
-                },
-                "model": {
-                    "type": "string",
-                    "description": "Optional model override. Defaults to the parent model."
-                },
-                "max_tool_calls": {
-                    "type": "number",
-                    "description": "Optional tool-call budget for this subagent. Defaults to 12 and is capped at 12."
-                },
-                "timeout_secs": {
-                    "type": "number",
-                    "description": "Optional wall-clock timeout. Defaults to 180 seconds and is capped at 180."
-                },
-                "max_output_tokens": {
-                    "type": "number",
-                    "description": "Optional output token cap. Defaults to 4096 and is capped at 4096."
+fn json_tool_result(value: Value, is_error: bool) -> tools::ToolExecutionResult {
+    let output = value.to_string();
+    tools::ToolExecutionResult {
+        model_output: output.clone(),
+        output,
+        is_error,
+    }
+}
+
+fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
+    let value = args
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{key} is required"))?;
+    Ok(value)
+}
+
+fn subagent_system_prompt(parent_system: &str, path: &str) -> String {
+    format!(
+        "{parent_system}\n\n<subagent_context>\nYou are JuCode subagent {path}. Work only on the task delegated by the parent. Keep work bounded: inspect only what is needed, avoid broad refactors, and stop when you have enough evidence. Return a concise self-contained answer with Summary, Evidence, Files/commands checked, and Risks or unknowns. Do not ask follow-up questions unless the task is impossible without missing information.\n</subagent_context>"
+    )
+}
+
+fn build_subagent_input(
+    input: &[Value],
+    pending_call_ids: &HashSet<String>,
+    fork_turns: &str,
+    child_path: &str,
+    message: &str,
+) -> Result<Vec<Value>, String> {
+    let mut forked = match fork_turns {
+        "none" => Vec::new(),
+        "all" => filter_pending_subagent_items(input, pending_call_ids),
+        other => {
+            let turns = other.parse::<usize>().map_err(|_| {
+                "fork_turns must be \"all\", \"none\", or a positive integer string".to_string()
+            })?;
+            if turns == 0 {
+                return Err(
+                    "fork_turns must be \"all\", \"none\", or a positive integer string"
+                        .to_string(),
+                );
+            }
+            let filtered = filter_pending_subagent_items(input, pending_call_ids);
+            let mut seen = 0usize;
+            let mut start = 0usize;
+            for (index, item) in filtered.iter().enumerate().rev() {
+                if item.get("role").and_then(Value::as_str) == Some("user") {
+                    seen += 1;
+                    if seen == turns {
+                        start = index;
+                        break;
+                    }
                 }
-            },
-            "required": ["task"],
-            "additionalProperties": false
+            }
+            filtered[start..].to_vec()
         }
-    })
+    };
+    forked.push(json!({
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": format!("<subagent_task path=\"{child_path}\">\n{message}\n</subagent_task>")
+        }]
+    }));
+    Ok(forked)
+}
+
+fn validate_fork_turns(fork_turns: &str) -> Result<(), String> {
+    if fork_turns == "all" || fork_turns == "none" {
+        return Ok(());
+    }
+    if fork_turns.parse::<usize>().is_ok_and(|turns| turns > 0) {
+        Ok(())
+    } else {
+        Err("fork_turns must be \"all\", \"none\", or a positive integer string".to_string())
+    }
+}
+
+fn filter_pending_subagent_items(
+    input: &[Value],
+    pending_call_ids: &HashSet<String>,
+) -> Vec<Value> {
+    input
+        .iter()
+        .filter(|item| {
+            if !matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call" | "function_call_output")
+            ) {
+                return true;
+            }
+            item.get("call_id")
+                .and_then(Value::as_str)
+                .is_none_or(|call_id| !pending_call_ids.contains(call_id))
+        })
+        .cloned()
+        .collect()
 }
 
 fn goal_tool_definitions() -> Vec<Value> {

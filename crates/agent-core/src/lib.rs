@@ -7,6 +7,7 @@ mod oauth;
 mod prompt;
 mod session;
 pub mod skills;
+mod subagents;
 mod tools;
 mod update;
 

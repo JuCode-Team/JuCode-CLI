@@ -103,6 +103,11 @@ pub enum AgentEvent {
         output: String,
         is_error: bool,
     },
+    SubagentLifecycle {
+        path: String,
+        status: String,
+        message: String,
+    },
     Usage {
         input_tokens: u64,
         output_tokens: u64,

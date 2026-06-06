@@ -312,6 +312,17 @@ impl TuiState {
                     self.upsert_tool(call_id, name, output, false);
                     true
                 }
+                AgentEvent::SubagentLifecycle {
+                    path,
+                    status,
+                    message,
+                } => {
+                    self.chat.push(ChatLine::System(format!(
+                        "Agent {path}: {status} — {message}"
+                    )));
+                    self.mark_history_dirty();
+                    true
+                }
                 AgentEvent::Usage {
                     input_tokens,
                     output_tokens,

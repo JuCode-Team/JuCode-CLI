@@ -251,7 +251,23 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> io::Result<()> {
         }
         let mut output = fs::File::create(&out)?;
         io::copy(&mut file, &mut output)?;
+        apply_zip_permissions(&file, &out)?;
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn apply_zip_permissions(file: &zip::read::ZipFile<'_>, path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(mode) = file.unix_mode() {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn apply_zip_permissions(_file: &zip::read::ZipFile<'_>, _path: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -319,9 +335,14 @@ fn copy_dir_contents(src: &Path, dest: &Path) -> io::Result<()> {
             copy_dir_contents(&src_path, &dest_path)?;
         } else {
             fs::copy(&src_path, &dest_path)?;
+            preserve_file_permissions(&src_path, &dest_path)?;
         }
     }
     Ok(())
+}
+
+fn preserve_file_permissions(src: &Path, dest: &Path) -> io::Result<()> {
+    fs::set_permissions(dest, fs::metadata(src)?.permissions())
 }
 
 fn replace_dir(dir: &Path) -> io::Result<()> {
@@ -371,6 +392,8 @@ fn safe_skill_dir(id: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::{
         io::Write,
         time::{SystemTime, UNIX_EPOCH},
@@ -457,6 +480,15 @@ mod tests {
             fs::read_to_string(root.join("skills/packaged/scripts/run.sh")).unwrap(),
             "#!/bin/sh\necho ok\n"
         );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(root.join("skills/packaged/scripts/run.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -474,8 +506,12 @@ mod tests {
     fn create_zip(path: &Path, files: &[(&str, &str)]) {
         let file = fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        let opts = zip::write::FileOptions::default();
         for (name, content) in files {
+            let opts = if name.ends_with(".sh") {
+                zip::write::FileOptions::default().unix_permissions(0o755)
+            } else {
+                zip::write::FileOptions::default().unix_permissions(0o644)
+            };
             zip.start_file(*name, opts).unwrap();
             zip.write_all(content.as_bytes()).unwrap();
         }

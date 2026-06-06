@@ -168,6 +168,16 @@ fn event_json(event: AgentEvent) -> Value {
             "output": output,
             "is_error": is_error
         }),
+        AgentEvent::SubagentLifecycle {
+            path,
+            status,
+            message,
+        } => json!({
+            "type": "subagent_lifecycle",
+            "path": path,
+            "status": status,
+            "message": message
+        }),
         AgentEvent::Usage {
             input_tokens,
             output_tokens,

@@ -13,6 +13,7 @@ use crate::{
         ThreadGoal, ThreadGoalStatus,
     },
     skills,
+    subagents::SubagentManager,
     update::{self, UpdateNotice},
 };
 use serde_json::{json, Value};
@@ -103,6 +104,7 @@ pub struct AgentCore {
     goal_continuation_running: bool,
     resume_summary_running: bool,
     interrupt_flag: Arc<AtomicBool>,
+    subagent_manager: SubagentManager,
 }
 
 impl AgentCore {
@@ -125,6 +127,7 @@ impl AgentCore {
             goal_continuation_running: false,
             resume_summary_running: false,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
+            subagent_manager: SubagentManager::default(),
         })
     }
 
@@ -228,16 +231,19 @@ impl AgentCore {
             return Vec::new();
         }
         self.interrupt_flag.store(true, Ordering::SeqCst);
+        self.subagent_manager.close_all();
         self.receiver = None;
         self.running = false;
         self.goal_tool_receiver = None;
         self.goal_continuation_running = false;
         self.turn_started_at = None;
         self.turn_goal_tokens = 0;
-        vec![
+        let mut events = vec![
             AgentEvent::Info("request interrupted".to_string()),
             AgentEvent::Status("interrupted".to_string()),
-        ]
+        ];
+        events.extend(self.drain_subagent_events());
+        events
     }
 
     pub fn handle_command(&mut self, input: &str) -> (bool, Vec<AgentEvent>) {
@@ -624,6 +630,8 @@ impl AgentCore {
                         });
                     }
                     WorkerEvent::Done => {
+                        self.subagent_manager
+                            .close_all_with_message("parent turn finished");
                         events.extend(self.finish_goal_turn());
                         self.running = false;
                         disconnected = true;
@@ -641,6 +649,8 @@ impl AgentCore {
                         }));
                     }
                     WorkerEvent::Error(error) => {
+                        self.subagent_manager
+                            .close_all_with_message("parent turn failed");
                         events.extend(self.finish_goal_turn());
                         self.running = false;
                         disconnected = true;
@@ -653,6 +663,7 @@ impl AgentCore {
                 self.receiver = Some(rx);
             }
         }
+        events.extend(self.drain_subagent_events());
         if let Some(rx) = self.update_receiver.take() {
             match rx.try_recv() {
                 Ok(notice) => events.push(AgentEvent::Info(notice.message())),
@@ -679,6 +690,18 @@ impl AgentCore {
         }
 
         events
+    }
+
+    fn drain_subagent_events(&self) -> Vec<AgentEvent> {
+        self.subagent_manager
+            .drain_events()
+            .into_iter()
+            .map(|event| AgentEvent::SubagentLifecycle {
+                path: event.path,
+                status: event.status,
+                message: event.message,
+            })
+            .collect()
     }
 
     fn start_turn(&mut self, message: String) -> Vec<AgentEvent> {
@@ -709,6 +732,7 @@ impl AgentCore {
     }
 
     fn spawn_current_context_turn(&mut self, save_event: Vec<AgentEvent>) -> Vec<AgentEvent> {
+        self.subagent_manager = SubagentManager::default();
         let base_prompt = match self.config.system_prompt() {
             Ok(prompt) => prompt,
             Err(error) => {
@@ -760,6 +784,11 @@ impl AgentCore {
                     "ripgrep",
                     "outline",
                     "checkpoint",
+                    "spawn_agent",
+                    "wait_agent",
+                    "list_agents",
+                    "send_message",
+                    "close_agent",
                 ],
                 project_instructions,
                 skills,
@@ -785,6 +814,7 @@ impl AgentCore {
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: Some(goal_tool_tx),
+            subagent_manager: Some(self.subagent_manager.clone()),
         }) else {
             let mut events = save_event;
             events.push(AgentEvent::Error(
@@ -1003,6 +1033,7 @@ impl AgentCore {
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: None,
+            subagent_manager: None,
         })
     }
 
@@ -1034,6 +1065,7 @@ impl AgentCore {
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: None,
+            subagent_manager: None,
         })
     }
 
