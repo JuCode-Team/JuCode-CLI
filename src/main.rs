@@ -5,10 +5,27 @@ use std::{
     env, io,
     io::{Read, Write},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 struct Runtime(AgentCore);
+
+#[derive(Default)]
+struct HeadlessStats {
+    status: String,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_tokens: u64,
+    context_tokens: u64,
+    context_tokenizer: Option<String>,
+    tool_calls: u64,
+    subagent_events: u64,
+    assistant_chars: usize,
+    last_error: Option<String>,
+    last_context_state: Option<String>,
+    event_counts: std::collections::BTreeMap<String, u64>,
+}
 
 impl TuiRuntime for Runtime {
     fn startup_events(&self) -> Vec<AgentEvent> {
@@ -40,14 +57,15 @@ fn main() -> io::Result<()> {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
     if args.first().map(String::as_str) == Some("--headless") {
         args.remove(0);
-        return run_headless(args);
+        let code = run_headless(args)?;
+        std::process::exit(code);
     }
     let mut core = AgentCore::new()?;
     core.start_update_check();
     TuiApp::new(Runtime(core)).run()
 }
 
-fn run_headless(args: Vec<String>) -> io::Result<()> {
+fn run_headless(args: Vec<String>) -> io::Result<i32> {
     let mut prompt = args.join(" ");
     if prompt.trim().is_empty() {
         io::stdin().read_to_string(&mut prompt)?;
@@ -55,10 +73,13 @@ fn run_headless(args: Vec<String>) -> io::Result<()> {
     let mut core = AgentCore::new()?;
     let mut stdout = io::stdout();
     let mut done = false;
+    let mut stats = HeadlessStats::default();
+    let started = Instant::now();
     for event in core.submit_user_message(prompt) {
         if matches!(event, AgentEvent::Error(_)) {
             done = true;
         }
+        record_headless_event(&event, &mut stats);
         write_event(&mut stdout, event)?;
     }
     while !done {
@@ -69,17 +90,121 @@ fn run_headless(args: Vec<String>) -> io::Result<()> {
             {
                 done = true;
             }
+            record_headless_event(&event, &mut stats);
             write_event(&mut stdout, event)?;
         }
         thread::sleep(Duration::from_millis(50));
     }
-    Ok(())
+    stats.status = if stats.last_error.is_some() {
+        "error".to_string()
+    } else {
+        "ready".to_string()
+    };
+    write_json_value(
+        &mut stdout,
+        final_result_json(&stats, started.elapsed().as_millis() as u64),
+    )?;
+    Ok(if stats.last_error.is_some() { 1 } else { 0 })
 }
 
 fn write_event(stdout: &mut impl Write, event: AgentEvent) -> io::Result<()> {
-    serde_json::to_writer(&mut *stdout, &event_json(event))?;
+    write_json_value(stdout, event_json(event))
+}
+
+fn write_json_value(stdout: &mut impl Write, value: Value) -> io::Result<()> {
+    serde_json::to_writer(&mut *stdout, &value)?;
     stdout.write_all(b"\n")?;
     stdout.flush()
+}
+
+fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
+    let key = match event {
+        AgentEvent::Startup { .. } => "startup",
+        AgentEvent::ModelStatus { .. } => "model_status",
+        AgentEvent::PendingMessages(_) => "pending_messages",
+        AgentEvent::UserMessage(_) => "user_message",
+        AgentEvent::FillInput(_) => "fill_input",
+        AgentEvent::Connecting => "connecting",
+        AgentEvent::CompactionStart => "compaction_start",
+        AgentEvent::CompactionProgress { .. } => "compaction_progress",
+        AgentEvent::CompactionEnd => "compaction_end",
+        AgentEvent::CompactionFailed(_) => "compaction_failed",
+        AgentEvent::ContextUsage { tokens, tokenizer } => {
+            stats.context_tokens = *tokens;
+            stats.context_tokenizer = Some(tokenizer.clone());
+            "context_usage"
+        }
+        AgentEvent::ThinkingStart => "thinking_start",
+        AgentEvent::ReasoningDelta(delta) => {
+            stats.assistant_chars += delta.len();
+            "reasoning_delta"
+        }
+        AgentEvent::AssistantStart => "assistant_start",
+        AgentEvent::AssistantDelta(delta) => {
+            stats.assistant_chars += delta.len();
+            "assistant_delta"
+        }
+        AgentEvent::Retrying { .. } => "retrying",
+        AgentEvent::ToolStart { .. } => {
+            stats.tool_calls += 1;
+            "tool_start"
+        }
+        AgentEvent::ToolUpdate { .. } => "tool_update",
+        AgentEvent::ToolOutput { .. } => "tool_output",
+        AgentEvent::SubagentLifecycle { .. } => {
+            stats.subagent_events += 1;
+            "subagent_lifecycle"
+        }
+        AgentEvent::Usage {
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            reasoning_tokens,
+        } => {
+            stats.input_tokens += input_tokens;
+            stats.cached_input_tokens += cached_input_tokens;
+            stats.output_tokens += output_tokens;
+            stats.reasoning_tokens += reasoning_tokens;
+            "usage"
+        }
+        AgentEvent::TreeView(_) => "tree_view",
+        AgentEvent::ResumeView(_) => "resume_view",
+        AgentEvent::ModelView { .. } => "model_view",
+        AgentEvent::CommandList(_) => "command_list",
+        AgentEvent::Goal(_) => "goal",
+        AgentEvent::Transcript(_) => "transcript",
+        AgentEvent::Info(_) => "info",
+        AgentEvent::Error(message) => {
+            stats.last_error = Some(message.clone());
+            "error"
+        }
+        AgentEvent::Status(message) => {
+            stats.last_context_state = Some(message.clone());
+            stats.status = message.clone();
+            "status"
+        }
+    };
+    *stats.event_counts.entry(key.to_string()).or_insert(0) += 1;
+}
+
+fn final_result_json(stats: &HeadlessStats, elapsed_ms: u64) -> Value {
+    json!({
+        "type": "final_result",
+        "status": stats.status,
+        "input_tokens": stats.input_tokens,
+        "cached_input_tokens": stats.cached_input_tokens,
+        "output_tokens": stats.output_tokens,
+        "reasoning_tokens": stats.reasoning_tokens,
+        "context_tokens": stats.context_tokens,
+        "context_tokenizer": stats.context_tokenizer,
+        "tool_calls": stats.tool_calls,
+        "subagent_events": stats.subagent_events,
+        "assistant_chars": stats.assistant_chars,
+        "elapsed_ms": elapsed_ms,
+        "last_error": stats.last_error,
+        "last_context_state": stats.last_context_state,
+        "event_counts": stats.event_counts,
+    })
 }
 
 fn event_json(event: AgentEvent) -> Value {
@@ -134,8 +259,8 @@ fn event_json(event: AgentEvent) -> Value {
         AgentEvent::CompactionFailed(error) => {
             json!({ "type": "compaction_failed", "error": error })
         }
-        AgentEvent::ContextUsage { tokens } => {
-            json!({ "type": "context_usage", "tokens": tokens })
+        AgentEvent::ContextUsage { tokens, tokenizer } => {
+            json!({ "type": "context_usage", "tokens": tokens, "tokenizer": tokenizer })
         }
         AgentEvent::ThinkingStart => json!({ "type": "thinking_start" }),
         AgentEvent::ReasoningDelta(delta) => {
@@ -161,6 +286,7 @@ fn event_json(event: AgentEvent) -> Value {
             name,
             output,
             is_error,
+            ..
         } => json!({
             "type": "tool_output",
             "call_id": call_id,
@@ -180,10 +306,11 @@ fn event_json(event: AgentEvent) -> Value {
         }),
         AgentEvent::Usage {
             input_tokens,
+            cached_input_tokens,
             output_tokens,
             reasoning_tokens,
         } => {
-            json!({ "type": "usage", "input_tokens": input_tokens, "output_tokens": output_tokens, "reasoning_tokens": reasoning_tokens })
+            json!({ "type": "usage", "input_tokens": input_tokens, "cached_input_tokens": cached_input_tokens, "output_tokens": output_tokens, "reasoning_tokens": reasoning_tokens })
         }
         AgentEvent::TreeView(nodes) => json!({
             "type": "tree_view",
@@ -243,5 +370,33 @@ fn event_json(event: AgentEvent) -> Value {
         AgentEvent::Info(message) => json!({ "type": "info", "message": message }),
         AgentEvent::Error(message) => json!({ "type": "error", "message": message }),
         AgentEvent::Status(message) => json!({ "type": "status", "message": message }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn final_result_contains_status_and_usage() {
+        let mut stats = HeadlessStats {
+            status: "ready".to_string(),
+            ..Default::default()
+        };
+        stats.input_tokens = 12;
+        stats.output_tokens = 8;
+        stats.reasoning_tokens = 4;
+        stats.context_tokens = 99;
+        stats.tool_calls = 3;
+        stats.subagent_events = 2;
+
+        let value = final_result_json(&stats, 123);
+        assert_eq!(value["type"], "final_result");
+        assert_eq!(value["status"], "ready");
+        assert_eq!(value["input_tokens"], 12);
+        assert_eq!(value["cached_input_tokens"], 0);
+        assert_eq!(value["context_tokens"], 99);
+        assert_eq!(value["tool_calls"], 3);
+        assert_eq!(value["elapsed_ms"], 123);
     }
 }

@@ -31,7 +31,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-/// Recent context (in estimated tokens) kept verbatim when compacting; older
+/// Recent context (in tokenizer-counted tokens) kept verbatim when compacting; older
 /// turns are folded into the summary.
 const COMPACTION_KEEP_RECENT_TOKENS: usize = 20_000;
 const RESUME_SUMMARY_IDLE_SECONDS: u64 = 5 * 60;
@@ -75,10 +75,12 @@ enum WorkerEvent {
         call_id: String,
         name: String,
         output: String,
+        model_output: String,
         is_error: bool,
     },
     Usage {
         input_tokens: u64,
+        cached_input_tokens: u64,
         output_tokens: u64,
         reasoning_tokens: u64,
     },
@@ -98,6 +100,7 @@ pub struct AgentCore {
     goal_tool_receiver: Option<Receiver<GoalToolRequest>>,
     update_receiver: Option<Receiver<UpdateNotice>>,
     total_input_tokens: u64,
+    total_cached_input_tokens: u64,
     total_output_tokens: u64,
     turn_started_at: Option<SystemTime>,
     turn_goal_tokens: u64,
@@ -121,6 +124,7 @@ impl AgentCore {
             goal_tool_receiver: None,
             update_receiver: None,
             total_input_tokens: 0,
+            total_cached_input_tokens: 0,
             total_output_tokens: 0,
             turn_started_at: None,
             turn_goal_tokens: 0,
@@ -597,12 +601,13 @@ impl AgentCore {
                         call_id,
                         name,
                         output,
+                        model_output,
                         is_error,
                     } => {
                         self.session.append(EntryKind::ToolOutput {
                             call_id: call_id.clone(),
                             name: name.clone(),
-                            output: output.clone(),
+                            output: model_output.clone(),
                         });
                         events.extend(self.save_session_event());
                         events.push(self.context_usage_event());
@@ -615,16 +620,21 @@ impl AgentCore {
                     }
                     WorkerEvent::Usage {
                         input_tokens,
+                        cached_input_tokens,
                         output_tokens,
                         reasoning_tokens,
                     } => {
                         self.total_input_tokens += input_tokens;
+                        self.total_cached_input_tokens += cached_input_tokens;
                         self.total_output_tokens += output_tokens;
+                        let non_cached_input_tokens =
+                            input_tokens.saturating_sub(cached_input_tokens);
                         self.turn_goal_tokens = self
                             .turn_goal_tokens
-                            .saturating_add(input_tokens.saturating_add(output_tokens));
+                            .saturating_add(non_cached_input_tokens.saturating_add(output_tokens));
                         events.push(AgentEvent::Usage {
                             input_tokens,
+                            cached_input_tokens,
                             output_tokens,
                             reasoning_tokens,
                         });
@@ -777,9 +787,9 @@ impl AgentCore {
                     "str_replace",
                     "hashline_edit",
                     "write",
+                    "apply_patch",
                     "bash",
                     "write_stdin",
-                    "diff",
                     "ls",
                     "ripgrep",
                     "outline",
@@ -801,6 +811,7 @@ impl AgentCore {
             model: self.config.model.clone(),
             reasoning_effort: self.config.reasoning_effort.clone(),
             system_prompt,
+            prompt_cache_key: self.session.session_id().to_string(),
             extensions: ExtensionRegistry::load(
                 &self.config.extensions,
                 &self.cwd,
@@ -824,21 +835,21 @@ impl AgentCore {
         };
 
         let request_items = self.session.request_context_items();
-        let estimated_context_tokens = self.session.estimated_context_tokens();
+        let (context_tokens, context_tokenizer) =
+            self.session.context_token_usage(&self.config.model);
         let compaction_threshold = self.config.compaction_threshold_tokens as usize;
         let model_context_budget = target_context_budget(&self.config.current_model_config());
-        let compaction = if should_auto_compact(
-            estimated_context_tokens,
-            model_context_budget,
-            compaction_threshold,
-        ) {
-            self.session.plan_compaction(COMPACTION_KEEP_RECENT_TOKENS)
-        } else {
-            None
-        };
+        let compaction =
+            if should_auto_compact(context_tokens, model_context_budget, compaction_threshold) {
+                self.session
+                    .plan_compaction(COMPACTION_KEEP_RECENT_TOKENS, &self.config.model)
+            } else {
+                None
+            };
         let mut events = save_event;
         events.push(AgentEvent::ContextUsage {
-            tokens: estimated_context_tokens as u64,
+            tokens: context_tokens as u64,
+            tokenizer: context_tokenizer,
         });
         let compaction_client = if compaction.is_some() {
             match self.compaction_client() {
@@ -913,19 +924,23 @@ impl AgentCore {
                         call_id,
                         name,
                         output,
+                        model_output,
                         is_error,
                     } => WorkerEvent::ToolOutput {
                         call_id,
                         name,
                         output,
+                        model_output,
                         is_error,
                     },
                     StreamEvent::Usage {
                         input_tokens,
+                        cached_input_tokens,
                         output_tokens,
                         reasoning_tokens,
                     } => WorkerEvent::Usage {
                         input_tokens,
+                        cached_input_tokens,
                         output_tokens,
                         reasoning_tokens,
                     },
@@ -975,7 +990,10 @@ impl AgentCore {
             ))];
         }
 
-        let Some(plan) = self.session.plan_compaction(COMPACTION_KEEP_RECENT_TOKENS) else {
+        let Some(plan) = self
+            .session
+            .plan_compaction(COMPACTION_KEEP_RECENT_TOKENS, &self.config.model)
+        else {
             return vec![AgentEvent::Info(
                 "nothing old enough to compact".to_string(),
             )];
@@ -1024,6 +1042,7 @@ impl AgentCore {
             model: self.config.compact_model.clone(),
             reasoning_effort: self.config.compact_reasoning_effort.clone(),
             system_prompt: String::new(),
+            prompt_cache_key: self.session.session_id().to_string(),
             extensions: ExtensionRegistry::load(&[], &self.cwd, self.config.profile_dir()),
             base_url: self.config.base_url.clone(),
             max_output_tokens: self.config.compact_model_config().max_output_tokens,
@@ -1056,6 +1075,7 @@ impl AgentCore {
             model,
             reasoning_effort: self.config.compact_reasoning_effort.clone(),
             system_prompt: String::new(),
+            prompt_cache_key: self.session.session_id().to_string(),
             extensions: ExtensionRegistry::load(&[], &self.cwd, self.config.profile_dir()),
             base_url: self.config.base_url.clone(),
             max_output_tokens,
@@ -1273,8 +1293,10 @@ impl AgentCore {
     }
 
     fn context_usage_event(&self) -> AgentEvent {
+        let (tokens, tokenizer) = self.session.context_token_usage(&self.config.model);
         AgentEvent::ContextUsage {
-            tokens: self.session.estimated_context_tokens() as u64,
+            tokens: tokens as u64,
+            tokenizer,
         }
     }
 
@@ -1436,11 +1458,12 @@ impl AgentCore {
     }
 
     fn context_events(&self) -> Vec<AgentEvent> {
-        let stats = self.session.context_statistics();
+        let stats = self.session.context_statistics(&self.config.model);
         vec![
             AgentEvent::Info(format_context_statistics(
                 &stats,
                 self.total_input_tokens,
+                self.total_cached_input_tokens,
                 self.total_output_tokens,
             )),
             self.context_usage_event(),
@@ -1782,17 +1805,18 @@ fn target_context_budget(model_config: &ModelConfig) -> usize {
 }
 
 fn should_auto_compact(
-    estimated_context_tokens: usize,
+    context_tokens: usize,
     model_context_budget: usize,
     compaction_threshold: usize,
 ) -> bool {
-    estimated_context_tokens > model_context_budget
-        || (compaction_threshold > 0 && estimated_context_tokens > compaction_threshold)
+    context_tokens > model_context_budget
+        || (compaction_threshold > 0 && context_tokens > compaction_threshold)
 }
 
 fn format_context_statistics(
     stats: &ContextStatistics,
     total_input_tokens: u64,
+    total_cached_input_tokens: u64,
     total_output_tokens: u64,
 ) -> String {
     let mut lines = vec![
@@ -1801,10 +1825,12 @@ fn format_context_statistics(
             stats.branch_entries, stats.context_items, stats.projected_items, stats.compacted
         ),
         format!(
-            "estimated_tokens: full={} projected={} api_usage_input={} api_usage_output={}",
-            stats.estimated_tokens,
-            stats.projected_estimated_tokens,
+            "context_tokens: full={} projected={} tokenizer={} api_usage_input={} api_usage_cached_input={} api_usage_output={}",
+            stats.tokens,
+            stats.projected_tokens,
+            stats.tokenizer,
             total_input_tokens,
+            total_cached_input_tokens,
             total_output_tokens
         ),
         format!(
@@ -1825,7 +1851,7 @@ fn format_context_statistics(
         lines.extend(stats.top_items.iter().map(|item| {
             format!(
                 "  {} ~{} tokens ({} chars)",
-                item.label, item.estimated_tokens, item.chars
+                item.label, item.tokens, item.chars
             )
         }));
     }

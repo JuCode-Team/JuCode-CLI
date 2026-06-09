@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const TOOL_GUIDANCE: &str = "prefer read/ls/ripgrep for exploration; use bash for commands and verification; read a file before changing it; use str_replace, write, or hashline_edit for file edits.";
+const TOOL_GUIDANCE: &str = "prefer read/ls/ripgrep/outline for targeted exploration; use bash or exec_command for shell commands and verification; when several read-only searches or inspections are independent, issue them together in the same assistant response; group dependent shell checks into one command when that reduces round trips; keep dependent edit-after-read and verify-after-edit steps ordered; read an existing file before changing it; write can create new files without a prior read; use str_replace, write, hashline_edit, or apply_patch for file edits; if a tool fails, correct the call or use another suitable tool and continue when feasible.";
 const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]

@@ -12,7 +12,11 @@ use std::{
     env,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Sender},
+    sync::{
+        mpsc::{self, Sender},
+        Arc, OnceLock,
+    },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -20,6 +24,19 @@ const MAX_SUBAGENT_OUTPUT_BYTES: usize = 16 * 1024;
 const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_SUBAGENT_MAX_TOOL_CALLS: u64 = 12;
 const DEFAULT_SUBAGENT_MAX_OUTPUT_TOKENS: u64 = 4096;
+const RETRY_BACKOFF_BASE_MS: u64 = 250;
+const RETRY_BACKOFF_MAX_MS: u64 = 4_000;
+const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
+const MAX_EMPTY_RESPONSE_CONTINUATIONS: usize = 2;
+const EMPTY_RESPONSE_REMINDER: &str = "<runtime_reminder>\nYou have not produced visible progress yet. Continue the user's implementation task now: inspect only what is needed, make the required file changes, run a focused verification when possible, and do not end after exploration alone.\n</runtime_reminder>";
+
+#[derive(Debug, Clone, Copy, Default)]
+struct UsageTokens {
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_tokens: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderKind {
@@ -32,6 +49,8 @@ pub struct OpenAiClient {
     pub model: String,
     reasoning_effort: String,
     system_prompt: String,
+    prompt_cache_key: String,
+    turn_state: Arc<OnceLock<String>>,
     extensions: ExtensionRegistry,
     base_url: String,
     max_output_tokens: u64,
@@ -52,6 +71,7 @@ pub struct OpenAiClientConfig<'a> {
     pub model: String,
     pub reasoning_effort: String,
     pub system_prompt: String,
+    pub prompt_cache_key: String,
     pub extensions: ExtensionRegistry,
     pub base_url: String,
     pub max_output_tokens: u64,
@@ -103,12 +123,39 @@ pub enum StreamEvent {
         call_id: String,
         name: String,
         output: String,
+        model_output: String,
         is_error: bool,
     },
     Usage {
         input_tokens: u64,
+        cached_input_tokens: u64,
         output_tokens: u64,
         reasoning_tokens: u64,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct ToolCallRequest {
+    call_id: String,
+    name: String,
+    arguments: String,
+}
+
+struct ToolCallResult {
+    request: ToolCallRequest,
+    result: tools::ToolExecutionResult,
+}
+
+enum ParallelToolMessage {
+    Update {
+        call_id: String,
+        name: String,
+        output: String,
+    },
+    Done {
+        index: usize,
+        request: ToolCallRequest,
+        result: tools::ToolExecutionResult,
     },
 }
 
@@ -129,6 +176,8 @@ impl OpenAiClient {
             model: config.model,
             reasoning_effort: config.reasoning_effort,
             system_prompt: config.system_prompt,
+            prompt_cache_key: config.prompt_cache_key,
+            turn_state: Arc::new(OnceLock::new()),
             extensions: config.extensions,
             base_url: config.base_url,
             max_output_tokens: config.max_output_tokens,
@@ -153,6 +202,7 @@ impl OpenAiClient {
         mut emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut tool_calls_executed = 0u64;
+        let mut empty_response_continuations = 0usize;
         loop {
             if self
                 .deadline
@@ -180,27 +230,30 @@ impl OpenAiClient {
             }
 
             if function_calls.is_empty() {
+                if should_continue_after_empty_response(&output_items)
+                    && empty_response_continuations < MAX_EMPTY_RESPONSE_CONTINUATIONS
+                {
+                    empty_response_continuations += 1;
+                    input.push(runtime_reminder_item());
+                    continue;
+                }
                 return Ok(());
             }
+            empty_response_continuations = 0;
             let pending_call_ids = function_calls
                 .iter()
                 .filter_map(|call| call.get("call_id").and_then(Value::as_str))
                 .map(str::to_string)
                 .collect::<HashSet<_>>();
 
+            let mut tool_requests = Vec::new();
             for call in function_calls {
-                if let Some(max_tool_calls) = self.max_tool_calls {
-                    if tool_calls_executed >= max_tool_calls {
-                        return Err(format!("subagent exceeded tool budget ({max_tool_calls})"));
-                    }
-                }
                 if self
                     .deadline
                     .is_some_and(|deadline| Instant::now() >= deadline)
                 {
                     return Err("subagent timed out".to_string());
                 }
-                tool_calls_executed += 1;
                 let name = call
                     .get("name")
                     .and_then(Value::as_str)
@@ -214,54 +267,63 @@ impl OpenAiClient {
                 let arguments = call
                     .get("arguments")
                     .and_then(Value::as_str)
-                    .unwrap_or("{}");
-                emit(StreamEvent::ToolStart {
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                })?;
-                let result = if let Some(result) = self.run_goal_tool(&name, arguments) {
-                    result
-                } else if let Some(result) =
-                    self.run_subagent_tool(&name, arguments, cwd, &input, &pending_call_ids)
-                {
-                    result
-                } else {
-                    tools::run_tool_with_events(&name, arguments, cwd, |event| {
-                        let tools::ToolExecutionEvent::Update(output) = event;
-                        emit(StreamEvent::ToolUpdate {
-                            call_id: call_id.clone(),
-                            name: name.clone(),
-                            output,
-                        })
-                    })
-                };
-                let result = if result.is_error && result.output.contains("unknown tool") {
-                    match self.extensions.run_tool(&name, arguments, cwd) {
-                        Some((output, is_error)) => tools::ToolExecutionResult {
-                            model_output: tools::project_model_output(&name, &output, cwd),
-                            output,
-                            is_error,
-                        },
-                        None => result,
-                    }
-                } else {
-                    result
-                };
-                let output = result.output;
-                let model_output = result.model_output;
-                input.push(json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": model_output
-                }));
-                emit(StreamEvent::ToolOutput {
+                    .unwrap_or("{}")
+                    .to_string();
+                tool_requests.push(ToolCallRequest {
                     call_id,
                     name,
-                    output,
-                    is_error: result.is_error,
-                })?;
+                    arguments,
+                });
+            }
+            if let Some(max_tool_calls) = self.max_tool_calls {
+                let requested = u64::try_from(tool_requests.len()).unwrap_or(u64::MAX);
+                if tool_calls_executed.saturating_add(requested) > max_tool_calls {
+                    return Err(format!("subagent exceeded tool budget ({max_tool_calls})"));
+                }
+            }
+            tool_calls_executed = tool_calls_executed
+                .saturating_add(u64::try_from(tool_requests.len()).unwrap_or(u64::MAX));
+
+            let tool_results = if should_run_parallel_tools(&tool_requests) {
+                for request in &tool_requests {
+                    emit(StreamEvent::ToolStart {
+                        call_id: request.call_id.clone(),
+                        name: request.name.clone(),
+                    })?;
+                }
+                run_parallel_builtin_tools(&tool_requests, cwd, &mut emit)?
+            } else {
+                let mut results = Vec::new();
+                for request in tool_requests {
+                    emit(StreamEvent::ToolStart {
+                        call_id: request.call_id.clone(),
+                        name: request.name.clone(),
+                    })?;
+                    let result =
+                        self.run_tool_call(&request, cwd, &input, &pending_call_ids, &mut emit);
+                    emit_tool_output(&request, &result, &mut emit)?;
+                    results.push(ToolCallResult { request, result });
+                }
+                results
+            };
+
+            for tool_result in tool_results {
+                input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": tool_result.request.call_id,
+                    "output": tool_result.result.model_output
+                }));
             }
         }
+    }
+
+    fn max_attempts(&self) -> usize {
+        env::var("JUCODE_RETRY_ATTEMPTS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(self.retry_attempts)
+            .saturating_add(1)
+            .max(1)
     }
 
     /// One-shot summarization used for context compaction. No tools, no thinking;
@@ -380,15 +442,18 @@ impl OpenAiClient {
         let body = json!({
             "model": self.model,
             "instructions": self.system_prompt,
+            "prompt_cache_key": self.prompt_cache_key,
             "reasoning": reasoning,
             "input": sanitize_openai_input(input),
             "tools": self.tool_definitions(),
             "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "store": false,
             "stream": true
         });
 
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let max_attempts = self.retry_attempts.saturating_add(1).max(1);
+        let max_attempts = self.max_attempts();
         for attempt in 1..=max_attempts {
             let response = self.send_with_retry(&url, &body, &mut emit)?;
             emit(StreamEvent::Connected)?;
@@ -421,12 +486,12 @@ impl OpenAiClient {
                     }
                     emit(StreamEvent::ResponseItem(item.clone()))?;
                 }
-                if let Some((input_tokens, output_tokens, reasoning_tokens)) = extract_usage(&value)
-                {
+                if let Some(usage) = extract_usage(&value) {
                     emit(StreamEvent::Usage {
-                        input_tokens,
-                        output_tokens,
-                        reasoning_tokens,
+                        input_tokens: usage.input_tokens,
+                        cached_input_tokens: usage.cached_input_tokens,
+                        output_tokens: usage.output_tokens,
+                        reasoning_tokens: usage.reasoning_tokens,
                     })?;
                 }
                 return Ok(output_items);
@@ -449,10 +514,11 @@ impl OpenAiClient {
                     }
                     return Ok(output_items);
                 }
-                Err(error) if attempt < max_attempts && is_stream_decode_error(&error) => {
+                Err(error) if attempt < max_attempts && is_retryable_stream_error(&error) => {
                     emit(StreamEvent::Retrying {
                         attempt: attempt + 1,
                     })?;
+                    std::thread::sleep(retry_backoff(attempt));
                 }
                 Err(error) => return Err(error),
             }
@@ -482,7 +548,7 @@ impl OpenAiClient {
         }
 
         let url = anthropic_messages_url(&self.base_url);
-        let max_attempts = self.retry_attempts.saturating_add(1).max(1);
+        let max_attempts = self.max_attempts();
         for attempt in 1..=max_attempts {
             let response = self.send_with_retry(&url, &body, &mut emit)?;
             emit(StreamEvent::Connected)?;
@@ -520,10 +586,11 @@ impl OpenAiClient {
                     }
                     return Ok(output_items);
                 }
-                Err(error) if attempt < max_attempts && is_stream_decode_error(&error) => {
+                Err(error) if attempt < max_attempts && is_retryable_stream_error(&error) => {
                     emit(StreamEvent::Retrying {
                         attempt: attempt + 1,
                     })?;
+                    std::thread::sleep(retry_backoff(attempt));
                 }
                 Err(error) => return Err(error),
             }
@@ -543,20 +610,44 @@ impl OpenAiClient {
             .timeout_connect(self.connect_timeout)
             .timeout_read(self.read_timeout)
             .build();
-        let max_attempts = self.retry_attempts.saturating_add(1).max(1);
+        let max_attempts = self.max_attempts();
         for attempt in 1..=max_attempts {
-            let result = agent
+            let mut request = agent
                 .post(url)
                 .set("Authorization", &format!("Bearer {}", self.api_key))
                 .set("Accept", "text/event-stream")
                 .set("Content-Type", "application/json")
-                .send_json(body.clone());
+                .set("session-id", &self.prompt_cache_key)
+                .set("thread-id", &self.prompt_cache_key)
+                .set("x-client-request-id", &self.prompt_cache_key);
+            if let Some(turn_state) = self.turn_state.get() {
+                request = request.set(X_CODEX_TURN_STATE_HEADER, turn_state);
+            }
+            if cache_debug_enabled() {
+                eprintln!(
+                    "[jucode-cache] send provider={:?} turn_state={}",
+                    self.provider_kind,
+                    self.turn_state.get().is_some()
+                );
+            }
+            let result = request.send_json(body.clone());
             match result {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    let saw_turn_state = capture_turn_state(&response, &self.turn_state);
+                    if cache_debug_enabled() {
+                        eprintln!(
+                            "[jucode-cache] response turn_state_header={} turn_state_stored={}",
+                            saw_turn_state,
+                            self.turn_state.get().is_some()
+                        );
+                    }
+                    return Ok(response);
+                }
                 Err(error) if attempt < max_attempts && is_retryable_error(&error) => {
                     emit(StreamEvent::Retrying {
                         attempt: attempt + 1,
                     })?;
+                    std::thread::sleep(retry_backoff(attempt));
                 }
                 Err(error) => return handle_response_error(error),
             }
@@ -621,6 +712,51 @@ impl OpenAiClient {
         })
     }
 
+    fn run_tool_call(
+        &self,
+        request: &ToolCallRequest,
+        cwd: &Path,
+        input: &[Value],
+        pending_call_ids: &HashSet<String>,
+        emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
+    ) -> tools::ToolExecutionResult {
+        let result = if let Some(result) = self.run_goal_tool(&request.name, &request.arguments) {
+            result
+        } else if let Some(result) = self.run_subagent_tool(
+            &request.name,
+            &request.arguments,
+            cwd,
+            input,
+            pending_call_ids,
+        ) {
+            result
+        } else {
+            tools::run_tool_with_events(&request.name, &request.arguments, cwd, |event| {
+                let tools::ToolExecutionEvent::Update(output) = event;
+                emit(StreamEvent::ToolUpdate {
+                    call_id: request.call_id.clone(),
+                    name: request.name.clone(),
+                    output,
+                })
+            })
+        };
+        if result.is_error && result.output.contains("unknown tool") {
+            match self
+                .extensions
+                .run_tool(&request.name, &request.arguments, cwd)
+            {
+                Some((output, is_error)) => tools::ToolExecutionResult {
+                    model_output: tools::project_model_output(&request.name, &output, cwd),
+                    output,
+                    is_error,
+                },
+                None => result,
+            }
+        } else {
+            result
+        }
+    }
+
     fn spawn_agent(
         &self,
         arguments: &str,
@@ -678,7 +814,7 @@ impl OpenAiClient {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or("all")
+            .unwrap_or("1")
             .to_string();
         validate_fork_turns(&fork_turns)?;
         let child_depth = self.agent_depth.saturating_add(1);
@@ -701,6 +837,8 @@ impl OpenAiClient {
             model: model.clone(),
             reasoning_effort,
             system_prompt: subagent_system_prompt(&self.system_prompt, &child_path),
+            prompt_cache_key: self.prompt_cache_key.clone(),
+            turn_state: Arc::clone(&self.turn_state),
             extensions: self.extensions.clone(),
             base_url: self.base_url.clone(),
             max_output_tokens,
@@ -723,6 +861,7 @@ impl OpenAiClient {
             let mut tool_iters = 0u64;
             let mut tools_used: Vec<String> = Vec::new();
             let mut input_tokens = 0u64;
+            let mut cached_input_tokens = 0u64;
             let mut output_tokens = 0u64;
             let result = child.run_turn_events(child_input, &child_cwd, |event| {
                 if slot
@@ -739,10 +878,12 @@ impl OpenAiClient {
                     }
                     StreamEvent::Usage {
                         input_tokens: input,
+                        cached_input_tokens: cached,
                         output_tokens: output,
                         ..
                     } => {
                         input_tokens += input;
+                        cached_input_tokens += cached;
                         output_tokens += output;
                     }
                     _ => {}
@@ -756,6 +897,7 @@ impl OpenAiClient {
                 tool_calls: tool_iters,
                 tools_used,
                 input_tokens,
+                cached_input_tokens,
                 output_tokens,
                 elapsed_ms,
                 model,
@@ -914,7 +1056,7 @@ fn subagent_definitions() -> Vec<Value> {
                     },
                     "fork_turns": {
                         "type": "string",
-                        "description": "Context to fork into the subagent: all (default), none, or a positive integer string for the last N user turns."
+                        "description": "Context to fork into the subagent: 1 (default), all, none, or a positive integer string for the last N user turns."
                     },
                     "model": {
                         "type": "string",
@@ -1013,6 +1155,119 @@ fn json_tool_result(value: Value, is_error: bool) -> tools::ToolExecutionResult 
         output,
         is_error,
     }
+}
+
+fn is_parallel_safe_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read"
+            | "ls"
+            | "ripgrep"
+            | "outline"
+            | "bash"
+            | "execute"
+            | "exec_command"
+            | "shell_command"
+    )
+}
+
+fn should_run_parallel_tools(requests: &[ToolCallRequest]) -> bool {
+    requests.len() > 1
+        && requests
+            .iter()
+            .all(|request| is_parallel_safe_tool(&request.name))
+}
+
+fn run_parallel_builtin_tools(
+    requests: &[ToolCallRequest],
+    cwd: &Path,
+    emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
+) -> Result<Vec<ToolCallResult>, String> {
+    let (tx, rx) = mpsc::channel();
+    let mut handles = Vec::new();
+
+    for (index, request) in requests.iter().cloned().enumerate() {
+        let tx = tx.clone();
+        let cwd = cwd.to_path_buf();
+        handles.push(thread::spawn(move || {
+            let result = tools::run_tool_with_events(&request.name, &request.arguments, &cwd, {
+                let tx = tx.clone();
+                let call_id = request.call_id.clone();
+                let name = request.name.clone();
+                move |event| {
+                    let tools::ToolExecutionEvent::Update(output) = event;
+                    tx.send(ParallelToolMessage::Update {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        output,
+                    })
+                    .map_err(|error| error.to_string())
+                }
+            });
+            let _ = tx.send(ParallelToolMessage::Done {
+                index,
+                request,
+                result,
+            });
+        }));
+    }
+    drop(tx);
+
+    let mut completed = Vec::new();
+    while completed.len() < requests.len() {
+        match rx.recv() {
+            Ok(ParallelToolMessage::Update {
+                call_id,
+                name,
+                output,
+            }) => emit(StreamEvent::ToolUpdate {
+                call_id,
+                name,
+                output,
+            })?,
+            Ok(ParallelToolMessage::Done {
+                index,
+                request,
+                result,
+            }) => completed.push((index, ToolCallResult { request, result })),
+            Err(error) => {
+                for handle in handles {
+                    let _ = handle.join();
+                }
+                return Err(format!("parallel tool worker failed: {error}"));
+            }
+        }
+    }
+
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| "parallel tool worker panicked".to_string())?;
+    }
+
+    completed.sort_by_key(|(index, _)| *index);
+    let results = completed
+        .into_iter()
+        .map(|(_, result)| result)
+        .collect::<Vec<_>>();
+    for result in &results {
+        emit_tool_output(&result.request, &result.result, emit)?;
+    }
+    Ok(results)
+}
+
+fn emit_tool_output(
+    request: &ToolCallRequest,
+    result: &tools::ToolExecutionResult,
+    emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
+) -> Result<(), String> {
+    emit(StreamEvent::ToolOutput {
+        call_id: request.call_id.clone(),
+        name: request.name.clone(),
+        output: result.output.clone(),
+        model_output: result.model_output.clone(),
+        is_error: result.is_error,
+    })
 }
 
 fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -1323,12 +1578,50 @@ fn response_content_text(item: &Value, preferred_type: &str) -> String {
         .join("")
 }
 
+fn should_continue_after_empty_response(output_items: &[Value]) -> bool {
+    output_items.iter().all(|item| {
+        item.get("type").and_then(Value::as_str) != Some("function_call")
+            && extract_response_text(item).trim().is_empty()
+    })
+}
+
+fn runtime_reminder_item() -> Value {
+    json!({
+        "role": "user",
+        "content": [{ "type": "input_text", "text": EMPTY_RESPONSE_REMINDER }]
+    })
+}
+
 /// Retry on transport errors (timeouts, dropped connections, DNS) and on 5xx
 /// responses. 4xx responses are client errors and are never retried.
 fn is_retryable_error(error: &ureq::Error) -> bool {
     match error {
         ureq::Error::Status(code, _) => *code >= 500,
         ureq::Error::Transport(_) => true,
+    }
+}
+
+fn retry_backoff(attempt: usize) -> Duration {
+    let multiplier = 1u64 << attempt.saturating_sub(1).min(4);
+    Duration::from_millis((RETRY_BACKOFF_BASE_MS * multiplier).min(RETRY_BACKOFF_MAX_MS))
+}
+
+fn cache_debug_enabled() -> bool {
+    env::var("JUCODE_CACHE_DEBUG")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn capture_turn_state(response: &ureq::Response, turn_state: &OnceLock<String>) -> bool {
+    if let Some(value) = response
+        .header(X_CODEX_TURN_STATE_HEADER)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let _ = turn_state.set(value.to_string());
+        true
+    } else {
+        false
     }
 }
 
@@ -1345,8 +1638,13 @@ fn is_stream_decode_error(message: &str) -> bool {
         "connection reset",
         "connection closed",
         "connection aborted",
+        "peer closed connection",
         "broken pipe",
+        "tls close_notify",
+        "stream closed before response.completed",
+        "unexpected end of file",
         "unexpected eof",
+        "unexpected-eof",
         "eof while",
         "io error",
     ]
@@ -1354,12 +1652,52 @@ fn is_stream_decode_error(message: &str) -> bool {
     .any(|needle| message.contains(needle))
 }
 
+fn is_retryable_stream_error(message: &str) -> bool {
+    is_stream_decode_error(message) || is_retryable_response_failed(message)
+}
+
+fn is_retryable_response_failed(message: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(message) else {
+        return false;
+    };
+    if value.get("type").and_then(Value::as_str) != Some("response.failed") {
+        return false;
+    }
+    let error = value
+        .get("response")
+        .and_then(|response| response.get("error"));
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let detail = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    code == "upstream_error" || detail.contains("upstream request failed")
+}
+
 fn sanitize_openai_input(input: Vec<Value>) -> Vec<Value> {
-    // Anthropic-only "thinking" items are not valid OpenAI Responses input.
     input
         .into_iter()
-        .filter(|item| item.get("type").and_then(Value::as_str) != Some("thinking"))
+        .filter_map(sanitize_openai_input_item)
         .collect()
+}
+
+fn sanitize_openai_input_item(mut item: Value) -> Option<Value> {
+    // Anthropic-only "thinking" items are not valid OpenAI Responses input.
+    if item.get("type").and_then(Value::as_str) == Some("thinking") {
+        return None;
+    }
+    // Response item ids are service-owned metadata. Replaying them makes the
+    // request prefix less stable and differs from Codex, which does not
+    // serialize ids back into Responses input.
+    if let Value::Object(map) = &mut item {
+        map.remove("id");
+    }
+    Some(item)
 }
 
 /// Maps a reasoning effort to an Anthropic extended-thinking token budget.
@@ -1380,6 +1718,7 @@ fn read_sse_output(
 ) -> Result<Vec<Value>, String> {
     let mut output_items = Vec::new();
     let mut data_lines = Vec::new();
+    let mut completed = false;
     let reader = BufReader::new(reader);
 
     for line in reader.lines() {
@@ -1396,6 +1735,7 @@ fn read_sse_output(
                 break;
             }
             if handle_sse_data(&data, &mut emit, &mut output_items)? {
+                completed = true;
                 break;
             }
         }
@@ -1404,8 +1744,12 @@ fn read_sse_output(
     if !data_lines.is_empty() {
         let data = data_lines.join("\n");
         if data != "[DONE]" {
-            let _ = handle_sse_data(&data, &mut emit, &mut output_items)?;
+            completed = handle_sse_data(&data, &mut emit, &mut output_items)?;
         }
+    }
+
+    if !completed {
+        return Err("stream closed before response.completed".to_string());
     }
 
     Ok(output_items)
@@ -1440,13 +1784,12 @@ fn handle_sse_data(
         }
         "response.completed" if output_items.is_empty() => {
             if let Some(response) = event.get("response") {
-                if let Some((input_tokens, output_tokens, reasoning_tokens)) =
-                    extract_usage(response)
-                {
+                if let Some(usage) = extract_usage(response) {
                     emit(StreamEvent::Usage {
-                        input_tokens,
-                        output_tokens,
-                        reasoning_tokens,
+                        input_tokens: usage.input_tokens,
+                        cached_input_tokens: usage.cached_input_tokens,
+                        output_tokens: usage.output_tokens,
+                        reasoning_tokens: usage.reasoning_tokens,
                     })?;
                 }
             }
@@ -1464,13 +1807,12 @@ fn handle_sse_data(
         }
         "response.completed" => {
             if let Some(response) = event.get("response") {
-                if let Some((input_tokens, output_tokens, reasoning_tokens)) =
-                    extract_usage(response)
-                {
+                if let Some(usage) = extract_usage(response) {
                     emit(StreamEvent::Usage {
-                        input_tokens,
-                        output_tokens,
-                        reasoning_tokens,
+                        input_tokens: usage.input_tokens,
+                        cached_input_tokens: usage.cached_input_tokens,
+                        output_tokens: usage.output_tokens,
+                        reasoning_tokens: usage.reasoning_tokens,
                     })?;
                 }
             }
@@ -1489,6 +1831,7 @@ struct AnthropicStreamState {
     output_items: Vec<Value>,
     blocks: BTreeMap<u64, AnthropicBlock>,
     input_tokens: u64,
+    cached_input_tokens: u64,
     output_tokens: u64,
 }
 
@@ -1545,10 +1888,15 @@ fn handle_anthropic_sse_data(
         .unwrap_or_default()
     {
         "message_start" => {
-            state.input_tokens = event
+            let usage = event
                 .get("message")
-                .and_then(|message| message.get("usage"))
+                .and_then(|message| message.get("usage"));
+            state.input_tokens = usage
                 .and_then(|usage| usage.get("input_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            state.cached_input_tokens = usage
+                .and_then(|usage| usage.get("cache_read_input_tokens"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
         }
@@ -1641,6 +1989,7 @@ fn handle_anthropic_sse_data(
         "message_stop" => {
             emit(StreamEvent::Usage {
                 input_tokens: state.input_tokens,
+                cached_input_tokens: state.cached_input_tokens,
                 output_tokens: state.output_tokens,
                 reasoning_tokens: 0,
             })?;
@@ -1676,6 +2025,10 @@ fn emit_anthropic_message(
         emit(StreamEvent::Usage {
             input_tokens: usage
                 .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            cached_input_tokens: usage
+                .get("cache_read_input_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
             output_tokens: usage
@@ -1757,16 +2110,32 @@ fn normalized_arguments(arguments: &str) -> String {
     }
 }
 
-fn extract_usage(value: &Value) -> Option<(u64, u64, u64)> {
+fn extract_usage(value: &Value) -> Option<UsageTokens> {
     let usage = value.get("usage")?;
     let input_tokens = usage.get("input_tokens").and_then(Value::as_u64)?;
     let output_tokens = usage.get("output_tokens").and_then(Value::as_u64)?;
+    let cached_input_tokens = usage
+        .get("cached_input_tokens")
+        .or_else(|| usage.get("cached_prompt_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .get("input_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0);
     let reasoning_tokens = usage
         .get("output_tokens_details")
         .and_then(|details| details.get("reasoning_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    Some((input_tokens, output_tokens, reasoning_tokens))
+    Some(UsageTokens {
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        reasoning_tokens,
+    })
 }
 
 fn truncate_error_body(body: &str) -> String {
@@ -1782,6 +2151,10 @@ fn truncate_error_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn converts_responses_context_to_anthropic_messages() {
@@ -1862,17 +2235,22 @@ mod tests {
         let sse = concat!(
             "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking...\"}\n\n",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":7,\"output_tokens_details\":{\"reasoning_tokens\":4}}}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":2},\"output_tokens\":7,\"output_tokens_details\":{\"reasoning_tokens\":4}}}}\n\n",
         );
         let mut reasoning = String::new();
+        let mut cached_input_tokens = 0;
         let mut reasoning_tokens = 0;
         let _ = read_sse_output(sse.as_bytes(), |event| {
             match event {
                 StreamEvent::ReasoningDelta(delta) => reasoning.push_str(&delta),
                 StreamEvent::Usage {
+                    cached_input_tokens: cached,
                     reasoning_tokens: tokens,
                     ..
-                } => reasoning_tokens = tokens,
+                } => {
+                    cached_input_tokens = cached;
+                    reasoning_tokens = tokens;
+                }
                 _ => {}
             }
             Ok(())
@@ -1880,7 +2258,148 @@ mod tests {
         .unwrap();
 
         assert_eq!(reasoning, "thinking...");
+        assert_eq!(cached_input_tokens, 2);
         assert_eq!(reasoning_tokens, 4);
+    }
+
+    #[test]
+    fn openai_input_sanitizer_removes_service_ids_and_anthropic_thinking() {
+        let input = vec![
+            json!({
+                "type": "reasoning",
+                "id": "rs_123",
+                "summary": [],
+                "encrypted_content": "enc"
+            }),
+            json!({
+                "type": "function_call",
+                "id": "fc_123",
+                "call_id": "call_1",
+                "name": "read",
+                "arguments": "{}"
+            }),
+            json!({ "type": "thinking", "thinking": "anthropic-only", "signature": "sig" }),
+        ];
+
+        let sanitized = sanitize_openai_input(input);
+
+        assert_eq!(sanitized.len(), 2);
+        assert!(sanitized[0].get("id").is_none());
+        assert_eq!(sanitized[0]["type"], "reasoning");
+        assert_eq!(sanitized[0]["encrypted_content"], "enc");
+        assert!(sanitized[1].get("id").is_none());
+        assert_eq!(sanitized[1]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn empty_non_tool_response_requests_runtime_reminder() {
+        assert!(should_continue_after_empty_response(&[]));
+        assert!(should_continue_after_empty_response(&[json!({
+            "type": "reasoning",
+            "summary": []
+        })]));
+        assert!(!should_continue_after_empty_response(&[json!({
+            "type": "message",
+            "content": [{ "type": "output_text", "text": "done" }]
+        })]));
+        assert!(!should_continue_after_empty_response(&[json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "ls",
+            "arguments": "{}"
+        })]));
+    }
+
+    #[test]
+    fn runtime_reminder_is_user_context_item() {
+        let item = runtime_reminder_item();
+
+        assert_eq!(item["role"], "user");
+        assert!(item["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("do not end after exploration alone"));
+    }
+
+    #[test]
+    fn parallel_policy_requires_multiple_safe_builtin_tools() {
+        let read = ToolCallRequest {
+            call_id: "read_1".to_string(),
+            name: "read".to_string(),
+            arguments: "{}".to_string(),
+        };
+        let rg = ToolCallRequest {
+            call_id: "rg_1".to_string(),
+            name: "ripgrep".to_string(),
+            arguments: "{}".to_string(),
+        };
+        let write = ToolCallRequest {
+            call_id: "write_1".to_string(),
+            name: "write".to_string(),
+            arguments: "{}".to_string(),
+        };
+        let subagent = ToolCallRequest {
+            call_id: "agent_1".to_string(),
+            name: "spawn_agent".to_string(),
+            arguments: "{}".to_string(),
+        };
+
+        assert!(should_run_parallel_tools(&[read.clone(), rg]));
+        assert!(!should_run_parallel_tools(&[read.clone()]));
+        assert!(!should_run_parallel_tools(&[read.clone(), write]));
+        assert!(!should_run_parallel_tools(&[read, subagent]));
+    }
+
+    #[test]
+    fn parallel_builtin_tools_run_concurrently_and_preserve_output_order() {
+        let dir = test_dir("parallel-tools");
+        fs::create_dir_all(&dir).unwrap();
+        let (wait_command, touch_command) = if cfg!(windows) {
+            (
+                "while (-not (Test-Path ready)) { Start-Sleep -Milliseconds 50 }; Write-Output first",
+                "Start-Sleep -Milliseconds 100; New-Item -ItemType File ready | Out-Null; Write-Output second",
+            )
+        } else {
+            (
+                "while [ ! -f ready ]; do sleep 0.05; done; echo first",
+                "sleep 0.1; touch ready; echo second",
+            )
+        };
+        let requests = vec![
+            ToolCallRequest {
+                call_id: "first".to_string(),
+                name: "exec_command".to_string(),
+                arguments: json!({ "cmd": wait_command, "timeout": 3 }).to_string(),
+            },
+            ToolCallRequest {
+                call_id: "second".to_string(),
+                name: "exec_command".to_string(),
+                arguments: json!({ "cmd": touch_command, "timeout": 3 }).to_string(),
+            },
+        ];
+        let mut events = Vec::new();
+
+        let results = run_parallel_builtin_tools(&requests, &dir, &mut |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(results[0].request.call_id, "first");
+        assert_eq!(results[1].request.call_id, "second");
+        assert!(!results[0].result.is_error, "{}", results[0].result.output);
+        assert!(!results[1].result.is_error, "{}", results[1].result.output);
+        assert!(results[0].result.output.contains("first"));
+        assert!(results[1].result.output.contains("second"));
+        let output_call_ids = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolOutput { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(output_call_ids, ["first", "second"]);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1888,10 +2407,63 @@ mod tests {
         assert!(is_stream_decode_error("Error while decoding chunks"));
         assert!(is_stream_decode_error("connection reset by peer"));
         assert!(is_stream_decode_error("the operation timed out"));
+        assert!(is_stream_decode_error(
+            "peer closed connection without sending TLS close_notify"
+        ));
+        assert!(is_stream_decode_error(
+            "https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
+        ));
+        assert!(is_stream_decode_error(
+            "tls connection init failed: unexpected end of file"
+        ));
+        assert!(is_stream_decode_error(
+            "stream closed before response.completed"
+        ));
+        assert!(is_retryable_stream_error(
+            r#"{"type":"response.failed","response":{"error":{"code":"upstream_error","message":"Upstream request failed"}}}"#
+        ));
         assert!(!is_stream_decode_error(
             "{\"type\":\"response.failed\",\"response\":{}}"
         ));
+        assert!(!is_retryable_stream_error(
+            r#"{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"bad request"}}}"#
+        ));
         assert!(!is_stream_decode_error("expected value at line 1 column 1"));
+    }
+
+    #[test]
+    fn captures_codex_turn_state_once() {
+        let turn_state = OnceLock::new();
+        let response: ureq::Response = "HTTP/1.1 200 OK\r\n\
+             x-codex-turn-state: sticky-1\r\n\
+             \r\n"
+            .parse()
+            .unwrap();
+
+        capture_turn_state(&response, &turn_state);
+
+        assert_eq!(turn_state.get().map(String::as_str), Some("sticky-1"));
+
+        let response: ureq::Response = "HTTP/1.1 200 OK\r\n\
+             x-codex-turn-state: sticky-2\r\n\
+             \r\n"
+            .parse()
+            .unwrap();
+
+        capture_turn_state(&response, &turn_state);
+
+        assert_eq!(turn_state.get().map(String::as_str), Some("sticky-1"));
+    }
+
+    #[test]
+    fn openai_stream_without_completed_is_an_error() {
+        let error = read_sse_output(
+            "data: {\"type\":\"response.created\"}\n\n".as_bytes(),
+            |_| Ok(()),
+        )
+        .expect_err("stream without response.completed should fail");
+
+        assert!(error.contains("stream closed before response.completed"));
     }
 
     #[test]
@@ -1904,6 +2476,15 @@ mod tests {
             500,
             ureq::Response::new(500, "Server Error", "").unwrap()
         )));
+    }
+
+    #[test]
+    fn retry_backoff_increases_and_caps() {
+        assert_eq!(retry_backoff(1), Duration::from_millis(250));
+        assert_eq!(retry_backoff(2), Duration::from_millis(500));
+        assert_eq!(retry_backoff(3), Duration::from_millis(1000));
+        assert_eq!(retry_backoff(5), Duration::from_millis(4000));
+        assert_eq!(retry_backoff(99), Duration::from_millis(4000));
     }
 
     #[test]
@@ -1941,5 +2522,70 @@ mod tests {
             anthropic_messages_url("https://api.jucode.cn/anthropic"),
             "https://api.jucode.cn/anthropic/v1/messages"
         );
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("jucode-llm-test-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn builds_subagent_input_from_last_user_turn_by_default() {
+        let input = vec![
+            json!({
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "old task" }]
+            }),
+            json!({ "type": "message", "content": [{ "type": "output_text", "text": "old answer" }] }),
+            json!({
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "recent task" }]
+            }),
+            json!({ "type": "function_call", "call_id": "pending_1", "name": "spawn_agent", "arguments": "{}" }),
+            json!({ "type": "function_call_output", "call_id": "done_1", "output": "done output" }),
+        ];
+        let pending_call_ids = HashSet::from(["pending_1".to_string()]);
+
+        let forked =
+            build_subagent_input(&input, &pending_call_ids, "1", "/root/child", "inspect").unwrap();
+
+        assert_eq!(forked.len(), 3);
+        assert_eq!(
+            response_content_text(&forked[0], "input_text"),
+            "recent task"
+        );
+        assert_eq!(forked[1]["call_id"], "done_1");
+        assert!(response_content_text(&forked[2], "input_text").contains("inspect"));
+        assert!(!forked.iter().any(|item| item["call_id"] == "pending_1"));
+    }
+
+    #[test]
+    fn builds_subagent_input_for_all_and_none_modes() {
+        let input = vec![
+            json!({
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "first" }]
+            }),
+            json!({
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "second" }]
+            }),
+        ];
+        let pending_call_ids = HashSet::new();
+
+        let all = build_subagent_input(&input, &pending_call_ids, "all", "/root/child", "inspect")
+            .unwrap();
+        let none =
+            build_subagent_input(&input, &pending_call_ids, "none", "/root/child", "inspect")
+                .unwrap();
+
+        assert_eq!(all.len(), 3);
+        assert_eq!(response_content_text(&all[0], "input_text"), "first");
+        assert_eq!(response_content_text(&all[1], "input_text"), "second");
+        assert_eq!(none.len(), 1);
+        assert!(response_content_text(&none[0], "input_text").contains("inspect"));
     }
 }

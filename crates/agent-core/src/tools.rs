@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
@@ -17,8 +18,18 @@ use std::{
 
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 60;
 const MAX_IMAGE_READ_BYTES: u64 = 1024 * 1024;
+const LARGE_TEXT_READ_SOFT_BYTES: u64 = 256 * 1024;
+const LARGE_RIPGREP_OUTPUT_SOFT_LINES: usize = 200;
+const LARGE_RIPGREP_OUTPUT_SOFT_BYTES: usize = 128 * 1024;
+const COMMAND_OUTPUT_MAX_LINES: usize = 3_000;
+const COMMAND_OUTPUT_MAX_BYTES: usize = 128 * 1024;
 const COMMAND_UPDATE_INTERVAL: Duration = Duration::from_millis(500);
 const HASHLINE_ALPHABET: &[u8; 16] = b"ZPMQVRWSNKTXJBYH";
+const READ_MODEL_CONTENT_OMIT_THRESHOLD: usize = 1024;
+const READ_MODEL_HASHLINES_LIMIT: usize = 8 * 1024;
+const DIFF_MODEL_OUTPUT_INLINE_LIMIT: usize = 8 * 1024;
+const MODEL_OUTPUT_INLINE_LIMIT: usize = 16 * 1024;
+const MODEL_OUTPUT_FIELD_LIMIT: usize = 4 * 1024;
 
 pub struct ToolExecutionResult {
     pub output: String,
@@ -31,11 +42,11 @@ pub enum ToolExecutionEvent {
 }
 
 pub fn definitions() -> Vec<Value> {
-    vec![
+    with_function_tool_defaults(vec![
         json!({
             "type": "function",
             "name": "read",
-            "description": "Read a text file, image, or binary file metadata. Text supports 1-indexed offset and line limit. Images return base64 when small enough.",
+            "description": "Read a text file, image, or binary file metadata. Text supports 1-indexed offset and line limit. Prefer offset/limit for large files; broad reads return a soft warning instead of being blocked. Safe to call in parallel with other read-only tools.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -50,7 +61,7 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "name": "str_replace",
-            "description": "Apply one or more exact targeted text replacements to a UTF-8 file. The file must be read first, and each oldText must match exactly once in the current file.",
+            "description": "Apply one or more exact targeted text replacements to a UTF-8 file. The file must be read first, and each oldText must match exactly once in the current file. Combine multiple edits for the same file in one call.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -76,7 +87,7 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "name": "hashline_edit",
-            "description": "Patch one UTF-8 file using LINE#HASH anchors from the most recent read output. Supports replace, append, and prepend line edits.",
+            "description": "Patch one UTF-8 file using LINE#HASH anchors from the most recent read output. Supports replace, append, and prepend line edits. Prefer this after read() when exact oldText is awkward.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -110,7 +121,7 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "name": "write",
-            "description": "Overwrite a UTF-8 file with full content. The file must be read first.",
+            "description": "Write full UTF-8 file content. Creates new files without a prior read; existing files must be read first before overwriting. Prefer for greenfield files or full-file rewrites.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -123,12 +134,26 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "type": "function",
+            "name": "apply_patch",
+            "description": "Apply a unified git diff patch to the current workspace. Use this for multi-file edits when exact replacement tools are awkward. If a patch fails, inspect the error and retry with a corrected minimal patch.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patch": { "type": "string", "description": "Unified diff text accepted by git apply." }
+                },
+                "required": ["patch"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
             "name": "bash",
-            "description": "Run a shell command in the current workspace. Returns exit code, stdout, stderr, timeout state, and truncation state.",
+            "description": "Run a shell command in the workspace. Returns exit code, stdout, stderr, timeout state, truncation state, or a session_id for long-running commands. Prefer commands that narrow output with paths, filters, or limits. Group dependent shell checks into one command when that reduces round trips; issue independent bash/read/ripgrep calls in the same assistant response when possible.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "Shell command to run." },
+                    "workdir": { "type": "string", "description": "Working directory for the command. Relative paths are resolved from the current workspace. Defaults to current workspace." },
                     "timeout": { "type": "number", "description": "Timeout in seconds. Defaults to 60." },
                     "yield_time_ms": { "type": "number", "description": "Return early after this many milliseconds if the command is still running. Use for dev servers, watchers, and long tasks." }
                 },
@@ -138,13 +163,33 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "type": "function",
+            "name": "exec_command",
+            "description": "Codex-compatible shell execution alias. Runs a shell command and returns output or a session_id for ongoing interaction. Use it like bash; prefer this name when following Codex-style command plans. Prefer specific paths, globs, head/tail, or tool-native limits for large outputs; broad output returns a soft warning. Independent exec_command calls may be emitted together in one assistant response.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cmd": { "type": "string", "description": "Shell command to execute." },
+                    "workdir": { "type": "string", "description": "Working directory for the command. Relative paths are resolved from the current workspace. Defaults to current workspace." },
+                    "timeout": { "type": "number", "description": "Timeout in seconds. Defaults to 60." },
+                    "yield_time_ms": { "type": "number", "description": "Return early after this many milliseconds if the command is still running." },
+                    "max_output_tokens": { "type": "number", "description": "Optional compatibility hint. JuCode may still project very large outputs through its global output budget." },
+                    "tty": { "type": "boolean", "description": "Compatibility hint accepted for Codex-style calls; JuCode command execution does not require it." },
+                    "login": { "type": "boolean", "description": "Compatibility hint accepted for Codex-style calls; JuCode uses its configured shell invocation." }
+                },
+                "required": ["cmd"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
             "name": "write_stdin",
-            "description": "Send input to a running bash session or poll it. Use the session_id returned by bash.",
+            "description": "Send input to a running bash/exec_command session or poll it. Use the session_id returned by bash or exec_command.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "number", "description": "Running bash session id." },
                     "text": { "type": "string", "description": "Text to write to stdin. Omit or pass empty text to only poll." },
+                    "chars": { "type": "string", "description": "Codex-compatible alias for text." },
                     "yield_time_ms": { "type": "number", "description": "Milliseconds to wait for more output. Defaults to 1000." }
                 },
                 "required": ["session_id"],
@@ -153,20 +198,8 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "type": "function",
-            "name": "diff",
-            "description": "Show workspace changes in git diff format. Optionally restrict to one path.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Optional file or directory path to diff." }
-                },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "type": "function",
             "name": "ls",
-            "description": "List directory contents sorted alphabetically. Directories have a trailing slash.",
+            "description": "List directory contents sorted alphabetically. Directories have a trailing slash. Safe to call in parallel with other read-only exploration tools.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -179,7 +212,7 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "name": "ripgrep",
-            "description": "Search file contents with ripgrep (rg). Respects .gitignore by default and returns matching lines with paths and line numbers.",
+            "description": "Search file contents with ripgrep (rg). Respects .gitignore by default and returns matching lines with paths and line numbers. Prefer a narrow path/glob or limit for broad patterns; large result sets return a soft warning. Use multiple ripgrep calls in one response for independent search hypotheses.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -198,7 +231,7 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "name": "outline",
-            "description": "Return a lightweight symbol outline for a source file without reading the full body.",
+            "description": "Return a lightweight symbol outline for a source file without reading the full body. Safe to call in parallel with other read-only tools.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -225,7 +258,18 @@ pub fn definitions() -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
-    ]
+    ])
+}
+
+fn with_function_tool_defaults(mut definitions: Vec<Value>) -> Vec<Value> {
+    for definition in &mut definitions {
+        if definition.get("type").and_then(Value::as_str) == Some("function") {
+            if let Some(map) = definition.as_object_mut() {
+                map.entry("strict").or_insert(json!(false));
+            }
+        }
+    }
+    definitions
 }
 
 #[cfg(test)]
@@ -256,10 +300,9 @@ pub fn run_tool_with_events(
         "str_replace" | "edit" => str_replace_file(&args, cwd),
         "hashline_edit" => hashline_edit_file(&args, cwd),
         "write" => write_file(&args, cwd),
-        "bash" | "execute" => bash(&args, cwd, &mut emit),
+        "bash" | "execute" | "exec_command" | "shell_command" => bash(&args, cwd, &mut emit),
         "write_stdin" => write_stdin(&args),
         "apply_patch" => apply_patch(&args, cwd, &mut emit),
-        "diff" => diff_workspace(&args, cwd),
         "ls" => list_dir(&args, cwd),
         "ripgrep" => ripgrep(&args, cwd),
         "outline" => outline_file(&args, cwd),
@@ -284,6 +327,15 @@ fn tool_result(name: &str, value: Value, cwd: &Path) -> ToolExecutionResult {
                 .unwrap_or(false),
         output,
         model_output,
+    }
+}
+
+fn add_soft_hint(value: &mut Value, warning: &str, suggestion: &str) {
+    if let Value::Object(map) = value {
+        map.entry("warning".to_string())
+            .or_insert_with(|| json!(warning));
+        map.entry("suggestion".to_string())
+            .or_insert_with(|| json!(suggestion));
     }
 }
 
@@ -370,7 +422,7 @@ fn read_file(args: &Value, cwd: &Path) -> Value {
     }
     mark_read(&path);
 
-    json!({
+    let mut value = json!({
         "path": path.display().to_string(),
         "kind": "text",
         "encoding": encoding,
@@ -379,7 +431,15 @@ fn read_file(args: &Value, cwd: &Path) -> Value {
         "truncated": truncated,
         "content": content,
         "hashlines": hashlines,
-    })
+    });
+    if limit.is_none() && metadata.len() > LARGE_TEXT_READ_SOFT_BYTES {
+        add_soft_hint(
+            &mut value,
+            "large file read without a line limit",
+            "Use read with offset/limit, outline, or ripgrep to narrow the next read unless the full file is required.",
+        );
+    }
+    value
 }
 
 fn str_replace_file(args: &Value, cwd: &Path) -> Value {
@@ -557,13 +617,18 @@ fn write_file(args: &Value, cwd: &Path) -> Value {
     };
 
     let path = resolve_path(cwd, path);
-    if !has_read(&path) {
+    let exists = path.exists();
+    if exists && !has_read(&path) {
         return json!({
             "path": path.display().to_string(),
-            "error": "write requires reading this file first before overwriting it"
+            "error": "write requires reading an existing file first before overwriting it; new files can be written without a prior read"
         });
     }
-    let original = fs::read_to_string(&path).unwrap_or_default();
+    let original = if exists {
+        fs::read_to_string(&path).unwrap_or_default()
+    } else {
+        String::new()
+    };
     if let Some(parent) = path.parent() {
         if let Err(error) = fs::create_dir_all(parent) {
             return json!({ "path": path.display().to_string(), "error": error.to_string() });
@@ -1098,8 +1163,16 @@ fn bash(
     cwd: &Path,
     emit: &mut impl FnMut(ToolExecutionEvent) -> Result<(), String>,
 ) -> Value {
-    let Some(command) = args.get("command").and_then(Value::as_str) else {
-        return json!({ "error": "missing command" });
+    let Some(command) = args
+        .get("command")
+        .or_else(|| args.get("cmd"))
+        .and_then(Value::as_str)
+    else {
+        return json!({ "error": "missing command; use `command` for bash or `cmd` for exec_command" });
+    };
+    let workdir = match command_workdir(args, cwd) {
+        Ok(workdir) => workdir,
+        Err(error) => return json!({ "command": command, "error": error }),
     };
     let timeout = Duration::from_secs(
         optional_u64(args, "timeout")
@@ -1114,26 +1187,47 @@ fn bash(
             program,
             &shell_args,
             command,
-            cwd,
+            &workdir,
             timeout,
             yield_time,
             emit,
         )
     } else {
-        run_command_events(program, &shell_args, None, cwd, timeout, emit)
+        run_command_events(program, &shell_args, None, &workdir, timeout, emit)
             .map(|result| command_result_json(command, Ok(result)))
     };
     match result {
-        Ok(value) => value,
+        Ok(mut value) => {
+            add_command_soft_hint(&mut value);
+            value
+        }
         Err(error) => json!({ "command": command, "error": error }),
     }
+}
+
+fn command_workdir(args: &Value, cwd: &Path) -> Result<PathBuf, String> {
+    let Some(workdir) = args.get("workdir").and_then(Value::as_str) else {
+        return Ok(cwd.to_path_buf());
+    };
+    let path = resolve_path(cwd, workdir);
+    if !path.exists() {
+        return Err(format!("workdir does not exist: {}", path.display()));
+    }
+    if !path.is_dir() {
+        return Err(format!("workdir is not a directory: {}", path.display()));
+    }
+    Ok(path)
 }
 
 fn write_stdin(args: &Value) -> Value {
     let Some(session_id) = args.get("session_id").and_then(Value::as_u64) else {
         return json!({ "error": "missing session_id" });
     };
-    let text = args.get("text").and_then(Value::as_str).unwrap_or_default();
+    let text = args
+        .get("text")
+        .or_else(|| args.get("chars"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let yield_time = Duration::from_millis(optional_u64(args, "yield_time_ms").unwrap_or(1000));
     match poll_or_write_session(session_id, text, yield_time) {
         Ok(value) => value,
@@ -1228,14 +1322,6 @@ fn poll_or_write_session(
             let Some(session) = sessions.get_mut(&session_id) else {
                 return Err("shell session not found".to_string());
             };
-            if !text.is_empty() {
-                if let Some(stdin) = session.stdin.as_mut() {
-                    stdin
-                        .write_all(text.as_bytes())
-                        .and_then(|_| stdin.flush())
-                        .map_err(|error| error.to_string())?;
-                }
-            }
             if session.started.elapsed().unwrap_or_default() >= session.timeout {
                 kill_child(&mut session.child);
                 finished = Some((true, None));
@@ -1255,6 +1341,24 @@ fn poll_or_write_session(
                     &session.stderr_path,
                 );
                 return Ok(command_result_json(&session.command, Ok(result)));
+            }
+            if !text.is_empty() {
+                if let Some(stdin) = session.stdin.as_mut() {
+                    if let Err(error) = stdin.write_all(text.as_bytes()).and_then(|_| stdin.flush())
+                    {
+                        if let Ok(Some(status)) = session.child.try_wait() {
+                            let session = sessions.remove(&session_id).expect("session exists");
+                            let result = collect_command_result(
+                                status.code(),
+                                false,
+                                &session.stdout_path,
+                                &session.stderr_path,
+                            );
+                            return Ok(command_result_json(&session.command, Ok(result)));
+                        }
+                        return Err(error.to_string());
+                    }
+                }
             }
         }
 
@@ -1335,8 +1439,279 @@ fn shell_sessions() -> &'static Mutex<HashMap<u64, ShellSession>> {
 }
 
 pub fn project_model_output(name: &str, output: &str, cwd: &Path) -> String {
-    let _ = (name, cwd);
-    output.to_string()
+    if let Some(projected) = project_read_model_output(name, output, cwd) {
+        return projected;
+    }
+    if let Some(projected) = project_diff_model_output(name, output, cwd) {
+        return projected;
+    }
+    if output.len() <= MODEL_OUTPUT_INLINE_LIMIT {
+        return output.to_string();
+    }
+
+    let full_output_path = write_full_tool_output(name, output, cwd);
+    let mut projected =
+        serde_json::from_str::<Value>(output).unwrap_or_else(|_| json!({ "output": output }));
+    let mut truncated = false;
+    truncate_large_strings(&mut projected, &mut truncated);
+
+    match &mut projected {
+        Value::Object(map) => {
+            map.insert("model_output_truncated".to_string(), json!(true));
+            map.insert(
+                "full_output_path".to_string(),
+                json!(full_output_path.display().to_string()),
+            );
+            map.insert(
+                "note".to_string(),
+                json!("Large tool output was projected for the model. Inspect full_output_path if exact full output is needed."),
+            );
+        }
+        _ => {
+            projected = json!({
+                "tool": name,
+                "model_output_truncated": true,
+                "full_output_path": full_output_path.display().to_string(),
+                "output": truncate_text(output, MODEL_OUTPUT_FIELD_LIMIT),
+            });
+        }
+    }
+
+    let serialized = projected.to_string();
+    if serialized.len() <= MODEL_OUTPUT_INLINE_LIMIT {
+        return serialized;
+    }
+
+    json!({
+        "tool": name,
+        "model_output_truncated": true,
+        "full_output_path": full_output_path.display().to_string(),
+        "output": truncate_text(&serialized, MODEL_OUTPUT_INLINE_LIMIT / 2),
+    })
+    .to_string()
+}
+
+fn project_read_model_output(name: &str, output: &str, cwd: &Path) -> Option<String> {
+    if env::var("JUCODE_PROJECT_READ_MODEL_OUTPUT")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "0" | "false" | "FALSE" | "off" | "OFF"))
+    {
+        return None;
+    }
+    project_read_model_output_inner(name, output, cwd)
+}
+
+fn project_read_model_output_inner(name: &str, output: &str, cwd: &Path) -> Option<String> {
+    if name != "read" {
+        return None;
+    }
+    let mut value = serde_json::from_str::<Value>(output).ok()?;
+    let content_len = value
+        .get("content")
+        .and_then(Value::as_str)
+        .map(|text| text.len())
+        .unwrap_or(0);
+    let hashlines_len = value
+        .get("hashlines")
+        .and_then(Value::as_str)
+        .map(|text| text.len())
+        .unwrap_or(0);
+    if content_len == 0 || hashlines_len == 0 {
+        return None;
+    }
+    let omit_content = content_len >= READ_MODEL_CONTENT_OMIT_THRESHOLD;
+    let truncate_hashlines = hashlines_len > READ_MODEL_HASHLINES_LIMIT;
+    if !omit_content && !truncate_hashlines {
+        return None;
+    }
+    let full_output_path = truncate_hashlines.then(|| write_full_tool_output(name, output, cwd));
+    if let Value::Object(map) = &mut value {
+        if omit_content {
+            map.remove("content");
+        }
+        if truncate_hashlines {
+            if let Some(Value::String(hashlines)) = map.get_mut("hashlines") {
+                *hashlines = truncate_text(hashlines, MODEL_OUTPUT_FIELD_LIMIT);
+            }
+        }
+        map.insert("model_output_truncated".to_string(), json!(true));
+        if let Some(path) = full_output_path {
+            map.insert(
+                "full_output_path".to_string(),
+                json!(path.display().to_string()),
+            );
+        }
+        map.insert(
+            "note".to_string(),
+            json!("Large read output was projected for the model. Re-read with offset/limit when exact nearby lines or anchors are needed."),
+        );
+        return Some(value.to_string());
+    }
+    None
+}
+
+fn project_diff_model_output(name: &str, output: &str, cwd: &Path) -> Option<String> {
+    if env::var("JUCODE_PROJECT_DIFF_MODEL_OUTPUT")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "0" | "false" | "FALSE" | "off" | "OFF"))
+    {
+        return None;
+    }
+    let mut value = serde_json::from_str::<Value>(output).ok()?;
+    let diff = value.get("diff").and_then(Value::as_str)?.to_string();
+    if diff.len() <= DIFF_MODEL_OUTPUT_INLINE_LIMIT && output.len() <= MODEL_OUTPUT_INLINE_LIMIT {
+        return None;
+    }
+    let full_output_path = write_full_tool_output(name, output, cwd);
+    let summary = summarize_unified_diff(&diff);
+    if let Value::Object(map) = &mut value {
+        map.insert(
+            "diff".to_string(),
+            json!(truncate_text(&diff, MODEL_OUTPUT_FIELD_LIMIT)),
+        );
+        map.insert("diff_summary".to_string(), summary);
+        map.insert("model_output_truncated".to_string(), json!(true));
+        map.insert(
+            "full_output_path".to_string(),
+            json!(full_output_path.display().to_string()),
+        );
+        map.insert(
+            "note".to_string(),
+            json!("Large diff was summarized for the model. Inspect full_output_path only if exact omitted hunks are necessary; otherwise use path-specific diff/read commands."),
+        );
+        return Some(value.to_string());
+    }
+    None
+}
+
+fn summarize_unified_diff(diff: &str) -> Value {
+    let mut files = Vec::new();
+    let mut additions = 0usize;
+    let mut deletions = 0usize;
+    let mut hunks = 0usize;
+    for line in diff.lines() {
+        if let Some(file) = diff_file_from_header(line) {
+            if !files.iter().any(|existing| existing == &file) {
+                files.push(file);
+            }
+        } else if line.starts_with("@@") {
+            hunks += 1;
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            additions += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            deletions += 1;
+        }
+    }
+    let total_files = files.len();
+    if files.len() > 20 {
+        files.truncate(20);
+    }
+    json!({
+        "files_changed": total_files,
+        "files_sample": files,
+        "hunks": hunks,
+        "additions": additions,
+        "deletions": deletions,
+        "diff_bytes": diff.len(),
+        "diff_lines": diff.lines().count(),
+    })
+}
+
+fn diff_file_from_header(line: &str) -> Option<String> {
+    if let Some(rest) = line.strip_prefix("diff --git ") {
+        let mut parts = rest.split_whitespace();
+        let _old = parts.next()?;
+        let new = parts.next()?;
+        return Some(strip_diff_prefix(new).to_string());
+    }
+    if let Some(path) = line.strip_prefix("+++ ") {
+        let path = path.trim();
+        if path != "/dev/null" {
+            return Some(strip_diff_prefix(path).to_string());
+        }
+    }
+    None
+}
+
+fn strip_diff_prefix(path: &str) -> &str {
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+}
+
+fn truncate_large_strings(value: &mut Value, truncated: &mut bool) {
+    match value {
+        Value::String(text) if text.len() > MODEL_OUTPUT_FIELD_LIMIT => {
+            *text = truncate_text(text, MODEL_OUTPUT_FIELD_LIMIT);
+            *truncated = true;
+        }
+        Value::Array(items) => {
+            for item in items {
+                truncate_large_strings(item, truncated);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                truncate_large_strings(value, truncated);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn truncate_text(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let half = limit / 2;
+    let head_end = safe_boundary(text, half);
+    let tail_start = text.len() - safe_boundary_rev(text, half);
+    format!(
+        "{}\n\n[...model projection omitted {} bytes...]\n\n{}",
+        &text[..head_end],
+        text.len()
+            .saturating_sub(head_end + (text.len() - tail_start)),
+        &text[tail_start..]
+    )
+}
+
+fn safe_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn safe_boundary_rev(text: &str, mut width: usize) -> usize {
+    width = width.min(text.len());
+    while width > 0 && !text.is_char_boundary(text.len() - width) {
+        width -= 1;
+    }
+    width
+}
+
+fn write_full_tool_output(name: &str, output: &str, cwd: &Path) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update([0]);
+    hasher.update(output.as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
+    let safe_name = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let dir = cwd.join(".jucode").join("truncated-results");
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join(format!("{safe_name}-{}.json", &hash[..16]));
+    let _ = fs::write(&path, output);
+    path
 }
 
 fn apply_patch(
@@ -1383,23 +1758,6 @@ fn apply_patch(
             value
         }
         Err(error) => json!({ "command": "git apply --check", "error": error }),
-    }
-}
-
-fn diff_workspace(args: &Value, cwd: &Path) -> Value {
-    let path = args
-        .get("path")
-        .and_then(Value::as_str)
-        .map(|path| resolve_path(cwd, path));
-    match git_diff(cwd, path.as_deref()) {
-        Some(diff) => json!({
-            "path": path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| cwd.display().to_string()),
-            "diff": diff,
-        }),
-        None => json!({ "error": "failed to get git diff" }),
     }
 }
 
@@ -1499,7 +1857,35 @@ fn ripgrep(args: &Value, cwd: &Path) -> Value {
         value["truncated"] = json!(value["truncated"].as_bool().unwrap_or(false) || truncated);
     }
     value["path"] = json!(search_path.display().to_string());
+    add_ripgrep_soft_hint(&mut value, limit.is_none());
     value
+}
+
+fn add_ripgrep_soft_hint(value: &mut Value, no_limit: bool) {
+    let stdout = value
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if value
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        add_soft_hint(
+            value,
+            "ripgrep output was truncated",
+            "Use a narrower path, glob, more specific pattern, or a limit before reading more.",
+        );
+    } else if no_limit
+        && (stdout.lines().count() > LARGE_RIPGREP_OUTPUT_SOFT_LINES
+            || stdout.len() > LARGE_RIPGREP_OUTPUT_SOFT_BYTES)
+    {
+        add_soft_hint(
+            value,
+            "large ripgrep output without a line limit",
+            "Use a narrower path, glob, more specific pattern, or limit to reduce context before inspecting matches.",
+        );
+    }
 }
 
 fn outline_file(args: &Value, cwd: &Path) -> Value {
@@ -1900,7 +2286,7 @@ fn run_command_events(
 }
 
 fn command_result_json(command: &str, result: Result<CommandResult, String>) -> Value {
-    match result {
+    let mut value = match result {
         Ok(result) => json!({
             "command": command,
             "exit_code": result.exit_code,
@@ -1910,6 +2296,51 @@ fn command_result_json(command: &str, result: Result<CommandResult, String>) -> 
             "truncated": result.truncated,
         }),
         Err(error) => json!({ "command": command, "error": error }),
+    };
+    add_command_soft_hint(&mut value);
+    value
+}
+
+fn add_command_soft_hint(value: &mut Value) {
+    let stdout = value
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let stderr = value
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let output_bytes = stdout.len().saturating_add(stderr.len());
+    let output_lines = stdout
+        .lines()
+        .count()
+        .saturating_add(stderr.lines().count());
+    if value
+        .get("timed_out")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        add_soft_hint(
+            value,
+            "command timed out",
+            "Inspect partial output, narrow the command, or rerun with a longer timeout only if the full command is necessary.",
+        );
+    } else if value
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        add_soft_hint(
+            value,
+            "command output was truncated",
+            "Rerun with a narrower command, redirect detailed output to a file, or inspect the referenced full output if provided.",
+        );
+    } else if output_bytes > COMMAND_OUTPUT_MAX_BYTES || output_lines > COMMAND_OUTPUT_MAX_LINES {
+        add_soft_hint(
+            value,
+            "large command output",
+            "Prefer a narrower command with paths, globs, grep/head/tail, or tool-native limits before requesting more output.",
+        );
     }
 }
 
@@ -1953,7 +2384,10 @@ fn unified_diff_for_file(cwd: &Path, path: &Path, original: &str, updated: &str)
     Some(simple_unified_diff(&label, original, updated))
 }
 
-fn git_diff(cwd: &Path, path: Option<&Path>) -> Option<String> {
+fn git_diff(cwd: &Path, path: Option<&Path>) -> Result<String, String> {
+    if path.is_some_and(|path| is_internal_tool_path(cwd, path)) {
+        return Ok(String::new());
+    }
     let result = if let Some(path) = path {
         let path_arg = diff_path_arg(cwd, path);
         run_command(
@@ -1971,10 +2405,102 @@ fn git_diff(cwd: &Path, path: Option<&Path>) -> Option<String> {
         )
     };
 
-    result
-        .ok()
-        .map(|result| result.stdout)
-        .filter(|diff| !diff.trim().is_empty())
+    let result = result?;
+    if result.exit_code != Some(0) {
+        return Err(command_failure_message("git diff", &result));
+    }
+
+    let mut chunks = Vec::new();
+    let tracked_diff = filter_internal_diff_sections(&result.stdout);
+    if !tracked_diff.trim().is_empty() {
+        chunks.push(tracked_diff);
+    }
+    for path in git_untracked_paths(cwd, path)? {
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Some(diff) = unified_diff_for_file(cwd, &path, "", &content) {
+                chunks.push(diff);
+            }
+        }
+    }
+    Ok(chunks.join("\n"))
+}
+
+fn git_untracked_paths(cwd: &Path, path: Option<&Path>) -> Result<Vec<PathBuf>, String> {
+    if path.is_some_and(|path| is_internal_tool_path(cwd, path)) {
+        return Ok(Vec::new());
+    }
+    let path_arg = path.map(|path| diff_path_arg(cwd, path));
+    let mut args = vec!["ls-files", "--others", "--exclude-standard", "--"];
+    if let Some(path_arg) = path_arg.as_deref() {
+        args.push(path_arg);
+    }
+    let result = run_command("git", &args, cwd, Duration::from_secs(30))?;
+    if result.exit_code != Some(0) {
+        return Err(command_failure_message("git ls-files", &result));
+    }
+    Ok(result
+        .stdout
+        .lines()
+        .map(|line| cwd.join(line))
+        .filter(|path| path.is_file())
+        .filter(|path| !is_internal_tool_path(cwd, path))
+        .collect())
+}
+
+fn filter_internal_diff_sections(diff: &str) -> String {
+    let mut output = String::new();
+    let mut section = String::new();
+    let mut keep_section = true;
+    let mut saw_header = false;
+
+    for line in diff.split_inclusive('\n') {
+        let bare = line.trim_end_matches('\n');
+        if bare.starts_with("diff --git ") {
+            if keep_section {
+                output.push_str(&section);
+            }
+            section.clear();
+            saw_header = true;
+            keep_section = !diff_header_is_internal(bare);
+        }
+        section.push_str(line);
+    }
+    if keep_section {
+        output.push_str(&section);
+    }
+    if saw_header {
+        output
+    } else {
+        diff.to_string()
+    }
+}
+
+fn diff_header_is_internal(line: &str) -> bool {
+    line.split_whitespace().skip(2).any(|path| {
+        let path = strip_diff_prefix(path);
+        path == ".jucode" || path.starts_with(".jucode/")
+    })
+}
+
+fn is_internal_tool_path(cwd: &Path, path: &Path) -> bool {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let relative = path.strip_prefix(cwd).unwrap_or(path.as_path());
+    relative
+        .components()
+        .next()
+        .is_some_and(|component| component.as_os_str() == ".jucode")
+}
+
+fn command_failure_message(command: &str, result: &CommandResult) -> String {
+    [result.stderr.trim(), result.stdout.trim()]
+        .into_iter()
+        .find(|text| !text.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{command} failed"))
 }
 
 fn diff_label(cwd: &Path, path: &Path) -> String {
@@ -2135,7 +2661,37 @@ fn read_output_file(path: &Path) -> (String, bool) {
     let Ok(bytes) = fs::read(path) else {
         return (String::new(), false);
     };
-    (String::from_utf8_lossy(&bytes).to_string(), false)
+    truncate_command_output(&String::from_utf8_lossy(&bytes))
+}
+
+fn truncate_command_output(text: &str) -> (String, bool) {
+    let lines = text.split_inclusive('\n').collect::<Vec<_>>();
+    let line_start = lines.len().saturating_sub(COMMAND_OUTPUT_MAX_LINES);
+    let mut output = lines[line_start..].concat();
+
+    let mut omitted_lines = line_start;
+    let mut omitted_bytes = text.len().saturating_sub(output.len());
+    if output.len() > COMMAND_OUTPUT_MAX_BYTES {
+        let keep_width = safe_boundary_rev(&output, COMMAND_OUTPUT_MAX_BYTES);
+        let keep_start = output.len() - keep_width;
+        omitted_bytes += keep_start;
+        omitted_lines += output[..keep_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        output = output[keep_start..].to_string();
+    }
+
+    if omitted_lines == 0 && omitted_bytes == 0 {
+        return (output, false);
+    }
+
+    (
+        format!(
+            "[...command output truncated: omitted {omitted_lines} earlier lines and {omitted_bytes} bytes...]\n{output}"
+        ),
+        true,
+    )
 }
 
 fn shell_command(command: &str) -> (&'static str, Vec<&str>) {
@@ -2230,6 +2786,52 @@ mod tests {
     }
 
     #[test]
+    fn read_warns_when_large_file_has_no_limit() {
+        let dir = test_dir("read-large-warning");
+        let path = dir.join("large.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "x".repeat(300 * 1024)).unwrap();
+
+        let result = run_tool("read", &json!({ "path": path }).to_string(), &dir);
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert!(value["warning"]
+            .as_str()
+            .unwrap()
+            .contains("large file read"));
+        assert!(value["suggestion"]
+            .as_str()
+            .unwrap()
+            .contains("offset/limit"));
+        assert_eq!(value["truncated"], false);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn bash_truncates_large_stdout() {
+        let dir = test_dir("bash-truncate");
+        fs::create_dir_all(&dir).unwrap();
+
+        let result = run_tool(
+            "bash",
+            &json!({
+                "command": "i=0; while [ $i -lt 3505 ]; do echo line-$i; i=$((i+1)); done"
+            })
+            .to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        let stdout = value["stdout"].as_str().unwrap();
+
+        assert_eq!(value["truncated"], true);
+        assert!(stdout.contains("command output truncated"));
+        assert!(stdout.contains("line-3504"));
+        assert!(!stdout.contains("line-0\n"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn edit_requires_unique_old_text() {
         let dir = test_dir("edit");
         let path = dir.join("sample.txt");
@@ -2309,7 +2911,26 @@ mod tests {
     }
 
     #[test]
-    fn write_requires_read_first() {
+    fn write_creates_new_file_without_prior_read() {
+        let dir = test_dir("write-create");
+        let path = dir.join("src").join("main.rs");
+        fs::create_dir_all(&dir).unwrap();
+
+        let result = run_tool(
+            "write",
+            &json!({ "path": path, "content": "fn main() {}\n" }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "fn main() {}\n");
+        assert!(value.get("error").is_none());
+        assert!(value["diff"].as_str().unwrap().contains("+fn main() {}"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_still_requires_read_before_overwriting_existing() {
         let dir = test_dir("write-read-first");
         let path = dir.join("sample.txt");
         fs::create_dir_all(&dir).unwrap();
@@ -2327,6 +2948,51 @@ mod tests {
             .unwrap()
             .contains("requires reading"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn git_diff_returns_empty_success_for_clean_workspace() {
+        let dir = test_dir("diff-clean");
+        fs::create_dir_all(&dir).unwrap();
+        run_command("git", &["init"], &dir, Duration::from_secs(30)).unwrap();
+
+        let diff = git_diff(&dir, None).unwrap();
+
+        assert_eq!(diff, "");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn git_diff_includes_untracked_text_file() {
+        let dir = test_dir("diff-untracked");
+        fs::create_dir_all(&dir).unwrap();
+        run_command("git", &["init"], &dir, Duration::from_secs(30)).unwrap();
+        fs::write(dir.join("new.txt"), "hello\n").unwrap();
+
+        let diff = git_diff(&dir, Some(&dir.join("new.txt"))).unwrap();
+
+        assert!(diff.contains("new.txt"));
+        assert!(diff.contains("+hello"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn git_diff_excludes_jucode_internal_files() {
+        let dir = test_dir("diff-internal");
+        fs::create_dir_all(dir.join(".jucode").join("checkpoints")).unwrap();
+        run_command("git", &["init"], &dir, Duration::from_secs(30)).unwrap();
+        fs::write(
+            dir.join(".jucode").join("checkpoints").join("cp.json"),
+            "{}\n",
+        )
+        .unwrap();
+        fs::write(dir.join("new.txt"), "hello\n").unwrap();
+
+        let diff = git_diff(&dir, None).unwrap();
+
+        assert!(diff.contains("new.txt"));
+        assert!(!diff.contains(".jucode"));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2471,9 +3137,33 @@ mod tests {
     }
 
     #[test]
+    fn ripgrep_warns_when_broad_output_has_no_limit() {
+        let dir = test_dir("rg-large-warning");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "needle\n".repeat(250)).unwrap();
+
+        let result = run_tool(
+            "ripgrep",
+            &json!({ "pattern": "needle", "path": path }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert!(value["warning"]
+            .as_str()
+            .unwrap()
+            .contains("large ripgrep output"));
+        assert!(value["suggestion"].as_str().unwrap().contains("limit"));
+        assert_eq!(value["truncated"], false);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn definitions_expose_expected_tools() {
-        let names = definitions()
-            .into_iter()
+        let tools = definitions();
+        let names = tools
+            .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
             .collect::<Vec<_>>();
 
@@ -2484,15 +3174,101 @@ mod tests {
                 "str_replace",
                 "hashline_edit",
                 "write",
+                "apply_patch",
                 "bash",
+                "exec_command",
                 "write_stdin",
-                "diff",
                 "ls",
                 "ripgrep",
                 "outline",
                 "checkpoint"
             ]
         );
+        assert!(tools
+            .iter()
+            .all(|tool| tool.get("strict") == Some(&json!(false))));
+    }
+
+    #[test]
+    fn exec_command_accepts_codex_style_cmd_and_workdir() {
+        let dir = test_dir("exec-command");
+        let subdir = dir.join("sub");
+        fs::create_dir_all(&subdir).unwrap();
+        fs::write(subdir.join("marker.txt"), "ok").unwrap();
+        let command = if cfg!(windows) {
+            "Get-ChildItem marker.txt | Select-Object -ExpandProperty Name"
+        } else {
+            "pwd; ls marker.txt"
+        };
+
+        let result = run_tool(
+            "exec_command",
+            &json!({ "cmd": command, "workdir": "sub", "timeout": 5 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["exit_code"], 0);
+        assert!(value["stdout"].as_str().unwrap().contains("marker.txt"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn exec_command_truncates_large_output() {
+        let dir = test_dir("exec-large-truncate");
+        fs::create_dir_all(&dir).unwrap();
+        let command = if cfg!(windows) {
+            "1..3500 | ForEach-Object { 'line' }"
+        } else {
+            "yes line | head -n 3500"
+        };
+
+        let result = run_tool(
+            "exec_command",
+            &json!({ "cmd": command, "timeout": 5 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["exit_code"], 0);
+        assert_eq!(value["truncated"], true);
+        assert!(value["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("command output truncated"));
+        assert!(value["warning"]
+            .as_str()
+            .unwrap()
+            .contains("command output was truncated"));
+        assert!(value["suggestion"]
+            .as_str()
+            .unwrap()
+            .contains("narrower command"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bash_accepts_workdir() {
+        let dir = test_dir("bash-workdir");
+        let subdir = dir.join("sub");
+        fs::create_dir_all(&subdir).unwrap();
+        fs::write(subdir.join("marker.txt"), "ok").unwrap();
+        let command = if cfg!(windows) {
+            "Get-ChildItem marker.txt | Select-Object -ExpandProperty Name"
+        } else {
+            "ls marker.txt"
+        };
+
+        let result = run_tool(
+            "bash",
+            &json!({ "command": command, "workdir": "sub", "timeout": 5 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["exit_code"], 0);
+        assert!(value["stdout"].as_str().unwrap().contains("marker.txt"));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2579,14 +3355,51 @@ mod tests {
             }
         }
 
-        assert_eq!(value["exit_code"], 0);
+        assert_eq!(value["exit_code"], 0, "{value}");
         assert!(value["stdout"].as_str().unwrap().contains("done"));
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn bash_returns_full_stdout_without_tail_truncation() {
-        let dir = test_dir("bash-no-tail-limit");
+    fn write_stdin_accepts_codex_style_chars() {
+        let dir = test_dir("write-stdin-chars");
+        fs::create_dir_all(&dir).unwrap();
+        let command = if cfg!(windows) {
+            "$line = [Console]::In.ReadLine(); Write-Output $line"
+        } else {
+            "head -n 1"
+        };
+
+        let result = run_tool(
+            "exec_command",
+            &json!({ "cmd": command, "timeout": 5, "yield_time_ms": 1 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        let session_id = value["session_id"].as_u64().unwrap();
+
+        let mut value = json!({ "running": true });
+        for index in 0..20 {
+            let args = if index == 0 {
+                json!({ "session_id": session_id, "chars": "hello\n", "yield_time_ms": 250 })
+            } else {
+                json!({ "session_id": session_id, "yield_time_ms": 250 })
+            };
+            let result = run_tool("write_stdin", &args.to_string(), &dir);
+            value = serde_json::from_str::<Value>(&result).unwrap();
+            if value["running"] != true {
+                break;
+            }
+        }
+
+        assert_eq!(value["exit_code"], 0);
+        assert!(value["stdout"].as_str().unwrap().contains("hello"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bash_truncates_output_instead_of_returning_full_stdout() {
+        let dir = test_dir("bash-tail-limit");
         fs::create_dir_all(&dir).unwrap();
         let command = if cfg!(windows) {
             "1..9000 | ForEach-Object { 'line' }"
@@ -2602,20 +3415,124 @@ mod tests {
         let value = serde_json::from_str::<Value>(&result).unwrap();
 
         assert_eq!(value["exit_code"], 0);
-        assert_eq!(value["stdout"].as_str().unwrap().lines().count(), 9000);
-        assert_eq!(value["truncated"], false);
+        assert_eq!(value["truncated"], true);
+        assert!(value["stdout"].as_str().unwrap().lines().count() < 9000);
+        assert!(value["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("command output truncated"));
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn long_tool_result_is_sent_to_model_untruncated() {
+    fn long_tool_result_is_projected_for_model() {
         let dir = test_dir("tool-projection");
         fs::create_dir_all(&dir).unwrap();
         let content = "x".repeat(128 * 1024);
         let result = tool_result("test_tool", json!({ "content": content }), &dir);
+        let projected = serde_json::from_str::<Value>(&result.model_output).unwrap();
+        let full_output_path = projected["full_output_path"].as_str().unwrap();
 
-        assert_eq!(result.output, result.model_output);
-        assert!(!dir.join(".jucode").join("truncated-results").exists());
+        assert_ne!(result.output, result.model_output);
+        assert!(result.model_output.contains("model_output_truncated"));
+        assert_eq!(fs::read_to_string(full_output_path).unwrap(), result.output);
+        assert!(dir.join(".jucode").join("truncated-results").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn large_edit_diff_is_summarized_for_model_output() {
+        let dir = test_dir("diff-projection");
+        fs::create_dir_all(&dir).unwrap();
+        let diff_body = (0..700)
+            .map(|index| format!("+added line {index}\n"))
+            .collect::<String>();
+        let diff = format!(
+            "diff --git a/src/app.rs b/src/app.rs\n--- a/src/app.rs\n+++ b/src/app.rs\n@@ -0,0 +1,700 @@\n{diff_body}"
+        );
+
+        let result = tool_result(
+            "write",
+            json!({
+                "path": dir.display().to_string(),
+                "has_changes": true,
+                "diff": diff
+            }),
+            &dir,
+        );
+        let projected = serde_json::from_str::<Value>(&result.model_output).unwrap();
+        let full_output_path = projected["full_output_path"].as_str().unwrap();
+
+        assert_ne!(result.output, result.model_output);
+        assert_eq!(projected["model_output_truncated"], true);
+        assert_eq!(projected["diff_summary"]["files_changed"], 1);
+        assert_eq!(projected["diff_summary"]["additions"], 700);
+        assert!(projected["diff"].as_str().unwrap().len() < 6000);
+        assert_eq!(fs::read_to_string(full_output_path).unwrap(), result.output);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_model_output_omits_duplicate_content_but_keeps_hashlines() {
+        let dir = test_dir("read-projection");
+        fs::create_dir_all(&dir).unwrap();
+        let content = format!("{}\n{}", "a".repeat(2048), "b".repeat(2048));
+        let hashlines = format!("1#AA:{}\n2#BB:{}", "a".repeat(2048), "b".repeat(2048));
+        let output = json!({
+            "path": "/tmp/example.py",
+            "kind": "text",
+            "content": content,
+            "hashlines": hashlines,
+            "lines_read": 2,
+            "truncated": false
+        })
+        .to_string();
+
+        let projected = serde_json::from_str::<Value>(
+            &project_read_model_output_inner("read", &output, &dir).unwrap(),
+        )
+        .unwrap();
+
+        assert!(projected.get("content").is_none());
+        assert!(projected["hashlines"].as_str().unwrap().contains("1#AA:"));
+        assert_eq!(projected["model_output_truncated"], true);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_model_output_truncates_large_hashlines_and_keeps_full_output_path() {
+        let dir = test_dir("read-hashlines-projection");
+        fs::create_dir_all(&dir).unwrap();
+        let content = (0..600)
+            .map(|index| format!("line {index}: {}\n", "x".repeat(32)))
+            .collect::<String>();
+        let hashlines = content
+            .lines()
+            .enumerate()
+            .map(|(index, line)| format!("{}#AA:{line}\n", index + 1))
+            .collect::<String>();
+        let output = json!({
+            "path": "/tmp/example.py",
+            "kind": "text",
+            "content": content,
+            "hashlines": hashlines,
+            "lines_read": 600,
+            "truncated": false
+        })
+        .to_string();
+
+        let projected = serde_json::from_str::<Value>(
+            &project_read_model_output_inner("read", &output, &dir).unwrap(),
+        )
+        .unwrap();
+        let full_output_path = projected["full_output_path"].as_str().unwrap();
+
+        assert!(projected.get("content").is_none());
+        assert!(projected["hashlines"]
+            .as_str()
+            .unwrap()
+            .contains("model projection omitted"));
+        assert_eq!(fs::read_to_string(full_output_path).unwrap(), output);
         let _ = fs::remove_dir_all(dir);
     }
 

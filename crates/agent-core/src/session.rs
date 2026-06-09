@@ -1,4 +1,7 @@
-use crate::event::{TranscriptItem, TreeNodeView};
+use crate::{
+    event::{TranscriptItem, TreeNodeView},
+    tokens,
+};
 use serde_json::{json, Value};
 use std::{
     cmp::Reverse,
@@ -149,7 +152,7 @@ pub struct ContextEntryCounts {
 #[derive(Debug, Clone)]
 pub struct ContextTopItem {
     pub label: String,
-    pub estimated_tokens: usize,
+    pub tokens: usize,
     pub chars: usize,
 }
 
@@ -159,8 +162,9 @@ pub struct ContextStatistics {
     pub context_items: usize,
     pub projected_items: usize,
     pub compacted: bool,
-    pub estimated_tokens: usize,
-    pub projected_estimated_tokens: usize,
+    pub tokens: usize,
+    pub projected_tokens: usize,
+    pub tokenizer: String,
     pub counts: ContextEntryCounts,
     pub top_items: Vec<ContextTopItem>,
 }
@@ -516,14 +520,25 @@ impl SessionStore {
         sanitize_tool_pairs(items)
     }
 
-    pub fn estimated_context_tokens(&self) -> usize {
-        estimate_items_tokens(self.request_context_items().iter())
+    #[cfg(test)]
+    pub fn context_tokens(&self, model: &str) -> usize {
+        self.context_token_usage(model).0
+    }
+
+    pub fn context_token_usage(&self, model: &str) -> (usize, String) {
+        let items = self.request_context_items();
+        let count = tokens::count_values(model, items.iter());
+        (count.tokens, count.tokenizer)
     }
 
     /// Plan a compaction that folds older turns (keeping roughly the most recent
     /// `keep_recent_tokens` of context verbatim) into a single summary. Returns
     /// None when there is nothing older to fold.
-    pub fn plan_compaction(&self, keep_recent_tokens: usize) -> Option<CompactionPlan> {
+    pub fn plan_compaction(
+        &self,
+        keep_recent_tokens: usize,
+        model: &str,
+    ) -> Option<CompactionPlan> {
         let branch = self.branch();
         let (summary, keep_after) = self.compaction_view(&branch);
         let kept: Vec<&SessionEntry> = branch
@@ -541,7 +556,7 @@ impl SessionStore {
         let mut tail_tokens = 0usize;
         for index in (0..kept.len()).rev() {
             let tokens = context_item_for_entry(kept[index])
-                .map(|item| estimate_item_tokens(&item))
+                .map(|item| tokens::count_value(model, &item).tokens)
                 .unwrap_or(0);
             if fold_end != kept.len() && tail_tokens + tokens > keep_recent_tokens {
                 break;
@@ -627,16 +642,16 @@ impl SessionStore {
         }
     }
 
-    pub fn context_statistics(&self) -> ContextStatistics {
+    pub fn context_statistics(&self, model: &str) -> ContextStatistics {
         let branch = self.branch();
         let items = self.request_context_items();
-        let projected_estimated_tokens = estimate_items_tokens(items.iter());
+        let projected = tokens::count_values(model, items.iter());
         let compacted = branch
             .iter()
             .any(|entry| matches!(entry.kind, EntryKind::Compaction { .. }));
         let mut counts = ContextEntryCounts::default();
         let mut context_items = 0usize;
-        let mut estimated_tokens = 0usize;
+        let mut token_count = 0usize;
         let mut top_items = Vec::new();
 
         for entry in &branch {
@@ -646,17 +661,17 @@ impl SessionStore {
             };
             let item_text = item.to_string();
             let chars = item_text.len();
-            let estimated = chars.saturating_add(3) / 4;
+            let item_tokens = tokens::count_value(model, &item).tokens;
             context_items += 1;
-            estimated_tokens += estimated;
+            token_count += item_tokens;
             top_items.push(ContextTopItem {
                 label: context_entry_label(entry),
-                estimated_tokens: estimated,
+                tokens: item_tokens,
                 chars,
             });
         }
 
-        top_items.sort_by_key(|item| std::cmp::Reverse(item.estimated_tokens));
+        top_items.sort_by_key(|item| std::cmp::Reverse(item.tokens));
         top_items.truncate(5);
 
         ContextStatistics {
@@ -664,8 +679,9 @@ impl SessionStore {
             context_items,
             projected_items: items.len(),
             compacted,
-            estimated_tokens,
-            projected_estimated_tokens,
+            tokens: token_count,
+            projected_tokens: projected.tokens,
+            tokenizer: projected.tokenizer,
             counts,
             top_items,
         }
@@ -1320,14 +1336,6 @@ fn context_entry_label(entry: &SessionEntry) -> String {
     }
 }
 
-fn estimate_items_tokens<'a>(items: impl Iterator<Item = &'a Value>) -> usize {
-    items.map(estimate_item_tokens).sum()
-}
-
-fn estimate_item_tokens(item: &Value) -> usize {
-    item.to_string().len().saturating_add(3) / 4
-}
-
 fn normalize_branch_label(label: &str) -> Result<String, String> {
     let label = label.trim();
     if label.is_empty() {
@@ -1632,7 +1640,7 @@ mod tests {
         assert!(!before.compacted);
 
         let plan = session
-            .plan_compaction(80)
+            .plan_compaction(80, "gpt-5")
             .expect("older turns should be foldable");
         session.apply_compaction("ROLLED UP SUMMARY".to_string(), plan.replaced_through);
 
@@ -1650,10 +1658,10 @@ mod tests {
             });
         }
         let before_items = session.request_context_items().len();
-        let before_tokens = session.estimated_context_tokens();
+        let before_tokens = session.context_tokens("gpt-5");
 
         let plan = session
-            .plan_compaction(80)
+            .plan_compaction(80, "gpt-5")
             .expect("older turns should be foldable");
         assert!(plan.folded_text.contains("User: turn 0"));
         session.apply_compaction("ROLLED UP SUMMARY".to_string(), plan.replaced_through);
@@ -1664,7 +1672,7 @@ mod tests {
             .unwrap()
             .contains("ROLLED UP SUMMARY"));
         assert!(items.len() < before_items);
-        assert!(session.estimated_context_tokens() < before_tokens);
+        assert!(session.context_tokens("gpt-5") < before_tokens);
     }
 
     #[test]
@@ -1755,7 +1763,7 @@ mod tests {
         // Across many keep-recent budgets the fold boundary must never leave a
         // function_call_output without its function_call.
         for keep in [10usize, 30, 60, 120, 240, 400] {
-            if let Some(plan) = session.plan_compaction(keep) {
+            if let Some(plan) = session.plan_compaction(keep, "gpt-5") {
                 assert!(
                     tool_pairs_balanced(&plan.kept_items),
                     "keep_recent={keep} produced an orphan tool output"
@@ -1813,7 +1821,7 @@ mod tests {
             content: "Be careful.".to_string(),
         });
 
-        let stats = session.context_statistics();
+        let stats = session.context_statistics("gpt-5");
 
         assert_eq!(stats.branch_entries, 6);
         assert_eq!(stats.context_items, 5);
@@ -1823,7 +1831,8 @@ mod tests {
         assert_eq!(stats.counts.tool_calls, 1);
         assert_eq!(stats.counts.tool_outputs, 1);
         assert_eq!(stats.counts.pinned_skills, 1);
-        assert!(stats.estimated_tokens > 0);
+        assert!(stats.tokens > 0);
+        assert_eq!(stats.tokenizer, "gpt-5");
         assert_eq!(stats.top_items[0].label, "tool output:read");
     }
 

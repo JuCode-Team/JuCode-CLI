@@ -568,6 +568,7 @@ fn reasoning_tokens_show_in_thinking_progress_not_transcript() {
         AgentEvent::ReasoningDelta("thinking".to_string()),
         AgentEvent::Usage {
             input_tokens: 5,
+            cached_input_tokens: 0,
             output_tokens: 2,
             reasoning_tokens: 88,
         },
@@ -693,6 +694,7 @@ fn thinking_tokens_reset_after_reply_completes() {
         AgentEvent::AssistantDelta("answer".to_string()),
         AgentEvent::Usage {
             input_tokens: 1,
+            cached_input_tokens: 0,
             output_tokens: 1,
             reasoning_tokens: 42,
         },
@@ -730,7 +732,10 @@ fn collapsed_reasoning_message_keeps_only_first_lines() {
 #[test]
 fn compaction_events_set_progress_notices_and_context_meter() {
     let mut app = TuiApp::new(TestRuntime::default());
-    app.apply_events(vec![AgentEvent::ContextUsage { tokens: 900_000 }]);
+    app.apply_events(vec![AgentEvent::ContextUsage {
+        tokens: 900_000,
+        tokenizer: "gpt-5".to_string(),
+    }]);
     assert_eq!(app.state.current_context_tokens, 900_000);
 
     app.apply_events(vec![AgentEvent::CompactionStart]);
@@ -746,7 +751,10 @@ fn compaction_events_set_progress_notices_and_context_meter() {
 
     app.apply_events(vec![
         AgentEvent::CompactionEnd,
-        AgentEvent::ContextUsage { tokens: 25_000 },
+        AgentEvent::ContextUsage {
+            tokens: 25_000,
+            tokenizer: "gpt-5".to_string(),
+        },
     ]);
     assert!(app
         .state

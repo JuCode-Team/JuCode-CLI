@@ -250,7 +250,7 @@ impl TuiState {
                     self.mark_history_dirty();
                     true
                 }
-                AgentEvent::ContextUsage { tokens } => {
+                AgentEvent::ContextUsage { tokens, .. } => {
                     let changed = self.current_context_tokens != tokens;
                     self.current_context_tokens = tokens;
                     changed
@@ -327,6 +327,7 @@ impl TuiState {
                     input_tokens,
                     output_tokens,
                     reasoning_tokens,
+                    ..
                 } => {
                     let _ = (input_tokens, output_tokens);
                     self.record_reasoning_tokens(reasoning_tokens);

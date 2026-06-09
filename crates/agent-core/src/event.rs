@@ -80,6 +80,7 @@ pub enum AgentEvent {
     CompactionFailed(String),
     ContextUsage {
         tokens: u64,
+        tokenizer: String,
     },
     ThinkingStart,
     ReasoningDelta(String),
@@ -110,6 +111,7 @@ pub enum AgentEvent {
     },
     Usage {
         input_tokens: u64,
+        cached_input_tokens: u64,
         output_tokens: u64,
         reasoning_tokens: u64,
     },

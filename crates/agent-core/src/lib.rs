@@ -8,6 +8,7 @@ mod prompt;
 mod session;
 pub mod skills;
 mod subagents;
+mod tokens;
 mod tools;
 mod update;
 
