@@ -15,6 +15,7 @@ pub(super) struct TuiState {
     pub(super) max_output_tokens: u64,
     pub(super) reasoning_efforts: Vec<String>,
     pub(super) current_context_tokens: u64,
+    pub(super) current_cost: f64,
     pub(super) activity: ActivityState,
     pub(super) commands: Vec<CommandCandidate>,
     pub(super) completion_index: usize,
@@ -47,6 +48,7 @@ impl Default for TuiState {
             max_output_tokens: 128_000,
             reasoning_efforts: vec!["medium".to_string()],
             current_context_tokens: 0,
+            current_cost: 0.0,
             activity: ActivityState::idle(),
             commands: default_commands(),
             completion_index: 0,
@@ -83,6 +85,7 @@ impl TuiState {
                     reasoning_effort: &self.reasoning_effort,
                     context_tokens: self.current_context_tokens,
                     context_window: self.context_window,
+                    cost: self.current_cost,
                 },
                 control_width,
             )
@@ -250,9 +253,11 @@ impl TuiState {
                     self.mark_history_dirty();
                     true
                 }
-                AgentEvent::ContextUsage { tokens, .. } => {
-                    let changed = self.current_context_tokens != tokens;
+                AgentEvent::ContextUsage { tokens, cost, .. } => {
+                    let changed =
+                        self.current_context_tokens != tokens || self.current_cost != cost;
                     self.current_context_tokens = tokens;
+                    self.current_cost = cost;
                     changed
                 }
                 AgentEvent::ThinkingStart => {
@@ -339,6 +344,10 @@ impl TuiState {
                 }
                 AgentEvent::ResumeView(sessions) => {
                     self.picker_view = Some(PickerState::resume(sessions));
+                    true
+                }
+                AgentEvent::TrustPrompt { cwd, repo_root } => {
+                    self.picker_view = Some(PickerState::trust(cwd, repo_root));
                     true
                 }
                 AgentEvent::ModelView {

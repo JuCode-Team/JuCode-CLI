@@ -1439,6 +1439,9 @@ fn shell_sessions() -> &'static Mutex<HashMap<u64, ShellSession>> {
 }
 
 pub fn project_model_output(name: &str, output: &str, cwd: &Path) -> String {
+    if let Some(projected) = project_image_model_output(name, output) {
+        return projected;
+    }
     if let Some(projected) = project_read_model_output(name, output, cwd) {
         return projected;
     }
@@ -1548,6 +1551,46 @@ fn project_read_model_output_inner(name: &str, output: &str, cwd: &Path) -> Opti
         return Some(value.to_string());
     }
     None
+}
+
+/// Replaces the inline base64 payload of an image read with a short note. The
+/// actual pixels are delivered to the model as a separate image message via
+/// [`image_content_item`], so keeping the base64 in the function output would
+/// only waste tokens.
+fn project_image_model_output(name: &str, output: &str) -> Option<String> {
+    if name != "read" {
+        return None;
+    }
+    let mut value = serde_json::from_str::<Value>(output).ok()?;
+    if value.get("kind").and_then(Value::as_str) != Some("image") {
+        return None;
+    }
+    let map = value.as_object_mut()?;
+    map.remove("base64")?;
+    map.insert(
+        "note".to_string(),
+        json!("Image content is attached as a separate message; view it directly."),
+    );
+    Some(value.to_string())
+}
+
+/// Builds a user image message from a `read` tool output that contains an inline
+/// base64 image, so the model can actually see the pixels. Returns `None` for
+/// non-image outputs.
+pub fn image_content_item(output: &str) -> Option<Value> {
+    let value = serde_json::from_str::<Value>(output).ok()?;
+    if value.get("kind").and_then(Value::as_str) != Some("image") {
+        return None;
+    }
+    let mime = value.get("mime").and_then(Value::as_str)?;
+    let base64 = value.get("base64").and_then(Value::as_str)?;
+    Some(json!({
+        "role": "user",
+        "content": [{
+            "type": "input_image",
+            "image_url": format!("data:{mime};base64,{base64}"),
+        }],
+    }))
 }
 
 fn project_diff_model_output(name: &str, output: &str, cwd: &Path) -> Option<String> {
@@ -2746,6 +2789,37 @@ fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_read_projects_note_and_builds_image_message() {
+        let output = json!({
+            "path": "/tmp/pic.png",
+            "kind": "image",
+            "mime": "image/png",
+            "bytes": 3,
+            "base64": "AAEC",
+        })
+        .to_string();
+
+        let projected = project_model_output("read", &output, Path::new("."));
+        let projected_value = serde_json::from_str::<Value>(&projected).unwrap();
+        assert!(projected_value.get("base64").is_none());
+        assert!(projected_value.get("note").is_some());
+
+        let image = image_content_item(&output).unwrap();
+        assert_eq!(image["role"], "user");
+        assert_eq!(image["content"][0]["type"], "input_image");
+        assert_eq!(
+            image["content"][0]["image_url"],
+            "data:image/png;base64,AAEC"
+        );
+    }
+
+    #[test]
+    fn non_image_read_has_no_image_message() {
+        let output = json!({ "content": "hello", "hashlines": "1#ab hello" }).to_string();
+        assert!(image_content_item(&output).is_none());
+    }
 
     #[test]
     fn read_supports_offset_and_limit() {

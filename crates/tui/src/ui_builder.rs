@@ -202,6 +202,9 @@ impl UiBuilder {
             }
             PickerMode::Resume => "resume: arrows move, enter resume, esc close",
             PickerMode::Model => "model: arrows move, shift+tab effort, enter select, esc close",
+            PickerMode::Trust => {
+                "trust project? arrows move, enter select (loads project skills & hooks if trusted)"
+            }
         };
         self.control_line(UiKind::Status, hint.to_string());
         if let Some(prompt) = picker.prompt.as_ref() {
@@ -228,9 +231,15 @@ impl UiBuilder {
             self.control_line(UiKind::Status, "(empty)".to_string());
             return self;
         }
+        let is_tree = picker.mode == PickerMode::Checkout;
+        let active_path = if is_tree {
+            picker.active_path_ids()
+        } else {
+            std::collections::HashSet::new()
+        };
         for (index, row) in picker.rows.iter().enumerate() {
-            let active = if row.active { " *" } else { "" };
-            let marker = if index == picker.selected { "> " } else { "  " };
+            let selected = index == picker.selected;
+            let cursor = if selected { "\u{203a} " } else { "  " };
             let directory = if row.has_children {
                 if picker.is_expanded_tree_row(&row.id) {
                     "[-] "
@@ -240,7 +249,7 @@ impl UiBuilder {
             } else {
                 "    "
             };
-            let kind = if index == picker.selected {
+            let kind = if selected {
                 UiKind::Selected
             } else if row.active {
                 UiKind::Brand
@@ -249,17 +258,37 @@ impl UiBuilder {
             } else {
                 UiKind::Status
             };
-            let detail = if row.detail.is_empty() {
-                String::new()
-            } else {
-                format!(" {}", row.detail)
-            };
-            self.control_line(
-                kind,
+            let line = if is_tree {
+                // HEAD marker for the current position, and a bullet for nodes on
+                // the path from the root to it, so the current branch reads clearly.
+                let dot = if active_path.contains(&row.id) {
+                    "\u{2022} "
+                } else {
+                    "  "
+                };
+                let head = if row.active { "  \u{25c0} current" } else { "" };
                 format!(
-                    "{marker}{}{directory}{}{}{active}",
+                    "{cursor}{}{directory}{dot}user: {}{head}",
+                    row.prefix, row.label
+                )
+            } else {
+                let active = if row.active { " *" } else { "" };
+                let detail = if row.detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", row.detail)
+                };
+                format!(
+                    "{cursor}{}{directory}{}{}{active}",
                     row.prefix, row.label, detail
-                ),
+                )
+            };
+            self.control_line(kind, line);
+        }
+        if is_tree {
+            self.control_line(
+                UiKind::Status,
+                format!("({}/{})", picker.selected + 1, picker.rows.len()),
             );
         }
         self.control_line(UiKind::System, String::new());
@@ -350,8 +379,13 @@ impl UiBuilder {
             "{} / {} ({})",
             status.provider, status.model, status.reasoning_effort
         );
+        let cost = if status.cost > 0.0 {
+            format!(" | ${:.4}", status.cost)
+        } else {
+            String::new()
+        };
         let right = format!(
-            "tokens {}/{} | context {percent:.1}%",
+            "tokens {}/{} | context {percent:.1}%{cost}",
             status.context_tokens, status.context_window
         );
         let line = format_status_line(&plain_left, &right, width).replace(

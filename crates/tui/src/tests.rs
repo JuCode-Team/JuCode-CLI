@@ -329,6 +329,7 @@ fn model_and_tokens_render_below_input_without_ready_status() {
                 reasoning_effort: "medium",
                 context_tokens: 12_345,
                 context_window: 400_000,
+                cost: 0.0,
             },
             64,
         )
@@ -416,6 +417,7 @@ fn colored_status_line_does_not_wrap_at_visible_width() {
                 reasoning_effort: "high",
                 context_tokens: 1633,
                 context_window: 400_000,
+                cost: 0.0,
             },
             64,
         )
@@ -735,6 +737,7 @@ fn compaction_events_set_progress_notices_and_context_meter() {
     app.apply_events(vec![AgentEvent::ContextUsage {
         tokens: 900_000,
         tokenizer: "gpt-5".to_string(),
+        cost: 0.0,
     }]);
     assert_eq!(app.state.current_context_tokens, 900_000);
 
@@ -754,6 +757,7 @@ fn compaction_events_set_progress_notices_and_context_meter() {
         AgentEvent::ContextUsage {
             tokens: 25_000,
             tokenizer: "gpt-5".to_string(),
+            cost: 0.0,
         },
     ]);
     assert!(app
@@ -964,6 +968,7 @@ fn projection_only_indents_text_not_ui_elements() {
                 reasoning_effort: "medium",
                 context_tokens: 10,
                 context_window: 100,
+                cost: 0.0,
             },
             40,
         )
@@ -1188,11 +1193,52 @@ fn checkout_tree_marks_rows_with_children_as_directories() {
     assert!(document
         .controls
         .iter()
-        .any(|line| line.text.contains("[-] root")));
+        .any(|line| line.text.contains("[-]") && line.text.contains("user: root")));
     assert!(document
         .controls
         .iter()
-        .any(|line| line.kind == UiKind::TreeDirectory && line.text.contains("[+] child 2")));
+        .any(|line| line.kind == UiKind::TreeDirectory
+            && line.text.contains("[+]")
+            && line.text.contains("user: child 2")));
+}
+
+#[test]
+fn checkout_tree_marks_head_and_active_path() {
+    // Linear history e1 -> e2 -> e3, with e3 as the current HEAD.
+    let nodes = vec![
+        TreeNodeView {
+            id: "e1".to_string(),
+            parent_id: None,
+            label: "first".to_string(),
+            active: false,
+        },
+        TreeNodeView {
+            id: "e2".to_string(),
+            parent_id: Some("e1".to_string()),
+            label: "second".to_string(),
+            active: false,
+        },
+        TreeNodeView {
+            id: "e3".to_string(),
+            parent_id: Some("e2".to_string()),
+            label: "third".to_string(),
+            active: true,
+        },
+    ];
+    let tree = PickerState::checkout(nodes);
+    let document = UiBuilder::new().picker(Some(&tree)).finish();
+    let controls = &document.controls;
+
+    // The HEAD node is annotated as the current position.
+    assert!(controls
+        .iter()
+        .any(|line| line.text.contains("user: third") && line.text.contains("current")));
+    // Every node on the path to the HEAD is bulleted (root e1 included).
+    assert!(controls
+        .iter()
+        .any(|line| line.text.contains('\u{2022}') && line.text.contains("user: first")));
+    // A position counter is shown; selection starts on the HEAD (row 3 of 3).
+    assert!(controls.iter().any(|line| line.text.contains("(3/3)")));
 }
 
 #[test]

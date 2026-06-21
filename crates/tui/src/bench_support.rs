@@ -73,6 +73,7 @@ fn build_document(rendered_history_lines: Vec<UiLine>, width: usize, tick: usize
                 reasoning_effort: "none",
                 context_tokens: tick as u64,
                 context_window: 1_000_000,
+                cost: 0.0,
             },
             width,
         )

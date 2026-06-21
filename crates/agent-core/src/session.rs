@@ -515,6 +515,11 @@ impl SessionStore {
             }
             if let Some(item) = context_item_for_entry(entry) {
                 items.push(item);
+                if let EntryKind::ToolOutput { output, .. } = &entry.kind {
+                    if let Some(image) = crate::tools::image_content_item(output) {
+                        items.push(image);
+                    }
+                }
             }
         }
         sanitize_tool_pairs(items)

@@ -2,6 +2,7 @@ use crate::{
     config::{profile_dir, AuthStore, Config, ModelConfig},
     event::{AgentEvent, CommandView, GoalView, ModelOptionView, SessionListItemView},
     extensions::ExtensionRegistry,
+    hooks::Hooks,
     llm::{GoalToolRequest, OpenAiClient, OpenAiClientConfig, StreamEvent, ToolGoalResponse},
     oauth::{self, OAuthModel},
     prompt::{
@@ -14,6 +15,7 @@ use crate::{
     },
     skills,
     subagents::SubagentManager,
+    trust::{self, TrustStore},
     update::{self, UpdateNotice},
 };
 use serde_json::{json, Value};
@@ -102,22 +104,34 @@ pub struct AgentCore {
     total_input_tokens: u64,
     total_cached_input_tokens: u64,
     total_output_tokens: u64,
+    total_cost: f64,
     turn_started_at: Option<SystemTime>,
     turn_goal_tokens: u64,
     goal_continuation_running: bool,
     resume_summary_running: bool,
     interrupt_flag: Arc<AtomicBool>,
     subagent_manager: SubagentManager,
+    trust: TrustStore,
+    project_trusted: bool,
+    hooks: Hooks,
 }
 
 impl AgentCore {
     pub fn new() -> io::Result<Self> {
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let trust = TrustStore::load_or_create()?;
+        let project_trusted = if trust::project_has_local_resources(&cwd) {
+            trust.decision_for(&cwd).unwrap_or(false)
+        } else {
+            true
+        };
+        let hooks = Hooks::load(&profile_dir()?, &cwd, project_trusted);
         Ok(Self {
             config: Config::load_or_create()?,
             auth: AuthStore::load_or_create()?,
             session: SessionStore::new(),
             profile_dir: profile_dir()?,
-            cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            cwd,
             queued: VecDeque::new(),
             running: false,
             receiver: None,
@@ -126,18 +140,22 @@ impl AgentCore {
             total_input_tokens: 0,
             total_cached_input_tokens: 0,
             total_output_tokens: 0,
+            total_cost: 0.0,
             turn_started_at: None,
             turn_goal_tokens: 0,
             goal_continuation_running: false,
             resume_summary_running: false,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             subagent_manager: SubagentManager::default(),
+            trust,
+            project_trusted,
+            hooks,
         })
     }
 
     pub fn startup_events(&self) -> Vec<AgentEvent> {
         let model_config = self.config.current_model_config();
-        vec![
+        let mut events = vec![
             AgentEvent::Startup {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 profile_dir: self.config.profile_dir().display().to_string(),
@@ -148,7 +166,19 @@ impl AgentCore {
             },
             self.model_status_event(),
             self.command_list_event(),
-        ]
+        ];
+        if trust::project_has_local_resources(&self.cwd)
+            && self.trust.decision_for(&self.cwd).is_none()
+        {
+            events.push(AgentEvent::TrustPrompt {
+                cwd: self.cwd.display().to_string(),
+                repo_root: trust::repo_root(&self.cwd).map(|path| path.display().to_string()),
+            });
+        }
+        for message in self.hooks.session_start(&self.cwd) {
+            events.push(AgentEvent::Info(message));
+        }
+        events
     }
 
     pub fn start_update_check(&mut self) {
@@ -180,8 +210,8 @@ impl AgentCore {
 
     fn command_list_event(&self) -> AgentEvent {
         let mut commands = [
-            "/help", "/login", "/new", "/model", "/tree", "/resume", "/context", "/doctor",
-            "/skills", "/pin", "/goal", "/compact", "/quit",
+            "/help", "/login", "/new", "/model", "/tree", "/trust", "/resume", "/context",
+            "/doctor", "/skills", "/pin", "/goal", "/compact", "/quit",
         ]
         .iter()
         .map(|command| CommandView {
@@ -189,7 +219,9 @@ impl AgentCore {
             marker: None,
         })
         .collect::<Vec<_>>();
-        if let Ok(skill_commands) = skill_commands(self.config.profile_dir(), &self.cwd) {
+        if let Ok(skill_commands) =
+            skill_commands(self.config.profile_dir(), &self.cwd, self.project_trusted)
+        {
             commands.extend(skill_commands.into_iter().map(|entry| CommandView {
                 command: entry.command,
                 marker: Some("SKILL".to_string()),
@@ -198,12 +230,68 @@ impl AgentCore {
         AgentEvent::CommandList(commands)
     }
 
+    fn trust_command_events(&mut self, arg: &str) -> Vec<AgentEvent> {
+        let (path, trusted) = match arg.split_whitespace().next().unwrap_or("") {
+            "" => {
+                let status = if self.project_trusted {
+                    "trusted"
+                } else {
+                    "not trusted"
+                };
+                let mut events = vec![AgentEvent::Info(format!(
+                    "project {}: {status}",
+                    self.cwd.display()
+                ))];
+                if trust::project_has_local_resources(&self.cwd) {
+                    events.push(AgentEvent::TrustPrompt {
+                        cwd: self.cwd.display().to_string(),
+                        repo_root: trust::repo_root(&self.cwd).map(|p| p.display().to_string()),
+                    });
+                }
+                return events;
+            }
+            "yes" => (self.cwd.clone(), true),
+            "no" => (self.cwd.clone(), false),
+            "repo" => (
+                trust::repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone()),
+                true,
+            ),
+            other => {
+                return vec![AgentEvent::Error(format!(
+                    "usage: /trust [yes|no|repo] (got '{other}')"
+                ))]
+            }
+        };
+        if let Err(error) = self.trust.set(&path, trusted) {
+            return vec![AgentEvent::Error(format!(
+                "failed to save trust decision: {error}"
+            ))];
+        }
+        self.project_trusted = self.trust.decision_for(&self.cwd).unwrap_or(trusted);
+        self.hooks = Hooks::load(self.config.profile_dir(), &self.cwd, self.project_trusted);
+        vec![
+            AgentEvent::Status(format!(
+                "{} {}",
+                if trusted { "trusted" } else { "untrusted" },
+                path.display()
+            )),
+            self.command_list_event(),
+        ]
+    }
+
     pub fn submit_user_message(&mut self, message: String) -> Vec<AgentEvent> {
         if self.running {
             self.queued.push_back(message);
             return vec![
                 AgentEvent::PendingMessages(self.queued.iter().cloned().collect()),
                 AgentEvent::Status(format!("queued: {}", self.queued.len())),
+            ];
+        }
+        if let Err(reason) = self.hooks.user_prompt_submit(&message, &self.cwd) {
+            return vec![
+                AgentEvent::UserMessage(message),
+                AgentEvent::Error(format!("blocked by user_prompt_submit hook: {reason}")),
+                AgentEvent::Status("ready".to_string()),
             ];
         }
         let mut events = vec![AgentEvent::UserMessage(message.clone())];
@@ -260,7 +348,7 @@ impl AgentCore {
         let events = match command {
             "/quit" | "/exit" => return (true, Vec::new()),
             "/help" | "/" => vec![AgentEvent::Info(
-                "/help /login [web-url] [api-url] /new /model [model] [effort] /tree /resume [session-id] /context /goal [objective|pause|resume|blocked|complete|clear] /doctor /skills [list|install <id>|sync] /pin <skill> /compact /quit"
+                "/help /login [web-url] [api-url] /new /model [model] [effort] /tree /trust [yes|no|repo] /resume [session-id] /context /goal [objective|pause|resume|blocked|complete|clear] /doctor /skills [list|install <id>|sync] /pin <skill> /compact /quit"
                     .to_string(),
             )],
             "/login" => self.login_events(input[command.len()..].trim()),
@@ -279,6 +367,7 @@ impl AgentCore {
             ))],
             "/model" => self.model_command_events(parts.collect()),
             "/tree" => vec![AgentEvent::TreeView(self.session.tree_view())],
+            "/trust" => self.trust_command_events(input[command.len()..].trim()),
             "/checkout" => {
                 let label = input[command.len()..].trim();
                 if label.is_empty() {
@@ -463,14 +552,15 @@ impl AgentCore {
         if wanted.is_empty() {
             return vec![AgentEvent::Error("usage: /pin <skill>".to_string())];
         }
-        let commands = match skill_commands(self.config.profile_dir(), &self.cwd) {
-            Ok(commands) => commands,
-            Err(error) => {
-                return vec![AgentEvent::Error(format!(
-                    "failed to discover skills: {error}"
-                ))]
-            }
-        };
+        let commands =
+            match skill_commands(self.config.profile_dir(), &self.cwd, self.project_trusted) {
+                Ok(commands) => commands,
+                Err(error) => {
+                    return vec![AgentEvent::Error(format!(
+                        "failed to discover skills: {error}"
+                    ))]
+                }
+            };
         let Some(skill) = commands
             .into_iter()
             .find(|entry| {
@@ -495,7 +585,8 @@ impl AgentCore {
     }
 
     fn skill_command_events(&mut self, command: &str, request: &str) -> Option<Vec<AgentEvent>> {
-        let commands = skill_commands(self.config.profile_dir(), &self.cwd).ok()?;
+        let commands =
+            skill_commands(self.config.profile_dir(), &self.cwd, self.project_trusted).ok()?;
         let skill = commands
             .into_iter()
             .find(|entry| entry.command == command)?
@@ -627,6 +718,11 @@ impl AgentCore {
                         self.total_input_tokens += input_tokens;
                         self.total_cached_input_tokens += cached_input_tokens;
                         self.total_output_tokens += output_tokens;
+                        self.total_cost += self.config.current_model_config().cost_for(
+                            input_tokens,
+                            cached_input_tokens,
+                            output_tokens,
+                        );
                         let non_cached_input_tokens =
                             input_tokens.saturating_sub(cached_input_tokens);
                         self.turn_goal_tokens = self
@@ -647,6 +743,9 @@ impl AgentCore {
                         disconnected = true;
                         self.goal_tool_receiver = None;
                         events.push(self.context_usage_event());
+                        for message in self.hooks.stop(&self.cwd) {
+                            events.push(AgentEvent::Info(message));
+                        }
                         if !self.queued.is_empty() {
                             events.push(AgentEvent::PendingMessages(
                                 self.queued.iter().cloned().collect(),
@@ -753,16 +852,17 @@ impl AgentCore {
                 return events;
             }
         };
-        let skills = match discover_skills(self.config.profile_dir(), &self.cwd) {
-            Ok(skills) => skills,
-            Err(error) => {
-                let mut events = save_event;
-                events.push(AgentEvent::Error(format!(
-                    "failed to discover skills: {error}"
-                )));
-                return events;
-            }
-        };
+        let skills =
+            match discover_skills(self.config.profile_dir(), &self.cwd, self.project_trusted) {
+                Ok(skills) => skills,
+                Err(error) => {
+                    let mut events = save_event;
+                    events.push(AgentEvent::Error(format!(
+                        "failed to discover skills: {error}"
+                    )));
+                    return events;
+                }
+            };
         let project_instructions = if self.config.include_project_instructions {
             match discover_project_instructions(&self.cwd) {
                 Ok(instructions) => instructions,
@@ -826,6 +926,7 @@ impl AgentCore {
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: Some(goal_tool_tx),
             subagent_manager: Some(self.subagent_manager.clone()),
+            hooks: self.hooks.clone(),
         }) else {
             let mut events = save_event;
             events.push(AgentEvent::Error(
@@ -850,6 +951,7 @@ impl AgentCore {
         events.push(AgentEvent::ContextUsage {
             tokens: context_tokens as u64,
             tokenizer: context_tokenizer,
+            cost: self.total_cost,
         });
         let compaction_client = if compaction.is_some() {
             match self.compaction_client() {
@@ -1053,6 +1155,7 @@ impl AgentCore {
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: None,
             subagent_manager: None,
+            hooks: Hooks::default(),
         })
     }
 
@@ -1086,6 +1189,7 @@ impl AgentCore {
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: None,
             subagent_manager: None,
+            hooks: Hooks::default(),
         })
     }
 
@@ -1297,6 +1401,7 @@ impl AgentCore {
         AgentEvent::ContextUsage {
             tokens: tokens as u64,
             tokenizer,
+            cost: self.total_cost,
         }
     }
 
@@ -1465,6 +1570,7 @@ impl AgentCore {
                 self.total_input_tokens,
                 self.total_cached_input_tokens,
                 self.total_output_tokens,
+                self.total_cost,
             )),
             self.context_usage_event(),
         ]
@@ -1762,6 +1868,9 @@ fn jucode_model_config(model: &OAuthModel) -> ModelConfig {
             .reasoning_efforts
             .clone()
             .unwrap_or(default_reasoning_efforts),
+        input_cost: 0.0,
+        cached_input_cost: 0.0,
+        output_cost: 0.0,
     }
 }
 
@@ -1818,6 +1927,7 @@ fn format_context_statistics(
     total_input_tokens: u64,
     total_cached_input_tokens: u64,
     total_output_tokens: u64,
+    total_cost: f64,
 ) -> String {
     let mut lines = vec![
         format!(
@@ -1825,13 +1935,14 @@ fn format_context_statistics(
             stats.branch_entries, stats.context_items, stats.projected_items, stats.compacted
         ),
         format!(
-            "context_tokens: full={} projected={} tokenizer={} api_usage_input={} api_usage_cached_input={} api_usage_output={}",
+            "context_tokens: full={} projected={} tokenizer={} api_usage_input={} api_usage_cached_input={} api_usage_output={} cost=${:.4}",
             stats.tokens,
             stats.projected_tokens,
             stats.tokenizer,
             total_input_tokens,
             total_cached_input_tokens,
-            total_output_tokens
+            total_output_tokens,
+            total_cost
         ),
         format!(
             "entries: users={} assistant={} tool_calls={} tool_outputs={} pinned_skills={} branches={} other_response_items={}",
