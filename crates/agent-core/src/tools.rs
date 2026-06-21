@@ -1593,6 +1593,38 @@ pub fn image_content_item(output: &str) -> Option<Value> {
     }))
 }
 
+/// Reads a local image file and returns an `input_image` content part for a user
+/// message, or an error describing why it cannot be attached.
+pub fn image_attachment_part(path: &Path) -> Result<Value, String> {
+    let Some(mime) = image_mime(path) else {
+        return Err(format!("{}: not a supported image", path.display()));
+    };
+    let metadata = fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if metadata.len() > MAX_IMAGE_READ_BYTES {
+        return Err(format!("{}: image is too large to attach", path.display()));
+    }
+    let bytes = fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(json!({
+        "type": "input_image",
+        "image_url": format!("data:{mime};base64,{}", BASE64_STANDARD.encode(bytes)),
+    }))
+}
+
+/// Cheap validation (no read/encode) of an image attachment path. Returns an
+/// error message if the path is not an attachable image, else `None`.
+pub fn image_attachment_error(path: &Path) -> Option<String> {
+    if image_mime(path).is_none() {
+        return Some(format!("{}: not a supported image", path.display()));
+    }
+    match fs::metadata(path) {
+        Err(error) => Some(format!("{}: {error}", path.display())),
+        Ok(metadata) if metadata.len() > MAX_IMAGE_READ_BYTES => {
+            Some(format!("{}: image is too large to attach", path.display()))
+        }
+        Ok(_) => None,
+    }
+}
+
 fn project_diff_model_output(name: &str, output: &str, cwd: &Path) -> Option<String> {
     if env::var("JUCODE_PROJECT_DIFF_MODEL_OUTPUT")
         .ok()

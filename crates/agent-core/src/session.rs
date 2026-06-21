@@ -1,6 +1,6 @@
 use crate::{
     event::{TranscriptItem, TreeNodeView},
-    tokens,
+    tokens, tools,
 };
 use serde_json::{json, Value};
 use std::{
@@ -35,6 +35,11 @@ pub enum EntryKind {
     },
     User {
         content: String,
+    },
+    /// Image attachments for the immediately preceding user message, stored as
+    /// local file paths and read into `input_image` parts at projection time.
+    UserImage {
+        paths: Vec<String>,
     },
     ResponseItem {
         item: Value,
@@ -735,6 +740,9 @@ impl SessionStore {
                     name: name.clone(),
                     output: output.clone(),
                 }),
+                EntryKind::UserImage { paths } => {
+                    (!paths.is_empty()).then(|| TranscriptItem::User(image_attachment_label(paths)))
+                }
                 EntryKind::PinnedSkill { .. } => None,
                 EntryKind::GoalContext { .. } => None,
                 EntryKind::Compaction { .. } => None,
@@ -1204,9 +1212,18 @@ pub fn compaction_summary_item(summary: &str) -> Value {
     })
 }
 
+fn image_attachment_label(paths: &[String]) -> String {
+    if paths.len() == 1 {
+        "[image attached]".to_string()
+    } else {
+        format!("[{} images attached]", paths.len())
+    }
+}
+
 fn render_entry_for_summary(entry: &SessionEntry) -> Option<String> {
     match &entry.kind {
         EntryKind::User { content } => Some(format!("User: {content}")),
+        EntryKind::UserImage { paths } => Some(format!("User attached {} image(s)", paths.len())),
         EntryKind::ResponseItem { item } => {
             if item.get("type").and_then(Value::as_str) == Some("function_call") {
                 let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
@@ -1234,6 +1251,7 @@ fn render_entry_for_resume_summary(entry: &SessionEntry) -> Option<String> {
             "User: {}",
             single_line_with_limit(content, SESSION_LABEL_MAX_CHARS)
         )),
+        EntryKind::UserImage { paths } => Some(format!("User attached {} image(s)", paths.len())),
         EntryKind::ResponseItem { item } => {
             if item.get("type").and_then(Value::as_str) == Some("function_call") {
                 let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
@@ -1276,6 +1294,13 @@ fn context_item_for_entry(entry: &SessionEntry) -> Option<Value> {
             "role": "user",
             "content": [{ "type": "input_text", "text": content }]
         })),
+        EntryKind::UserImage { paths } => {
+            let content = paths
+                .iter()
+                .filter_map(|path| tools::image_attachment_part(Path::new(path)).ok())
+                .collect::<Vec<_>>();
+            (!content.is_empty()).then(|| json!({ "role": "user", "content": content }))
+        }
         EntryKind::ResponseItem { item } => Some(item.clone()),
         EntryKind::ToolOutput {
             call_id, output, ..
@@ -1314,6 +1339,7 @@ fn count_context_entry(kind: &EntryKind, counts: &mut ContextEntryCounts) {
         EntryKind::ToolOutput { .. } => counts.tool_outputs += 1,
         EntryKind::PinnedSkill { .. } => counts.pinned_skills += 1,
         EntryKind::GoalContext { .. } => counts.users += 1,
+        EntryKind::UserImage { .. } => {}
         EntryKind::Compaction { .. } => {}
     }
 }
@@ -1322,6 +1348,7 @@ fn context_entry_label(entry: &SessionEntry) -> String {
     match &entry.kind {
         EntryKind::Branch { label } => format!("branch:{label}"),
         EntryKind::User { .. } => "user".to_string(),
+        EntryKind::UserImage { .. } => "user_image".to_string(),
         EntryKind::ResponseItem { item } => match item.get("type").and_then(Value::as_str) {
             Some("function_call") => item
                 .get("name")
@@ -1380,6 +1407,7 @@ fn entry_to_json(entry: &SessionEntry) -> Value {
     let kind = match &entry.kind {
         EntryKind::Branch { label } => json!({ "type": "branch", "label": label }),
         EntryKind::User { content } => json!({ "type": "user", "content": content }),
+        EntryKind::UserImage { paths } => json!({ "type": "user_image", "paths": paths }),
         EntryKind::ResponseItem { item } => json!({ "type": "response_item", "item": item }),
         EntryKind::ToolOutput {
             call_id,
@@ -1422,6 +1450,14 @@ fn entry_from_json(value: &Value) -> Option<SessionEntry> {
         },
         "user" => EntryKind::User {
             content: kind_value.get("content")?.as_str()?.to_string(),
+        },
+        "user_image" => EntryKind::UserImage {
+            paths: kind_value
+                .get("paths")?
+                .as_array()?
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect(),
         },
         "response_item" => EntryKind::ResponseItem {
             item: kind_value.get("item")?.clone(),
@@ -1794,6 +1830,38 @@ mod tests {
         let value = entry_to_json(session.branch().last().unwrap());
         let restored = entry_from_json(&value).expect("compaction entry round-trips");
         assert!(matches!(restored.kind, EntryKind::Compaction { .. }));
+    }
+
+    #[test]
+    fn user_image_attachment_survives_journal_round_trip() {
+        let mut session = SessionStore::new();
+        session.append(EntryKind::User {
+            content: "look".to_string(),
+        });
+        session.append(EntryKind::UserImage {
+            paths: vec!["/tmp/a.png".to_string(), "/tmp/b.png".to_string()],
+        });
+
+        let value = entry_to_json(session.branch().last().unwrap());
+        let restored = entry_from_json(&value).expect("user_image entry round-trips");
+        match restored.kind {
+            EntryKind::UserImage { paths } => {
+                assert_eq!(paths, vec!["/tmp/a.png".to_string(), "/tmp/b.png".to_string()]);
+            }
+            _ => panic!("expected UserImage entry"),
+        }
+    }
+
+    #[test]
+    fn user_image_with_missing_files_yields_no_context_item() {
+        let entry = SessionEntry {
+            id: EntryId(9),
+            parent_id: None,
+            kind: EntryKind::UserImage {
+                paths: vec!["/nonexistent/never.png".to_string()],
+            },
+        };
+        assert!(context_item_for_entry(&entry).is_none());
     }
 
     #[test]

@@ -3,7 +3,8 @@ use jucode_tui::{TuiApp, TuiRuntime};
 use serde_json::{json, Value};
 use std::{
     env, io,
-    io::{Read, Write},
+    io::{BufRead, Read, Write},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -61,6 +62,10 @@ fn main() -> io::Result<()> {
         let code = run_headless(args)?;
         std::process::exit(code);
     }
+    if args.first().map(String::as_str) == Some("serve") {
+        let code = run_serve()?;
+        std::process::exit(code);
+    }
     let mut core = AgentCore::new()?;
     core.start_update_check();
     TuiApp::new(Runtime(core)).run()
@@ -106,6 +111,118 @@ fn run_headless(args: Vec<String>) -> io::Result<i32> {
         final_result_json(&stats, started.elapsed().as_millis() as u64),
     )?;
     Ok(if stats.last_error.is_some() { 1 } else { 0 })
+}
+
+/// Persistent bidirectional protocol mode for GUI/IDE front-ends.
+///
+/// Reads newline-delimited JSON commands on stdin and emits the engine's
+/// `AgentEvent` stream as newline-delimited JSON on stdout (same schema as
+/// `--headless`). Runs until stdin closes or a `shutdown`/`/quit` command.
+fn run_serve() -> io::Result<i32> {
+    let mut core = AgentCore::new()?;
+    core.start_update_check();
+    let mut stdout = io::stdout();
+
+    for event in core.startup_events() {
+        write_event(&mut stdout, event)?;
+    }
+    // Seed dedup so the first poll loop doesn't immediately re-emit model_status.
+    let mut last_status = Some(event_json(core.model_status_event()));
+
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            match line {
+                Ok(line) => {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    loop {
+        loop {
+            match rx.try_recv() {
+                Ok(line) => {
+                    if handle_serve_line(&mut core, &mut stdout, &line)? {
+                        return Ok(0);
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return Ok(0),
+            }
+        }
+
+        for event in core.poll_events() {
+            write_event(&mut stdout, event)?;
+        }
+
+        let status = event_json(core.model_status_event());
+        if last_status.as_ref() != Some(&status) {
+            write_json_value(&mut stdout, status.clone())?;
+            last_status = Some(status);
+        }
+
+        thread::sleep(Duration::from_millis(30));
+    }
+}
+
+/// Dispatch one stdin command line. Returns `Ok(true)` to terminate serve mode.
+fn handle_serve_line(
+    core: &mut AgentCore,
+    stdout: &mut impl Write,
+    line: &str,
+) -> io::Result<bool> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(false);
+    }
+    let value = match serde_json::from_str::<Value>(line) {
+        Ok(value) => value,
+        Err(error) => {
+            write_event(stdout, AgentEvent::Error(format!("invalid command: {error}")))?;
+            return Ok(false);
+        }
+    };
+    let op = value.get("op").and_then(Value::as_str).unwrap_or_default();
+    let events = match op {
+        "user_message" => {
+            let content = value
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let images = value
+                .get("images")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            core.submit_user_message_with_images(content.to_string(), images)
+        }
+        "command" => {
+            let input = value.get("input").and_then(Value::as_str).unwrap_or_default();
+            let (quit, events) = core.handle_command(input);
+            for event in events {
+                write_event(stdout, event)?;
+            }
+            return Ok(quit);
+        }
+        "steer" => core.steer(),
+        "interrupt" => core.interrupt(),
+        "shutdown" => return Ok(true),
+        other => vec![AgentEvent::Error(format!("unknown op: {other}"))],
+    };
+    for event in events {
+        write_event(stdout, event)?;
+    }
+    Ok(false)
 }
 
 fn write_event(stdout: &mut impl Write, event: AgentEvent) -> io::Result<()> {

@@ -4,7 +4,7 @@ use crate::{
     extensions::ExtensionRegistry,
     hooks::Hooks,
     llm::{GoalToolRequest, OpenAiClient, OpenAiClientConfig, StreamEvent, ToolGoalResponse},
-    oauth::{self, OAuthModel},
+    oauth::{self, OAuthLoginResult, OAuthModel},
     prompt::{
         build_system_prompt, discover_project_instructions, discover_skills, skill_commands,
         skill_message, skill_pin_message, PromptContext,
@@ -96,11 +96,12 @@ pub struct AgentCore {
     session: SessionStore,
     profile_dir: PathBuf,
     cwd: PathBuf,
-    queued: VecDeque<String>,
+    queued: VecDeque<(String, Vec<String>)>,
     running: bool,
     receiver: Option<Receiver<WorkerEvent>>,
     goal_tool_receiver: Option<Receiver<GoalToolRequest>>,
     update_receiver: Option<Receiver<UpdateNotice>>,
+    login_receiver: Option<Receiver<Result<OAuthLoginResult, String>>>,
     total_input_tokens: u64,
     total_cached_input_tokens: u64,
     total_output_tokens: u64,
@@ -137,6 +138,7 @@ impl AgentCore {
             receiver: None,
             goal_tool_receiver: None,
             update_receiver: None,
+            login_receiver: None,
             total_input_tokens: 0,
             total_cached_input_tokens: 0,
             total_output_tokens: 0,
@@ -280,23 +282,50 @@ impl AgentCore {
     }
 
     pub fn submit_user_message(&mut self, message: String) -> Vec<AgentEvent> {
+        self.submit_user_message_with_images(message, Vec::new())
+    }
+
+    pub fn submit_user_message_with_images(
+        &mut self,
+        message: String,
+        images: Vec<String>,
+    ) -> Vec<AgentEvent> {
+        let (images, mut events) = self.validate_image_attachments(images);
         if self.running {
-            self.queued.push_back(message);
-            return vec![
-                AgentEvent::PendingMessages(self.queued.iter().cloned().collect()),
-                AgentEvent::Status(format!("queued: {}", self.queued.len())),
-            ];
+            self.queued.push_back((message, images));
+            events.push(AgentEvent::PendingMessages(self.pending_texts()));
+            events.push(AgentEvent::Status(format!("queued: {}", self.queued.len())));
+            return events;
         }
         if let Err(reason) = self.hooks.user_prompt_submit(&message, &self.cwd) {
-            return vec![
-                AgentEvent::UserMessage(message),
-                AgentEvent::Error(format!("blocked by user_prompt_submit hook: {reason}")),
-                AgentEvent::Status("ready".to_string()),
-            ];
+            events.push(AgentEvent::UserMessage(message));
+            events.push(AgentEvent::Error(format!(
+                "blocked by user_prompt_submit hook: {reason}"
+            )));
+            events.push(AgentEvent::Status("ready".to_string()));
+            return events;
         }
-        let mut events = vec![AgentEvent::UserMessage(message.clone())];
-        events.extend(self.start_turn(message));
+        events.push(AgentEvent::UserMessage(message.clone()));
+        events.extend(self.start_turn(message, images));
         events
+    }
+
+    /// Splits attachment paths into valid ones (kept) and a warning event per
+    /// unattachable path. Reads no file contents.
+    fn validate_image_attachments(&self, images: Vec<String>) -> (Vec<String>, Vec<AgentEvent>) {
+        let mut valid = Vec::new();
+        let mut events = Vec::new();
+        for path in images {
+            match crate::tools::image_attachment_error(std::path::Path::new(&path)) {
+                Some(error) => events.push(AgentEvent::Info(format!("skipped attachment {error}"))),
+                None => valid.push(path),
+            }
+        }
+        (valid, events)
+    }
+
+    fn pending_texts(&self) -> Vec<String> {
+        self.queued.iter().map(|(text, _)| text.clone()).collect()
     }
 
     pub fn steer(&mut self) -> Vec<AgentEvent> {
@@ -306,15 +335,15 @@ impl AgentCore {
 
         self.receiver = None;
         self.running = false;
-        let Some(next) = self.queued.pop_front() else {
+        let Some((next, images)) = self.queued.pop_front() else {
             return Vec::new();
         };
         let mut events = vec![
             AgentEvent::Status("steering".to_string()),
-            AgentEvent::PendingMessages(self.queued.iter().cloned().collect()),
+            AgentEvent::PendingMessages(self.pending_texts()),
             AgentEvent::UserMessage(next.clone()),
         ];
-        events.extend(self.start_turn(next));
+        events.extend(self.start_turn(next, images));
         events
     }
 
@@ -600,9 +629,9 @@ impl AgentCore {
             }
         };
         if self.running {
-            self.queued.push_back(message);
+            self.queued.push_back((message, Vec::new()));
             return Some(vec![
-                AgentEvent::PendingMessages(self.queued.iter().cloned().collect()),
+                AgentEvent::PendingMessages(self.pending_texts()),
                 AgentEvent::Status(format!("queued: {}", self.queued.len())),
             ]);
         }
@@ -612,7 +641,7 @@ impl AgentCore {
             format!("{command} {request}")
         };
         let mut events = vec![AgentEvent::UserMessage(display)];
-        events.extend(self.start_turn(message));
+        events.extend(self.start_turn(message, Vec::new()));
         Some(events)
     }
 
@@ -747,9 +776,7 @@ impl AgentCore {
                             events.push(AgentEvent::Info(message));
                         }
                         if !self.queued.is_empty() {
-                            events.push(AgentEvent::PendingMessages(
-                                self.queued.iter().cloned().collect(),
-                            ));
+                            events.push(AgentEvent::PendingMessages(self.pending_texts()));
                         }
                         events.push(AgentEvent::Status(if self.queued.is_empty() {
                             "ready".to_string()
@@ -780,19 +807,27 @@ impl AgentCore {
                 Err(mpsc::TryRecvError::Disconnected) => {}
             }
         }
+        if let Some(rx) = self.login_receiver.take() {
+            match rx.try_recv() {
+                Ok(Ok(result)) => events.extend(self.apply_login_result(result)),
+                Ok(Err(error)) => {
+                    events.push(AgentEvent::Error(format!("JuCode login failed: {error}")))
+                }
+                Err(mpsc::TryRecvError::Empty) => self.login_receiver = Some(rx),
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
         events.extend(self.poll_goal_tool_requests());
         if self.should_generate_resume_summary() {
             self.start_resume_summary();
         }
 
         if !self.running {
-            if let Some(next) = self.queued.pop_front() {
+            if let Some((next, images)) = self.queued.pop_front() {
                 self.goal_continuation_running = false;
-                events.push(AgentEvent::PendingMessages(
-                    self.queued.iter().cloned().collect(),
-                ));
+                events.push(AgentEvent::PendingMessages(self.pending_texts()));
                 events.push(AgentEvent::UserMessage(next.clone()));
-                events.extend(self.start_turn(next));
+                events.extend(self.start_turn(next, images));
             } else if self.should_continue_goal() {
                 events.extend(self.start_goal_continuation());
             }
@@ -813,8 +848,11 @@ impl AgentCore {
             .collect()
     }
 
-    fn start_turn(&mut self, message: String) -> Vec<AgentEvent> {
+    fn start_turn(&mut self, message: String, images: Vec<String>) -> Vec<AgentEvent> {
         self.session.append(EntryKind::User { content: message });
+        if !images.is_empty() {
+            self.session.append(EntryKind::UserImage { paths: images });
+        }
         self.turn_started_at = Some(SystemTime::now());
         self.turn_goal_tokens = 0;
         let save_event = self.save_session_event();
@@ -1446,62 +1484,71 @@ impl AgentCore {
                 web_url.clone()
             }
         });
-        let mut events = vec![AgentEvent::Info(format!(
-            "opening browser for JuCode OAuth: {web_url}"
-        ))];
-        match oauth::login(&web_url, &api_url) {
-            Ok(result) => {
-                let models = result
-                    .models
-                    .iter()
-                    .filter(|model| is_jucode_supported_model(&model.id))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                self.config.provider = "jucode".to_string();
-                self.config.jucode_web_url = result.web_url.clone();
-                self.config.jucode_api_url = result.api_url.clone();
-                self.config.base_url = format!("{}/v1", result.api_url);
-                for model in &models {
-                    let model_config = jucode_model_config(model);
-                    if let Some(existing) = self
-                        .config
-                        .models
-                        .iter_mut()
-                        .find(|entry| entry.name == model.id)
-                    {
-                        *existing = model_config;
-                    } else {
-                        self.config.models.push(model_config);
-                    }
-                }
-                if let Some(model) = models.first() {
-                    self.config.model = model.id.clone();
-                    let supported = self.reasoning_efforts_for_model(&model.id);
-                    if !supported
-                        .iter()
-                        .any(|effort| effort == &self.config.reasoning_effort)
-                    {
-                        self.config.reasoning_effort =
-                            self.default_reasoning_effort_for_model(&model.id);
-                    }
-                }
-                self.auth.set_key_for("jucode", result.api_key);
-                match self.auth.save().and_then(|_| self.config.save()) {
-                    Ok(()) => {
-                        events.push(AgentEvent::Info(
-                            "JuCode account connected; provider switched to jucode".to_string(),
-                        ));
-                        events.push(self.model_status_event());
-                        events.extend(self.sync_default_skills_events());
-                    }
-                    Err(error) => {
-                        events.push(AgentEvent::Error(format!("failed to save login: {error}")))
-                    }
-                }
-            }
-            Err(error) => events.push(AgentEvent::Error(format!("JuCode login failed: {error}"))),
+        if self.login_receiver.is_some() {
+            return vec![AgentEvent::Error(
+                "a login is already in progress".to_string(),
+            )];
         }
-        events
+        let (tx, rx) = mpsc::channel();
+        let web = web_url.clone();
+        let api = api_url.clone();
+        thread::spawn(move || {
+            let _ = tx.send(oauth::login(&web, &api));
+        });
+        self.login_receiver = Some(rx);
+        vec![AgentEvent::Info(format!(
+            "opening browser for JuCode OAuth: {web_url}"
+        ))]
+    }
+
+    fn apply_login_result(&mut self, result: OAuthLoginResult) -> Vec<AgentEvent> {
+        let models = result
+            .models
+            .iter()
+            .filter(|model| is_jucode_supported_model(&model.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.config.provider = "jucode".to_string();
+        self.config.jucode_web_url = result.web_url.clone();
+        self.config.jucode_api_url = result.api_url.clone();
+        self.config.base_url = format!("{}/v1", result.api_url);
+        for model in &models {
+            let model_config = jucode_model_config(model);
+            if let Some(existing) = self
+                .config
+                .models
+                .iter_mut()
+                .find(|entry| entry.name == model.id)
+            {
+                *existing = model_config;
+            } else {
+                self.config.models.push(model_config);
+            }
+        }
+        if let Some(model) = models.first() {
+            self.config.model = model.id.clone();
+            let supported = self.reasoning_efforts_for_model(&model.id);
+            if !supported
+                .iter()
+                .any(|effort| effort == &self.config.reasoning_effort)
+            {
+                self.config.reasoning_effort = self.default_reasoning_effort_for_model(&model.id);
+            }
+        }
+        self.auth.set_key_for("jucode", result.api_key);
+        match self.auth.save().and_then(|_| self.config.save()) {
+            Ok(()) => {
+                let mut events = vec![
+                    AgentEvent::Info(
+                        "JuCode account connected; provider switched to jucode".to_string(),
+                    ),
+                    self.model_status_event(),
+                ];
+                events.extend(self.sync_default_skills_events());
+                events
+            }
+            Err(error) => vec![AgentEvent::Error(format!("failed to save login: {error}"))],
+        }
     }
 
     fn resume_list_events(&self) -> Vec<AgentEvent> {
