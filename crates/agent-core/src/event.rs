@@ -81,6 +81,8 @@ pub enum AgentEvent {
     ContextUsage {
         tokens: u64,
         tokenizer: String,
+        /// Cumulative USD cost so far this session. 0 when prices are unconfigured.
+        cost: f64,
     },
     ThinkingStart,
     ReasoningDelta(String),
@@ -117,6 +119,11 @@ pub enum AgentEvent {
     },
     TreeView(Vec<TreeNodeView>),
     ResumeView(Vec<SessionListItemView>),
+    /// Ask the user whether to trust the current project's local resources.
+    TrustPrompt {
+        cwd: String,
+        repo_root: Option<String>,
+    },
     ModelView {
         models: Vec<ModelOptionView>,
         active_effort: String,

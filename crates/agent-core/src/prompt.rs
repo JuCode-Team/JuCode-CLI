@@ -85,17 +85,27 @@ pub fn build_system_prompt(base: &str, context: &PromptContext) -> String {
     prompt
 }
 
-pub fn discover_skills(profile_dir: &Path, cwd: &Path) -> io::Result<Vec<SkillPromptItem>> {
+pub fn discover_skills(
+    profile_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+) -> io::Result<Vec<SkillPromptItem>> {
     let mut skills = Vec::new();
     read_skills_dir(&profile_dir.join("skills"), &mut skills)?;
-    read_skills_dir(&cwd.join(".jucode").join("skills"), &mut skills)?;
+    if project_trusted {
+        read_skills_dir(&cwd.join(".jucode").join("skills"), &mut skills)?;
+    }
     skills.sort_by(|left, right| left.name.cmp(&right.name));
     skills.dedup_by(|left, right| left.name == right.name && left.path == right.path);
     Ok(skills)
 }
 
-pub fn skill_commands(profile_dir: &Path, cwd: &Path) -> io::Result<Vec<SkillCommand>> {
-    let mut commands = discover_skills(profile_dir, cwd)?
+pub fn skill_commands(
+    profile_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+) -> io::Result<Vec<SkillCommand>> {
+    let mut commands = discover_skills(profile_dir, cwd, project_trusted)?
         .into_iter()
         .map(|skill| SkillCommand {
             command: format!("/{}", skill_command_name(&skill.name)),
@@ -368,7 +378,7 @@ mod tests {
         )
         .unwrap();
 
-        let skills = discover_skills(&root.join("profile"), &root.join("cwd")).unwrap();
+        let skills = discover_skills(&root.join("profile"), &root.join("cwd"), true).unwrap();
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "review");
@@ -398,7 +408,7 @@ mod tests {
         )
         .unwrap();
 
-        let skills = discover_skills(&root.join("profile"), &root.join("cwd")).unwrap();
+        let skills = discover_skills(&root.join("profile"), &root.join("cwd"), true).unwrap();
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "nested-review");
@@ -423,7 +433,7 @@ mod tests {
         )
         .unwrap();
 
-        let commands = skill_commands(&root.join("profile"), &root.join("cwd")).unwrap();
+        let commands = skill_commands(&root.join("profile"), &root.join("cwd"), true).unwrap();
 
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].command, "/code-review");

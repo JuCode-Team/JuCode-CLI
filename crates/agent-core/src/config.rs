@@ -88,6 +88,22 @@ pub struct ModelConfig {
     pub context_window: u64,
     pub max_output_tokens: u64,
     pub reasoning_efforts: Vec<String>,
+    /// USD price per 1M tokens. 0 means unknown, which suppresses cost display.
+    pub input_cost: f64,
+    pub cached_input_cost: f64,
+    pub output_cost: f64,
+}
+
+impl ModelConfig {
+    /// Cumulative USD cost for a turn's token usage. Returns 0 when no prices are
+    /// configured for the model.
+    pub fn cost_for(&self, input_tokens: u64, cached_input_tokens: u64, output_tokens: u64) -> f64 {
+        let non_cached_input = input_tokens.saturating_sub(cached_input_tokens);
+        (non_cached_input as f64 * self.input_cost
+            + cached_input_tokens as f64 * self.cached_input_cost
+            + output_tokens as f64 * self.output_cost)
+            / 1_000_000.0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -337,6 +353,10 @@ fn read_bool(value: &Value, key: &str, default: bool) -> bool {
     value.get(key).and_then(Value::as_bool).unwrap_or(default)
 }
 
+fn read_f64(value: &Value, key: &str, default: f64) -> f64 {
+    value.get(key).and_then(Value::as_f64).unwrap_or(default)
+}
+
 fn read_api_key_env(value: &Value) -> String {
     let raw = value
         .get("api_key_env")
@@ -417,6 +437,9 @@ fn read_model_configs(value: &Value) -> Vec<ModelConfig> {
                 .and_then(Value::as_u64)
                 .unwrap_or(128_000),
             reasoning_efforts,
+            input_cost: read_f64(model, "input_cost", 0.0),
+            cached_input_cost: read_f64(model, "cached_input_cost", 0.0),
+            output_cost: read_f64(model, "output_cost", 0.0),
         });
     }
 
@@ -459,6 +482,9 @@ fn model_config_value(model: &ModelConfig) -> Value {
         "context_window": model.context_window,
         "max_output_tokens": model.max_output_tokens,
         "reasoning_efforts": model.reasoning_efforts,
+        "input_cost": model.input_cost,
+        "cached_input_cost": model.cached_input_cost,
+        "output_cost": model.output_cost,
     })
 }
 
@@ -520,6 +546,9 @@ fn default_model_configs() -> Vec<ModelConfig> {
                 .iter()
                 .map(|value| value.to_string())
                 .collect(),
+            input_cost: 0.0,
+            cached_input_cost: 0.0,
+            output_cost: 0.0,
         },
     )
     .collect()
@@ -534,6 +563,9 @@ fn default_model_config(name: &str) -> ModelConfig {
             context_window: 400_000,
             max_output_tokens: 128_000,
             reasoning_efforts: default_reasoning_efforts(),
+            input_cost: 0.0,
+            cached_input_cost: 0.0,
+            output_cost: 0.0,
         })
 }
 
@@ -586,6 +618,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cost_for_prices_cached_input_separately() {
+        let model = ModelConfig {
+            name: "m".to_string(),
+            context_window: 1,
+            max_output_tokens: 1,
+            reasoning_efforts: vec![],
+            input_cost: 2.0,
+            cached_input_cost: 0.5,
+            output_cost: 8.0,
+        };
+        // 1M non-cached input @2 + 1M cached @0.5 + 1M output @8 = 10.5
+        let cost = model.cost_for(2_000_000, 1_000_000, 1_000_000);
+        assert!((cost - 10.5).abs() < 1e-9, "cost was {cost}");
+    }
+
+    #[test]
+    fn cost_for_zero_prices_is_free() {
+        let model = default_model_config("gpt-5.4");
+        assert_eq!(model.cost_for(1_000, 100, 1_000), 0.0);
+    }
+
+    #[test]
     fn compact_model_config_uses_compact_model() {
         let config = Config {
             provider: "openai".to_string(),
@@ -599,12 +653,18 @@ mod tests {
                     context_window: 100,
                     max_output_tokens: 10,
                     reasoning_efforts: vec!["medium".to_string()],
+                    input_cost: 0.0,
+                    cached_input_cost: 0.0,
+                    output_cost: 0.0,
                 },
                 ModelConfig {
                     name: "compact-model".to_string(),
                     context_window: 200,
                     max_output_tokens: 20,
                     reasoning_efforts: vec!["low".to_string()],
+                    input_cost: 0.0,
+                    cached_input_cost: 0.0,
+                    output_cost: 0.0,
                 },
             ],
             base_url: "https://api.openai.com/v1".to_string(),

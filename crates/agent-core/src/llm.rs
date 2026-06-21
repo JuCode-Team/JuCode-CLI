@@ -1,5 +1,6 @@
 use crate::{
     extensions::ExtensionRegistry,
+    hooks::Hooks,
     session::extract_response_text,
     subagents::{
         SubagentManager, SubagentRunResult, SubagentSpawn, MAX_LIVE_SUBAGENTS, MAX_SUBAGENT_DEPTH,
@@ -65,6 +66,7 @@ pub struct OpenAiClient {
     subagent_manager: Option<SubagentManager>,
     agent_path: String,
     agent_depth: u64,
+    hooks: Hooks,
 }
 
 pub struct OpenAiClientConfig<'a> {
@@ -82,6 +84,7 @@ pub struct OpenAiClientConfig<'a> {
     pub read_timeout: Duration,
     pub goal_tool_tx: Option<Sender<GoalToolRequest>>,
     pub subagent_manager: Option<SubagentManager>,
+    pub hooks: Hooks,
 }
 
 #[derive(Debug)]
@@ -192,6 +195,7 @@ impl OpenAiClient {
             subagent_manager: config.subagent_manager,
             agent_path: "/root".to_string(),
             agent_depth: 0,
+            hooks: config.hooks,
         })
     }
 
@@ -284,17 +288,35 @@ impl OpenAiClient {
             tool_calls_executed = tool_calls_executed
                 .saturating_add(u64::try_from(tool_requests.len()).unwrap_or(u64::MAX));
 
-            let tool_results = if should_run_parallel_tools(&tool_requests) {
-                for request in &tool_requests {
+            // Fire pre_tool_use hooks up front: a hook may block a tool, in which
+            // case it is never executed and the model receives the block reason.
+            let mut blocked_results = Vec::new();
+            let mut allowed_requests = Vec::new();
+            for request in tool_requests {
+                if let Some(reason) = self.hooks.pre_tool(&request.name, &request.arguments, cwd) {
+                    emit(StreamEvent::ToolStart {
+                        call_id: request.call_id.clone(),
+                        name: request.name.clone(),
+                    })?;
+                    let result = hook_blocked_result(&reason);
+                    emit_tool_output(&request, &result, &mut emit)?;
+                    blocked_results.push(ToolCallResult { request, result });
+                } else {
+                    allowed_requests.push(request);
+                }
+            }
+
+            let mut tool_results = if should_run_parallel_tools(&allowed_requests) {
+                for request in &allowed_requests {
                     emit(StreamEvent::ToolStart {
                         call_id: request.call_id.clone(),
                         name: request.name.clone(),
                     })?;
                 }
-                run_parallel_builtin_tools(&tool_requests, cwd, &mut emit)?
+                run_parallel_builtin_tools(&allowed_requests, cwd, &mut emit)?
             } else {
                 let mut results = Vec::new();
-                for request in tool_requests {
+                for request in allowed_requests {
                     emit(StreamEvent::ToolStart {
                         call_id: request.call_id.clone(),
                         name: request.name.clone(),
@@ -307,12 +329,22 @@ impl OpenAiClient {
                 results
             };
 
+            for tool_result in &tool_results {
+                self.hooks
+                    .post_tool(&tool_result.request.name, &tool_result.result.output, cwd);
+            }
+            tool_results.append(&mut blocked_results);
+
             for tool_result in tool_results {
+                let image_item = tools::image_content_item(&tool_result.result.output);
                 input.push(json!({
                     "type": "function_call_output",
                     "call_id": tool_result.request.call_id,
                     "output": tool_result.result.model_output
                 }));
+                if let Some(image_item) = image_item {
+                    input.push(image_item);
+                }
             }
         }
     }
@@ -853,6 +885,7 @@ impl OpenAiClient {
             subagent_manager: Some(manager.clone()),
             agent_path: child_path.clone(),
             agent_depth: child_depth,
+            hooks: self.hooks.clone(),
         };
 
         std::thread::spawn(move || {
@@ -1256,6 +1289,18 @@ fn run_parallel_builtin_tools(
     Ok(results)
 }
 
+fn hook_blocked_result(reason: &str) -> tools::ToolExecutionResult {
+    let output = json!({
+        "error": format!("blocked by pre_tool_use hook: {reason}")
+    })
+    .to_string();
+    tools::ToolExecutionResult {
+        model_output: output.clone(),
+        output,
+        is_error: true,
+    }
+}
+
 fn emit_tool_output(
     request: &ToolCallRequest,
     result: &tools::ToolExecutionResult,
@@ -1472,6 +1517,18 @@ fn responses_input_to_anthropic_messages(input: &[Value], include_thinking: bool
                     json!({ "type": "text", "text": text }),
                 );
             }
+            for part in item
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if part.get("type").and_then(Value::as_str) == Some("input_image") {
+                    if let Some(block) = anthropic_image_block(part) {
+                        push_anthropic_content(&mut messages, "user", block);
+                    }
+                }
+            }
             continue;
         }
 
@@ -1547,6 +1604,23 @@ fn responses_input_to_anthropic_messages(input: &[Value], include_thinking: bool
         }
     }
     messages
+}
+
+/// Converts an OpenAI-style `input_image` part (a `data:<mime>;base64,<data>`
+/// URL) into an Anthropic image content block. Returns `None` if the URL is not
+/// an inline base64 data URL.
+fn anthropic_image_block(part: &Value) -> Option<Value> {
+    let url = part.get("image_url").and_then(Value::as_str)?;
+    let rest = url.strip_prefix("data:")?;
+    let (media_type, data) = rest.split_once(";base64,")?;
+    Some(json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media_type,
+            "data": data,
+        },
+    }))
 }
 
 fn push_anthropic_content(messages: &mut Vec<Value>, role: &str, block: Value) {

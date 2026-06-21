@@ -39,6 +39,7 @@ pub(crate) enum PickerMode {
     Checkout,
     Resume,
     Model,
+    Trust,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +137,38 @@ impl PickerState {
         }
     }
 
+    pub(crate) fn trust(cwd: String, repo_root: Option<String>) -> Self {
+        let row = |id: &str, label: &str, detail: String| PickerRow {
+            id: id.to_string(),
+            parent_id: None,
+            depth: 0,
+            prefix: String::new(),
+            label: label.to_string(),
+            active: false,
+            has_children: false,
+            detail,
+            reasoning_efforts: Vec::new(),
+        };
+        let mut rows = vec![row("yes", "Trust this folder", cwd)];
+        if let Some(root) = repo_root {
+            rows.push(row("repo", "Trust the whole repository", root));
+        }
+        rows.push(row(
+            "no",
+            "Do not trust (project skills & hooks stay disabled)",
+            String::new(),
+        ));
+        Self {
+            rows,
+            selected: 0,
+            mode: PickerMode::Trust,
+            tree: None,
+            efforts: Vec::new(),
+            selected_effort: 0,
+            prompt: None,
+        }
+    }
+
     pub(crate) fn selected_id(&self) -> Option<String> {
         self.rows.get(self.selected).map(|row| row.id.clone())
     }
@@ -149,7 +182,30 @@ impl PickerState {
                 let effort = self.efforts.get(self.selected_effort)?;
                 Some(format!("/model {id} {effort}"))
             }
+            PickerMode::Trust => Some(format!("/trust {id}")),
         }
+    }
+
+    /// Ids of the nodes on the path from the root to the current HEAD, used to
+    /// highlight "where you are" in the tree. Empty outside checkout mode.
+    pub(crate) fn active_path_ids(&self) -> HashSet<String> {
+        let mut path = HashSet::new();
+        let Some(tree) = self.tree.as_ref() else {
+            return path;
+        };
+        let Some(active) = tree.all_rows.iter().find(|row| row.active) else {
+            return path;
+        };
+        let mut current = Some(active.id.clone());
+        while let Some(id) = current {
+            path.insert(id.clone());
+            current = tree
+                .all_rows
+                .iter()
+                .find(|row| row.id == id)
+                .and_then(|row| row.parent_id.clone());
+        }
+        path
     }
 
     pub(crate) fn is_expanded_tree_row(&self, id: &str) -> bool {

@@ -150,6 +150,7 @@ pub(crate) struct BottomStatus<'a> {
     pub(crate) reasoning_effort: &'a str,
     pub(crate) context_tokens: u64,
     pub(crate) context_window: u64,
+    pub(crate) cost: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,8 +170,8 @@ impl From<CommandView> for CommandCandidate {
 
 fn default_commands() -> Vec<CommandCandidate> {
     [
-        "/help", "/login", "/new", "/model", "/tree", "/resume", "/context", "/doctor", "/skills",
-        "/pin", "/goal", "/compact", "/quit",
+        "/help", "/login", "/new", "/model", "/tree", "/trust", "/resume", "/context", "/doctor",
+        "/skills", "/pin", "/goal", "/compact", "/quit",
     ]
     .iter()
     .map(|command| CommandCandidate {

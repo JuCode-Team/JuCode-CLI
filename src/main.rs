@@ -19,6 +19,7 @@ struct HeadlessStats {
     reasoning_tokens: u64,
     context_tokens: u64,
     context_tokenizer: Option<String>,
+    cost: f64,
     tool_calls: u64,
     subagent_events: u64,
     assistant_chars: usize,
@@ -129,9 +130,14 @@ fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
         AgentEvent::CompactionProgress { .. } => "compaction_progress",
         AgentEvent::CompactionEnd => "compaction_end",
         AgentEvent::CompactionFailed(_) => "compaction_failed",
-        AgentEvent::ContextUsage { tokens, tokenizer } => {
+        AgentEvent::ContextUsage {
+            tokens,
+            tokenizer,
+            cost,
+        } => {
             stats.context_tokens = *tokens;
             stats.context_tokenizer = Some(tokenizer.clone());
+            stats.cost = *cost;
             "context_usage"
         }
         AgentEvent::ThinkingStart => "thinking_start",
@@ -169,6 +175,7 @@ fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
         }
         AgentEvent::TreeView(_) => "tree_view",
         AgentEvent::ResumeView(_) => "resume_view",
+        AgentEvent::TrustPrompt { .. } => "trust_prompt",
         AgentEvent::ModelView { .. } => "model_view",
         AgentEvent::CommandList(_) => "command_list",
         AgentEvent::Goal(_) => "goal",
@@ -197,6 +204,7 @@ fn final_result_json(stats: &HeadlessStats, elapsed_ms: u64) -> Value {
         "reasoning_tokens": stats.reasoning_tokens,
         "context_tokens": stats.context_tokens,
         "context_tokenizer": stats.context_tokenizer,
+        "cost": stats.cost,
         "tool_calls": stats.tool_calls,
         "subagent_events": stats.subagent_events,
         "assistant_chars": stats.assistant_chars,
@@ -259,8 +267,12 @@ fn event_json(event: AgentEvent) -> Value {
         AgentEvent::CompactionFailed(error) => {
             json!({ "type": "compaction_failed", "error": error })
         }
-        AgentEvent::ContextUsage { tokens, tokenizer } => {
-            json!({ "type": "context_usage", "tokens": tokens, "tokenizer": tokenizer })
+        AgentEvent::ContextUsage {
+            tokens,
+            tokenizer,
+            cost,
+        } => {
+            json!({ "type": "context_usage", "tokens": tokens, "tokenizer": tokenizer, "cost": cost })
         }
         AgentEvent::ThinkingStart => json!({ "type": "thinking_start" }),
         AgentEvent::ReasoningDelta(delta) => {
@@ -323,6 +335,11 @@ fn event_json(event: AgentEvent) -> Value {
             "items": items.into_iter().map(|item| {
                 json!({ "id": item.id, "label": item.label, "active": item.active })
             }).collect::<Vec<_>>()
+        }),
+        AgentEvent::TrustPrompt { cwd, repo_root } => json!({
+            "type": "trust_prompt",
+            "cwd": cwd,
+            "repo_root": repo_root,
         }),
         AgentEvent::ModelView {
             models,
