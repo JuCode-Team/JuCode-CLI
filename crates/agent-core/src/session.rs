@@ -80,6 +80,7 @@ pub struct SessionEntry {
     pub id: EntryId,
     pub parent_id: Option<EntryId>,
     pub kind: EntryKind,
+    pub created_at: u64,
 }
 
 #[derive(Debug, Default)]
@@ -119,6 +120,13 @@ pub struct ThreadGoal {
     pub time_used_seconds: u64,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserTurnView {
+    pub id: String,
+    pub content: String,
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -382,6 +390,7 @@ impl SessionStore {
             id,
             parent_id: self.leaf_id,
             kind,
+            created_at: now_secs(),
         };
         self.by_id.insert(id, self.entries.len());
         self.entries.push(entry);
@@ -439,6 +448,28 @@ impl SessionStore {
             return Err(format!("entry {} is not a user node", id.display()));
         }
         self.switch_to(entry.parent_id)
+    }
+
+    /// User messages on the active branch, oldest first — the rewindable points.
+    pub fn user_turns(&self) -> Vec<UserTurnView> {
+        self.branch()
+            .into_iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::User { content } => Some(UserTurnView {
+                    id: entry.id.display(),
+                    content: content.clone(),
+                    created_at: entry.created_at,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Creation time of a user-turn entry, if `id` names one.
+    pub fn user_turn_created_at(&self, id: &str) -> Option<u64> {
+        let id = parse_entry_id(id)?;
+        let entry = self.entry(id)?;
+        matches!(entry.kind, EntryKind::User { .. }).then_some(entry.created_at)
     }
 
     pub fn delete_branch(&mut self, label: &str) -> Result<(), String> {
@@ -1435,6 +1466,7 @@ fn entry_to_json(entry: &SessionEntry) -> Value {
     json!({
         "id": entry.id.0,
         "parent_id": entry.parent_id.map(|id| id.0),
+        "created_at": entry.created_at,
         "kind": kind
     })
 }
@@ -1442,6 +1474,7 @@ fn entry_to_json(entry: &SessionEntry) -> Value {
 fn entry_from_json(value: &Value) -> Option<SessionEntry> {
     let id = EntryId(value.get("id")?.as_u64()?);
     let parent_id = value.get("parent_id").and_then(Value::as_u64).map(EntryId);
+    let created_at = value.get("created_at").and_then(Value::as_u64).unwrap_or(0);
     let kind_value = value.get("kind")?;
     let kind_type = kind_value.get("type")?.as_str()?;
     let kind = match kind_type {
@@ -1485,6 +1518,7 @@ fn entry_from_json(value: &Value) -> Option<SessionEntry> {
         id,
         parent_id,
         kind,
+        created_at,
     })
 }
 
@@ -1860,6 +1894,7 @@ mod tests {
             kind: EntryKind::UserImage {
                 paths: vec!["/nonexistent/never.png".to_string()],
             },
+            created_at: 0,
         };
         assert!(context_item_for_entry(&entry).is_none());
     }

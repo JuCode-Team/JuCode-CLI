@@ -1674,70 +1674,89 @@ impl AgentCore {
         }
     }
 
+    /// List the rewindable points — the user turns on the active branch.
     fn checkpoint_list_events(&self) -> Vec<AgentEvent> {
-        match crate::tools::list_checkpoints(&self.cwd) {
-            Ok(items) if items.is_empty() => {
-                vec![AgentEvent::Info("no checkpoints to rewind to".to_string())]
-            }
-            Ok(items) => vec![AgentEvent::CheckpointView(
-                items
-                    .into_iter()
-                    .map(|item| {
-                        let id = item
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        let name = item
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("checkpoint");
-                        let files = item.get("files").and_then(Value::as_u64).unwrap_or(0);
-                        let created = item.get("created_at").and_then(Value::as_u64).unwrap_or(0);
-                        let file_word = if files == 1 {
-                            "1 file".to_string()
-                        } else {
-                            format!("{files} files")
-                        };
-                        SessionListItemView {
-                            active: false,
-                            label: name.replace('-', " "),
-                            detail: format!("{file_word} · {}", format_checkpoint_age(created)),
-                            id,
-                        }
-                    })
-                    .collect(),
-            )],
-            Err(error) => vec![AgentEvent::Error(format!(
-                "failed to list checkpoints: {error}"
-            ))],
+        let turns = self.session.user_turns();
+        if turns.is_empty() {
+            return vec![AgentEvent::Info("no earlier turns to rewind to".to_string())];
         }
+        vec![AgentEvent::CheckpointView(
+            turns
+                .into_iter()
+                .map(|turn| {
+                    let label: String = turn
+                        .content
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(60)
+                        .collect();
+                    SessionListItemView {
+                        active: false,
+                        label: if label.trim().is_empty() {
+                            "(empty)".to_string()
+                        } else {
+                            label
+                        },
+                        detail: format_checkpoint_age(turn.created_at),
+                        id: turn.id,
+                    }
+                })
+                .collect(),
+        )]
     }
 
+    /// Rewind to a user turn: truncate the conversation to before it and
+    /// reconstruct the working tree to its state at that point.
     fn checkpoint_restore_events(&mut self, id: &str) -> Vec<AgentEvent> {
         if self.running {
             return vec![AgentEvent::Error(
                 "cannot rewind while a response is running".to_string(),
             )];
         }
-        match crate::tools::restore_checkpoint(&self.cwd, id) {
-            Ok(result) => {
-                let restored = result
+        let Some(t) = self.session.user_turn_created_at(id) else {
+            return vec![AgentEvent::Error(
+                "that is not a rewindable turn".to_string(),
+            )];
+        };
+        if let Err(error) = self.session.checkout(id) {
+            return vec![AgentEvent::Error(format!(
+                "failed to rewind conversation: {error}"
+            ))];
+        }
+        let (restored, removed) = match crate::tools::restore_to_timestamp(&self.cwd, t) {
+            Ok(result) => (
+                result
                     .get("restored")
                     .and_then(Value::as_array)
                     .map(Vec::len)
-                    .unwrap_or(0);
-                let removed = result
+                    .unwrap_or(0),
+                result
                     .get("removed")
                     .and_then(Value::as_array)
                     .map(Vec::len)
-                    .unwrap_or(0);
-                vec![AgentEvent::Info(format!(
-                    "rewound: restored {restored} file(s), removed {removed}"
-                ))]
+                    .unwrap_or(0),
+            ),
+            Err(error) => {
+                return vec![
+                    AgentEvent::Transcript(self.session.transcript_items()),
+                    AgentEvent::Error(format!(
+                        "conversation rewound, but file restore failed: {error}"
+                    )),
+                ];
             }
-            Err(error) => vec![AgentEvent::Error(format!("failed to rewind: {error}"))],
-        }
+        };
+        let save_event = self.save_session_event();
+        vec![
+            AgentEvent::Transcript(self.session.transcript_items()),
+            AgentEvent::Info(format!(
+                "rewound · restored {restored} file(s), removed {removed}"
+            )),
+        ]
+        .into_iter()
+        .chain(save_event)
+        .collect()
     }
 
     fn resume_list_events(&self) -> Vec<AgentEvent> {

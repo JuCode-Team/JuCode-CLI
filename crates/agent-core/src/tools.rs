@@ -2241,6 +2241,77 @@ pub(crate) fn restore_checkpoint(cwd: &Path, id: &str) -> io::Result<Value> {
     Ok(json!({ "id": id, "restored": restored, "removed": removed }))
 }
 
+/// Reconstruct the working tree as of `t` (a turn's creation time): for every
+/// file touched at or after `t`, restore the content captured by the earliest
+/// such checkpoint (its pre-edit state), and delete files that did not yet
+/// exist then. Checkpoints are ordered by their nanosecond id for precision.
+pub(crate) fn restore_to_timestamp(cwd: &Path, t: u64) -> io::Result<Value> {
+    let dir = checkpoint_dir(cwd);
+    if !dir.exists() {
+        return Ok(json!({ "restored": [], "removed": [] }));
+    }
+    let mut snaps: Vec<(u128, Value)> = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let created = value.get("created_at").and_then(Value::as_u64).unwrap_or(0);
+        if created < t {
+            continue;
+        }
+        let nanos = value
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| id.strip_prefix("cp-"))
+            .and_then(|n| n.parse::<u128>().ok())
+            .unwrap_or(0);
+        if let Some(files) = value.get("files").cloned() {
+            snaps.push((nanos, files));
+        }
+    }
+    snaps.sort_by_key(|(nanos, _)| *nanos);
+
+    let mut earliest: HashMap<String, Value> = HashMap::new();
+    for (_, files) in &snaps {
+        for file in files.as_array().into_iter().flatten() {
+            let Some(rel) = file.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            earliest
+                .entry(rel.to_string())
+                .or_insert_with(|| file.get("content").cloned().unwrap_or(Value::Null));
+        }
+    }
+
+    let mut restored = Vec::new();
+    let mut removed = Vec::new();
+    for (rel, content) in earliest {
+        let abs = resolve_path(cwd, &rel);
+        if !is_inside(cwd, &abs) {
+            continue;
+        }
+        if let Some(text) = content.as_str() {
+            if let Some(parent) = abs.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&abs, text)?;
+            mark_read(&abs);
+            restored.push(rel);
+        } else if abs.exists() {
+            fs::remove_file(&abs)?;
+            removed.push(rel);
+        }
+    }
+    Ok(json!({ "restored": restored, "removed": removed }))
+}
+
 fn checkpoint_dir(cwd: &Path) -> PathBuf {
     cwd.join(".jucode").join("checkpoints")
 }
