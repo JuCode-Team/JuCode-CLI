@@ -54,6 +54,7 @@ pub enum TranscriptItem {
 pub enum AgentEvent {
     Startup {
         version: String,
+        session_id: String,
         profile_dir: String,
         config_path: String,
         cwd: String,

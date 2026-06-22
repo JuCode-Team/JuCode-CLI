@@ -168,6 +168,7 @@ impl TuiState {
             changed |= match event {
                 AgentEvent::Startup {
                     version,
+                    session_id: _,
                     profile_dir,
                     config_path,
                     cwd,

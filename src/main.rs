@@ -336,6 +336,7 @@ fn event_json(event: AgentEvent) -> Value {
     match event {
         AgentEvent::Startup {
             version,
+            session_id,
             profile_dir,
             config_path,
             cwd,
@@ -345,6 +346,7 @@ fn event_json(event: AgentEvent) -> Value {
             json!({
                 "type": "startup",
                 "version": version,
+                "session_id": session_id,
                 "profile_dir": profile_dir,
                 "config_path": config_path,
                 "cwd": cwd,

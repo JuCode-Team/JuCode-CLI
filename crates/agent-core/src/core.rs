@@ -160,6 +160,7 @@ impl AgentCore {
         let mut events = vec![
             AgentEvent::Startup {
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                session_id: self.session.session_id().to_string(),
                 profile_dir: self.config.profile_dir().display().to_string(),
                 config_path: self.config.path().display().to_string(),
                 cwd: self.cwd.display().to_string(),
