@@ -41,6 +41,7 @@ pub(crate) enum PickerMode {
     Rewind,
     Model,
     Trust,
+    Approval,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +165,38 @@ impl PickerState {
         }
     }
 
+    pub(crate) fn approval(call_id: String, name: String, summary: String) -> Self {
+        let row = |suffix: &str, label: String, detail: String| PickerRow {
+            id: format!("{call_id} {suffix}"),
+            parent_id: None,
+            depth: 0,
+            prefix: String::new(),
+            label,
+            active: false,
+            has_children: false,
+            detail,
+            reasoning_efforts: Vec::new(),
+        };
+        let rows = vec![
+            row("allow once", "Allow once".to_string(), summary),
+            row(
+                "allow always",
+                format!("Allow {name} for this session"),
+                String::new(),
+            ),
+            row("deny", "Deny".to_string(), String::new()),
+        ];
+        Self {
+            rows,
+            selected: 0,
+            mode: PickerMode::Approval,
+            tree: None,
+            efforts: Vec::new(),
+            selected_effort: 0,
+            prompt: None,
+        }
+    }
+
     pub(crate) fn trust(cwd: String, repo_root: Option<String>) -> Self {
         let row = |id: &str, label: &str, detail: String| PickerRow {
             id: id.to_string(),
@@ -206,6 +239,7 @@ impl PickerState {
             PickerMode::Checkout => Some(format!("/checkout {id}")),
             PickerMode::Resume => Some(format!("/resume {id}")),
             PickerMode::Rewind => Some(format!("/rewind {id}")),
+            PickerMode::Approval => Some(format!("/approve {id}")),
             PickerMode::Model => {
                 let effort = self.efforts.get(self.selected_effort)?;
                 Some(format!("/model {id} {effort}"))

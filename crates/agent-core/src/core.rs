@@ -3,7 +3,10 @@ use crate::{
     event::{AgentEvent, CommandView, GoalView, ModelOptionView, PlanItem, SessionListItemView},
     extensions::ExtensionRegistry,
     hooks::Hooks,
-    llm::{GoalToolRequest, OpenAiClient, OpenAiClientConfig, StreamEvent, ToolGoalResponse},
+    llm::{
+        ApprovalRequest, GoalToolRequest, OpenAiClient, OpenAiClientConfig, StreamEvent,
+        ToolGoalResponse,
+    },
     oauth::{self, OAuthLoginResult, OAuthModel},
     prompt::{
         build_system_prompt, discover_project_instructions, discover_skills, skill_commands,
@@ -20,7 +23,7 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     env, io,
     path::PathBuf,
     process::Command,
@@ -100,6 +103,9 @@ pub struct AgentCore {
     running: bool,
     receiver: Option<Receiver<WorkerEvent>>,
     goal_tool_receiver: Option<Receiver<GoalToolRequest>>,
+    approval_receiver: Option<Receiver<ApprovalRequest>>,
+    pending_approvals: HashMap<String, (mpsc::Sender<bool>, String)>,
+    approved_tools: HashSet<String>,
     update_receiver: Option<Receiver<UpdateNotice>>,
     login_receiver: Option<Receiver<Result<OAuthLoginResult, String>>>,
     total_input_tokens: u64,
@@ -154,6 +160,9 @@ impl AgentCore {
             project_trusted,
             hooks,
             plan: Vec::new(),
+            approval_receiver: None,
+            pending_approvals: HashMap::new(),
+            approved_tools: HashSet::new(),
         })
     }
 
@@ -360,6 +369,8 @@ impl AgentCore {
         self.receiver = None;
         self.running = false;
         self.goal_tool_receiver = None;
+        self.approval_receiver = None;
+        self.pending_approvals.clear();
         self.goal_continuation_running = false;
         self.turn_started_at = None;
         self.turn_goal_tokens = 0;
@@ -467,6 +478,12 @@ impl AgentCore {
                 None => self.checkpoint_list_events(),
                 Some(id) => self.checkpoint_restore_events(id),
             },
+            "/approve" => {
+                let call_id = parts.next().unwrap_or_default();
+                let allow = parts.next() == Some("allow");
+                let always = parts.next() == Some("always");
+                self.approve_events(call_id, allow, always)
+            }
             "/extensions" => self.extension_events(),
             "/context" => self.context_events(),
             "/stats" => self.stats_events(),
@@ -833,6 +850,7 @@ impl AgentCore {
             }
         }
         events.extend(self.poll_goal_tool_requests());
+        events.extend(self.poll_approval_requests());
         if self.should_generate_resume_summary() {
             self.start_resume_summary();
         }
@@ -960,6 +978,9 @@ impl AgentCore {
 
         let (goal_tool_tx, goal_tool_rx) = mpsc::channel();
         self.goal_tool_receiver = Some(goal_tool_rx);
+        let (approval_tx, approval_rx) = mpsc::channel();
+        self.approval_receiver = Some(approval_rx);
+        self.pending_approvals.clear();
         let Ok(client) = OpenAiClient::from_config(OpenAiClientConfig {
             model: self.config.model.clone(),
             reasoning_effort: self.config.reasoning_effort.clone(),
@@ -978,6 +999,7 @@ impl AgentCore {
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: Some(goal_tool_tx),
+            approval_tx: Some(approval_tx),
             subagent_manager: Some(self.subagent_manager.clone()),
             hooks: self.hooks.clone(),
         }) else {
@@ -1207,6 +1229,7 @@ impl AgentCore {
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: None,
+            approval_tx: None,
             subagent_manager: None,
             hooks: Hooks::default(),
         })
@@ -1241,6 +1264,7 @@ impl AgentCore {
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: None,
+            approval_tx: None,
             subagent_manager: None,
             hooks: Hooks::default(),
         })
@@ -1305,6 +1329,46 @@ impl AgentCore {
         }
         self.goal_continuation_running = false;
         events
+    }
+
+    /// Drain pending tool-approval requests from the worker. Allowlisted tools
+    /// are auto-approved; the rest surface an ApprovalRequest and park their
+    /// responder until the client decides.
+    fn poll_approval_requests(&mut self) -> Vec<AgentEvent> {
+        let Some(rx) = self.approval_receiver.take() else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        while let Ok(request) = rx.try_recv() {
+            if self.approved_tools.contains(&request.name) {
+                let _ = request.response_tx.send(true);
+                continue;
+            }
+            events.push(AgentEvent::ApprovalRequest {
+                call_id: request.call_id.clone(),
+                name: request.name.clone(),
+                summary: request.summary.clone(),
+            });
+            self.pending_approvals
+                .insert(request.call_id, (request.response_tx, request.name));
+        }
+        self.approval_receiver = Some(rx);
+        events
+    }
+
+    /// Forward the client's allow/deny decision to the parked tool call. With
+    /// `always`, the tool is added to the per-session allowlist.
+    fn approve_events(&mut self, call_id: &str, allow: bool, always: bool) -> Vec<AgentEvent> {
+        let Some((response_tx, name)) = self.pending_approvals.remove(call_id) else {
+            return vec![AgentEvent::Error(
+                "no pending approval for that call".to_string(),
+            )];
+        };
+        if allow && always {
+            self.approved_tools.insert(name);
+        }
+        let _ = response_tx.send(allow);
+        Vec::new()
     }
 
     fn poll_goal_tool_requests(&mut self) -> Vec<AgentEvent> {

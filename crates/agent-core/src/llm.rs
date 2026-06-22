@@ -63,6 +63,7 @@ pub struct OpenAiClient {
     deadline: Option<Instant>,
     provider_kind: ProviderKind,
     goal_tool_tx: Option<Sender<GoalToolRequest>>,
+    approval_tx: Option<Sender<ApprovalRequest>>,
     subagent_manager: Option<SubagentManager>,
     agent_path: String,
     agent_depth: u64,
@@ -83,6 +84,7 @@ pub struct OpenAiClientConfig<'a> {
     pub connect_timeout: Duration,
     pub read_timeout: Duration,
     pub goal_tool_tx: Option<Sender<GoalToolRequest>>,
+    pub approval_tx: Option<Sender<ApprovalRequest>>,
     pub subagent_manager: Option<SubagentManager>,
     pub hooks: Hooks,
 }
@@ -92,6 +94,16 @@ pub struct GoalToolRequest {
     pub name: String,
     pub arguments: String,
     pub response_tx: Sender<ToolGoalResponse>,
+}
+
+/// A gated tool call awaiting the user's allow/deny decision. The worker thread
+/// blocks on `response_rx` until the core forwards the client's decision.
+#[derive(Debug)]
+pub struct ApprovalRequest {
+    pub call_id: String,
+    pub name: String,
+    pub summary: String,
+    pub response_tx: Sender<bool>,
 }
 
 #[derive(Debug)]
@@ -192,6 +204,7 @@ impl OpenAiClient {
             deadline: None,
             provider_kind,
             goal_tool_tx: config.goal_tool_tx,
+            approval_tx: config.approval_tx,
             subagent_manager: config.subagent_manager,
             agent_path: "/root".to_string(),
             agent_depth: 0,
@@ -305,6 +318,24 @@ impl OpenAiClient {
                     allowed_requests.push(request);
                 }
             }
+
+            // Gate side-effecting tools on a user decision before any execution,
+            // so the prompt happens one at a time even when calls run in parallel.
+            let mut approved_requests = Vec::new();
+            for request in allowed_requests {
+                if self.needs_approval(&request.name) && !self.request_approval(&request) {
+                    emit(StreamEvent::ToolStart {
+                        call_id: request.call_id.clone(),
+                        name: request.name.clone(),
+                    })?;
+                    let result = approval_denied_result();
+                    emit_tool_output(&request, &result, &mut emit)?;
+                    blocked_results.push(ToolCallResult { request, result });
+                } else {
+                    approved_requests.push(request);
+                }
+            }
+            let allowed_requests = approved_requests;
 
             let mut tool_results = if should_run_parallel_tools(&allowed_requests) {
                 for request in &allowed_requests {
@@ -883,6 +914,7 @@ impl OpenAiClient {
             deadline: Some(started + Duration::from_secs(timeout_secs)),
             provider_kind: ProviderKind::from_model(&model),
             goal_tool_tx: None,
+            approval_tx: None,
             subagent_manager: Some(manager.clone()),
             agent_path: child_path.clone(),
             agent_depth: child_depth,
@@ -1061,6 +1093,46 @@ impl OpenAiClient {
             output: response.output,
             is_error: response.is_error,
         })
+    }
+
+    /// Tools whose side effects warrant a user decision before they run:
+    /// shell execution and file mutations. Only gated when an approval handler
+    /// is wired (interactive serve / TUI), never for subagents.
+    fn needs_approval(&self, name: &str) -> bool {
+        self.approval_tx.is_some()
+            && matches!(
+                name,
+                "bash"
+                    | "execute"
+                    | "exec_command"
+                    | "shell_command"
+                    | "write"
+                    | "edit"
+                    | "str_replace"
+                    | "hashline_edit"
+                    | "apply_patch"
+            )
+    }
+
+    /// Blocks until the core forwards the user's decision. A dropped channel
+    /// (interrupt / no handler) is treated as a denial so the worker unblocks.
+    fn request_approval(&self, request: &ToolCallRequest) -> bool {
+        let Some(tx) = &self.approval_tx else {
+            return true;
+        };
+        let (response_tx, response_rx) = mpsc::channel();
+        if tx
+            .send(ApprovalRequest {
+                call_id: request.call_id.clone(),
+                name: request.name.clone(),
+                summary: approval_summary(&request.name, &request.arguments),
+                response_tx,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        response_rx.recv().unwrap_or(false)
     }
 }
 
@@ -1302,6 +1374,30 @@ fn hook_blocked_result(reason: &str) -> tools::ToolExecutionResult {
         model_output: output.clone(),
         output,
         is_error: true,
+    }
+}
+
+fn approval_denied_result() -> tools::ToolExecutionResult {
+    let output = json!({
+        "error": "denied by user: the user declined to run this tool call. Do not retry it; ask how to proceed or try a different approach."
+    })
+    .to_string();
+    tools::ToolExecutionResult {
+        model_output: output.clone(),
+        output,
+        is_error: true,
+    }
+}
+
+/// A short human-readable description of a gated tool call for the approval UI.
+fn approval_summary(name: &str, arguments: &str) -> String {
+    let args = serde_json::from_str::<Value>(arguments).unwrap_or(Value::Null);
+    let field = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_string);
+    match name {
+        "bash" | "execute" | "exec_command" | "shell_command" => {
+            field("command").or_else(|| field("cmd")).unwrap_or_default()
+        }
+        _ => field("path").unwrap_or_default(),
     }
 }
 

@@ -293,6 +293,7 @@ fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
         AgentEvent::TreeView(_) => "tree_view",
         AgentEvent::ResumeView(_) => "resume_view",
         AgentEvent::CheckpointView(_) => "checkpoint_view",
+        AgentEvent::ApprovalRequest { .. } => "approval_request",
         AgentEvent::TrustPrompt { .. } => "trust_prompt",
         AgentEvent::ModelView { .. } => "model_view",
         AgentEvent::CommandList(_) => "command_list",
@@ -462,6 +463,12 @@ fn event_json(event: AgentEvent) -> Value {
             "items": items.into_iter().map(|item| {
                 json!({ "id": item.id, "label": item.label, "detail": item.detail })
             }).collect::<Vec<_>>()
+        }),
+        AgentEvent::ApprovalRequest { call_id, name, summary } => json!({
+            "type": "approval_request",
+            "call_id": call_id,
+            "name": name,
+            "summary": summary,
         }),
         AgentEvent::TrustPrompt { cwd, repo_root } => json!({
             "type": "trust_prompt",

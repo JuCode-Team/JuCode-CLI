@@ -351,6 +351,14 @@ impl TuiState {
                     self.picker_view = Some(PickerState::checkpoint(items));
                     true
                 }
+                AgentEvent::ApprovalRequest {
+                    call_id,
+                    name,
+                    summary,
+                } => {
+                    self.picker_view = Some(PickerState::approval(call_id, name, summary));
+                    true
+                }
                 AgentEvent::TrustPrompt { cwd, repo_root } => {
                     self.picker_view = Some(PickerState::trust(cwd, repo_root));
                     true

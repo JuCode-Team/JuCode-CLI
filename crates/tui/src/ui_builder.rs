@@ -202,6 +202,7 @@ impl UiBuilder {
             }
             PickerMode::Resume => "resume: arrows move, enter resume, esc close",
             PickerMode::Rewind => "rewind: arrows move, enter restore checkpoint, esc close",
+            PickerMode::Approval => "approve tool? arrows move, enter select, esc deny",
             PickerMode::Model => "model: arrows move, shift+tab effort, enter select, esc close",
             PickerMode::Trust => {
                 "trust project? arrows move, enter select (loads project skills & hooks if trusted)"
