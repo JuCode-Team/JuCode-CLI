@@ -477,7 +477,7 @@ fn event_json(event: AgentEvent) -> Value {
         AgentEvent::CommandList(commands) => json!({
             "type": "command_list",
             "commands": commands.into_iter().map(|command| {
-                json!({ "command": command.command, "marker": command.marker })
+                json!({ "command": command.command, "marker": command.marker, "args": command.args, "description": command.description })
             }).collect::<Vec<_>>()
         }),
         AgentEvent::Goal(goal) => json!({

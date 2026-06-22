@@ -211,22 +211,23 @@ impl AgentCore {
     }
 
     fn command_list_event(&self) -> AgentEvent {
-        let mut commands = [
-            "/help", "/login", "/new", "/model", "/tree", "/trust", "/resume", "/context",
-            "/doctor", "/skills", "/pin", "/goal", "/compact", "/quit",
-        ]
-        .iter()
-        .map(|command| CommandView {
-            command: (*command).to_string(),
-            marker: None,
-        })
-        .collect::<Vec<_>>();
+        let mut commands = crate::commands::COMMANDS
+            .iter()
+            .map(|spec| CommandView {
+                command: spec.name.to_string(),
+                marker: spec.advanced.then(|| "ADV".to_string()),
+                args: spec.args.to_string(),
+                description: spec.description.to_string(),
+            })
+            .collect::<Vec<_>>();
         if let Ok(skill_commands) =
             skill_commands(self.config.profile_dir(), &self.cwd, self.project_trusted)
         {
             commands.extend(skill_commands.into_iter().map(|entry| CommandView {
                 command: entry.command,
                 marker: Some("SKILL".to_string()),
+                args: String::new(),
+                description: entry.skill.description,
             }));
         }
         AgentEvent::CommandList(commands)
@@ -373,13 +374,16 @@ impl AgentCore {
         if let Some(events) = self.skill_command_events(command, input[command.len()..].trim()) {
             return (false, events);
         }
+        if !crate::commands::is_known(command) {
+            return (
+                false,
+                vec![AgentEvent::Error(format!("unknown command: {command}"))],
+            );
+        }
 
         let events = match command {
             "/quit" | "/exit" => return (true, Vec::new()),
-            "/help" | "/" => vec![AgentEvent::Info(
-                "/help /login [web-url] [api-url] /new /model [model] [effort] /tree /trust [yes|no|repo] /resume [session-id] /context /goal [objective|pause|resume|blocked|complete|clear] /doctor /skills [list|install <id>|sync] /pin <skill> /compact /quit"
-                    .to_string(),
-            )],
+            "/help" | "/" => vec![AgentEvent::Info(crate::commands::help_line())],
             "/login" => self.login_events(input[command.len()..].trim()),
             "/new" => self.new_session_events(),
             "/config" => vec![AgentEvent::Info(format!(
@@ -464,7 +468,11 @@ impl AgentCore {
             "/skills" => self.skills_events(input[command.len()..].trim()),
             "/pin" => self.pin_skill_events(input[command.len()..].trim()),
             "/compact" => self.compact_command_events(),
-            _ => vec![AgentEvent::Error(format!("unknown command: {command}"))],
+            // Reached only if a command is registered in `commands::COMMANDS` but
+            // has no dispatch arm here — a wiring bug, surfaced explicitly.
+            _ => vec![AgentEvent::Error(format!(
+                "command not implemented: {command}"
+            ))],
         };
         (false, events)
     }

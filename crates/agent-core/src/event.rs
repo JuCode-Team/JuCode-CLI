@@ -27,6 +27,8 @@ pub struct ModelOptionView {
 pub struct CommandView {
     pub command: String,
     pub marker: Option<String>,
+    pub args: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone)]

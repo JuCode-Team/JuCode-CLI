@@ -1,3 +1,4 @@
+mod commands;
 mod config;
 mod core;
 pub mod event;
