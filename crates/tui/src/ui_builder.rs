@@ -201,6 +201,7 @@ impl UiBuilder {
                 "tree: arrows move/expand, enter checkout, f fork, delete branch, esc close"
             }
             PickerMode::Resume => "resume: arrows move, enter resume, esc close",
+            PickerMode::Rewind => "rewind: arrows move, enter restore checkpoint, esc close",
             PickerMode::Model => "model: arrows move, shift+tab effort, enter select, esc close",
             PickerMode::Trust => {
                 "trust project? arrows move, enter select (loads project skills & hooks if trusted)"

@@ -38,6 +38,7 @@ pub(crate) struct PickerRow {
 pub(crate) enum PickerMode {
     Checkout,
     Resume,
+    Rewind,
     Model,
     Trust,
 }
@@ -91,6 +92,32 @@ impl PickerState {
             rows,
             selected,
             mode: PickerMode::Resume,
+            tree: None,
+            efforts: Vec::new(),
+            selected_effort: 0,
+            prompt: None,
+        }
+    }
+
+    pub(crate) fn checkpoint(items: Vec<SessionListItemView>) -> Self {
+        let rows = items
+            .into_iter()
+            .map(|item| PickerRow {
+                id: item.id,
+                parent_id: None,
+                depth: 0,
+                prefix: String::new(),
+                label: item.label,
+                active: false,
+                has_children: false,
+                detail: item.detail,
+                reasoning_efforts: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        Self {
+            rows,
+            selected: 0,
+            mode: PickerMode::Rewind,
             tree: None,
             efforts: Vec::new(),
             selected_effort: 0,
@@ -178,6 +205,7 @@ impl PickerState {
         match self.mode {
             PickerMode::Checkout => Some(format!("/checkout {id}")),
             PickerMode::Resume => Some(format!("/resume {id}")),
+            PickerMode::Rewind => Some(format!("/rewind {id}")),
             PickerMode::Model => {
                 let effort = self.efforts.get(self.selected_effort)?;
                 Some(format!("/model {id} {effort}"))

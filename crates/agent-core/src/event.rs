@@ -140,6 +140,7 @@ pub enum AgentEvent {
     CommandList(Vec<CommandView>),
     Goal(Option<GoalView>),
     Plan(Vec<PlanItem>),
+    CheckpointView(Vec<SessionListItemView>),
     Transcript(Vec<TranscriptItem>),
     Info(String),
     Error(String),

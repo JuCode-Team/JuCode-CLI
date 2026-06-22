@@ -2177,7 +2177,7 @@ fn create_checkpoint(cwd: &Path, name: &str, paths: &[PathBuf]) -> io::Result<Va
     }))
 }
 
-fn list_checkpoints(cwd: &Path) -> io::Result<Vec<Value>> {
+pub(crate) fn list_checkpoints(cwd: &Path) -> io::Result<Vec<Value>> {
     let dir = checkpoint_dir(cwd);
     if !dir.exists() {
         return Ok(Vec::new());
@@ -2207,7 +2207,7 @@ fn list_checkpoints(cwd: &Path) -> io::Result<Vec<Value>> {
     Ok(items)
 }
 
-fn restore_checkpoint(cwd: &Path, id: &str) -> io::Result<Value> {
+pub(crate) fn restore_checkpoint(cwd: &Path, id: &str) -> io::Result<Value> {
     let path = checkpoint_dir(cwd).join(format!("{id}.json"));
     let value =
         serde_json::from_str::<Value>(&fs::read_to_string(path)?).map_err(io::Error::other)?;

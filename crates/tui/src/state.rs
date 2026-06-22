@@ -347,6 +347,10 @@ impl TuiState {
                     self.picker_view = Some(PickerState::resume(sessions));
                     true
                 }
+                AgentEvent::CheckpointView(items) => {
+                    self.picker_view = Some(PickerState::checkpoint(items));
+                    true
+                }
                 AgentEvent::TrustPrompt { cwd, repo_root } => {
                     self.picker_view = Some(PickerState::trust(cwd, repo_root));
                     true

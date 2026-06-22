@@ -463,6 +463,10 @@ impl AgentCore {
                 None => self.resume_list_events(),
                 Some(session_id) => self.resume_session_events(session_id),
             },
+            "/rewind" | "/undo" => match parts.next() {
+                None => self.checkpoint_list_events(),
+                Some(id) => self.checkpoint_restore_events(id),
+            },
             "/extensions" => self.extension_events(),
             "/context" => self.context_events(),
             "/stats" => self.stats_events(),
@@ -1606,6 +1610,72 @@ impl AgentCore {
         }
     }
 
+    fn checkpoint_list_events(&self) -> Vec<AgentEvent> {
+        match crate::tools::list_checkpoints(&self.cwd) {
+            Ok(items) if items.is_empty() => {
+                vec![AgentEvent::Info("no checkpoints to rewind to".to_string())]
+            }
+            Ok(items) => vec![AgentEvent::CheckpointView(
+                items
+                    .into_iter()
+                    .map(|item| {
+                        let id = item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let name = item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("checkpoint");
+                        let files = item.get("files").and_then(Value::as_u64).unwrap_or(0);
+                        let created = item.get("created_at").and_then(Value::as_u64).unwrap_or(0);
+                        let file_word = if files == 1 {
+                            "1 file".to_string()
+                        } else {
+                            format!("{files} files")
+                        };
+                        SessionListItemView {
+                            active: false,
+                            label: name.replace('-', " "),
+                            detail: format!("{file_word} · {}", format_checkpoint_age(created)),
+                            id,
+                        }
+                    })
+                    .collect(),
+            )],
+            Err(error) => vec![AgentEvent::Error(format!(
+                "failed to list checkpoints: {error}"
+            ))],
+        }
+    }
+
+    fn checkpoint_restore_events(&mut self, id: &str) -> Vec<AgentEvent> {
+        if self.running {
+            return vec![AgentEvent::Error(
+                "cannot rewind while a response is running".to_string(),
+            )];
+        }
+        match crate::tools::restore_checkpoint(&self.cwd, id) {
+            Ok(result) => {
+                let restored = result
+                    .get("restored")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                let removed = result
+                    .get("removed")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                vec![AgentEvent::Info(format!(
+                    "rewound: restored {restored} file(s), removed {removed}"
+                ))]
+            }
+            Err(error) => vec![AgentEvent::Error(format!("failed to rewind: {error}"))],
+        }
+    }
+
     fn resume_list_events(&self) -> Vec<AgentEvent> {
         match SessionStore::list_for_cwd(&self.profile_dir, &self.cwd) {
             Ok(sessions) if sessions.is_empty() => {
@@ -2069,6 +2139,23 @@ fn format_context_statistics(
         }));
     }
     lines.join("\n")
+}
+
+fn format_checkpoint_age(created_at: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let secs = now.saturating_sub(created_at);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
 }
 
 fn goal_view(goal: &ThreadGoal) -> GoalView {

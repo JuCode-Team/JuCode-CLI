@@ -292,6 +292,7 @@ fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
         }
         AgentEvent::TreeView(_) => "tree_view",
         AgentEvent::ResumeView(_) => "resume_view",
+        AgentEvent::CheckpointView(_) => "checkpoint_view",
         AgentEvent::TrustPrompt { .. } => "trust_prompt",
         AgentEvent::ModelView { .. } => "model_view",
         AgentEvent::CommandList(_) => "command_list",
@@ -454,6 +455,12 @@ fn event_json(event: AgentEvent) -> Value {
             "type": "resume_view",
             "items": items.into_iter().map(|item| {
                 json!({ "id": item.id, "label": item.label, "active": item.active })
+            }).collect::<Vec<_>>()
+        }),
+        AgentEvent::CheckpointView(items) => json!({
+            "type": "checkpoint_view",
+            "items": items.into_iter().map(|item| {
+                json!({ "id": item.id, "label": item.label, "detail": item.detail })
             }).collect::<Vec<_>>()
         }),
         AgentEvent::TrustPrompt { cwd, repo_root } => json!({

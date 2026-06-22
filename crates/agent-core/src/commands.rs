@@ -24,6 +24,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "/tree", aliases: &[], args: "", description: "Show the conversation tree", advanced: false },
     CommandSpec { name: "/trust", aliases: &[], args: "[yes|no|repo]", description: "Trust this project's local resources", advanced: false },
     CommandSpec { name: "/resume", aliases: &[], args: "[session-id]", description: "List or resume sessions", advanced: false },
+    CommandSpec { name: "/rewind", aliases: &["/undo"], args: "[checkpoint-id]", description: "List or restore file checkpoints", advanced: false },
     CommandSpec { name: "/context", aliases: &[], args: "", description: "Show context usage", advanced: false },
     CommandSpec { name: "/goal", aliases: &[], args: "[objective|pause|resume|blocked|complete|clear]", description: "Manage the session goal", advanced: false },
     CommandSpec { name: "/doctor", aliases: &[], args: "", description: "Run environment diagnostics", advanced: false },
