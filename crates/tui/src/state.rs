@@ -368,6 +368,11 @@ impl TuiState {
                     self.mark_history_dirty();
                     true
                 }
+                AgentEvent::Plan(items) => {
+                    self.chat.push(ChatLine::System(format_plan_summary(&items)));
+                    self.mark_history_dirty();
+                    true
+                }
                 AgentEvent::Transcript(items) => {
                     self.replace_transcript(items);
                     true

@@ -43,6 +43,12 @@ pub struct GoalView {
 }
 
 #[derive(Debug, Clone)]
+pub struct PlanItem {
+    pub step: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone)]
 pub enum TranscriptItem {
     User(String),
     Assistant(String),
@@ -133,6 +139,7 @@ pub enum AgentEvent {
     },
     CommandList(Vec<CommandView>),
     Goal(Option<GoalView>),
+    Plan(Vec<PlanItem>),
     Transcript(Vec<TranscriptItem>),
     Info(String),
     Error(String),

@@ -296,6 +296,7 @@ fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
         AgentEvent::ModelView { .. } => "model_view",
         AgentEvent::CommandList(_) => "command_list",
         AgentEvent::Goal(_) => "goal",
+        AgentEvent::Plan(_) => "plan",
         AgentEvent::Transcript(_) => "transcript",
         AgentEvent::Info(_) => "info",
         AgentEvent::Error(message) => {
@@ -493,6 +494,13 @@ fn event_json(event: AgentEvent) -> Value {
                 "created_at": goal.created_at,
                 "updated_at": goal.updated_at,
             }))
+        }),
+        AgentEvent::Plan(items) => json!({
+            "type": "plan",
+            "plan": items.into_iter().map(|item| json!({
+                "step": item.step,
+                "status": item.status,
+            })).collect::<Vec<_>>()
         }),
         AgentEvent::Transcript(items) => json!({
             "type": "transcript",

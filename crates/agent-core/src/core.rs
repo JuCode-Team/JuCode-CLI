@@ -1,6 +1,6 @@
 use crate::{
     config::{profile_dir, AuthStore, Config, ModelConfig},
-    event::{AgentEvent, CommandView, GoalView, ModelOptionView, SessionListItemView},
+    event::{AgentEvent, CommandView, GoalView, ModelOptionView, PlanItem, SessionListItemView},
     extensions::ExtensionRegistry,
     hooks::Hooks,
     llm::{GoalToolRequest, OpenAiClient, OpenAiClientConfig, StreamEvent, ToolGoalResponse},
@@ -115,6 +115,7 @@ pub struct AgentCore {
     trust: TrustStore,
     project_trusted: bool,
     hooks: Hooks,
+    plan: Vec<PlanItem>,
 }
 
 impl AgentCore {
@@ -152,6 +153,7 @@ impl AgentCore {
             trust,
             project_trusted,
             hooks,
+            plan: Vec::new(),
         })
     }
 
@@ -1326,6 +1328,9 @@ impl AgentCore {
     ) -> (ToolGoalResponse, Option<AgentEvent>) {
         let args = serde_json::from_str::<Value>(arguments)
             .unwrap_or_else(|error| json!({ "error": format!("invalid JSON arguments: {error}") }));
+        if name == "update_plan" {
+            return self.handle_update_plan(&args);
+        }
         let result = match name {
             "get_goal" => Ok(self.session.goal().cloned()),
             "create_goal" => {
@@ -1371,6 +1376,47 @@ impl AgentCore {
                 )
             }
         }
+    }
+
+    fn handle_update_plan(&mut self, args: &Value) -> (ToolGoalResponse, Option<AgentEvent>) {
+        let Some(items) = args.get("plan").and_then(Value::as_array) else {
+            let output = json!({ "error": "update_plan requires a plan array" }).to_string();
+            return (
+                ToolGoalResponse {
+                    output,
+                    is_error: true,
+                },
+                None,
+            );
+        };
+        let mut plan = Vec::new();
+        for item in items {
+            let step = item.get("step").and_then(Value::as_str).unwrap_or_default();
+            let status = item
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("pending");
+            if step.is_empty() {
+                continue;
+            }
+            let status = match status {
+                "in_progress" | "completed" => status,
+                _ => "pending",
+            };
+            plan.push(PlanItem {
+                step: step.to_string(),
+                status: status.to_string(),
+            });
+        }
+        self.plan = plan;
+        let output = json!({ "ok": true, "steps": self.plan.len() }).to_string();
+        (
+            ToolGoalResponse {
+                output,
+                is_error: false,
+            },
+            Some(AgentEvent::Plan(self.plan.clone())),
+        )
     }
 
     fn should_continue_goal(&self) -> bool {

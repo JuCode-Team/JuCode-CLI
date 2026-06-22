@@ -181,6 +181,22 @@ fn default_commands() -> Vec<CommandCandidate> {
     .collect()
 }
 
+fn format_plan_summary(items: &[jucode_agent_core::PlanItem]) -> String {
+    if items.is_empty() {
+        return "Plan cleared".to_string();
+    }
+    let mut lines = vec!["Plan".to_string()];
+    for item in items {
+        let mark = match item.status.as_str() {
+            "completed" => "[x]",
+            "in_progress" => "[~]",
+            _ => "[ ]",
+        };
+        lines.push(format!("{mark} {}", item.step));
+    }
+    lines.join("\n")
+}
+
 fn format_goal_summary(goal: Option<jucode_agent_core::GoalView>) -> String {
     let Some(goal) = goal else {
         return "Goal\nNo goal set.\nCommands: /goal <objective>".to_string();

@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude 模型系列性能基准报告 · Opus 4.6 — Fable 5 / Mythos 5</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400;0,6..72,500;0,6..72,600;0,6..72,700;1,6..72,400;1,6..72,500&family=Noto+Serif+SC:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#FAF6EF;
+  --paper-deep:#F2EBDF;
+  --ink:#211C16;
+  --ink-soft:#5C544A;
+  --ink-faint:#8A8175;
+  --hairline:#D8CFC0;
+  --clay:#BC5333;        /* Fable 5 */
+  --oxblood:#7C2417;     /* Mythos */
+  --opus-48:#27506E;     /* Opus 4.8 */
+  --opus-47:#48708C;     /* Opus 4.7 */
+  --opus-46:#7E9BB0;     /* Opus 4.6 */
+  --rival:#B3AA9C;       /* 竞品 */
+  --serif:"Newsreader","Noto Serif SC",serif;
+  --sans:"Noto Sans SC",-apple-system,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  background:var(--paper);
+  color:var(--ink);
+  font-family:var(--sans);
+  font-size:15px;
+  line-height:1.75;
+  -webkit-font-smoothing:antialiased;
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(188,83,51,.06), transparent),
+    repeating-linear-gradient(0deg, transparent 0 2px, rgba(33,28,22,.012) 2px 4px);
+}
+.wrap{max-width:1060px;margin:0 auto;padding:0 32px}
+
+/* ============ masthead ============ */
+.masthead{padding:64px 0 0;border-bottom:3px double var(--ink)}
+.kicker{
+  display:flex;justify-content:space-between;align-items:baseline;
+  font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--ink-soft);border-bottom:1px solid var(--hairline);padding-bottom:12px;
+}
+.kicker .dot{color:var(--clay)}
+h1{
+  font-family:var(--serif);font-weight:600;
+  font-size:clamp(36px,5.4vw,58px);line-height:1.12;letter-spacing:-.01em;
+  margin:36px 0 8px;max-width:21em;
+}
+h1 em{font-style:italic;color:var(--clay)}
+.standfirst{
+  font-family:var(--serif);font-size:19px;line-height:1.6;color:var(--ink-soft);
+  max-width:46em;margin:14px 0 36px;
+}
+.meta-strip{
+  display:grid;grid-template-columns:repeat(4,1fr);
+  border-top:1px solid var(--ink);
+}
+.meta-strip>div{padding:14px 18px 18px 0;border-right:1px solid var(--hairline)}
+.meta-strip>div:last-child{border-right:none}
+.meta-strip .lbl{font-family:var(--mono);font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-faint)}
+.meta-strip .val{font-family:var(--serif);font-size:16px;margin-top:2px}
+
+/* ============ sections ============ */
+section{padding:56px 0 8px}
+.sec-head{display:flex;align-items:baseline;gap:18px;margin-bottom:8px}
+.sec-num{font-family:var(--mono);font-size:13px;color:var(--clay);letter-spacing:.1em}
+h2{font-family:var(--serif);font-weight:600;font-size:31px;letter-spacing:-.01em}
+.sec-rule{flex:1;height:1px;background:var(--hairline);align-self:center}
+.lede{color:var(--ink-soft);max-width:50em;margin-bottom:28px}
+h3{font-family:var(--serif);font-weight:600;font-size:20px;margin:34px 0 6px}
+
+/* ============ timeline ============ */
+.timeline{position:relative;margin:44px 0 28px;padding-top:10px}
+.timeline::before{content:"";position:absolute;left:0;right:0;top:58px;height:1px;background:var(--ink)}
+.tl-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}
+.tl-item{position:relative;padding-top:64px}
+.tl-item::before{
+  content:"";position:absolute;top:53px;left:0;width:11px;height:11px;border-radius:50%;
+  background:var(--paper);border:2.5px solid var(--ink);
+}
+.tl-item.accent::before{background:var(--clay);border-color:var(--clay)}
+.tl-item.restricted::before{background:var(--paper);border-color:var(--oxblood);border-style:dashed}
+.tl-date{position:absolute;top:18px;left:0;font-family:var(--mono);font-size:11.5px;color:var(--ink-soft)}
+.tl-name{font-family:var(--serif);font-weight:600;font-size:17px;line-height:1.25}
+.tl-desc{font-size:12.5px;color:var(--ink-soft);line-height:1.55;margin-top:5px}
+.tl-item.restricted .tl-name{color:var(--oxblood)}
+
+/* ============ model cards ============ */
+.cards{display:grid;grid-template-columns:repeat(2,1fr);gap:1px;background:var(--hairline);border:1px solid var(--hairline);margin:30px 0}
+.card{background:var(--paper);padding:26px 28px}
+.card.feature{background:linear-gradient(135deg,#FBF1E9,var(--paper))}
+.card-top{display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+.card h4{font-family:var(--serif);font-weight:600;font-size:21px}
+.tag{font-family:var(--mono);font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;padding:3px 8px;border:1px solid currentColor;border-radius:99px;white-space:nowrap}
+.tag.ga{color:#3D6B49}
+.tag.frontier{color:var(--clay)}
+.tag.restricted{color:var(--oxblood)}
+.card .mid{font-family:var(--mono);font-size:12px;color:var(--clay);margin:3px 0 10px}
+.card p{font-size:13.5px;color:var(--ink-soft);line-height:1.7}
+.card dl{display:grid;grid-template-columns:auto 1fr;gap:3px 16px;margin-top:14px;font-size:12.5px}
+.card dt{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-faint);padding-top:2px}
+.card dd{font-family:var(--mono);font-size:12.5px}
+
+/* ============ tables ============ */
+table{width:100%;border-collapse:collapse;margin:26px 0 10px;font-size:13.5px}
+caption{text-align:left;font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-faint);padding-bottom:10px}
+thead th{
+  font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--ink-soft);text-align:right;padding:8px 12px;border-bottom:1.5px solid var(--ink);
+}
+thead th:first-child{text-align:left;padding-left:0}
+tbody td{padding:10px 12px;border-bottom:1px solid var(--hairline);text-align:right;font-family:var(--mono);font-size:13px}
+tbody td:first-child{text-align:left;font-family:var(--sans);font-weight:500;padding-left:0}
+tbody tr.hl td{background:rgba(188,83,51,.05)}
+td .sub{display:block;font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);font-weight:400}
+.best{color:var(--clay);font-weight:600}
+
+/* ============ bar charts ============ */
+.bench{margin:38px 0;border:1px solid var(--hairline);background:#FFFDF8}
+.bench-head{display:flex;justify-content:space-between;gap:16px;align-items:baseline;padding:18px 24px 4px;flex-wrap:wrap}
+.bench-title{font-family:var(--serif);font-weight:600;font-size:18.5px}
+.bench-title span{font-family:var(--mono);font-size:11px;font-weight:400;color:var(--ink-faint);margin-left:8px;letter-spacing:.05em}
+.bench-note{font-size:12px;color:var(--ink-soft);padding:0 24px 6px;max-width:60em}
+.bars{padding:12px 24px 20px;display:grid;gap:7px}
+.bar-row{display:grid;grid-template-columns:148px 1fr 64px;align-items:center;gap:14px}
+.bar-label{font-size:12.5px;font-weight:500;text-align:right;line-height:1.3}
+.bar-label small{display:block;font-family:var(--mono);font-size:9.5px;color:var(--ink-faint);font-weight:400}
+.bar-track{height:22px;background:var(--paper-deep);position:relative;overflow:hidden}
+.bar-fill{
+  height:100%;width:calc(var(--w) * 1%);
+  display:flex;align-items:center;
+  animation:grow 1s cubic-bezier(.22,1,.36,1) both;
+  background:
+    linear-gradient(rgba(255,255,255,.12),transparent),
+    var(--c,var(--rival));
+}
+@keyframes grow{from{width:0}}
+.bar-row:nth-child(1) .bar-fill{animation-delay:.05s}
+.bar-row:nth-child(2) .bar-fill{animation-delay:.12s}
+.bar-row:nth-child(3) .bar-fill{animation-delay:.19s}
+.bar-row:nth-child(4) .bar-fill{animation-delay:.26s}
+.bar-row:nth-child(5) .bar-fill{animation-delay:.33s}
+.bar-row:nth-child(6) .bar-fill{animation-delay:.40s}
+.bar-row:nth-child(7) .bar-fill{animation-delay:.47s}
+.bar-val{font-family:var(--mono);font-size:12.5px;font-weight:500}
+.bench-src{font-family:var(--mono);font-size:10px;color:var(--ink-faint);padding:10px 24px 16px;border-top:1px dashed var(--hairline);letter-spacing:.03em}
+.f5{--c:var(--clay)} .mp{--c:var(--oxblood)} .o48{--c:var(--opus-48)} .o47{--c:var(--opus-47)} .o46{--c:var(--opus-46)} .rv{--c:var(--rival)}
+
+.legend{display:flex;flex-wrap:wrap;gap:18px;margin:24px 0 4px;font-size:12px;color:var(--ink-soft)}
+.legend span{display:inline-flex;align-items:center;gap:7px}
+.legend i{width:14px;height:14px;display:inline-block}
+
+.bench-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+.bench-grid .bench{margin:14px 0}
+
+/* ============ callouts ============ */
+.callout{
+  border-left:3px solid var(--clay);background:#FBF3EB;
+  padding:18px 24px;margin:26px 0;font-size:13.5px;color:var(--ink-soft);
+}
+.callout.warn{border-color:var(--oxblood);background:#F8EEE9}
+.callout strong{color:var(--ink)}
+
+/* ============ big numbers ============ */
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--hairline);border:1px solid var(--hairline);margin:30px 0}
+.stat{background:#FFFDF8;padding:24px 26px}
+.stat .n{font-family:var(--serif);font-size:42px;font-weight:600;line-height:1;color:var(--clay)}
+.stat .n small{font-size:20px}
+.stat .d{font-size:12.5px;color:var(--ink-soft);margin-top:8px;line-height:1.55}
+
+/* ============ sources ============ */
+.sources ol{margin:20px 0 0 0;padding-left:0;counter-reset:src;list-style:none}
+.sources li{
+  counter-increment:src;display:grid;grid-template-columns:44px 1fr;gap:8px;
+  padding:11px 0;border-bottom:1px solid var(--hairline);font-size:13px;
+}
+.sources li::before{content:"[" counter(src,decimal-leading-zero) "]";font-family:var(--mono);font-size:11.5px;color:var(--clay);padding-top:2px}
+.sources a{color:var(--ink);text-decoration:underline;text-decoration-color:var(--hairline);text-underline-offset:3px}
+.sources a:hover{text-decoration-color:var(--clay)}
+.sources .s-meta{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint)}
+sup.ref{font-family:var(--mono);font-size:10px;color:var(--clay);font-weight:600}
+
+footer{margin-top:64px;border-top:3px double var(--ink);padding:28px 0 56px;
+  display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap;
+  font-family:var(--mono);font-size:11px;color:var(--ink-faint);letter-spacing:.06em}
+
+@media(max-width:880px){
+  .meta-strip,.stats{grid-template-columns:repeat(2,1fr)}
+  .tl-grid{grid-template-columns:1fr 1fr;gap:30px 14px}
+  .timeline::before{display:none}
+  .tl-item{padding-top:40px}
+  .tl-item::before{top:29px}
+  .tl-date{top:0}
+  .cards,.bench-grid{grid-template-columns:1fr}
+  .bar-row{grid-template-columns:104px 1fr 56px}
+}
+@media print{
+  body{background:#fff}
+  .bar-fill{animation:none}
+}
+</style>
+</head>
+<body>
+
+<!-- ==================== MASTHEAD ==================== -->
+<header class="masthead">
+  <div class="wrap">
+    <div class="kicker">
+      <span>MODEL EVALUATION REPORT <span class="dot">●</span> ANTHROPIC CLAUDE FAMILY</span>
+      <span>2026-06-10 · 第 1 版</span>
+    </div>
+    <h1>Claude 旗舰模型性能基准：<br>从 Opus 4.6 到 <em>Fable 5 / Mythos 5</em></h1>
+    <p class="standfirst">基于 Anthropic 官方公告与第三方独立评测的公开数据，系统梳理 2026 年 2 月至 6 月间五代旗舰模型（Opus 4.6 / 4.7 / 4.8、Mythos Preview、Fable 5 / Mythos 5）在软件工程、知识推理、计算机操作与专业领域基准上的表现轨迹。</p>
+    <div class="meta-strip">
+      <div><div class="lbl">覆盖周期</div><div class="val">2026.02 — 2026.06</div></div>
+      <div><div class="lbl">模型数量</div><div class="val">5 代旗舰 + 2 竞品参照</div></div>
+      <div><div class="lbl">基准项目</div><div class="val">18 项公开基准</div></div>
+      <div><div class="lbl">数据性质</div><div class="val">厂商报告 + 第三方复测</div></div>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+<!-- ==================== 01 摘要 ==================== -->
+<section id="summary">
+  <div class="sec-head"><span class="sec-num">01</span><h2>核心结论</h2><div class="sec-rule"></div></div>
+  <p class="lede">2026 年上半年，Anthropic 以约 6—10 周的节奏连续迭代旗舰模型。增益集中在<strong>未饱和的高难度基准</strong>上（SWE-bench Pro、HLE、FrontierCode），而接近饱和的基准（GPQA Diamond、SWE-bench Verified）增幅趋缓甚至统计持平。6 月 9 日发布的 Fable 5 将原本仅限安全研究的 Mythos 级能力开放为通用模型，在绝大多数已测基准上达到 SOTA。<sup class="ref">[01][04]</sup></p>
+
+  <div class="stats">
+    <div class="stat"><div class="n">80.3<small>%</small></div><div class="d">Fable 5 / Mythos 5 在 SWE-bench Pro 上的得分——较 Opus 4.8（69.2%）提升 11.1 个百分点，领先 GPT-5.5（58.6%）21.7 个百分点。<sup class="ref">[04]</sup></div></div>
+    <div class="stat"><div class="n">29.3<small>%</small></div><div class="d">FrontierCode Diamond（Cognition 出品，考察可维护的智能体编码）。Opus 4.8 为 13.4%，GPT-5.5 为 5.7%——差距超过 2 倍。<sup class="ref">[04]</sup></div></div>
+    <div class="stat"><div class="n">&lt;5<small>%</small></div><div class="d">Fable 5 安全护栏触发率：网络安全、生物化学与蒸馏类请求会回退至 Opus 4.8 作答，平均影响不足 5% 的会话。<sup class="ref">[01]</sup></div></div>
+  </div>
+
+  <div class="callout">
+    <strong>关于 Mythos 系列的定位：</strong>Mythos Preview 于 2026 年 4 月 7 日由 Anthropic 安全研究部门（red.anthropic.com）披露，定向用于网络安全研究（Project Glasswing），与约 50 家合作方累计发现逾一万个高危/严重级漏洞。<strong>Mythos 5 与 Fable 5 为同一底层模型</strong>：前者面向少数网络防御机构与生物研究者、部分领域护栏解除；后者为加装安全护栏后的通用公开版本。<sup class="ref">[01][02][03]</sup>
+  </div>
+</section>
+
+<!-- ==================== 02 发布时间线 ==================== -->
+<section id="timeline">
+  <div class="sec-head"><span class="sec-num">02</span><h2>发布时间线</h2><div class="sec-rule"></div></div>
+  <div class="timeline">
+    <div class="tl-grid">
+      <div class="tl-item">
+        <div class="tl-date">2026-02-05</div>
+        <div class="tl-name">Opus 4.6</div>
+        <div class="tl-desc">引入自适应思考、1M 上下文（beta）、128K 输出。SWE-bench Verified 80.8%。<sup class="ref">[08]</sup></div>
+      </div>
+      <div class="tl-item restricted">
+        <div class="tl-date">2026-04-07</div>
+        <div class="tl-name">Mythos Preview</div>
+        <div class="tl-desc">非公开。定向网络安全研究，红队披露。SWE-bench Pro 77.8%。<sup class="ref">[02]</sup></div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-date">2026-04-16</div>
+        <div class="tl-name">Opus 4.7</div>
+        <div class="tl-desc">高难度软件工程显著提升；高分辨率视觉；Anthropic 公开承认其落后于未发布的 Mythos。<sup class="ref">[06][07]</sup></div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-date">2026-05-28</div>
+        <div class="tl-name">Opus 4.8</div>
+        <div class="tl-desc">长程自主执行与诚实性升级，价格不变（$5/$25）。SWE-bench Pro +4.9pp。<sup class="ref">[05]</sup></div>
+      </div>
+      <div class="tl-item accent">
+        <div class="tl-date">2026-06-09</div>
+        <div class="tl-name">Fable 5 / Mythos 5</div>
+        <div class="tl-desc">Mythos 级能力公开化。几乎所有已测基准 SOTA；定价 $10/$50。<sup class="ref">[01]</sup></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== 03 模型概览 ==================== -->
+<section id="lineup">
+  <div class="sec-head"><span class="sec-num">03</span><h2>模型规格与定位</h2><div class="sec-rule"></div></div>
+  <p class="lede">下表汇总各模型的 API 标识、上下文规格与官方定价。Opus 三代价格保持一致；Fable 5 定价为 Opus 系的 2 倍，但据 Anthropic 称低于 Mythos Preview 期价格的一半。<sup class="ref">[01]</sup></p>
+
+  <div class="cards">
+    <div class="card feature">
+      <div class="card-top"><h4>Claude Fable 5</h4><span class="tag frontier">Frontier · GA</span></div>
+      <div class="mid">claude-fable-5</div>
+      <p>当前最强公开可用模型。Mythos 级底座 + 通用安全护栏，长程分析任务核心基准首次突破 90%（较 Opus 提升 10 分），推理 token 用量约为 Opus 的 1/3。Stripe 实测：5,000 万行 Ruby 代码库的全库迁移由逾两个月压缩至一天。</p>
+      <dl>
+        <dt>上下文</dt><dd>1M tokens</dd>
+        <dt>最大输出</dt><dd>128K tokens</dd>
+        <dt>定价</dt><dd>$10 / $50 每百万 tokens（输入/输出）</dd>
+        <dt>发布</dt><dd>2026-06-09</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <div class="card-top"><h4>Claude Mythos 5</h4><span class="tag restricted">Restricted</span></div>
+      <div class="mid">不提供公开 API</div>
+      <p>与 Fable 5 同一底层模型，在网络安全与生物领域解除部分护栏。仅向 Project Glasswing 网络防御合作方与少数生物研究者开放；流量执行 30 天留存要求且不用于训练。对齐评估显示其失准行为水平"低，且与 Opus 4.8 相当"。</p>
+      <dl>
+        <dt>访问方式</dt><dd>定向审批</dd>
+        <dt>外部红队</dt><dd>1,000+ 小时无通用越狱</dd>
+        <dt>披露</dt><dd>2026-06-09（Preview：2026-04-07）</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <div class="card-top"><h4>Claude Opus 4.8</h4><span class="tag ga">GA</span></div>
+      <div class="mid">claude-opus-4-8</div>
+      <p>Opus 线现役主力。长程自主智能体执行的前 SOTA，写作更清晰直接；另提供 Fast Mode（$10/$50）。与 4.7 同一 API 表面，无新增破坏性变更。</p>
+      <dl>
+        <dt>上下文 / 输出</dt><dd>1M / 128K</dd>
+        <dt>定价</dt><dd>$5 / $25</dd>
+        <dt>发布</dt><dd>2026-05-28</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <div class="card-top"><h4>Claude Opus 4.7 / 4.6</h4><span class="tag ga">GA（上代）</span></div>
+      <div class="mid">claude-opus-4-7 · claude-opus-4-6</div>
+      <p>4.7（4 月）：高难度软件工程大幅跃升（SWE-bench Pro +10.9pp）、2576px 高分辨率视觉、xhigh 努力档。4.6（2 月）：自适应思考与 1M 上下文的奠基版本。两者均仍在服务中。</p>
+      <dl>
+        <dt>上下文 / 输出</dt><dd>1M / 128K</dd>
+        <dt>定价</dt><dd>$5 / $25（两代相同）</dd>
+        <dt>发布</dt><dd>2026-04-16 · 2026-02-05</dd>
+      </dl>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span><i style="background:var(--clay)"></i>Fable 5 / Mythos 5</span>
+    <span><i style="background:var(--oxblood)"></i>Mythos Preview</span>
+    <span><i style="background:var(--opus-48)"></i>Opus 4.8</span>
+    <span><i style="background:var(--opus-47)"></i>Opus 4.7</span>
+    <span><i style="background:var(--opus-46)"></i>Opus 4.6</span>
+    <span><i style="background:var(--rival)"></i>竞品（GPT-5.5 / Gemini 3.1 Pro）</span>
+  </div>
+</section>
+
+<!-- ==================== 04 软件工程 ==================== -->
+<section id="coding">
+  <div class="sec-head"><span class="sec-num">04</span><h2>软件工程基准</h2><div class="sec-rule"></div></div>
+  <p class="lede">增益的分布揭示了改进方向：SWE-bench Verified 已接近饱和（4.7→4.8 仅 +1.0pp），而难度更高、多语言的 SWE-bench Pro 与考察代码可维护性的 FrontierCode Diamond 仍有大幅空间——这正是 4.7、4.8 与 Fable 5 拉开差距的地方。<sup class="ref">[05]</sup></p>
+
+  <div class="bench">
+    <div class="bench-head"><div class="bench-title">SWE-bench Pro <span>多语言 · 高难度真实仓库修复</span></div></div>
+    <p class="bench-note">本周期内区分度最高的编码基准。Opus 三代呈阶梯式提升（53.4 → 64.3 → 69.2），Mythos/Fable 系再抬升一个台阶。</p>
+    <div class="bars">
+      <div class="bar-row"><div class="bar-label">Fable 5 / Mythos 5</div><div class="bar-track"><div class="bar-fill f5" style="--w:80.3"></div></div><div class="bar-val">80.3%</div></div>
+      <div class="bar-row"><div class="bar-label">Mythos Preview</div><div class="bar-track"><div class="bar-fill mp" style="--w:77.8"></div></div><div class="bar-val">77.8%</div></div>
+      <div class="bar-row"><div class="bar-label">Opus 4.8</div><div class="bar-track"><div class="bar-fill o48" style="--w:69.2"></div></div><div class="bar-val">69.2%</div></div>
+      <div class="bar-row"><div class="bar-label">Opus 4.7</div><div class="bar-track"><div class="bar-fill o47" style="--w:64.3"></div></div><div class="bar-val">64.3%</div></div>
+      <div class="bar-row"><div class="bar-label">GPT-5.5 <small>OpenAI</small></div><div class="bar-track"><div class="bar-fill rv" style="--w:58.6"></div></div><div class="bar-val">58.6%</div></div>
+      <div class="bar-row"><div class="bar-label">Gemini 3.1 Pro <small>Google</small></div><div class="bar-track"><div class="bar-fill rv" style="--w:54.2"></div></div><div class="bar-val">54.2%</div></div>
+      <div class="bar-row"><div class="bar-label">Opus 4.6</div><div class="bar-track"><div class="bar-fill o46" style="--w:53.4"></div></div><div class="bar-val">53.4%</div></div>
+    </div>
+    <div class="bench-src">来源：Anthropic 官方发布数据，经 Vellum / W&amp;B / llm-stats 转述 [04][05][09]</div>
+  </div>
+
+  <div class="bench-grid">
+    <div class="bench">
+      <div class="bench-head"><div class="bench-title">SWE-bench Verified <span>接近饱和</span></div></div>
+      <div class="bars">
+        <div class="bar-row"><div class="bar-label">Opus 4.8</div><div class="bar-track"><div class="bar-fill o48" style="--w:88.6"></div></div><div class="bar-val">88.6%</div></div>
+        <div class="bar-row"><div class="bar-label">Opus 4.7</div><div class="bar-track"><div class="bar-fill o47" style="--w:87.6"></div></div><div class="bar-val">87.6%</div></div>
+        <div class="bar-row"><div class="bar-label">Opus 4.6</div><div class="bar-track"><div class="bar-fill o46" style="--w:80.8"></div></div><div class="bar-val">80.8%</div></div>
+        <div class="bar-row"><div class="bar-label">Gemini 3.1 Pro</div><div class="bar-track"><div class="bar-fill rv" style="--w:80.6"></div></div><div class="bar-val">80.6%</div></div>
+      </div>
+      <div class="bench-src">来源：[05][09]。Fable 5 该项官方未披露</div>
+    </div>
+    <div class="bench">
+      <div class="bench-head"><div class="bench-title">FrontierCode Diamond <span>Cognition · 可维护性</span></div></div>
+      <div class="bars">
+        <div class="bar-row"><div class="bar-label">Fable 5 / Mythos 5</div><div class="bar-track"><div class="bar-fill f5" style="--w:29.3"></div></div><div class="bar-val">29.3%</div></div>
+        <div class="bar-row"><div class="bar-label">Opus 4.8</div><div class="bar-track"><div class="bar-fill o48" style="--w:13.4"></div></div><div class="bar-val">13.4%</div></div>
+        <div class="bar-row"><div class="bar-label">GPT-5.5</div><div class="bar-track"><div class="bar-fill rv" style="--w:5.7"></div></div><div class="bar-val">5.7%</div></div>
+      </div>
+      <div class="bench-src">来源：[01][04]。考察高质量、可维护的智能体编码，远未饱和</div>
+    </div>
+  </div>
+
+  <div class="bench">
+    <div class="bench-head"><div class="bench-title">Terminal-Bench 2.1 <span>终端环境智能体任务</span></div></div>
+    <p class="bench-note">⚠ 该基准对评测脚手架（harness）高度敏感，不同来源数字不可直接混比。下图采用 Anthropic 发布口径 [04]；第三方 Terminus-2 harness 复测中 Opus 4.8 为 74.6%、GPT-5.5 为 78.2%，排序有所不同 [05]。</p>
+    <div class="bars">
+      <div class="bar-row"><div class="bar-label">Fable 5 / Mythos 5</div><div class="bar-track"><div class="bar-fill f5" style="--w:88.0"></div></div><div class="bar-val">88.0%</div></div>
+      <div class="bar-row"><div class="bar-label">GPT-5.5</div><div class="bar-track"><div class="bar-fill rv" style="--w:83.4"></div></div><div class="bar-val">83.4%</div></div>
+      <div class="bar-row"><div class="bar-label">Opus 4.8</div><div class="bar-track"><div class="bar-fill o48" style="--w:82.7"></div></div><div class="bar-val">82.7%</div></div>
+      <div class="bar-row"><div class="bar-label">Gemini 3.1 Pro</div><div class="bar-track"><div class="bar-fill rv" style="--w:70.7"></div></div><div class="bar-val">70.7%</div></div>
+    </div>
+    <div class="bench-src">来源：[04]。Opus 4.7 / 4.6 在较早的 Terminal-Bench 2.0 上分别为 69.4% / 65.4%，版本不同未并入本图 [06]</div>
+  </div>
+</section>
+
+<!-- ==================== 05 知识与推理 ==================== -->
+<section id="reasoning">
+  <div class="sec-head"><span class="sec-num">05</span><h2>知识、推理与经济价值任务</h2><div class="sec-rule"></div></div>
+  <p class="lede">Humanity's Last Exam（HLE）覆盖数千道前沿学术难题，是当前区分度最好的知识推理基准之一；GDPval-AA 以 Elo 形式衡量模型完成真实经济价值工作的能力。注意：GPQA Diamond 上 Opus 4.7、4.8 与 Gemini 3.1 Pro 三者统计持平，该基准已基本饱和。<sup class="ref">[05]</sup></p>
+
+  <div class="bench">
+    <div class="bench-head"><div class="bench-title">Humanity's Last Exam <span>带工具</span></div></div>
+    <div class="bars">
+      <div class="bar-row"><div class="bar-label">Mythos Preview</div><div class="bar-track"><div class="bar-fill mp" style="--w:64.7"></div></div><div class="bar-val">64.7%</div></div>
+      <div class="bar-row"><div class="bar-label">Fable 5 / Mythos 5</div><div class="bar-track"><div class="bar-fill f5" style="--w:64.5"></div></div><div class="bar-val">64.5%</div></div>
+      <div class="bar-row"><div class="bar-label">Opus 4.8</div><div class="bar-track"><div class="bar-fill o48" style="--w:57.9"></div></div><div class="bar-val">57.9%</div></div>
+      <div class="bar-row"><div class="bar-label">Opus 4.7</div><div class="bar-track"><div class="bar-fill o47" style="--w:54.7"></div></div><div class="bar-val">54.7%</div></div>
+      <div class="bar-row"><div class="bar-label">GPT-5.5</div><div class="bar-track"><div class="bar-fill rv" style="--w:52.2"></div></div><div class="bar-val">52.2%</div></div>
+      <div class="bar-row"><div class="bar-label">Gemini 3.1 Pro</div><div class="bar-track"><div class="bar-fill rv" style="--w:51.4"></div></div><div class="bar-val">51.4%</div></div>
+    </div>
+    <div class="bench-src">来源：[04][05]。无工具口径：Fable 5 59.0% · Mythos Preview 56.8% · Opus 4.8 49.8% · Gemini 44.4% · GPT-5.5 41.4%</div>
+  </div>
+
+  <div class="bench-grid">
+    <div class="bench">
+      <div class="bench-head"><div class="bench-title">GDPval-AA <span>Elo · 经济价值工作</span></div></div>
+      <div class="bars">
+        <div class="bar-row"><div class="bar-label">Fable 5 / Mythos 5</div><div class="bar-track"><div class="bar-fill f5" style="--w:96.6"></div></div><div class="bar-val">1932</div></div>
+        <div class="bar-row"><div class="bar-label">Opus 4.8</div><div class="bar-track"><div class="bar-fill o48" style="--w:94.5"></div></div><div class="bar-val">1890</div></div>
+        <div class="bar-row"><div class="bar-label">GPT-5.5</div><div class="bar-track"><div class="bar-fill rv" style="--w:88.5"></div></div><div class="bar-val">1769</div></div>
+        <div class="bar-row"><div class="bar-label">Opus 4.7</div><div class="bar-track"><div class="bar-fill o47" style="--w:87.7"></div></div><div class="bar-val">1753</div></div>
+        <div class="bar-row"><div class="bar-label">Gemini 3.1 Pro</div><div class="bar-track"><div class="bar-fill rv" style="--w:65.7"></div></div><div class="bar-val">1314</div></div>
+      </div>
+      <div class="bench-src">来源：[04][05]。条形按 Elo/2000 归一化绘制</div>
+    </div>
+    <div class="bench">
+      <div class="bench-head"><div class="bench-title">GPQA Diamond <span>研究生级科学 · 已饱和</span></div></div>
+      <div class="bars">
+        <div class="bar-row"><div class="bar-label">Gemini 3.1 Pro</div><div class="bar-track"><div class="bar-fill rv" style="--w:94.3"></div></div><div class="bar-val">94.3%</div></div>
+        <div class="bar-row"><div class="bar-label">Opus 4.7</div><div class="bar-track"><div class="bar-fill o47" style="--w:94.2"></div></div><div class="bar-val">94.2%</div></div>
+        <div class="bar-row"><div class="bar-label">Opus 4.8</div><div class="bar-track"><div class="bar-fill o48" style="--w:93.6"></div></div><div class="bar-val">93.6%</div></div>
+      </div>
+      <div class="bench-src">来源：[05]。三者差异在统计噪声范围内，应视为持平</div>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== 06 智能体与计算机操作 ==================== -->
+<section id="agentic">
+  <div class="sec-head"><span class="sec-num">06</span><h2>计算机操作与垂直智能体</h2><div class="sec-rule"></div></div>
+
+  <div class="bench">
+    <div class="bench-head"><div class="bench-title">OSWorld-Verified <span>图形界面计算机操作</span></div></div>
+    <div class="bars">
+      <div class="bar-row"><div class="bar-label">Mythos Preview</div><div class="bar-track"><div class="bar-fill mp" style="--w:85.4"></div></div><div class="bar-val">85.4%</div></div>
+      <div class="bar-row"><div class="bar-label">Fable 5 / Mythos 5</div><div class="bar-track"><div class="bar-fill f5" style="--w:85.0"></div></div><div class="bar-val">85.0%</div></div>
+      <div class="bar-row"><div class="bar-label">Opus 4.8</div><div class="bar-track"><div class="bar-fill o48" style="--w:83.4"></div></div><div class="bar-val">83.4%</div></div>
+      <div class="bar-row"><div class="bar-label">Opus 4.7</div><div class="bar-track"><div class="bar-fill o47" style="--w:82.8"></div></div><div class="bar-val">82.8%</div></div>
+      <div class="bar-row"><div class="bar-label">GPT-5.5</div><div class="bar-track"><div class="bar-fill rv" style="--w:78.7"></div></div><div class="bar-val">78.7%</div></div>
+      <div class="bar-row"><div class="bar-label">Gemini 3.1 Pro</div><div class="bar-track"><div class="bar-fill rv" style="--w:76.2"></div></div><div class="bar-val">76.2%</div></div>
+    </div>
+    <div class="bench-src">来源：[04][05]。Opus 4.6 在早期 OSWorld 口径下为 72.7% [08]</div>
+  </div>
+
+  <div class="bench-grid">
+    <div class="bench">
+      <div class="bench-head"><div class="bench-title">Finance Agent v2 <span>金融智能体</span></div></div>
+      <div class="bars">
+        <div class="bar-row"><div class="bar-label">Gemini 3.5 Flash</div><div class="bar-track"><div class="bar-fill rv" style="--w:57.9"></div></div><div class="bar-val">57.9%</div></div>
+        <div class="bar-row"><div class="bar-label">Opus 4.8</div><div class="bar-track"><div class="bar-fill o48" style="--w:53.9"></div></div><div class="bar-val">53.9%</div></div>
+        <div class="bar-row"><div class="bar-label">GPT-5.5</div><div class="bar-track"><div class="bar-fill rv" style="--w:51.8"></div></div><div class="bar-val">51.8%</div></div>
+        <div class="bar-row"><div class="bar-label">Opus 4.7</div><div class="bar-track"><div class="bar-fill o47" style="--w:51.5"></div></div><div class="bar-val">51.5%</div></div>
+      </div>
+      <div class="bench-src">来源：[05]。Fable 5 该项未披露；另据 [01]，Fable 5 在 Hebbia 金融基准上为全模型最高分</div>
+    </div>
+    <div class="bench">
+      <div class="bench-head"><div class="bench-title">Legal Agent Benchmark <span>法律智能体 · 极难</span></div></div>
+      <div class="bars">
+        <div class="bar-row"><div class="bar-label">Fable 5 / Mythos 5</div><div class="bar-track"><div class="bar-fill f5" style="--w:13.3"></div></div><div class="bar-val">13.3%</div></div>
+        <div class="bar-row"><div class="bar-label">Opus 4.8</div><div class="bar-track"><div class="bar-fill o48" style="--w:10.4"></div></div><div class="bar-val">10.4%</div></div>
+        <div class="bar-row"><div class="bar-label">GPT-5.5</div><div class="bar-track"><div class="bar-fill rv" style="--w:2.1"></div></div><div class="bar-val">2.1%</div></div>
+        <div class="bar-row"><div class="bar-label">Gemini 3.1 Pro</div><div class="bar-track"><div class="bar-fill rv" style="--w:0.001"></div></div><div class="bar-val">0.0%</div></div>
+      </div>
+      <div class="bench-src">来源：[04]。绝对分数低，反映该基准难度而非模型缺陷</div>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== 07 专业领域 ==================== -->
+<section id="domains">
+  <div class="sec-head"><span class="sec-num">07</span><h2>专业领域：安全、生物与视觉</h2><div class="sec-rule"></div></div>
+  <p class="lede">这组基准最能体现 Mythos 系列的差异化：网络安全（ExploitBench）与生物科研（BioMysteryBench）是 Mythos 训练定位的直接产物——也正是 Fable 5 加装分类器护栏的原因。<sup class="ref">[02][04]</sup></p>
+
+  <div class="bench">
+    <div class="bench-head"><div class="bench-title">ExploitBench <span>多步网络安全任务</span></div></div>
+    <p class="bench-note">Fable 5 / Mythos 5 相对 Opus 4.8 接近翻倍。注意：Fable 5 公开版中，触发安全分类器的网络安全请求会回退至 Opus 4.8 作答。</p>
+    <div class="bars">
+      <div class="bar-row"><div class="bar-label">Fable 5 / Mythos 5</div><div class="bar-track"><div class="bar-fill f5" style="--w:78.0"></div></div><div class="bar-val">78.0%</div></div>
+      <div class="bar-row"><div class="bar-label">Mythos Preview</div><div class="bar-track"><div class="bar-fill mp" style="--w:69.0"></div></div><div class="bar-val">69.0%</div></div>
+      <div class="bar-row"><div class="bar-label">Opus 4.8</div><div class="bar-track"><div class="bar-fill o48" style="--w:40.0"></div></div><div class="bar-val">40.0%</div></div>
+      <div class="bar-row"><div class="bar-label">GPT-5.5</div><div class="bar-track"><div class="bar-fill rv" style="--w:34.0"></div></div><div class="bar-val">34.0%</div></div>
+    </div>
+    <div class="bench-src">来源：[04]</div>
+  </div>
+
+  <table>
+    <caption>专业领域基准明细（%，加粗为该行最高）</caption>
+    <thead><tr><th>基准</th><th>Fable 5 / Mythos 5</th><th>Mythos Preview</th><th>Opus 4.8</th><th>GPT-5.5</th><th>Gemini 3.1 Pro</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td>BioMysteryBench Hard<span class="sub">生物科研推理 · 高难</span></td><td class="best">46.1</td><td>29.6</td><td>40.0</td><td>—</td><td>—</td></tr>
+      <tr><td>BioMysteryBench Human-Solved</td><td class="best">83.9</td><td>82.6</td><td>80.4</td><td>—</td><td>—</td></tr>
+      <tr class="hl"><td>HealthBench Professional<span class="sub">专业医疗问答</span></td><td class="best">66.0</td><td>64.7</td><td>56.9</td><td>51.8</td><td>—</td></tr>
+      <tr><td>GDP.pdf<span class="sub">复杂文档视觉理解</span></td><td class="best">29.8</td><td>—</td><td>22.5</td><td>24.9</td><td>16.7</td></tr>
+      <tr><td>Blueprint-Bench 2<span class="sub">图纸空间推理</span></td><td class="best">38.6</td><td>—</td><td>14.5</td><td>36.2</td><td>26.5</td></tr>
+      <tr><td>AutomationBench<span class="sub">自动化流程</span></td><td class="best">17.4</td><td>—</td><td>15.5</td><td>12.9</td><td>9.6</td></tr>
+    </tbody>
+  </table>
+  <div class="bench-src" style="border:none;padding-left:0">来源：[04]。"—" 表示该来源未披露对应数字</div>
+
+  <div class="callout warn">
+    <strong>实验性结果（非标准基准，谨慎采信）：</strong>药物设计——内部蛋白质专家报告设计流程约 10 倍加速，14 个蛋白靶点中 9 个产出强候选药物分子；分子生物学盲评中，科学家约 80% 的情况下更偏好 Mythos 的假设（对照 Opus 级模型）。这些为 Anthropic 自报的内部评估，缺乏外部复现。<sup class="ref">[01]</sup>
+  </div>
+</section>
+
+<!-- ==================== 08 价格 ==================== -->
+<section id="pricing">
+  <div class="sec-head"><span class="sec-num">08</span><h2>定价与性价比</h2><div class="sec-rule"></div></div>
+  <table>
+    <caption>API 定价（美元 / 百万 tokens）· 数据截至 2026-06-10</caption>
+    <thead><tr><th>模型</th><th>API 标识</th><th>输入</th><th>输出</th><th>上下文</th><th>最大输出</th><th>发布日期</th></tr></thead>
+    <tbody>
+      <tr class="hl"><td>Claude Fable 5</td><td>claude-fable-5</td><td>$10.00</td><td>$50.00</td><td>1M</td><td>128K</td><td>2026-06-09</td></tr>
+      <tr><td>Claude Mythos 5</td><td>—（定向访问）</td><td colspan="2">$10.00 / $50.00</td><td>—</td><td>—</td><td>2026-06-09</td></tr>
+      <tr><td>Claude Opus 4.8</td><td>claude-opus-4-8</td><td>$5.00</td><td>$25.00</td><td>1M</td><td>128K</td><td>2026-05-28</td></tr>
+      <tr><td>Claude Opus 4.8 Fast Mode</td><td>—（/fast 切换）</td><td>$10.00</td><td>$50.00</td><td>1M</td><td>128K</td><td>2026-05-28</td></tr>
+      <tr><td>Claude Opus 4.7</td><td>claude-opus-4-7</td><td>$5.00</td><td>$25.00</td><td>1M</td><td>128K</td><td>2026-04-16</td></tr>
+      <tr><td>Claude Opus 4.6</td><td>claude-opus-4-6</td><td>$5.00</td><td>$25.00</td><td>1M</td><td>128K</td><td>2026-02-05</td></tr>
+    </tbody>
+  </table>
+  <p class="bench-src" style="padding-left:0">注：Opus 系 1M 上下文为标准定价，无长上下文加价。Fable 5 于 2026-06-09 至 06-22 期间在 Pro / Max / Team / Enterprise 订阅中免费提供，之后转为消耗用量额度 [01]。Token 效率方面，Anthropic 称 Fable 5 以约 1/3 的推理 token 达成结果，部分抵消其 2 倍单价。</p>
+</section>
+
+<!-- ==================== 09 方法论 ==================== -->
+<section id="methodology">
+  <div class="sec-head"><span class="sec-num">09</span><h2>方法论说明与数据局限</h2><div class="sec-rule"></div></div>
+  <div class="callout">
+    <strong>阅读本报告前请注意以下四点：</strong><br>
+    ① <strong>厂商自报偏差</strong>——多数数字源自 Anthropic 发布材料，竞品分数为 Anthropic 选取的对照口径；GPT-5.5 与 Gemini 3.1 Pro 官方报告的数字可能因脚手架与采样设置不同而更高。
+    ② <strong>脚手架敏感性</strong>——Terminal-Bench 等智能体基准在不同 harness 下分差可达 8 个百分点以上（本文已分别标注口径）。
+    ③ <strong>饱和基准的排名无意义</strong>——GPQA Diamond、SWE-bench Verified 上 1 个百分点以内的差异应视为统计持平。
+    ④ <strong>Fable 5 部分项目缺数</strong>——其 SWE-bench Verified、GPQA、AIME、MMMU 分数截至本报告日期未公开披露，空缺处已以"—"标明，不做推断。
+  </div>
+</section>
+
+<!-- ==================== 10 来源 ==================== -->
+<section id="sources" class="sources">
+  <div class="sec-head"><span class="sec-num">10</span><h2>资料来源</h2><div class="sec-rule"></div></div>
+  <ol>
+    <li><div><a href="https://www.anthropic.com/news/claude-fable-5-mythos-5">Claude Fable 5 and Claude Mythos 5 — Anthropic 官方公告</a><div class="s-meta">anthropic.com · 2026-06-09 · 一手来源：定价、安全护栏、企业实测</div></div></li>
+    <li><div><a href="https://red.anthropic.com/2026/mythos-preview/">Claude Mythos Preview — Anthropic 红队披露</a><div class="s-meta">red.anthropic.com · 2026-04-07 · 一手来源：Mythos 定位与 Project Glasswing</div></div></li>
+    <li><div><a href="https://www.anthropic.com/claude/mythos">Claude Mythos 产品页 — Anthropic</a><div class="s-meta">anthropic.com · 一手来源</div></div></li>
+    <li><div><a href="https://wandb.ai/byyoung3/ml-news/reports/Claude-Fable-5-Benchmark-Scores--VmlldzoxNzE3NTE3MQ">Claude Fable 5 Benchmark Scores — Weights &amp; Biases ML News</a><div class="s-meta">wandb.ai · 2026-06 · 二手汇编：Fable 5 / Mythos 全套基准表</div></div></li>
+    <li><div><a href="https://www.vellum.ai/blog/claude-opus-4-8-benchmarks-explained">Claude Opus 4.8 Benchmarks Explained — Vellum</a><div class="s-meta">vellum.ai · 2026-05 · 二手分析：Opus 4.8 全套基准与 Terminus-2 复测</div></div></li>
+    <li><div><a href="https://www.anthropic.com/news/claude-opus-4-7">Introducing Claude Opus 4.7 — Anthropic 官方公告</a><div class="s-meta">anthropic.com · 2026-04-16 · 一手来源</div></div></li>
+    <li><div><a href="https://www.axios.com/2026/04/16/anthropic-claude-opus-model-mythos">Anthropic releases Claude Opus 4.7, concedes it trails unreleased Mythos — Axios</a><div class="s-meta">axios.com · 2026-04-16 · 独立报道</div></div></li>
+    <li><div><a href="https://www.datacamp.com/blog/claude-opus-4-6">Claude Opus 4.6: Features, Benchmarks, Tests — DataCamp</a><div class="s-meta">datacamp.com · 2026-02 · 二手分析：Opus 4.6 基线数据</div></div></li>
+    <li><div><a href="https://www.vellum.ai/blog/claude-opus-4-7-benchmarks-explained">Claude Opus 4.7 Benchmarks Explained — Vellum</a><div class="s-meta">vellum.ai · 2026-04 · 二手分析：4.7 vs 4.6 对比</div></div></li>
+    <li><div><a href="https://venturebeat.com/technology/anthropic-brings-mythos-to-the-masses-with-claude-fable-5-its-most-powerful-generally-available-model-ever">Anthropic brings Mythos to the masses with Claude Fable 5 — VentureBeat</a><div class="s-meta">venturebeat.com · 2026-06-09 · 独立报道</div></div></li>
+    <li><div><a href="https://the-decoder.com/anthropic-releases-claude-fable-5-and-mythos-5-with-major-gains-in-coding-and-science/">Anthropic releases Claude Fable 5 and Mythos 5 — The Decoder</a><div class="s-meta">the-decoder.com · 2026-06-09 · 独立报道</div></div></li>
+  </ol>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap" style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:16px;padding:0 32px">
+    <span>CLAUDE MODEL FAMILY · BENCHMARK REPORT · v1.0</span>
+    <span>数据截至 2026-06-10 · 仅供研究参考，不构成采购建议</span>
+  </div>
+</footer>
+
+</body>
+</html>

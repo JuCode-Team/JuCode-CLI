@@ -695,6 +695,7 @@ impl OpenAiClient {
         definitions.extend(self.extensions.definitions());
         if self.goal_tool_tx.is_some() {
             definitions.extend(goal_tool_definitions());
+            definitions.push(plan_tool_definition());
         }
         definitions
     }
@@ -1026,7 +1027,10 @@ impl OpenAiClient {
     }
 
     fn run_goal_tool(&self, name: &str, arguments: &str) -> Option<tools::ToolExecutionResult> {
-        if !matches!(name, "get_goal" | "create_goal" | "update_goal") {
+        if !matches!(
+            name,
+            "get_goal" | "create_goal" | "update_goal" | "update_plan"
+        ) {
             return None;
         }
         let Some(tx) = &self.goal_tool_tx else {
@@ -1452,6 +1456,34 @@ fn goal_tool_definitions() -> Vec<Value> {
             }
         }),
     ]
+}
+
+fn plan_tool_definition() -> Value {
+    json!({
+        "type": "function",
+        "name": "update_plan",
+        "description": "Maintain a short, visible task plan for multi-step work. Call it at the start to lay out the steps, and again whenever the plan changes — mark exactly one step in_progress and flip finished steps to completed. Keep steps concise (a handful of words). Skip it for trivial single-step tasks.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "plan": {
+                    "type": "array",
+                    "description": "The full ordered list of steps; replaces the previous plan.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": { "type": "string", "description": "Short description of the step." },
+                            "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
+                        },
+                        "required": ["step", "status"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["plan"],
+            "additionalProperties": false
+        }
+    })
 }
 
 fn truncate_subagent_output(value: &str) -> String {
