@@ -509,13 +509,13 @@ fn default_model_configs() -> Vec<ModelConfig> {
     [
         (
             "gpt-5.5",
-            1_050_000,
+            272_000,
             128_000,
             &["none", "low", "medium", "high", "xhigh"][..],
         ),
         (
             "gpt-5.4",
-            1_050_000,
+            272_000,
             128_000,
             &["none", "low", "medium", "high", "xhigh"],
         ),
