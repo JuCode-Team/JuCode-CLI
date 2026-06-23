@@ -622,7 +622,7 @@ fn deepseek_model_configs() -> Vec<ModelConfig> {
         name: (*name).to_string(),
         context_window: *context_window,
         max_output_tokens: *max_output_tokens,
-        reasoning_efforts: default_reasoning_efforts(),
+        reasoning_efforts: vec!["high".to_string(), "max".to_string()],
         input_cost: 0.0,
         cached_input_cost: 0.0,
         output_cost: 0.0,

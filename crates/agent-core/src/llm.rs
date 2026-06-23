@@ -1920,6 +1920,7 @@ fn anthropic_thinking_budget(effort: &str) -> Option<u64> {
         "medium" => Some(10_000),
         "high" => Some(20_000),
         "xhigh" => Some(32_000),
+        "max" => Some(64_000),
         _ => None,
     }
 }
