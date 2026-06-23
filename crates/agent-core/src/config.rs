@@ -144,8 +144,9 @@ impl Config {
 
         let content = fs::read_to_string(&path)?;
         let value = serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({}));
+        let provider = read_string(&value, "provider", "openai");
         let model = read_string(&value, "model", "gpt-5");
-        let mut models = read_model_configs(&value);
+        let mut models = read_model_configs(&value, &provider);
         if !models.iter().any(|entry| entry.name == model) {
             models.insert(0, default_model_config(&model));
         }
@@ -171,18 +172,16 @@ impl Config {
         } else {
             &legacy_jucode_url
         };
+        let default_base_url =
+            default_base_url_for_provider(&provider).unwrap_or("https://api.openai.com/v1");
         let config = Self {
-            provider: read_string(&value, "provider", "openai"),
             model,
             reasoning_effort,
             compact_model,
             compact_reasoning_effort,
             models,
-            base_url: normalize_base_url(&read_string(
-                &value,
-                "base_url",
-                "https://api.openai.com/v1",
-            )),
+            base_url: normalize_base_url(&read_string(&value, "base_url", default_base_url)),
+            provider,
             jucode_web_url: normalize_base_url(&read_string(
                 &value,
                 "jucode_web_url",
@@ -398,9 +397,9 @@ fn read_reasoning_effort(
     }
 }
 
-fn read_model_configs(value: &Value) -> Vec<ModelConfig> {
+fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
     let Some(models) = value.get("models").and_then(Value::as_array) else {
-        return default_model_configs();
+        return models_for_provider(provider);
     };
 
     let mut configs = Vec::new();
@@ -446,7 +445,7 @@ fn read_model_configs(value: &Value) -> Vec<ModelConfig> {
     }
 
     if configs.is_empty() {
-        default_model_configs()
+        models_for_provider(provider)
     } else {
         configs
     }
@@ -556,9 +555,72 @@ fn default_model_configs() -> Vec<ModelConfig> {
     .collect()
 }
 
-fn default_model_config(name: &str) -> ModelConfig {
-    default_model_configs()
+/// A built-in provider: its default API base URL and the models it serves.
+/// Add an entry here to ship a new provider; users can still override base_url
+/// and models in the config file.
+struct ProviderTemplate {
+    id: &'static str,
+    base_url: &'static str,
+    models: fn() -> Vec<ModelConfig>,
+}
+
+fn default_providers() -> Vec<ProviderTemplate> {
+    vec![
+        ProviderTemplate {
+            id: "openai",
+            base_url: "https://api.openai.com/v1",
+            models: default_model_configs,
+        },
+        // The jucode gateway speaks the OpenAI Responses API and serves the gpt-5
+        // family (plus claude-* models, which users configure by name).
+        ProviderTemplate {
+            id: "jucode",
+            base_url: "https://api.jucode.cn/v1",
+            models: default_model_configs,
+        },
+        ProviderTemplate {
+            id: "deepseek",
+            base_url: "https://api.deepseek.com/v1",
+            models: deepseek_model_configs,
+        },
+    ]
+}
+
+/// Default model table for a provider, falling back to the openai set.
+pub fn models_for_provider(id: &str) -> Vec<ModelConfig> {
+    default_providers()
         .into_iter()
+        .find(|p| p.id == id)
+        .map(|p| (p.models)())
+        .unwrap_or_else(default_model_configs)
+}
+
+fn default_base_url_for_provider(id: &str) -> Option<&'static str> {
+    default_providers().into_iter().find(|p| p.id == id).map(|p| p.base_url)
+}
+
+fn deepseek_model_configs() -> Vec<ModelConfig> {
+    [
+        ("deepseek-v4-pro", 1_000_000, 384_000),
+        ("deepseek-v4-flash", 1_000_000, 384_000),
+    ]
+    .iter()
+    .map(|(name, context_window, max_output_tokens)| ModelConfig {
+        name: (*name).to_string(),
+        context_window: *context_window,
+        max_output_tokens: *max_output_tokens,
+        reasoning_efforts: default_reasoning_efforts(),
+        input_cost: 0.0,
+        cached_input_cost: 0.0,
+        output_cost: 0.0,
+    })
+    .collect()
+}
+
+fn default_model_config(name: &str) -> ModelConfig {
+    default_providers()
+        .into_iter()
+        .flat_map(|p| (p.models)())
         .find(|entry| entry.name == name)
         .unwrap_or_else(|| ModelConfig {
             name: name.to_string(),
