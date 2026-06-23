@@ -900,15 +900,6 @@ impl AgentCore {
         self.turn_goal_tokens = 0;
         let save_event = self.save_session_event();
 
-        if self.config.provider != "openai" && self.config.provider != "jucode" {
-            let mut events = save_event;
-            events.push(AgentEvent::Error(format!(
-                "unsupported provider '{}'. Supported providers: openai, jucode.",
-                self.config.provider
-            )));
-            return events;
-        }
-
         if self.config.provider == "jucode" && !is_jucode_supported_model(&self.config.model) {
             let mut events = save_event;
             events.push(AgentEvent::Error(format!(
@@ -1164,12 +1155,6 @@ impl AgentCore {
                 "cannot compact while a response is running".to_string(),
             )];
         }
-        if self.config.provider != "openai" && self.config.provider != "jucode" {
-            return vec![AgentEvent::Error(format!(
-                "unsupported provider '{}'. Supported providers: openai, jucode.",
-                self.config.provider
-            ))];
-        }
         if self.config.provider == "jucode"
             && !is_jucode_supported_model(&self.config.compact_model)
         {
@@ -1304,15 +1289,6 @@ impl AgentCore {
         self.turn_started_at = Some(SystemTime::now());
         self.turn_goal_tokens = 0;
         let save_event = self.save_session_event();
-
-        if self.config.provider != "openai" && self.config.provider != "jucode" {
-            let mut events = save_event;
-            events.push(AgentEvent::Error(format!(
-                "unsupported provider '{}'. Supported providers: openai, jucode.",
-                self.config.provider
-            )));
-            return events;
-        }
 
         if self.config.provider == "jucode" && !is_jucode_supported_model(&self.config.model) {
             let mut events = save_event;
