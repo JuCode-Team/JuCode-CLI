@@ -72,6 +72,7 @@ pub struct OpenAiClient {
 
 pub struct OpenAiClientConfig<'a> {
     pub model: String,
+    pub protocol: String,
     pub reasoning_effort: String,
     pub system_prompt: String,
     pub prompt_cache_key: String,
@@ -185,7 +186,7 @@ impl OpenAiClient {
                 )
             })?,
         };
-        let provider_kind = ProviderKind::from_model(&config.model);
+        let provider_kind = ProviderKind::resolve(&config.protocol, &config.model);
         Ok(Self {
             api_key,
             model: config.model,
@@ -912,7 +913,7 @@ impl OpenAiClient {
             allow_subagents: child_depth < MAX_SUBAGENT_DEPTH,
             max_tool_calls: Some(max_tool_calls),
             deadline: Some(started + Duration::from_secs(timeout_secs)),
-            provider_kind: ProviderKind::from_model(&model),
+            provider_kind: self.provider_kind,
             goal_tool_tx: None,
             approval_tx: None,
             subagent_manager: Some(manager.clone()),
@@ -1142,6 +1143,15 @@ impl ProviderKind {
             Self::AnthropicMessages
         } else {
             Self::OpenAiResponses
+        }
+    }
+
+    /// An explicit provider protocol wins; otherwise fall back to the model heuristic.
+    fn resolve(protocol: &str, model: &str) -> Self {
+        match protocol {
+            "anthropic" => Self::AnthropicMessages,
+            "responses" => Self::OpenAiResponses,
+            _ => Self::from_model(model),
         }
     }
 }

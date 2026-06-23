@@ -57,6 +57,9 @@ const DEFAULT_COMPACT_REASONING_EFFORT: &str = "low";
 #[derive(Debug, Clone)]
 pub struct Config {
     pub provider: String,
+    /// Wire protocol override: "responses" | "anthropic". Empty falls back to the
+    /// per-model heuristic (claude-* → anthropic, else responses).
+    pub protocol: String,
     pub model: String,
     pub reasoning_effort: String,
     pub compact_model: String,
@@ -119,6 +122,7 @@ impl Config {
         if !path.exists() {
             let config = Self {
                 provider: "jucode".to_string(),
+                protocol: "responses".to_string(),
                 model: "gpt-5.5".to_string(),
                 reasoning_effort: "medium".to_string(),
                 compact_model: "gpt-5.5".to_string(),
@@ -173,6 +177,7 @@ impl Config {
         let default_base_url =
             default_base_url_for_provider(&provider).unwrap_or("https://api.openai.com/v1");
         let config = Self {
+            protocol: read_string(&value, "protocol", ""),
             model,
             reasoning_effort,
             compact_model,
@@ -223,6 +228,7 @@ impl Config {
 
         let value = json!({
             "provider": self.provider,
+            "protocol": self.protocol,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
             "compact_model": self.compact_model,
@@ -560,6 +566,8 @@ fn default_model_configs() -> Vec<ModelConfig> {
 struct ProviderTemplate {
     id: &'static str,
     base_url: &'static str,
+    /// Wire protocol: "responses" (OpenAI Responses API) or "anthropic" (Messages API).
+    protocol: &'static str,
     models: fn() -> Vec<ModelConfig>,
 }
 
@@ -570,21 +578,24 @@ fn default_providers() -> Vec<ProviderTemplate> {
         ProviderTemplate {
             id: "jucode",
             base_url: "https://api.jucode.cn/v1",
+            protocol: "responses",
             models: default_model_configs,
         },
+        // DeepSeek exposes an Anthropic-compatible endpoint; route via Messages.
         ProviderTemplate {
             id: "deepseek",
-            base_url: "https://api.deepseek.com/v1",
+            base_url: "https://api.deepseek.com/anthropic",
+            protocol: "anthropic",
             models: deepseek_model_configs,
         },
     ]
 }
 
-/// Built-in providers as (id, default base_url) — for UIs to offer a picker.
-pub fn builtin_providers() -> Vec<(String, String)> {
+/// Built-in providers as (id, default base_url, protocol) — for UIs to offer a picker.
+pub fn builtin_providers() -> Vec<(String, String, String)> {
     default_providers()
         .into_iter()
-        .map(|p| (p.id.to_string(), p.base_url.to_string()))
+        .map(|p| (p.id.to_string(), p.base_url.to_string(), p.protocol.to_string()))
         .collect()
 }
 
@@ -709,6 +720,7 @@ mod tests {
     fn compact_model_config_uses_compact_model() {
         let config = Config {
             provider: "openai".to_string(),
+            protocol: String::new(),
             model: "chat-model".to_string(),
             reasoning_effort: "medium".to_string(),
             compact_model: "compact-model".to_string(),

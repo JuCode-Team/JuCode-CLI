@@ -984,6 +984,7 @@ impl AgentCore {
         self.pending_approvals.clear();
         let Ok(client) = OpenAiClient::from_config(OpenAiClientConfig {
             model: self.config.model.clone(),
+            protocol: self.config.protocol.clone(),
             reasoning_effort: self.config.reasoning_effort.clone(),
             system_prompt,
             prompt_cache_key: self.session.session_id().to_string(),
@@ -1214,6 +1215,7 @@ impl AgentCore {
     fn compaction_client(&self) -> Result<OpenAiClient, String> {
         OpenAiClient::from_config(OpenAiClientConfig {
             model: self.config.compact_model.clone(),
+            protocol: self.config.protocol.clone(),
             reasoning_effort: self.config.compact_reasoning_effort.clone(),
             system_prompt: String::new(),
             prompt_cache_key: self.session.session_id().to_string(),
@@ -1249,6 +1251,7 @@ impl AgentCore {
             .unwrap_or_else(|| self.config.compact_model_config().max_output_tokens);
         OpenAiClient::from_config(OpenAiClientConfig {
             model,
+            protocol: self.config.protocol.clone(),
             reasoning_effort: self.config.compact_reasoning_effort.clone(),
             system_prompt: String::new(),
             prompt_cache_key: self.session.session_id().to_string(),

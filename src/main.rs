@@ -69,7 +69,7 @@ fn main() -> io::Result<()> {
     if args.first().map(String::as_str) == Some("providers") {
         let list = jucode_agent_core::builtin_providers()
             .into_iter()
-            .map(|(id, base_url)| {
+            .map(|(id, base_url, protocol)| {
                 let models = jucode_agent_core::models_for_provider(&id)
                     .into_iter()
                     .map(|m| {
@@ -81,7 +81,7 @@ fn main() -> io::Result<()> {
                         })
                     })
                     .collect::<Vec<_>>();
-                json!({ "id": id, "base_url": base_url, "models": models })
+                json!({ "id": id, "base_url": base_url, "protocol": protocol, "models": models })
             })
             .collect::<Vec<_>>();
         println!("{}", json!(list));
