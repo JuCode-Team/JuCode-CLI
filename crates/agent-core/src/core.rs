@@ -210,6 +210,20 @@ impl AgentCore {
         ) as u64
     }
 
+    /// The configured effort, or a valid fallback when it isn't one the current
+    /// model supports (e.g. a stale "medium" after switching to a high/max model).
+    fn effective_reasoning_effort(&self) -> String {
+        let efforts = self.config.current_model_config().reasoning_efforts;
+        if efforts.is_empty() || efforts.iter().any(|e| e == &self.config.reasoning_effort) {
+            return self.config.reasoning_effort.clone();
+        }
+        efforts
+            .iter()
+            .find(|e| e.as_str() == "high")
+            .cloned()
+            .unwrap_or_else(|| efforts[efforts.len() / 2].clone())
+    }
+
     pub fn model_status_event(&self) -> AgentEvent {
         let state = if self.running {
             "streaming".to_string()
@@ -223,7 +237,7 @@ impl AgentCore {
         AgentEvent::ModelStatus {
             provider: self.config.provider.clone(),
             model: self.config.model.clone(),
-            reasoning_effort: self.config.reasoning_effort.clone(),
+            reasoning_effort: self.effective_reasoning_effort(),
             context_window: model_config.context_window,
             context_limit: self.effective_context_limit(),
             max_output_tokens: model_config.max_output_tokens,
@@ -985,7 +999,7 @@ impl AgentCore {
         let Ok(client) = OpenAiClient::from_config(OpenAiClientConfig {
             model: self.config.model.clone(),
             protocol: self.config.protocol.clone(),
-            reasoning_effort: self.config.reasoning_effort.clone(),
+            reasoning_effort: self.effective_reasoning_effort(),
             system_prompt,
             prompt_cache_key: self.session.session_id().to_string(),
             extensions: ExtensionRegistry::load(
