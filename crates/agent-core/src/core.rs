@@ -204,13 +204,10 @@ impl AgentCore {
     /// Token count at which auto-compaction triggers — the honest denominator for
     /// the UI context gauge. Matches `should_auto_compact`.
     fn effective_context_limit(&self) -> u64 {
-        let budget = target_context_budget(&self.config.current_model_config()) as u64;
-        let threshold = self.config.compaction_threshold_tokens;
-        if threshold > 0 {
-            budget.min(threshold)
-        } else {
-            budget
-        }
+        target_context_budget(
+            &self.config.current_model_config(),
+            self.config.compaction_threshold_percent,
+        ) as u64
     }
 
     pub fn model_status_event(&self) -> AgentEvent {
@@ -1026,10 +1023,12 @@ impl AgentCore {
         let request_items = self.session.request_context_items();
         let (context_tokens, context_tokenizer) =
             self.session.context_token_usage(&self.config.model);
-        let compaction_threshold = self.config.compaction_threshold_tokens as usize;
-        let model_context_budget = target_context_budget(&self.config.current_model_config());
+        let model_context_budget = target_context_budget(
+            &self.config.current_model_config(),
+            self.config.compaction_threshold_percent,
+        );
         let compaction =
-            if should_auto_compact(context_tokens, model_context_budget, compaction_threshold) {
+            if should_auto_compact(context_tokens, model_context_budget) {
                 self.session
                     .plan_compaction(COMPACTION_KEEP_RECENT_TOKENS, &self.config.model)
             } else {
@@ -2177,17 +2176,13 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
     (year as i32, month as u32, day as u32)
 }
 
-fn target_context_budget(model_config: &ModelConfig) -> usize {
-    (model_config.context_window as usize).saturating_mul(3) / 4
+fn target_context_budget(model_config: &ModelConfig, threshold_percent: u64) -> usize {
+    let percent = threshold_percent.clamp(10, 95) as usize;
+    (model_config.context_window as usize).saturating_mul(percent) / 100
 }
 
-fn should_auto_compact(
-    context_tokens: usize,
-    model_context_budget: usize,
-    compaction_threshold: usize,
-) -> bool {
+fn should_auto_compact(context_tokens: usize, model_context_budget: usize) -> bool {
     context_tokens > model_context_budget
-        || (compaction_threshold > 0 && context_tokens > compaction_threshold)
 }
 
 fn format_context_statistics(

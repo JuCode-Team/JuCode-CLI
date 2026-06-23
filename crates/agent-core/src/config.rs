@@ -50,10 +50,8 @@ const PROMPT_FILE_NAME: &str = "prompt.txt";
 const DEFAULT_RETRY_ATTEMPTS: usize = 5;
 const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_READ_TIMEOUT_SECONDS: u64 = 300;
-/// Absolute context-token cap that forces compaction regardless of window size.
-/// 0 (default) disables it, so compaction is driven only by the per-model budget
-/// (3/4 of the context window). Set a positive value to cap large-window models.
-const DEFAULT_COMPACTION_THRESHOLD_TOKENS: u64 = 0;
+/// Percentage of the model's context window at which older turns are compacted.
+const DEFAULT_COMPACTION_THRESHOLD_PERCENT: u64 = 75;
 const DEFAULT_COMPACT_REASONING_EFFORT: &str = "low";
 
 #[derive(Debug, Clone)]
@@ -71,7 +69,7 @@ pub struct Config {
     pub retry_attempts: usize,
     pub connect_timeout_seconds: u64,
     pub read_timeout_seconds: u64,
-    pub compaction_threshold_tokens: u64,
+    pub compaction_threshold_percent: u64,
     pub include_project_instructions: bool,
     pub extensions: Vec<ExtensionConfig>,
     path: PathBuf,
@@ -133,7 +131,7 @@ impl Config {
                 retry_attempts: DEFAULT_RETRY_ATTEMPTS,
                 connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,
                 read_timeout_seconds: DEFAULT_READ_TIMEOUT_SECONDS,
-                compaction_threshold_tokens: DEFAULT_COMPACTION_THRESHOLD_TOKENS,
+                compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
                 include_project_instructions: true,
                 extensions: Vec::new(),
                 path,
@@ -204,11 +202,12 @@ impl Config {
                 "read_timeout_seconds",
                 DEFAULT_READ_TIMEOUT_SECONDS,
             ),
-            compaction_threshold_tokens: read_u64(
+            compaction_threshold_percent: read_u64(
                 &value,
-                "compaction_threshold_tokens",
-                DEFAULT_COMPACTION_THRESHOLD_TOKENS,
-            ),
+                "compaction_threshold_percent",
+                DEFAULT_COMPACTION_THRESHOLD_PERCENT,
+            )
+            .clamp(10, 95),
             include_project_instructions: read_bool(&value, "include_project_instructions", true),
             extensions: read_extensions(&value),
             path,
@@ -236,7 +235,7 @@ impl Config {
             "retry_attempts": self.retry_attempts,
             "connect_timeout_seconds": self.connect_timeout_seconds,
             "read_timeout_seconds": self.read_timeout_seconds,
-            "compaction_threshold_tokens": self.compaction_threshold_tokens,
+            "compaction_threshold_percent": self.compaction_threshold_percent,
             "include_project_instructions": self.include_project_instructions,
             "extensions": self.extensions.iter().map(extension_config_value).collect::<Vec<_>>()
         });
@@ -746,7 +745,7 @@ mod tests {
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
             connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,
             read_timeout_seconds: DEFAULT_READ_TIMEOUT_SECONDS,
-            compaction_threshold_tokens: DEFAULT_COMPACTION_THRESHOLD_TOKENS,
+            compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
             include_project_instructions: true,
             extensions: Vec::new(),
             path: PathBuf::from("config.json"),
