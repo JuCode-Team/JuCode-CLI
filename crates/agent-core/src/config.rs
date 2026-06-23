@@ -118,13 +118,13 @@ impl Config {
         ensure_system_prompt_file()?;
         if !path.exists() {
             let config = Self {
-                provider: "openai".to_string(),
-                model: "gpt-5".to_string(),
+                provider: "jucode".to_string(),
+                model: "gpt-5.5".to_string(),
                 reasoning_effort: "medium".to_string(),
-                compact_model: "gpt-5".to_string(),
+                compact_model: "gpt-5.5".to_string(),
                 compact_reasoning_effort: DEFAULT_COMPACT_REASONING_EFFORT.to_string(),
-                models: default_model_configs(),
-                base_url: "https://api.openai.com/v1".to_string(),
+                models: models_for_provider("jucode"),
+                base_url: "https://api.jucode.cn/v1".to_string(),
                 jucode_web_url: "https://api.jucode.cn".to_string(),
                 jucode_api_url: "https://api.jucode.cn".to_string(),
                 api_key_env: "OPENAI_API_KEY".to_string(),
@@ -565,11 +565,6 @@ struct ProviderTemplate {
 
 fn default_providers() -> Vec<ProviderTemplate> {
     vec![
-        ProviderTemplate {
-            id: "openai",
-            base_url: "https://api.openai.com/v1",
-            models: default_model_configs,
-        },
         // The jucode gateway speaks the OpenAI Responses API and serves the gpt-5
         // family (plus claude-* models, which users configure by name).
         ProviderTemplate {
