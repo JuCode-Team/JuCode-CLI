@@ -50,8 +50,10 @@ const PROMPT_FILE_NAME: &str = "prompt.txt";
 const DEFAULT_RETRY_ATTEMPTS: usize = 5;
 const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_READ_TIMEOUT_SECONDS: u64 = 300;
-/// Estimated context tokens above which older turns are compacted. 0 disables it.
-const DEFAULT_COMPACTION_THRESHOLD_TOKENS: u64 = 150_000;
+/// Absolute context-token cap that forces compaction regardless of window size.
+/// 0 (default) disables it, so compaction is driven only by the per-model budget
+/// (3/4 of the context window). Set a positive value to cap large-window models.
+const DEFAULT_COMPACTION_THRESHOLD_TOKENS: u64 = 0;
 const DEFAULT_COMPACT_REASONING_EFFORT: &str = "low";
 
 #[derive(Debug, Clone)]

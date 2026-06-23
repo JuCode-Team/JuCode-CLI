@@ -72,6 +72,7 @@ pub enum AgentEvent {
         model: String,
         reasoning_effort: String,
         context_window: u64,
+        context_limit: u64,
         max_output_tokens: u64,
         reasoning_efforts: Vec<String>,
         state: String,

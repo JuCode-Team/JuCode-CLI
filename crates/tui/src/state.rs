@@ -190,6 +190,7 @@ impl TuiState {
                     model,
                     reasoning_effort,
                     context_window,
+                    context_limit: _,
                     max_output_tokens,
                     reasoning_efforts,
                     state,

@@ -362,6 +362,7 @@ fn event_json(event: AgentEvent) -> Value {
             model,
             reasoning_effort,
             context_window,
+            context_limit,
             max_output_tokens,
             reasoning_efforts,
             state,
@@ -371,6 +372,7 @@ fn event_json(event: AgentEvent) -> Value {
             "model": model,
             "reasoning_effort": reasoning_effort,
             "context_window": context_window,
+            "context_limit": context_limit,
             "max_output_tokens": max_output_tokens,
             "reasoning_efforts": reasoning_efforts,
             "state": state

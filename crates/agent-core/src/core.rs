@@ -201,6 +201,18 @@ impl AgentCore {
         }
     }
 
+    /// Token count at which auto-compaction triggers — the honest denominator for
+    /// the UI context gauge. Matches `should_auto_compact`.
+    fn effective_context_limit(&self) -> u64 {
+        let budget = target_context_budget(&self.config.current_model_config()) as u64;
+        let threshold = self.config.compaction_threshold_tokens;
+        if threshold > 0 {
+            budget.min(threshold)
+        } else {
+            budget
+        }
+    }
+
     pub fn model_status_event(&self) -> AgentEvent {
         let state = if self.running {
             "streaming".to_string()
@@ -216,6 +228,7 @@ impl AgentCore {
             model: self.config.model.clone(),
             reasoning_effort: self.config.reasoning_effort.clone(),
             context_window: model_config.context_window,
+            context_limit: self.effective_context_limit(),
             max_output_tokens: model_config.max_output_tokens,
             reasoning_efforts: model_config.reasoning_efforts,
             state,
