@@ -586,6 +586,14 @@ fn default_providers() -> Vec<ProviderTemplate> {
     ]
 }
 
+/// Built-in providers as (id, default base_url) — for UIs to offer a picker.
+pub fn builtin_providers() -> Vec<(String, String)> {
+    default_providers()
+        .into_iter()
+        .map(|p| (p.id.to_string(), p.base_url.to_string()))
+        .collect()
+}
+
 /// Default model table for a provider, falling back to the openai set.
 pub fn models_for_provider(id: &str) -> Vec<ModelConfig> {
     default_providers()

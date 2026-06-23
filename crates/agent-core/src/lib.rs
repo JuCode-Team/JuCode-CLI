@@ -15,6 +15,7 @@ mod tools;
 mod trust;
 mod update;
 
+pub use config::{builtin_providers, models_for_provider, ModelConfig};
 pub use core::AgentCore;
 pub use event::{
     AgentEvent, CommandView, GoalView, ModelOptionView, PlanItem, SessionListItemView,

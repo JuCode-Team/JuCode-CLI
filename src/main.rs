@@ -66,6 +66,27 @@ fn main() -> io::Result<()> {
         let code = run_serve()?;
         std::process::exit(code);
     }
+    if args.first().map(String::as_str) == Some("providers") {
+        let list = jucode_agent_core::builtin_providers()
+            .into_iter()
+            .map(|(id, base_url)| {
+                let models = jucode_agent_core::models_for_provider(&id)
+                    .into_iter()
+                    .map(|m| {
+                        json!({
+                            "name": m.name,
+                            "context_window": m.context_window,
+                            "max_output_tokens": m.max_output_tokens,
+                            "reasoning_efforts": m.reasoning_efforts,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                json!({ "id": id, "base_url": base_url, "models": models })
+            })
+            .collect::<Vec<_>>();
+        println!("{}", json!(list));
+        std::process::exit(0);
+    }
     let mut core = AgentCore::new()?;
     core.start_update_check();
     TuiApp::new(Runtime(core)).run()
