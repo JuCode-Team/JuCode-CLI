@@ -1817,6 +1817,8 @@ fn apply_patch(
 
     match check {
         Ok(_) => {
+            // Snapshot the patch's target files (pre-apply) so /rewind can undo it.
+            let _ = create_checkpoint(cwd, "auto-patch", &patch_target_paths(patch, cwd));
             let result = run_command_events(
                 "git",
                 &["apply", "--whitespace=nowarn", "-"],
@@ -2131,6 +2133,34 @@ static READ_TRACKER: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 fn read_tracker() -> &'static Mutex<HashSet<String>> {
     READ_TRACKER.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Files referenced by a unified diff's `---`/`+++` headers, for pre-apply
+/// snapshotting. `/dev/null` (creations/deletions) is skipped on its own line
+/// but the counterpart path is kept, so created and deleted files are captured.
+fn patch_target_paths(patch: &str, cwd: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for line in patch.lines() {
+        let Some(rest) = line
+            .strip_prefix("--- ")
+            .or_else(|| line.strip_prefix("+++ "))
+        else {
+            continue;
+        };
+        let rest = rest.trim();
+        if rest == "/dev/null" {
+            continue;
+        }
+        let rel = rest
+            .strip_prefix("a/")
+            .or_else(|| rest.strip_prefix("b/"))
+            .unwrap_or(rest);
+        let abs = resolve_path(cwd, rel);
+        if !paths.contains(&abs) {
+            paths.push(abs);
+        }
+    }
+    paths
 }
 
 fn create_checkpoint(cwd: &Path, name: &str, paths: &[PathBuf]) -> io::Result<Value> {
