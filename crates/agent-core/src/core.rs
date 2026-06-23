@@ -856,6 +856,7 @@ impl AgentCore {
             }
         }
         events.extend(self.drain_subagent_events());
+        events.extend(self.fold_subagent_usage());
         if let Some(rx) = self.update_receiver.take() {
             match rx.try_recv() {
                 Ok(notice) => events.push(AgentEvent::Info(notice.message())),
@@ -903,6 +904,27 @@ impl AgentCore {
                 message: event.message,
             })
             .collect()
+    }
+
+    /// Folds finished subagents' token usage into the parent's cumulative totals,
+    /// priced at each child's own model. Subagent context is separate, so this
+    /// only affects usage/cost accounting, never the context gauge.
+    fn fold_subagent_usage(&mut self) -> Vec<AgentEvent> {
+        let finished = self.subagent_manager.drain_finished_usage();
+        if finished.is_empty() {
+            return Vec::new();
+        }
+        for usage in finished {
+            self.total_input_tokens += usage.input_tokens;
+            self.total_cached_input_tokens += usage.cached_input_tokens;
+            self.total_output_tokens += usage.output_tokens;
+            self.total_cost += self.config.model_config(&usage.model).cost_for(
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.output_tokens,
+            );
+        }
+        vec![self.context_usage_event()]
     }
 
     fn start_turn(&mut self, message: String, images: Vec<String>) -> Vec<AgentEvent> {
@@ -1000,6 +1022,12 @@ impl AgentCore {
             model: self.config.model.clone(),
             protocol: self.config.protocol.clone(),
             reasoning_effort: self.effective_reasoning_effort(),
+            model_reasoning_efforts: self
+                .config
+                .models
+                .iter()
+                .map(|m| (m.name.clone(), m.reasoning_efforts.clone()))
+                .collect(),
             system_prompt,
             prompt_cache_key: self.session.session_id().to_string(),
             extensions: ExtensionRegistry::load(
@@ -1231,6 +1259,7 @@ impl AgentCore {
             model: self.config.compact_model.clone(),
             protocol: self.config.protocol.clone(),
             reasoning_effort: self.config.compact_reasoning_effort.clone(),
+            model_reasoning_efforts: Vec::new(),
             system_prompt: String::new(),
             prompt_cache_key: self.session.session_id().to_string(),
             extensions: ExtensionRegistry::load(&[], &self.cwd, self.config.profile_dir()),
@@ -1267,6 +1296,7 @@ impl AgentCore {
             model,
             protocol: self.config.protocol.clone(),
             reasoning_effort: self.config.compact_reasoning_effort.clone(),
+            model_reasoning_efforts: Vec::new(),
             system_prompt: String::new(),
             prompt_cache_key: self.session.session_id().to_string(),
             extensions: ExtensionRegistry::load(&[], &self.cwd, self.config.profile_dir()),

@@ -93,6 +93,9 @@ struct SubagentInner {
 struct SubagentRegistry {
     agents: BTreeMap<String, SubagentRecord>,
     events: VecDeque<SubagentLifecycleEvent>,
+    /// Token usage of subagents that reached a final state, awaiting fold-in to
+    /// the parent's cumulative totals. Drained once via `drain_finished_usage`.
+    finished_usage: Vec<SubagentRunResult>,
 }
 
 struct SubagentRecord {
@@ -179,6 +182,7 @@ impl SubagentManager {
     pub(crate) fn finish_ok(&self, path: &str, result: SubagentRunResult) {
         let mut state = self.inner.state.lock().unwrap();
         let mut event = None;
+        let mut finished = None;
         if let Some(agent) = state.agents.get_mut(path) {
             if agent.status == SubagentStatus::Closed {
                 self.inner.changed.notify_all();
@@ -186,9 +190,13 @@ impl SubagentManager {
             }
             agent.status = SubagentStatus::Completed;
             agent.completed_at_ms = Some(now_ms());
-            agent.result = Some(result);
+            agent.result = Some(result.clone());
             agent.error = None;
             event = Some(("completed", "finished".to_string()));
+            finished = Some(result);
+        }
+        if let Some(usage) = finished {
+            state.finished_usage.push(usage);
         }
         if let Some((status, message)) = event {
             state.push_event(path, status, &message);
@@ -199,6 +207,7 @@ impl SubagentManager {
     pub(crate) fn finish_err(&self, path: &str, error: String, partial: SubagentRunResult) {
         let mut state = self.inner.state.lock().unwrap();
         let mut event = None;
+        let mut finished = None;
         if let Some(agent) = state.agents.get_mut(path) {
             if agent.status == SubagentStatus::Closed {
                 self.inner.changed.notify_all();
@@ -211,10 +220,14 @@ impl SubagentManager {
                 SubagentStatus::Errored
             };
             agent.completed_at_ms = Some(now_ms());
-            agent.result = Some(partial);
+            agent.result = Some(partial.clone());
             agent.error = Some(error.clone());
             let status = agent.status.as_str();
             event = Some((status, error));
+            finished = Some(partial);
+        }
+        if let Some(usage) = finished {
+            state.finished_usage.push(usage);
         }
         if let Some((status, message)) = event {
             state.push_event(path, status, &message);
@@ -366,6 +379,13 @@ impl SubagentManager {
     pub(crate) fn drain_events(&self) -> Vec<SubagentLifecycleEvent> {
         let mut state = self.inner.state.lock().unwrap();
         state.events.drain(..).collect()
+    }
+
+    /// Drains the token usage of subagents that have reached a final state so the
+    /// parent can fold it into its cumulative totals. Returns each result once.
+    pub(crate) fn drain_finished_usage(&self) -> Vec<SubagentRunResult> {
+        let mut state = self.inner.state.lock().unwrap();
+        state.finished_usage.drain(..).collect()
     }
 
     fn resolve_existing_target(
@@ -594,6 +614,42 @@ mod tests {
         let listed = manager.list_agents("/root", None);
         assert_eq!(listed["agents"][0]["result"]["summary"], "done");
         assert_eq!(listed["agents"][0]["result"]["tool_calls"], 0);
+    }
+
+    fn run_result(input: u64, output: u64) -> SubagentRunResult {
+        SubagentRunResult {
+            summary: "done".to_string(),
+            partial_output: "done".to_string(),
+            tool_calls: 0,
+            tools_used: Vec::new(),
+            input_tokens: input,
+            cached_input_tokens: 0,
+            output_tokens: output,
+            elapsed_ms: 1,
+            model: "gpt-test".to_string(),
+        }
+    }
+
+    #[test]
+    fn finished_usage_drains_once_and_skips_closed_agents() {
+        let manager = SubagentManager::default();
+        manager.reserve_spawn(spawn("worker")).unwrap();
+        manager.finish_ok("/root/worker", run_result(100, 7));
+
+        let drained = manager.drain_finished_usage();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].input_tokens, 100);
+        assert_eq!(drained[0].output_tokens, 7);
+        assert_eq!(drained[0].model, "gpt-test");
+        // Drained exactly once: a second drain is empty.
+        assert!(manager.drain_finished_usage().is_empty());
+
+        // A closed agent contributes no usage even if its thread later finishes.
+        manager.reserve_spawn(spawn("closed_worker")).unwrap();
+        manager.mark_running("/root/closed_worker");
+        manager.close_agent("/root", "closed_worker").unwrap();
+        manager.finish_ok("/root/closed_worker", run_result(999, 999));
+        assert!(manager.drain_finished_usage().is_empty());
     }
 
     #[test]

@@ -49,6 +49,9 @@ pub struct OpenAiClient {
     api_key: String,
     pub model: String,
     reasoning_effort: String,
+    /// Supported reasoning-effort tiers per model name (low→high), used to default
+    /// a spawned subagent to the cheapest tier of its model.
+    model_reasoning_efforts: Vec<(String, Vec<String>)>,
     system_prompt: String,
     prompt_cache_key: String,
     turn_state: Arc<OnceLock<String>>,
@@ -74,6 +77,9 @@ pub struct OpenAiClientConfig<'a> {
     pub model: String,
     pub protocol: String,
     pub reasoning_effort: String,
+    /// Supported reasoning-effort tiers per model name (low→high). Pass an empty
+    /// vec for clients that never spawn subagents.
+    pub model_reasoning_efforts: Vec<(String, Vec<String>)>,
     pub system_prompt: String,
     pub prompt_cache_key: String,
     pub extensions: ExtensionRegistry,
@@ -191,6 +197,7 @@ impl OpenAiClient {
             api_key,
             model: config.model,
             reasoning_effort: config.reasoning_effort,
+            model_reasoning_efforts: config.model_reasoning_efforts,
             system_prompt: config.system_prompt,
             prompt_cache_key: config.prompt_cache_key,
             turn_state: Arc::new(OnceLock::new()),
@@ -847,13 +854,23 @@ impl OpenAiClient {
             .filter(|value| !value.is_empty())
             .unwrap_or(&self.model)
             .to_string();
-        let reasoning_effort = args
+        let reasoning_effort = match args
             .get("reasoning_effort")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or(&self.reasoning_effort)
-            .to_string();
+        {
+            Some(explicit) => explicit.to_string(),
+            // Default a subagent to the cheapest supported tier of its model
+            // (subagents don't share the parent prompt cache, so this is free
+            // savings). Fall back to the parent effort when tiers are unknown.
+            None => self
+                .model_reasoning_efforts
+                .iter()
+                .find(|(name, _)| name == &model)
+                .and_then(|(_, efforts)| efforts.first().cloned())
+                .unwrap_or_else(|| self.reasoning_effort.clone()),
+        };
         let max_tool_calls = args
             .get("max_tool_calls")
             .and_then(Value::as_u64)
@@ -901,6 +918,7 @@ impl OpenAiClient {
             api_key: self.api_key.clone(),
             model: model.clone(),
             reasoning_effort,
+            model_reasoning_efforts: self.model_reasoning_efforts.clone(),
             system_prompt: subagent_system_prompt(&self.system_prompt, &child_path),
             prompt_cache_key: self.prompt_cache_key.clone(),
             turn_state: Arc::clone(&self.turn_state),
@@ -1277,17 +1295,10 @@ fn json_tool_result(value: Value, is_error: bool) -> tools::ToolExecutionResult 
 }
 
 fn is_parallel_safe_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "read"
-            | "ls"
-            | "ripgrep"
-            | "outline"
-            | "bash"
-            | "execute"
-            | "exec_command"
-            | "shell_command"
-    )
+    // Only read-only inspection tools may fan out. Shell tools are excluded: a
+    // model can batch several mutating commands that share one cwd, and running
+    // those concurrently races (and bypasses the sequential approval path).
+    matches!(name, "read" | "ls" | "ripgrep" | "outline")
 }
 
 fn should_run_parallel_tools(requests: &[ToolCallRequest]) -> bool {
@@ -2556,13 +2567,24 @@ mod tests {
             name: "spawn_agent".to_string(),
             arguments: "{}".to_string(),
         };
+        let bash = ToolCallRequest {
+            call_id: "bash_1".to_string(),
+            name: "exec_command".to_string(),
+            arguments: "{}".to_string(),
+        };
 
         assert!(should_run_parallel_tools(&[read.clone(), rg]));
         assert!(!should_run_parallel_tools(&[read.clone()]));
         assert!(!should_run_parallel_tools(&[read.clone(), write]));
-        assert!(!should_run_parallel_tools(&[read, subagent]));
+        assert!(!should_run_parallel_tools(&[read.clone(), subagent]));
+        // Shell tools are not parallel-safe: a batch of commands serializes.
+        assert!(!should_run_parallel_tools(&[bash.clone(), bash.clone()]));
+        assert!(!should_run_parallel_tools(&[read, bash]));
     }
 
+    // Exercises the executor directly: it can run any tools concurrently and
+    // preserves submission order. The routing policy (is_parallel_safe_tool)
+    // decides what actually reaches it — shell is no longer routed here.
     #[test]
     fn parallel_builtin_tools_run_concurrently_and_preserve_output_order() {
         let dir = test_dir("parallel-tools");

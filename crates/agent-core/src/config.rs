@@ -267,7 +267,7 @@ impl Config {
         self.model_config(&self.compact_model)
     }
 
-    fn model_config(&self, model: &str) -> ModelConfig {
+    pub fn model_config(&self, model: &str) -> ModelConfig {
         self.models
             .iter()
             .find(|entry| entry.name == model)
