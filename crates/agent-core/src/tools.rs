@@ -2192,6 +2192,11 @@ fn create_checkpoint(cwd: &Path, name: &str, paths: &[PathBuf]) -> io::Result<Va
     });
     let dir = checkpoint_dir(cwd);
     fs::create_dir_all(&dir)?;
+    // Keep .jucode out of the user's git history.
+    let ignore = cwd.join(".jucode").join(".gitignore");
+    if !ignore.exists() {
+        let _ = fs::write(&ignore, "*\n");
+    }
     fs::write(
         dir.join(format!("{id}.json")),
         format!(
@@ -2199,12 +2204,49 @@ fn create_checkpoint(cwd: &Path, name: &str, paths: &[PathBuf]) -> io::Result<Va
             serde_json::to_string_pretty(&checkpoint).map_err(io::Error::other)?
         ),
     )?;
+    prune_checkpoints(&dir);
     Ok(json!({
         "id": id,
         "name": name,
         "files": checkpoint["files"].as_array().map(Vec::len).unwrap_or(0),
         "bytes": bytes,
     }))
+}
+
+/// Bound checkpoint disk use: keep the newest checkpoints within both a count
+/// and a total-size budget, deleting the oldest beyond either limit.
+const MAX_CHECKPOINTS: usize = 200;
+const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+
+fn prune_checkpoints(dir: &Path) {
+    let Ok(read) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(u128, PathBuf, u64)> = Vec::new();
+    for entry in read.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let nanos = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_prefix("cp-"))
+            .and_then(|n| n.parse::<u128>().ok())
+            .unwrap_or(0);
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        files.push((nanos, path, size));
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    let mut kept = 0usize;
+    let mut bytes = 0u64;
+    for (_, path, size) in files {
+        kept += 1;
+        bytes = bytes.saturating_add(size);
+        if kept > MAX_CHECKPOINTS || bytes > MAX_CHECKPOINT_BYTES {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 pub(crate) fn list_checkpoints(cwd: &Path) -> io::Result<Vec<Value>> {
