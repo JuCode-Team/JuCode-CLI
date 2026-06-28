@@ -4,8 +4,8 @@ use crate::markdown::{
     MD_ITALIC_ON,
 };
 use crate::tool_preview::tool_output_preview;
-use crossterm::event::{KeyCode, KeyModifiers};
 use jucode_agent_core::{ModelOptionView, SessionListItemView, TreeNodeView};
+use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 fn strip_ansi(text: &str) -> String {
@@ -351,7 +351,7 @@ fn model_and_tokens_render_below_input_without_ready_status() {
 }
 
 #[test]
-fn input_background_extends_across_frame_width() {
+fn input_line_pads_to_frame_width() {
     let document = UiBuilder::new()
         .input(&format!("hi{CURSOR_MARKER}{VISIBLE_CURSOR}"), &[], 0)
         .finish();
@@ -363,7 +363,7 @@ fn input_background_extends_across_frame_width() {
         .find(|line| strip_ansi(line).contains("› hi"))
         .expect("input line should render");
 
-    assert!(input_line.contains("\x1b[38;2;224;226;232;48;2;48;52;62m"));
+    assert!(input_line.contains("\x1b[38;2;224;226;232m"));
     assert_eq!(UnicodeWidthStr::width(strip_ansi(input_line).as_str()), 40);
 }
 
@@ -994,7 +994,7 @@ fn projection_only_indents_text_not_ui_elements() {
 }
 
 #[test]
-fn rendered_frame_keeps_full_history_for_native_scrollback() {
+fn projection_keeps_full_history_for_in_app_scroll() {
     let document = UiBuilder::new().finish_with_history_and_input(20);
 
     let frame = RenderedFrame::build(&document, 80);

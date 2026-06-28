@@ -17,8 +17,18 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 pub struct OAuthLoginResult {
     pub web_url: String,
     pub api_url: String,
-    pub api_key: String,
+    pub tokens: Tokens,
     pub models: Vec<OAuthModel>,
+}
+
+/// OAuth token bundle. Times are absolute unix seconds so the caller can
+/// decide when to refresh without re-deriving from a relative TTL.
+#[derive(Debug, Clone)]
+pub struct Tokens {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub access_expires_at: u64,
+    pub refresh_expires_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,12 +109,12 @@ pub fn login(web_url: &str, api_url: &str) -> Result<OAuthLoginResult, String> {
     };
     write_callback_response(&mut stream, true)?;
 
-    let api_key = exchange_code(&api_url, code, &redirect_uri, &verifier)?;
-    let models = fetch_models(&api_url, &api_key).unwrap_or_default();
+    let tokens = exchange_code(&api_url, code, &redirect_uri, &verifier, &device_name())?;
+    let models = fetch_models(&api_url, &tokens.access_token).unwrap_or_default();
     Ok(OAuthLoginResult {
         web_url,
         api_url,
-        api_key,
+        tokens,
         models,
     })
 }
@@ -114,8 +124,9 @@ fn exchange_code(
     code: &str,
     redirect_uri: &str,
     verifier: &str,
-) -> Result<String, String> {
-    let url = format!("{}/v1/oauth/cli/token", base_url);
+    device_name: &str,
+) -> Result<Tokens, String> {
+    let url = format!("{}/v1/oauth/token", base_url);
     let response = ureq::post(&url)
         .set("Content-Type", "application/json")
         .send_json(json!({
@@ -124,24 +135,113 @@ fn exchange_code(
             "code": code,
             "redirect_uri": redirect_uri,
             "code_verifier": verifier,
+            "device_name": device_name,
         }));
-    let value = json_response(response)?;
-    value
-        .get("api_key")
+    parse_tokens(&json_response(response)?)
+}
+
+/// Exchange a refresh token for a fresh access+refresh pair (rotation).
+/// Used by the LLM client when the access token has expired or is rejected.
+pub fn refresh(api_url: &str, refresh_token: &str) -> Result<Tokens, String> {
+    let api_url = api_url.trim().trim_end_matches('/');
+    if api_url.is_empty() {
+        return Err("JuCode API URL cannot be empty".to_string());
+    }
+    let url = format!("{}/v1/oauth/token", api_url);
+    let response = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_json(json!({
+            "grant_type": "refresh_token",
+            "client_id": CLIENT_ID,
+            "refresh_token": refresh_token,
+        }));
+    parse_tokens(&json_response(response)?)
+}
+
+fn parse_tokens(value: &Value) -> Result<Tokens, String> {
+    let access_token = value
+        .get("access_token")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
-        .ok_or_else(|| "OAuth token response did not include api_key".to_string())
+        .ok_or_else(|| "OAuth token response did not include access_token".to_string())?;
+    let refresh_token = value
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "OAuth token response did not include refresh_token".to_string())?;
+    let now = unix_now();
+    let expires_in = value
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .unwrap_or(3600);
+    let refresh_expires_in = value
+        .get("refresh_expires_in")
+        .and_then(Value::as_u64)
+        .unwrap_or(90 * 24 * 3600);
+    Ok(Tokens {
+        access_token,
+        refresh_token,
+        access_expires_at: now.saturating_add(expires_in),
+        refresh_expires_at: now.saturating_add(refresh_expires_in),
+    })
 }
 
-fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<OAuthModel>, String> {
+/// GET an OAuth-protected JSON endpoint (e.g. /v1/oauth/userinfo) with the
+/// device access token. Used by the `/usage` command.
+pub fn get_json(api_url: &str, path: &str, access_token: &str) -> Result<Value, String> {
+    let url = format!("{}{}", api_url.trim_end_matches('/'), path);
+    json_response(
+        ureq::get(&url)
+            .set("Authorization", &format!("Bearer {access_token}"))
+            .call(),
+    )
+}
+
+fn fetch_models(base_url: &str, access_token: &str) -> Result<Vec<OAuthModel>, String> {
     let url = format!("{}/v1/models", base_url);
     let value = json_response(
         ureq::get(&url)
-            .set("Authorization", &format!("Bearer {api_key}"))
+            .set("Authorization", &format!("Bearer {access_token}"))
             .call(),
     )?;
     Ok(parse_models_response(&value))
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A human-facing device label shown under 授权设备管理. Best-effort
+/// hostname + OS; never fails (falls back to a generic label).
+fn device_name() -> String {
+    let host = hostname().unwrap_or_else(|| "unknown-host".to_string());
+    format!("JuCode CLI · {host} ({})", std::env::consts::OS)
+}
+
+fn hostname() -> Option<String> {
+    if cfg!(windows) {
+        return std::env::var("COMPUTERNAME")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+    Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("HOSTNAME")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
 }
 
 fn parse_models_response(value: &Value) -> Vec<OAuthModel> {

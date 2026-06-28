@@ -10,16 +10,15 @@ mod tests;
 mod tool_preview;
 mod ui_builder;
 
-use crossterm::{
-    cursor::{Hide, MoveTo, Show},
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    execute,
-    style::ResetColor,
-    terminal::{self, Clear, ClearType},
-};
 use input::{paste_burst_render_delay, InputBuffer, PasteBurst, PasteCharDecision, PasteFlush};
 use jucode_agent_core::{AgentEvent, CommandView, TranscriptItem};
 use picker::{PickerState, TreePromptAction};
+use ratatui::crossterm::{
+    cursor::{Hide, Show},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use state::TuiState;
 use std::{
     io::{self, Write},
@@ -44,18 +43,9 @@ const CURSOR_MARKER: &str = "\x1b_jucode:cursor\x07";
 const VISIBLE_CURSOR: &str = "|";
 const SELECT_START: &str = "\x1b[7m";
 const SELECT_END: &str = "\x1b[27m";
-pub(crate) const HIDE_CURSOR: &str = "\x1b[?25l";
-pub(crate) const SHOW_CURSOR: &str = "\x1b[?25h";
-pub(crate) const SHOW_HARDWARE_CURSOR: bool = false;
-pub(crate) const DISABLE_AUTOWRAP: &str = "\x1b[?7l";
-pub(crate) const ENABLE_AUTOWRAP: &str = "\x1b[?7h";
-const DISABLE_SCROLL_ON_OUTPUT: &str = "\x1b[?1010l";
-const ENABLE_SCROLL_ON_OUTPUT: &str = "\x1b[?1010h";
 const ENABLE_BRACKETED_PASTE: &str = "\x1b[?2004h";
 const DISABLE_BRACKETED_PASTE: &str = "\x1b[?2004l";
 pub(crate) const CONTENT_LEFT_PADDING: usize = 2;
-pub(crate) const SYNC_START: &str = "\x1b[?2026h";
-pub(crate) const SYNC_END: &str = "\x1b[?2026l";
 pub(crate) const RESET: &str = "\x1b[0m";
 const INVERSE_ON: &str = "\x1b[7m";
 const INVERSE_OFF: &str = "\x1b[27m";
@@ -132,11 +122,16 @@ pub(crate) struct CursorTarget {
     pub(crate) column: usize,
 }
 
+#[cfg(test)]
 pub(crate) struct RenderedFrame {
     pub(crate) lines: Vec<String>,
     pub(crate) cursor: Option<CursorTarget>,
 }
 
+// Flat projection of a document into terminal lines plus cursor position. The live
+// renderer composes regions directly with ratatui widgets; this remains as a compact
+// model for asserting layout invariants in tests.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct ProjectedDocument {
     pub(crate) transcript_lines: Vec<String>,
@@ -291,6 +286,14 @@ fn compact_home_path(path: &str) -> String {
     }
 }
 
+/// Number of transcript lines a PageUp/PageDown moves the viewport, one screen minus a
+/// little overlap so context carries across the jump. Falls back if the size query fails.
+fn scroll_page_size() -> usize {
+    terminal::size()
+        .map(|(_, height)| (height.saturating_sub(2)).max(1) as usize)
+        .unwrap_or(10)
+}
+
 fn pad_to_width(text: &str, width: usize) -> String {
     let visible_width = UnicodeWidthStr::width(text);
     if visible_width >= width {
@@ -314,6 +317,9 @@ pub struct TuiApp<R> {
     input: InputBuffer,
     paste_burst: PasteBurst,
     state: TuiState,
+    /// Lines the transcript viewport is lifted above the live tail (PageUp/PageDown).
+    /// Zero follows live output; the renderer clamps it to the available range.
+    scroll_offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -386,6 +392,7 @@ impl<R: TuiRuntime> TuiApp<R> {
             input: InputBuffer::default(),
             paste_burst: PasteBurst::default(),
             state: TuiState::default(),
+            scroll_offset: 0,
         };
         let events = app.runtime.startup_events();
         app.apply_events(events);
@@ -394,8 +401,7 @@ impl<R: TuiRuntime> TuiApp<R> {
 
     pub fn run(mut self) -> io::Result<()> {
         let _guard = TerminalGuard::enter()?;
-        let mut stdout = io::stdout();
-        let mut renderer = TerminalRenderer::new();
+        let mut renderer = TerminalRenderer::new()?;
         let now = Instant::now();
         let mut frames = FrameScheduler::new(now);
         let mut next_progress_at = now + PROGRESS_INTERVAL;
@@ -424,7 +430,7 @@ impl<R: TuiRuntime> TuiApp<R> {
                 let (width, _) = terminal::size()?;
                 let width = width.max(1) as usize;
                 let document = self.build_document(width, now);
-                renderer.render(&mut stdout, &document)?;
+                renderer.render(&document, &mut self.scroll_offset)?;
                 if document.reset_screen {
                     self.state.reset_screen = false;
                 }
@@ -453,7 +459,6 @@ impl<R: TuiRuntime> TuiApp<R> {
                             }
                         }
                         Event::Resize(_, _) => {
-                            renderer.force_transcript_rebuild();
                             frames.request_now(event_now);
                         }
                         Event::Paste(text) => {
@@ -476,6 +481,12 @@ impl<R: TuiRuntime> TuiApp<R> {
         if self.state.picker_view.is_some() {
             self.flush_paste_burst_before_non_plain_input();
             return self.handle_picker_key(code, modifiers);
+        }
+
+        // Scrolling the transcript is a transient browse mode: any other interaction
+        // snaps the viewport back to the live tail so new output and typing stay visible.
+        if !matches!(code, KeyCode::PageUp | KeyCode::PageDown) {
+            self.scroll_offset = 0;
         }
 
         match code {
@@ -582,6 +593,16 @@ impl<R: TuiRuntime> TuiApp<R> {
                 self.flush_paste_burst_before_non_plain_input();
                 self.input.delete_forward();
                 self.clamp_completion_index();
+                false
+            }
+            KeyCode::PageUp => {
+                self.flush_paste_burst_before_non_plain_input();
+                self.scroll_offset = self.scroll_offset.saturating_add(scroll_page_size());
+                false
+            }
+            KeyCode::PageDown => {
+                self.flush_paste_burst_before_non_plain_input();
+                self.scroll_offset = self.scroll_offset.saturating_sub(scroll_page_size());
                 false
             }
             KeyCode::Tab => {
@@ -1063,9 +1084,8 @@ impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, Hide)?;
+        execute!(stdout, EnterAlternateScreen, Hide)?;
         stdout.write_all(ENABLE_BRACKETED_PASTE.as_bytes())?;
-        stdout.write_all(DISABLE_SCROLL_ON_OUTPUT.as_bytes())?;
         stdout.flush()?;
         Ok(Self)
     }
@@ -1073,21 +1093,10 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = io::stdout().write_all(DISABLE_BRACKETED_PASTE.as_bytes());
-        let _ = io::stdout().write_all(ENABLE_AUTOWRAP.as_bytes());
-        let _ = io::stdout().write_all(ENABLE_SCROLL_ON_OUTPUT.as_bytes());
-        let _ = execute!(
-            io::stdout(),
-            MoveTo(
-                0,
-                terminal::size()
-                    .map(|(_, height)| height.saturating_sub(1))
-                    .unwrap_or(0)
-            ),
-            Clear(ClearType::CurrentLine),
-            ResetColor,
-            Show
-        );
+        let mut stdout = io::stdout();
+        let _ = stdout.write_all(DISABLE_BRACKETED_PASTE.as_bytes());
+        let _ = stdout.flush();
+        let _ = execute!(stdout, Show, LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -1336,10 +1345,10 @@ pub(crate) fn color_code(kind: UiKind) -> &'static str {
         UiKind::Separator => "\x1b[38;2;105;108;120m",
         UiKind::ToolHeader => "\x1b[37m",
         UiKind::Tool | UiKind::System | UiKind::Status => "\x1b[90m",
-        UiKind::BottomStatus => "\x1b[97m",
+        UiKind::BottomStatus => "\x1b[97;48;2;30;33;43m",
         UiKind::Error => "\x1b[31m",
         UiKind::Selected => "\x1b[97m",
-        UiKind::Input => "\x1b[38;2;224;226;232;48;2;48;52;62m",
+        UiKind::Input => "\x1b[38;2;224;226;232m",
         UiKind::TreeDirectory => "\x1b[33m",
         UiKind::DiffAdd => "\x1b[38;2;170;220;170;48;2;28;70;38m",
         UiKind::DiffRemove => "\x1b[38;2;230;150;145;48;2;85;38;32m",

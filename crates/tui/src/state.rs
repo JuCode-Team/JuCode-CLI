@@ -66,7 +66,9 @@ impl TuiState {
         width: usize,
         now: Instant,
     ) -> UiDocument {
-        let content_width = padded_content_width(width);
+        // Reserve one column for the transcript scrollbar so wrapped history lines do not
+        // collide with it.
+        let content_width = padded_content_width(width).saturating_sub(1).max(1);
         let control_width = width.max(1);
         let command_matches = self.command_matches(input);
         let input_display = input.render(!self.activity.is_active());
@@ -382,7 +384,8 @@ impl TuiState {
                     true
                 }
                 AgentEvent::Plan(items) => {
-                    self.chat.push(ChatLine::System(format_plan_summary(&items)));
+                    self.chat
+                        .push(ChatLine::System(format_plan_summary(&items)));
                     self.mark_history_dirty();
                     true
                 }

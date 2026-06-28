@@ -45,11 +45,10 @@ impl InputBuffer {
         display
     }
 
-    /// Display string for the UI. The hardware cursor marker is embedded at the
-    /// cursor position; the cell under the cursor is rendered as a reverse-video
-    /// block (an overwrite-style caret) and any active selection is reverse-video
-    /// highlighted. Selection styling is closed and reopened around newlines so
-    /// every logical line stays balanced.
+    /// Display string for the UI. The logical cursor marker is embedded at the cursor
+    /// position so the renderer can place the terminal's hardware cursor there; any active
+    /// selection is reverse-video highlighted. Selection styling is closed and reopened
+    /// around newlines so every logical line stays balanced.
     pub(crate) fn render(&self, show_cursor: bool) -> String {
         let selection = if show_cursor { self.selection() } else { None };
         let mut out = String::new();
@@ -70,24 +69,11 @@ impl InputBuffer {
                     in_selection = true;
                 }
             }
-            // Block caret on the cell under the cursor (only when nothing is selected,
-            // so it does not double up with the selection highlight).
-            let block_caret = show_cursor && selection.is_none() && index == self.cursor;
             let Some(cell) = self.cells.get(index) else {
-                if block_caret {
-                    out.push_str(SELECT_START);
-                    out.push(' ');
-                    out.push_str(SELECT_END);
-                }
                 continue;
             };
             match cell {
                 Cell::Char('\n') => {
-                    if block_caret {
-                        out.push_str(SELECT_START);
-                        out.push(' ');
-                        out.push_str(SELECT_END);
-                    }
                     if in_selection {
                         out.push_str(SELECT_END);
                     }
@@ -96,25 +82,10 @@ impl InputBuffer {
                         out.push_str(SELECT_START);
                     }
                 }
-                Cell::Char(ch) => {
-                    if block_caret {
-                        out.push_str(SELECT_START);
-                        out.push(*ch);
-                        out.push_str(SELECT_END);
-                    } else {
-                        out.push(*ch);
-                    }
-                }
+                Cell::Char(ch) => out.push(*ch),
                 Cell::LargePaste(paste) => {
                     let char_count = paste.chars().count();
-                    let placeholder = format!("[Pasted: {char_count} chars]");
-                    if block_caret {
-                        out.push_str(SELECT_START);
-                        out.push_str(&placeholder);
-                        out.push_str(SELECT_END);
-                    } else {
-                        out.push_str(&placeholder);
-                    }
+                    out.push_str(&format!("[Pasted: {char_count} chars]"));
                 }
             }
         }
@@ -486,7 +457,6 @@ impl PasteBurst {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::VISIBLE_CURSOR;
 
     fn typed(text: &str) -> InputBuffer {
         let mut input = InputBuffer::default();
@@ -590,22 +560,16 @@ mod tests {
     }
 
     #[test]
-    fn block_caret_highlights_char_under_cursor() {
+    fn caret_marker_sits_before_char_under_cursor() {
         let mut input = typed("abc");
-        input.move_left(false); // cursor at index 2, on 'c'
-        assert_eq!(
-            input.render(true),
-            format!("ab{CURSOR_MARKER}{SELECT_START}c{SELECT_END}")
-        );
+        input.move_left(false); // cursor at index 2, before 'c'
+        assert_eq!(input.render(true), format!("ab{CURSOR_MARKER}c"));
     }
 
     #[test]
-    fn block_caret_at_end_renders_trailing_block() {
+    fn caret_marker_at_end_has_no_trailing_glyph() {
         let input = typed("ab"); // cursor at end
-        assert_eq!(
-            input.render(true),
-            format!("ab{CURSOR_MARKER}{SELECT_START} {SELECT_END}")
-        );
+        assert_eq!(input.render(true), format!("ab{CURSOR_MARKER}"));
     }
 
     #[test]
@@ -649,12 +613,8 @@ mod tests {
     }
 
     #[test]
-    fn block_caret_uses_visible_cursor_placeholder_shape() {
+    fn caret_marker_on_empty_input_is_just_the_marker() {
         let input = typed("");
-        assert_eq!(
-            input.render(true),
-            format!("{CURSOR_MARKER}{SELECT_START} {SELECT_END}")
-        );
-        assert_eq!(VISIBLE_CURSOR, "|");
+        assert_eq!(input.render(true), CURSOR_MARKER.to_string());
     }
 }

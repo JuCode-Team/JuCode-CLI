@@ -1,5 +1,5 @@
 use crate::{
-    config::{profile_dir, AuthStore, Config, ModelConfig},
+    config::{profile_dir, AuthStore, Config, JucodeTokens, ModelConfig},
     event::{AgentEvent, CommandView, GoalView, ModelOptionView, PlanItem, SessionListItemView},
     extensions::ExtensionRegistry,
     hooks::Hooks,
@@ -423,6 +423,7 @@ impl AgentCore {
             "/quit" | "/exit" => return (true, Vec::new()),
             "/help" | "/" => vec![AgentEvent::Info(crate::commands::help_line())],
             "/login" => self.login_events(input[command.len()..].trim()),
+            "/usage" => self.usage_events(),
             "/new" => self.new_session_events(),
             "/config" => vec![AgentEvent::Info(format!(
                 "provider={} model={} reasoning_effort={} base_url={} jucode_web_url={} jucode_api_url={} auth_key={} api_key_env={} retry_attempts={}",
@@ -432,7 +433,7 @@ impl AgentCore {
                 self.config.base_url,
                 self.config.jucode_web_url,
                 self.config.jucode_api_url,
-                mask_key(self.auth.key_for(&self.config.provider)),
+                mask_key(self.provider_api_key()),
                 self.config.api_key_env,
                 self.config.retry_attempts
             ))],
@@ -619,12 +620,129 @@ impl AgentCore {
     }
 
     fn fetch_marketplace(&self) -> Result<skills::Marketplace, String> {
-        skills::fetch_marketplace(
-            &self.config.jucode_api_url,
-            self.auth
-                .key_for("jucode")
-                .or_else(|| self.auth.key_for(&self.config.provider)),
-        )
+        skills::fetch_marketplace(&self.config.jucode_api_url, self.auth.jucode_access_token())
+    }
+
+    /// Returns the bearer token for the active provider: the JuCode OAuth
+    /// access token for the jucode provider, otherwise the raw provider key.
+    fn provider_api_key(&self) -> Option<&str> {
+        if self.config.provider == "jucode" {
+            self.auth.jucode_access_token()
+        } else {
+            self.auth.key_for(&self.config.provider)
+        }
+    }
+
+    /// Refreshes the JuCode access token when it's near expiry so the
+    /// inference call carries a valid bearer. No-op for non-jucode providers.
+    fn ensure_provider_credentials(&mut self) -> Result<(), String> {
+        if self.config.provider != "jucode" {
+            return Ok(());
+        }
+        // Reload auth.json from disk first. The Desktop shell shares
+        // ~/.jucode/auth.json and may have rotated the (single-use) refresh
+        // token out-of-band; picking up its tokens avoids refreshing with a
+        // stale token and getting a spurious "session expired".
+        if let Ok(fresh) = AuthStore::load_or_create() {
+            self.auth = fresh;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let (access_ok, refresh_token, refresh_alive) = match self.auth.jucode_tokens() {
+            Some(t) => (
+                t.access_expires_at > now + 120,
+                t.refresh_token.clone(),
+                t.refresh_expires_at > now,
+            ),
+            None => return Err("not logged in to JuCode. Run /login.".to_string()),
+        };
+        if access_ok {
+            return Ok(());
+        }
+        if !refresh_alive {
+            self.auth.clear_jucode();
+            let _ = self.auth.save();
+            return Err("JuCode session expired. Run /login to sign in again.".to_string());
+        }
+        match oauth::refresh(&self.config.jucode_api_url, &refresh_token) {
+            Ok(t) => {
+                self.auth.set_jucode_tokens(JucodeTokens {
+                    access_token: t.access_token,
+                    refresh_token: t.refresh_token,
+                    access_expires_at: t.access_expires_at,
+                    refresh_expires_at: t.refresh_expires_at,
+                });
+                self.auth.save().map_err(|error| error.to_string())
+            }
+            Err(error) => Err(format!("failed to refresh JuCode session: {error}. Run /login.")),
+        }
+    }
+
+    /// `/usage` — query the JuCode account via the OAuth read endpoints and
+    /// print 套餐 / 余额 / 用量 / 最近调用详情.
+    fn usage_events(&mut self) -> Vec<AgentEvent> {
+        if self.config.provider != "jucode" {
+            return vec![AgentEvent::Error(
+                "/usage requires the jucode provider. Run /login.".to_string(),
+            )];
+        }
+        if let Err(error) = self.ensure_provider_credentials() {
+            return vec![AgentEvent::Error(error)];
+        }
+        let Some(token) = self.auth.jucode_access_token().map(str::to_string) else {
+            return vec![AgentEvent::Error(
+                "not logged in to JuCode. Run /login.".to_string(),
+            )];
+        };
+        let api = self.config.jucode_api_url.clone();
+        let mut lines: Vec<String> = Vec::new();
+
+        match oauth::get_json(&api, "/v1/oauth/userinfo", &token) {
+            Ok(v) => {
+                let email = v.get("email").and_then(Value::as_str).unwrap_or("-");
+                let balance = v.get("balance").and_then(Value::as_str).unwrap_or("0");
+                let currency = v.get("currency").and_then(Value::as_str).unwrap_or("");
+                lines.push(format!("账户: {email}"));
+                lines.push(format!("余额: {balance} {currency}"));
+                match v.get("active_plan").and_then(|p| p.get("name")).and_then(Value::as_str) {
+                    Some(name) => lines.push(format!("套餐: {name}")),
+                    None => lines.push("套餐: 无活跃套餐".to_string()),
+                }
+            }
+            Err(error) => return vec![AgentEvent::Error(format!("查询账户失败: {error}"))],
+        }
+
+        if let Ok(v) = oauth::get_json(&api, "/v1/oauth/usage", &token) {
+            if v.get("has_active_plan").and_then(Value::as_bool).unwrap_or(false) {
+                let used5 = v.get("used_5h").and_then(Value::as_str).unwrap_or("0");
+                let quota5 = v.get("quota_5h").and_then(Value::as_str).unwrap_or("0");
+                let usedm = v.get("used_monthly").and_then(Value::as_str).unwrap_or("0");
+                let quotam = v.get("quota_monthly").and_then(Value::as_str).unwrap_or("0");
+                lines.push(format!("5h 用量: {used5} / {quota5}"));
+                lines.push(format!("月度用量: {usedm} / {quotam}"));
+            }
+        }
+
+        if let Ok(v) = oauth::get_json(&api, "/v1/oauth/usage-logs?limit=5", &token) {
+            let logs = v
+                .get("logs")
+                .or_else(|| v.get("items"))
+                .and_then(Value::as_array);
+            if let Some(logs) = logs.filter(|l| !l.is_empty()) {
+                lines.push("最近调用:".to_string());
+                for l in logs {
+                    let model = l.get("model").and_then(Value::as_str).unwrap_or("-");
+                    let tin = l.get("tokens_in").and_then(Value::as_u64).unwrap_or(0);
+                    let tout = l.get("tokens_out").and_then(Value::as_u64).unwrap_or(0);
+                    let cost = l.get("cost_final").and_then(Value::as_str).unwrap_or("0");
+                    lines.push(format!("  {model}  in {tin} / out {tout}  cost {cost}"));
+                }
+            }
+        }
+
+        vec![AgentEvent::Info(lines.join("\n"))]
     }
 
     fn pin_skill_events(&mut self, name: &str) -> Vec<AgentEvent> {
@@ -949,6 +1067,11 @@ impl AgentCore {
     }
 
     fn spawn_current_context_turn(&mut self, save_event: Vec<AgentEvent>) -> Vec<AgentEvent> {
+        if let Err(error) = self.ensure_provider_credentials() {
+            let mut events = save_event;
+            events.push(AgentEvent::Error(error));
+            return events;
+        }
         self.subagent_manager = SubagentManager::default();
         let base_prompt = match self.config.system_prompt() {
             Ok(prompt) => prompt,
@@ -1037,7 +1160,7 @@ impl AgentCore {
             ),
             base_url: self.config.base_url.clone(),
             max_output_tokens: self.config.current_model_config().max_output_tokens,
-            api_key: self.auth.key_for(&self.config.provider),
+            api_key: self.provider_api_key(),
             api_key_env: &self.config.api_key_env,
             retry_attempts: self.config.retry_attempts,
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
@@ -1215,6 +1338,9 @@ impl AgentCore {
                 "nothing old enough to compact".to_string(),
             )];
         };
+        if let Err(error) = self.ensure_provider_credentials() {
+            return vec![AgentEvent::Error(error)];
+        }
         let client = match self.compaction_client() {
             Ok(client) => client,
             Err(error) => return vec![AgentEvent::Error(error)],
@@ -1265,7 +1391,7 @@ impl AgentCore {
             extensions: ExtensionRegistry::load(&[], &self.cwd, self.config.profile_dir()),
             base_url: self.config.base_url.clone(),
             max_output_tokens: self.config.compact_model_config().max_output_tokens,
-            api_key: self.auth.key_for(&self.config.provider),
+            api_key: self.provider_api_key(),
             api_key_env: &self.config.api_key_env,
             retry_attempts: self.config.retry_attempts,
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
@@ -1302,7 +1428,7 @@ impl AgentCore {
             extensions: ExtensionRegistry::load(&[], &self.cwd, self.config.profile_dir()),
             base_url: self.config.base_url.clone(),
             max_output_tokens,
-            api_key: self.auth.key_for(&self.config.provider),
+            api_key: self.provider_api_key(),
             api_key_env: &self.config.api_key_env,
             retry_attempts: self.config.retry_attempts,
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
@@ -1561,6 +1687,9 @@ impl AgentCore {
             .goal()
             .map(|goal| normalize_resume_status(goal.status))
             .unwrap_or(ThreadGoalStatus::Active);
+        if self.ensure_provider_credentials().is_err() {
+            return;
+        }
         let client = match self.resume_summary_client() {
             Ok(client) => client,
             Err(_) => return,
@@ -1654,9 +1783,9 @@ impl AgentCore {
             let _ = tx.send(oauth::login(&web, &api));
         });
         self.login_receiver = Some(rx);
-        vec![AgentEvent::Info(format!(
-            "opening browser for JuCode OAuth: {web_url}"
-        ))]
+        vec![AgentEvent::Info(
+            "Opening your browser to sign in to JuCode. Complete the authorization there — waiting for it to finish (up to 5 min)…".to_string(),
+        )]
     }
 
     fn apply_login_result(&mut self, result: OAuthLoginResult) -> Vec<AgentEvent> {
@@ -1693,7 +1822,12 @@ impl AgentCore {
                 self.config.reasoning_effort = self.default_reasoning_effort_for_model(&model.id);
             }
         }
-        self.auth.set_key_for("jucode", result.api_key);
+        self.auth.set_jucode_tokens(JucodeTokens {
+            access_token: result.tokens.access_token,
+            refresh_token: result.tokens.refresh_token,
+            access_expires_at: result.tokens.access_expires_at,
+            refresh_expires_at: result.tokens.refresh_expires_at,
+        });
         match self.auth.save().and_then(|_| self.config.save()) {
             Ok(()) => {
                 let mut events = vec![
@@ -1911,7 +2045,7 @@ impl AgentCore {
         lines.push(format!("model: {}", self.config.model));
         lines.push(format!(
             "auth: {}",
-            if self.auth.key_for(&self.config.provider).is_some()
+            if self.provider_api_key().is_some()
                 || env::var_os(&self.config.api_key_env).is_some()
             {
                 "ok"

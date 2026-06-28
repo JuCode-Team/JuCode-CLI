@@ -4,15 +4,29 @@ This document explains how JuCode-CLI's TUI is structured today and how data flo
 
 ## Overview
 
-JuCode's TUI is intentionally lightweight. It does not use a heavyweight widget framework or a large state-management layer. Instead, it follows a direct pipeline:
+JuCode's TUI is a ratatui application running on the terminal's alternate screen. It keeps a thin state layer but renders natively with ratatui's `Layout` and widgets. The pipeline is:
 
 1. `AgentCore` produces `AgentEvent`s.
 2. `TuiApp` owns the interactive TUI state and applies those events.
-3. `UiBuilder` converts TUI state into a `UiDocument`.
-4. `ProjectedDocument` and `RenderedFrame` turn that document into terminal lines plus cursor position.
-5. `TerminalRenderer` writes the frame efficiently to the terminal, using full redraws only when needed and buffer diffs otherwise.
+3. `UiBuilder` converts TUI state into a `UiDocument` (a transcript plus a flat list of control lines).
+4. `TerminalRenderer` owns a `ratatui::Terminal` on the alternate screen. Each draw it splits the screen into regions, paints each region's styled lines into its rect, and draws the chrome (input box border, scrollbar, status bar) with ratatui widgets.
+5. Ratatui diffs the frame buffer against the previous frame and writes only the cells that changed.
 
 This keeps the architecture close to the product model: runtime events in, state update, document build, terminal render.
+
+The TUI runs on the terminal's **alternate screen** (a ratatui-owned full-screen surface), not the main scrollback buffer. Because the alternate screen has no native scrollback, the transcript is scrolled in-app with PageUp/PageDown; any other key snaps the viewport back to the live tail.
+
+### Screen layout
+
+`draw()` splits the frame vertically, bottom-up, so the input and status always fit:
+
+- **transcript** — scrollable history viewport with a `Scrollbar` on its right column; takes the remaining height.
+- **live** — assistant stream, picker, pending messages, and the progress spinner.
+- **input box** — the prompt wrapped in a rounded `Block` border.
+- **candidates** — the slash-command completion list.
+- **status bar** — a single full-width row with a background tint.
+
+The renderer derives these regions from the flat `UiDocument.controls` list using the builder's ordering invariants (the status line is last, the completion candidates are the trailing non-input run, the input box is the trailing run of `Input` lines, and everything above is the live region).
 
 ## Entry Point and Runtime Boundary
 
@@ -100,12 +114,7 @@ It also supports a special `LargePaste(String)` cell. Large pasted content is st
 
 ### Rendered Cursor and Selection
 
-The input renderer embeds a logical cursor marker into text and uses reverse-video ANSI sequences for:
-
-- block caret display
-- selected ranges
-
-This is important because JuCode usually hides the hardware cursor and renders its own cursor appearance in text.
+The input renderer embeds a logical cursor marker into the text and reverse-video ANSI sequences around selected ranges. The renderer extracts that marker from the input region (`extract_cursor`) to position the terminal's real hardware cursor inside the input box, so the caret sits between characters (insert-style) like a normal text field. Selection stays reverse-video highlighted in the buffer.
 
 ### Paste Burst Handling
 
@@ -260,32 +269,19 @@ The rendering pipeline has a few layers.
 
 `TuiApp::build_document()` creates the current document.
 
-### 2. Project into terminal lines
+### 2. Render with `TerminalRenderer`
 
-`ProjectedDocument::from_document()`:
+`crates/tui/src/terminal_renderer.rs` owns a `ratatui::Terminal<CrosstermBackend<Stdout>>` on the alternate screen. Each frame it calls `terminal.draw(...)`, and `draw()`:
 
-- wraps history and control lines to terminal width
-- pads content with left margin
-- extracts the logical cursor marker
-- computes final cursor row/column
-- combines transcript and active control lines into frame-ready output
+- splits the flat `controls` list into regions (`ControlRegions::split`)
+- computes the region rects bottom-up
+- selects the visible window of transcript lines (`visible_window`): the live tail by default, or lifted by the scroll offset, and draws a `Scrollbar`
+- wraps the input region in a rounded `Block` and paints the prompt inside it
+- paints the live, candidate, and status regions into their rects
 
-### 3. Convert to a `RenderedFrame`
+Each region's lines are still styled with ANSI escapes (built by `UiBuilder`/`markdown`/`tool_preview`); `paint_ansi_line` translates those into `ratatui::Buffer` cell styles within a region's rect. Ratatui keeps the previous frame buffer and writes only the cells that changed, so the renderer implements no diffing of its own.
 
-A `RenderedFrame` is just:
-
-- `lines: Vec<String>`
-- `cursor: Option<CursorTarget>`
-
-### 4. Render with `TerminalRenderer`
-
-`crates/tui/src/terminal_renderer.rs` decides whether to:
-
-- redraw transcript projection
-- do a full render
-- do a buffer-diff render
-
-It uses a `ratatui::Buffer` internally, but not the usual ratatui widget tree. Ratatui is used here more as a terminal cell buffer and style structure.
+`ProjectedDocument` still exists as a flat projection (transcript plus control lines plus cursor position) but is now used only by tests to assert layout invariants.
 
 ## Rendering Strategy and Performance Choices
 
@@ -300,19 +296,16 @@ This TUI is optimized around a few practical ideas.
 
 So input changes or progress animation do not require rebuilding the whole transcript every frame.
 
-### Transcript vs controls split
+### Window painting plus ratatui diffing
 
-The renderer tracks whether transcript lines changed separately from the active controls area. That matters because the transcript is usually much more stable than the bottom live region.
+The renderer only paints the visible window (one screen of lines) into the frame buffer; the rest of the transcript stays out of the buffer. Ratatui then writes only the cells that changed against the previous frame.
 
-### Buffer diff rendering
-
-When possible, `TerminalRenderer` only writes changed cells instead of repainting everything.
-
-This reduces terminal I/O and helps the interface feel smoother during:
+This keeps per-frame terminal I/O small and the interface smooth during:
 
 - streamed output
 - spinner animation
 - input editing
+- scrolling the transcript
 
 ### Explicit frame scheduling
 
@@ -327,19 +320,14 @@ The app manages terminal mode itself.
 `TerminalGuard`:
 
 - enables raw mode on entry
+- enters the alternate screen
 - hides the cursor
 - enables bracketed paste
-- disables scroll-on-output behavior
-- restores terminal state on drop
+- on drop: disables bracketed paste, shows the cursor, leaves the alternate screen, and disables raw mode
 
-The code also uses ANSI sequences directly for:
+Leaving the alternate screen restores the user's previous terminal contents, so the session does not leave its transcript behind in the shell. The renderer still builds styled lines with ANSI sequences (color, selection/caret display) in the `UiDocument`; ratatui's crossterm backend is responsible for clearing, cursor moves, and emitting the cell-level escapes during each draw.
 
-- color
-- selection/cursor display
-- synchronized updates
-- screen clearing
-
-This keeps the stack small and gives tight control over behavior.
+Because the alternate screen has no native scrollback, the transcript is browsed in-app: PageUp/PageDown move a `scroll_offset` (clamped to the available range by the renderer), and any other key resets it to the live tail.
 
 ## Activity and Progress Model
 

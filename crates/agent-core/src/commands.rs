@@ -19,6 +19,7 @@ pub struct CommandSpec {
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "/help", aliases: &["/"], args: "", description: "Show available commands", advanced: false },
     CommandSpec { name: "/login", aliases: &[], args: "[web-url] [api-url]", description: "Sign in to JuCode (OAuth)", advanced: false },
+    CommandSpec { name: "/usage", aliases: &[], args: "", description: "Show plan, balance, usage and recent calls", advanced: false },
     CommandSpec { name: "/new", aliases: &[], args: "", description: "Start a new session", advanced: false },
     CommandSpec { name: "/model", aliases: &[], args: "[model] [effort]", description: "Show or switch the model", advanced: false },
     CommandSpec { name: "/tree", aliases: &[], args: "", description: "Show the conversation tree", advanced: false },

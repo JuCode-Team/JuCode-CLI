@@ -112,7 +112,19 @@ impl ModelConfig {
 #[derive(Debug, Clone)]
 pub struct AuthStore {
     keys: BTreeMap<String, String>,
+    jucode: Option<JucodeTokens>,
     path: PathBuf,
+}
+
+/// OAuth tokens for the JuCode account, stored separately from the raw
+/// `providers` map (which holds bring-your-own keys for openai/deepseek/…).
+/// The CLI no longer holds a JuCode API key — only these rotating tokens.
+#[derive(Debug, Clone)]
+pub struct JucodeTokens {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub access_expires_at: u64,
+    pub refresh_expires_at: u64,
 }
 
 impl Config {
@@ -286,6 +298,7 @@ impl AuthStore {
         if !path.exists() {
             let auth = Self {
                 keys: BTreeMap::new(),
+                jucode: None,
                 path,
             };
             auth.save()?;
@@ -294,13 +307,18 @@ impl AuthStore {
 
         let content = fs::read_to_string(&path)?;
         let value = serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({}));
-        let keys = value
+        let mut keys = value
             .get("providers")
             .and_then(Value::as_object)
             .map(read_provider_keys)
             .unwrap_or_default();
+        // Clean break: a pre-OAuth install kept a raw JuCode API key under
+        // providers.jucode. It's no longer a valid auth path — drop it so
+        // the user is forced through /login (which writes the token block).
+        keys.remove("jucode");
+        let jucode = value.get("jucode").and_then(read_jucode_tokens);
 
-        let auth = Self { keys, path };
+        let auth = Self { keys, jucode, path };
         auth.save()?;
         Ok(auth)
     }
@@ -309,8 +327,22 @@ impl AuthStore {
         self.keys.get(provider).map(String::as_str)
     }
 
-    pub fn set_key_for(&mut self, provider: &str, key: String) {
-        self.keys.insert(provider.to_string(), key);
+    /// The current JuCode OAuth token bundle, if logged in.
+    pub fn jucode_tokens(&self) -> Option<&JucodeTokens> {
+        self.jucode.as_ref()
+    }
+
+    /// The current JuCode access token (used as the gateway Bearer).
+    pub fn jucode_access_token(&self) -> Option<&str> {
+        self.jucode.as_ref().map(|t| t.access_token.as_str())
+    }
+
+    pub fn set_jucode_tokens(&mut self, tokens: JucodeTokens) {
+        self.jucode = Some(tokens);
+    }
+
+    pub fn clear_jucode(&mut self) {
+        self.jucode = None;
     }
 
     pub fn save(&self) -> io::Result<()> {
@@ -318,7 +350,15 @@ impl AuthStore {
             fs::create_dir_all(parent)?;
         }
 
-        let value = json!({ "providers": self.keys });
+        let mut value = json!({ "providers": self.keys });
+        if let Some(t) = &self.jucode {
+            value["jucode"] = json!({
+                "access_token": t.access_token,
+                "refresh_token": t.refresh_token,
+                "access_expires_at": t.access_expires_at,
+                "refresh_expires_at": t.refresh_expires_at,
+            });
+        }
         fs::write(
             &self.path,
             format!("{}\n", serde_json::to_string_pretty(&value)?),
@@ -654,6 +694,32 @@ fn read_provider_keys(providers: &Map<String, Value>) -> BTreeMap<String, String
         }
     }
     keys
+}
+
+fn read_jucode_tokens(value: &Value) -> Option<JucodeTokens> {
+    let access_token = read_nonempty_str(value, "access_token")?;
+    let refresh_token = read_nonempty_str(value, "refresh_token")?;
+    Some(JucodeTokens {
+        access_token,
+        refresh_token,
+        access_expires_at: value
+            .get("access_expires_at")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        refresh_expires_at: value
+            .get("refresh_expires_at")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
+fn read_nonempty_str(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn config_path() -> io::Result<PathBuf> {
