@@ -1943,6 +1943,13 @@ fn read_sse_output(
     let mut output_items = Vec::new();
     let mut data_lines = Vec::new();
     let mut completed = false;
+    // Accumulates streamed function-call fields keyed by the stable item id.
+    // The Responses API streams a tool call's name/call_id in
+    // `response.output_item.added` and its arguments via
+    // `response.function_call_arguments.delta`, then may deliver the final
+    // `response.output_item.done` item with those fields blanked out —
+    // expecting the consumer to have stitched the pieces together.
+    let mut streamed_calls: BTreeMap<String, StreamedFunctionCall> = BTreeMap::new();
     let reader = BufReader::new(reader);
 
     for line in reader.lines() {
@@ -1958,7 +1965,7 @@ fn read_sse_output(
             if data == "[DONE]" {
                 break;
             }
-            if handle_sse_data(&data, &mut emit, &mut output_items)? {
+            if handle_sse_data(&data, &mut emit, &mut output_items, &mut streamed_calls)? {
                 completed = true;
                 break;
             }
@@ -1968,7 +1975,8 @@ fn read_sse_output(
     if !data_lines.is_empty() {
         let data = data_lines.join("\n");
         if data != "[DONE]" {
-            completed = handle_sse_data(&data, &mut emit, &mut output_items)?;
+            completed =
+                handle_sse_data(&data, &mut emit, &mut output_items, &mut streamed_calls)?;
         }
     }
 
@@ -1983,6 +1991,7 @@ fn handle_sse_data(
     data: &str,
     emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
     output_items: &mut Vec<Value>,
+    streamed_calls: &mut BTreeMap<String, StreamedFunctionCall>,
 ) -> Result<bool, String> {
     let event = serde_json::from_str::<Value>(data).map_err(|error| error.to_string())?;
     match event
@@ -2000,10 +2009,48 @@ fn handle_sse_data(
                 emit(StreamEvent::ReasoningDelta(delta.to_string()))?;
             }
         }
+        // The tool call's name + call_id (and id) are announced here, before
+        // the arguments stream. Some gateways then blank these out on the
+        // terminal `output_item.done`, so capture them now keyed by item id.
+        "response.output_item.added" => {
+            if let Some(item) = event.get("item") {
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    if let Some(id) = item.get("id").and_then(Value::as_str) {
+                        let entry = streamed_calls.entry(id.to_string()).or_default();
+                        entry.merge_fields(item);
+                    }
+                }
+            }
+        }
+        // Tool-call arguments stream incrementally; stitch the fragments
+        // together keyed by the owning item id. The delta event also carries
+        // name/call_id, so capture those too in case `added` was missed.
+        "response.function_call_arguments.delta" => {
+            if let Some(item_id) = event.get("item_id").and_then(Value::as_str) {
+                let entry = streamed_calls.entry(item_id.to_string()).or_default();
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    entry.arguments.push_str(delta);
+                }
+                entry.merge_fields(&event);
+            }
+        }
+        // The terminal arguments event carries the full string when populated.
+        "response.function_call_arguments.done" => {
+            if let Some(item_id) = event.get("item_id").and_then(Value::as_str) {
+                let entry = streamed_calls.entry(item_id.to_string()).or_default();
+                if let Some(arguments) = event.get("arguments").and_then(Value::as_str) {
+                    if !arguments.is_empty() {
+                        entry.arguments = arguments.to_string();
+                    }
+                }
+                entry.merge_fields(&event);
+            }
+        }
         "response.output_item.done" => {
             if let Some(item) = event.get("item") {
+                let item = backfill_function_call(item.clone(), streamed_calls);
                 emit(StreamEvent::ResponseItem(item.clone()))?;
-                output_items.push(item.clone());
+                output_items.push(item);
             }
         }
         "response.completed" if output_items.is_empty() => {
@@ -2023,9 +2070,10 @@ fn handle_sse_data(
                 .and_then(Value::as_array)
             {
                 for item in items {
+                    let item = backfill_function_call(item.clone(), streamed_calls);
                     emit(StreamEvent::ResponseItem(item.clone()))?;
+                    output_items.push(item);
                 }
-                output_items.extend(items.iter().cloned());
             }
             return Ok(true);
         }
@@ -2334,6 +2382,89 @@ fn normalized_arguments(arguments: &str) -> String {
     }
 }
 
+/// Fields of a tool call accumulated across Responses streaming events, keyed
+/// by the stable item id. Some gateways announce a call's name/call_id in
+/// `response.output_item.added` and stream its arguments separately, then send
+/// the terminal `response.output_item.done` item with those fields blanked —
+/// so we stitch them back together.
+#[derive(Default)]
+struct StreamedFunctionCall {
+    name: String,
+    call_id: String,
+    arguments: String,
+}
+
+impl StreamedFunctionCall {
+    /// Fills any not-yet-known name/call_id from an event/item, without
+    /// overwriting a value already captured with a non-empty one.
+    fn merge_fields(&mut self, source: &Value) {
+        if self.name.is_empty() {
+            if let Some(name) = source.get("name").and_then(Value::as_str) {
+                if !name.is_empty() {
+                    self.name = name.to_string();
+                }
+            }
+        }
+        if self.call_id.is_empty() {
+            if let Some(call_id) = source.get("call_id").and_then(Value::as_str) {
+                if !call_id.is_empty() {
+                    self.call_id = call_id.to_string();
+                }
+            }
+        }
+    }
+}
+
+/// Backfills a streamed `function_call` item's name/call_id/arguments from the
+/// fragments captured during streaming. Gateways translating Anthropic tool
+/// calls to the Responses protocol can deliver the terminal item with these
+/// fields empty, which previously surfaced as "unknown tool:" and
+/// "EOF while parsing a value". Falls back to `{}` for genuinely argument-less
+/// calls so an empty string never reaches the JSON parser.
+fn backfill_function_call(
+    mut item: Value,
+    streamed_calls: &BTreeMap<String, StreamedFunctionCall>,
+) -> Value {
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return item;
+    }
+    let streamed = item
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(|id| streamed_calls.get(id));
+
+    let is_blank = |map: &serde_json::Map<String, Value>, key: &str| {
+        map.get(key)
+            .and_then(Value::as_str)
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
+    };
+
+    if let Value::Object(map) = &mut item {
+        if is_blank(map, "name") {
+            if let Some(name) = streamed.map(|call| call.name.as_str()).filter(|n| !n.is_empty()) {
+                map.insert("name".to_string(), Value::String(name.to_string()));
+            }
+        }
+        if is_blank(map, "call_id") {
+            if let Some(call_id) = streamed
+                .map(|call| call.call_id.as_str())
+                .filter(|c| !c.is_empty())
+            {
+                map.insert("call_id".to_string(), Value::String(call_id.to_string()));
+            }
+        }
+        if is_blank(map, "arguments") {
+            let accumulated = streamed.map(|call| call.arguments.as_str()).unwrap_or("");
+            map.insert(
+                "arguments".to_string(),
+                Value::String(normalized_arguments(accumulated)),
+            );
+        }
+    }
+    item
+}
+
 fn extract_usage(value: &Value) -> Option<UsageTokens> {
     let usage = value.get("usage")?;
     let input_tokens = usage.get("input_tokens").and_then(Value::as_u64)?;
@@ -2484,6 +2615,48 @@ mod tests {
         assert_eq!(reasoning, "thinking...");
         assert_eq!(cached_input_tokens, 2);
         assert_eq!(reasoning_tokens, 4);
+    }
+
+    #[test]
+    fn openai_streamed_tool_call_backfills_blanked_done_item() {
+        // Matches the JuCode gateway's Anthropic→Responses translation: the
+        // name + call_id arrive in `output_item.added`, the arguments stream
+        // via `function_call_arguments.delta`, and the terminal
+        // `output_item.done` blanks name/call_id/arguments — leaving only the
+        // stable `id`. All three must be stitched back in.
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"tooluse_X\",\"name\":\"read\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_1\",\"call_id\":\"tooluse_X\",\"name\":\"read\",\"delta\":\"{\\\"path\\\": \\\"src/store.ts\\\"}\"}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_1\",\"arguments\":\"\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"\",\"name\":\"\",\"arguments\":\"\",\"status\":\"completed\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        );
+        let items = read_sse_output(sse.as_bytes(), |_| Ok(())).unwrap();
+        let call = items
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .expect("function_call item present");
+        assert_eq!(call["name"], "read");
+        assert_eq!(call["call_id"], "tooluse_X");
+        let parsed: Value =
+            serde_json::from_str(call["arguments"].as_str().unwrap()).expect("arguments parse");
+        assert_eq!(parsed["path"], "src/store.ts");
+    }
+
+    #[test]
+    fn openai_argumentless_tool_call_defaults_to_empty_object() {
+        // A genuinely argument-less call with no deltas must still yield "{}"
+        // rather than an empty string that fails JSON parsing.
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_2\",\"call_id\":\"call_2\",\"name\":\"list_agents\",\"arguments\":\"\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        );
+        let items = read_sse_output(sse.as_bytes(), |_| Ok(())).unwrap();
+        let call = items
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .expect("function_call item present");
+        assert_eq!(call["arguments"], "{}");
     }
 
     #[test]
