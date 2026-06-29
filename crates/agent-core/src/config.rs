@@ -471,6 +471,20 @@ fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
             })
             .filter(|values| !values.is_empty())
             .unwrap_or_else(default_reasoning_efforts);
+        let mut max_output_tokens = model
+            .get("max_output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(128_000);
+        // Migrate older / metadata-poor Claude entries that only offer "none":
+        // Claude supports extended thinking, so surface the standard tiers
+        // (and lift the tiny default cap so high-tier budgets fit) without
+        // forcing a re-login.
+        let reasoning_efforts = if name.starts_with("claude-") && is_thinking_disabled(&reasoning_efforts) {
+            max_output_tokens = max_output_tokens.max(CLAUDE_MIN_MAX_OUTPUT_TOKENS);
+            claude_thinking_tiers()
+        } else {
+            reasoning_efforts
+        };
 
         configs.push(ModelConfig {
             name: name.to_string(),
@@ -478,10 +492,7 @@ fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
                 .get("context_window")
                 .and_then(Value::as_u64)
                 .unwrap_or(400_000),
-            max_output_tokens: model
-                .get("max_output_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(128_000),
+            max_output_tokens,
             reasoning_efforts,
             input_cost: read_f64(model, "input_cost", 0.0),
             cached_input_cost: read_f64(model, "cached_input_cost", 0.0),
@@ -547,6 +558,26 @@ fn default_reasoning_efforts() -> Vec<String> {
         .iter()
         .map(|value| value.to_string())
         .collect()
+}
+
+/// Minimum max-output budget for Claude models so a high-tier thinking budget
+/// (see `llm::anthropic_thinking_budget`) isn't clamped away.
+pub(crate) const CLAUDE_MIN_MAX_OUTPUT_TOKENS: u64 = 32_000;
+
+/// Thinking-strength tiers offered for Claude models. They map to an Anthropic
+/// extended-thinking budget on the Messages path and to `reasoning.effort` on
+/// the Responses path.
+pub(crate) fn claude_thinking_tiers() -> Vec<String> {
+    ["none", "low", "medium", "high"]
+        .iter()
+        .map(|value| value.to_string())
+        .collect()
+}
+
+/// True when an effort list offers no actual thinking — empty, or only "none".
+/// Such a list hides thinking-strength selection in the model picker.
+pub(crate) fn is_thinking_disabled(efforts: &[String]) -> bool {
+    efforts.is_empty() || efforts.iter().all(|effort| effort == "none")
 }
 
 fn default_model_configs() -> Vec<ModelConfig> {
@@ -780,6 +811,43 @@ mod tests {
     fn cost_for_zero_prices_is_free() {
         let model = default_model_config("gpt-5.4");
         assert_eq!(model.cost_for(1_000, 100, 1_000), 0.0);
+    }
+
+    #[test]
+    fn claude_thinking_disabled_entries_are_upgraded_on_load() {
+        // A persisted config whose Claude model only offers "none" must be
+        // upgraded to the thinking tiers without a re-login.
+        let value = json!({
+            "models": [{
+                "name": "claude-opus-4-8",
+                "context_window": 200_000,
+                "max_output_tokens": 8_192,
+                "reasoning_efforts": ["none"]
+            }]
+        });
+        let configs = read_model_configs(&value, "jucode");
+        let claude = configs
+            .iter()
+            .find(|m| m.name == "claude-opus-4-8")
+            .expect("claude entry present");
+        assert_eq!(claude.reasoning_efforts, vec!["none", "low", "medium", "high"]);
+        assert!(claude.max_output_tokens >= CLAUDE_MIN_MAX_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn claude_entries_with_real_tiers_are_left_alone() {
+        let value = json!({
+            "models": [{
+                "name": "claude-sonnet-4-6",
+                "context_window": 200_000,
+                "max_output_tokens": 64_000,
+                "reasoning_efforts": ["low", "medium", "high"]
+            }]
+        });
+        let configs = read_model_configs(&value, "jucode");
+        let claude = configs.iter().find(|m| m.name == "claude-sonnet-4-6").unwrap();
+        assert_eq!(claude.reasoning_efforts, vec!["low", "medium", "high"]);
+        assert_eq!(claude.max_output_tokens, 64_000);
     }
 
     #[test]

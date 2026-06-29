@@ -2268,30 +2268,46 @@ fn is_jucode_supported_model(model: &str) -> bool {
 }
 
 fn jucode_model_config(model: &OAuthModel) -> ModelConfig {
-    let (default_context_window, default_max_output_tokens, default_reasoning_efforts) =
-        if model.id.starts_with("claude-") {
-            (200_000, 8_192, vec!["none".to_string()])
-        } else {
-            (
-                400_000,
-                128_000,
-                vec![
-                    "none".to_string(),
-                    "low".to_string(),
-                    "medium".to_string(),
-                    "high".to_string(),
-                    "xhigh".to_string(),
-                ],
-            )
-        };
+    let is_claude = model.id.starts_with("claude-");
+    let (default_context_window, default_max_output_tokens, default_reasoning_efforts) = if is_claude
+    {
+        // Claude models support extended thinking, so offer the thinking-strength
+        // tiers (mapped to an Anthropic budget in llm.rs::anthropic_thinking_budget,
+        // or forwarded as `reasoning.effort` on the Responses path).
+        (
+            200_000,
+            crate::config::CLAUDE_MIN_MAX_OUTPUT_TOKENS,
+            crate::config::claude_thinking_tiers(),
+        )
+    } else {
+        (
+            400_000,
+            128_000,
+            vec![
+                "none".to_string(),
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string(),
+            ],
+        )
+    };
+    let mut reasoning_efforts = model
+        .reasoning_efforts
+        .clone()
+        .unwrap_or_else(|| default_reasoning_efforts.clone());
+    let mut max_output_tokens = model.max_output_tokens.unwrap_or(default_max_output_tokens);
+    // The gateway may advertise Claude models with only "none"; still surface
+    // the thinking tiers (and a budget large enough to use them).
+    if is_claude && crate::config::is_thinking_disabled(&reasoning_efforts) {
+        reasoning_efforts = crate::config::claude_thinking_tiers();
+        max_output_tokens = max_output_tokens.max(crate::config::CLAUDE_MIN_MAX_OUTPUT_TOKENS);
+    }
     ModelConfig {
         name: model.id.clone(),
         context_window: model.context_window.unwrap_or(default_context_window),
-        max_output_tokens: model.max_output_tokens.unwrap_or(default_max_output_tokens),
-        reasoning_efforts: model
-            .reasoning_efforts
-            .clone()
-            .unwrap_or(default_reasoning_efforts),
+        max_output_tokens,
+        reasoning_efforts,
         input_cost: 0.0,
         cached_input_cost: 0.0,
         output_cost: 0.0,
@@ -2445,5 +2461,46 @@ fn format_resume_detail(summary: &SessionSummary) -> String {
             "{status} · updated {} · entries {} · {}",
             summary.updated_at, summary.entries, summary.leaf
         ),
+    }
+}
+
+#[cfg(test)]
+mod model_config_tests {
+    use super::*;
+
+    fn oauth_model(id: &str) -> OAuthModel {
+        OAuthModel {
+            id: id.to_string(),
+            context_window: None,
+            max_output_tokens: None,
+            reasoning_efforts: None,
+        }
+    }
+
+    #[test]
+    fn claude_models_offer_thinking_strength_tiers() {
+        // Regression: Claude models synced from /login used to default to
+        // ["none"] only, so no thinking strength could be selected.
+        let config = jucode_model_config(&oauth_model("claude-opus-4-8"));
+        assert_eq!(
+            config.reasoning_efforts,
+            vec!["none", "low", "medium", "high"]
+        );
+        // max_output must leave room for the higher tiers' thinking budgets.
+        assert!(config.max_output_tokens >= 32_000);
+    }
+
+    #[test]
+    fn marketplace_reasoning_efforts_override_claude_defaults() {
+        let model = OAuthModel {
+            id: "claude-sonnet-4-6".to_string(),
+            context_window: Some(1_000_000),
+            max_output_tokens: Some(64_000),
+            reasoning_efforts: Some(vec!["low".to_string(), "high".to_string()]),
+        };
+        let config = jucode_model_config(&model);
+        assert_eq!(config.reasoning_efforts, vec!["low", "high"]);
+        assert_eq!(config.max_output_tokens, 64_000);
+        assert_eq!(config.context_window, 1_000_000);
     }
 }
