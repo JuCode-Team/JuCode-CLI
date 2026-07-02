@@ -200,7 +200,7 @@ fn download_skill_package(url: &str) -> io::Result<Vec<u8>> {
     let response = ureq::get(url)
         .timeout(std::time::Duration::from_secs(60))
         .call()
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+        .map_err(|error| io::Error::other(error.to_string()))?;
     let mut reader = response.into_reader();
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;

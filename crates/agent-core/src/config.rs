@@ -479,12 +479,13 @@ fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
         // Claude supports extended thinking, so surface the standard tiers
         // (and lift the tiny default cap so high-tier budgets fit) without
         // forcing a re-login.
-        let reasoning_efforts = if name.starts_with("claude-") && is_thinking_disabled(&reasoning_efforts) {
-            max_output_tokens = max_output_tokens.max(CLAUDE_MIN_MAX_OUTPUT_TOKENS);
-            claude_thinking_tiers()
-        } else {
-            reasoning_efforts
-        };
+        let reasoning_efforts =
+            if name.starts_with("claude-") && is_thinking_disabled(&reasoning_efforts) {
+                max_output_tokens = max_output_tokens.max(CLAUDE_MIN_MAX_OUTPUT_TOKENS);
+                claude_thinking_tiers()
+            } else {
+                reasoning_efforts
+            };
 
         configs.push(ModelConfig {
             name: name.to_string(),
@@ -666,7 +667,13 @@ fn default_providers() -> Vec<ProviderTemplate> {
 pub fn builtin_providers() -> Vec<(String, String, String)> {
     default_providers()
         .into_iter()
-        .map(|p| (p.id.to_string(), p.base_url.to_string(), p.protocol.to_string()))
+        .map(|p| {
+            (
+                p.id.to_string(),
+                p.base_url.to_string(),
+                p.protocol.to_string(),
+            )
+        })
         .collect()
 }
 
@@ -680,7 +687,10 @@ pub fn models_for_provider(id: &str) -> Vec<ModelConfig> {
 }
 
 fn default_base_url_for_provider(id: &str) -> Option<&'static str> {
-    default_providers().into_iter().find(|p| p.id == id).map(|p| p.base_url)
+    default_providers()
+        .into_iter()
+        .find(|p| p.id == id)
+        .map(|p| p.base_url)
 }
 
 fn deepseek_model_configs() -> Vec<ModelConfig> {
@@ -830,7 +840,10 @@ mod tests {
             .iter()
             .find(|m| m.name == "claude-opus-4-8")
             .expect("claude entry present");
-        assert_eq!(claude.reasoning_efforts, vec!["none", "low", "medium", "high"]);
+        assert_eq!(
+            claude.reasoning_efforts,
+            vec!["none", "low", "medium", "high"]
+        );
         assert!(claude.max_output_tokens >= CLAUDE_MIN_MAX_OUTPUT_TOKENS);
     }
 
@@ -845,7 +858,10 @@ mod tests {
             }]
         });
         let configs = read_model_configs(&value, "jucode");
-        let claude = configs.iter().find(|m| m.name == "claude-sonnet-4-6").unwrap();
+        let claude = configs
+            .iter()
+            .find(|m| m.name == "claude-sonnet-4-6")
+            .unwrap();
         assert_eq!(claude.reasoning_efforts, vec!["low", "medium", "high"]);
         assert_eq!(claude.max_output_tokens, 64_000);
     }

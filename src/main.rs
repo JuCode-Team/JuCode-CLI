@@ -204,7 +204,10 @@ fn handle_serve_line(
     let value = match serde_json::from_str::<Value>(line) {
         Ok(value) => value,
         Err(error) => {
-            write_event(stdout, AgentEvent::Error(format!("invalid command: {error}")))?;
+            write_event(
+                stdout,
+                AgentEvent::Error(format!("invalid command: {error}")),
+            )?;
             return Ok(false);
         }
     };
@@ -228,7 +231,10 @@ fn handle_serve_line(
             core.submit_user_message_with_images(content.to_string(), images)
         }
         "command" => {
-            let input = value.get("input").and_then(Value::as_str).unwrap_or_default();
+            let input = value
+                .get("input")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let (quit, events) = core.handle_command(input);
             for event in events {
                 write_event(stdout, event)?;
@@ -487,7 +493,11 @@ fn event_json(event: AgentEvent) -> Value {
                 json!({ "id": item.id, "label": item.label, "detail": item.detail })
             }).collect::<Vec<_>>()
         }),
-        AgentEvent::ApprovalRequest { call_id, name, summary } => json!({
+        AgentEvent::ApprovalRequest {
+            call_id,
+            name,
+            summary,
+        } => json!({
             "type": "approval_request",
             "call_id": call_id,
             "name": name,

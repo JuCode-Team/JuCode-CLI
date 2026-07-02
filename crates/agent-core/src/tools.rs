@@ -345,8 +345,14 @@ fn read_file(args: &Value, cwd: &Path) -> Value {
     };
 
     let path = resolve_path(cwd, path);
-    let offset = optional_usize(args, "offset").unwrap_or(1).max(1);
-    let limit = optional_usize(args, "limit").map(|limit| limit.max(1));
+    let offset = match optional_usize(args, "offset") {
+        Ok(offset) => offset.unwrap_or(1).max(1),
+        Err(error) => return json!({ "error": error }),
+    };
+    let limit = match optional_usize(args, "limit") {
+        Ok(limit) => limit.map(|limit| limit.max(1)),
+        Err(error) => return json!({ "error": error }),
+    };
 
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
@@ -861,17 +867,24 @@ fn resolve_hashline_replace(
         ));
     }
     let replacement = edit.lines.join("\n");
-    let start = line_index.starts[pos.line - 1];
-    let end_offset = if edit.lines.is_empty() {
+    let (start, end_offset) = if edit.lines.is_empty() {
         if pos.line == 1 && end.line == line_index.lines.len() {
-            content.len()
+            (0, content.len())
         } else if end.line < line_index.lines.len() {
-            line_index.starts[end.line]
+            (line_index.starts[pos.line - 1], line_index.starts[end.line])
         } else {
-            line_index.starts[pos.line - 1].saturating_sub(1)
+            // Deleting through the final line of a file without a trailing
+            // newline: consume the preceding newline instead of a trailing one.
+            (
+                line_index.starts[pos.line - 1].saturating_sub(1),
+                content.len(),
+            )
         }
     } else {
-        line_index.starts[end.line - 1] + line_index.lines[end.line - 1].len()
+        (
+            line_index.starts[pos.line - 1],
+            line_index.starts[end.line - 1] + line_index.lines[end.line - 1].len(),
+        )
     };
     Ok(HashlineSpan {
         start,
@@ -1174,12 +1187,14 @@ fn bash(
         Ok(workdir) => workdir,
         Err(error) => return json!({ "command": command, "error": error }),
     };
-    let timeout = Duration::from_secs(
-        optional_u64(args, "timeout")
-            .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
-            .max(1),
-    );
-    let yield_time = optional_u64(args, "yield_time_ms").map(Duration::from_millis);
+    let timeout = match optional_u64(args, "timeout") {
+        Ok(timeout) => Duration::from_secs(timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS).max(1)),
+        Err(error) => return json!({ "command": command, "error": error }),
+    };
+    let yield_time = match optional_u64(args, "yield_time_ms") {
+        Ok(yield_time) => yield_time.map(Duration::from_millis),
+        Err(error) => return json!({ "command": command, "error": error }),
+    };
 
     let (program, shell_args) = shell_command(command);
     let result = if let Some(yield_time) = yield_time {
@@ -1220,15 +1235,21 @@ fn command_workdir(args: &Value, cwd: &Path) -> Result<PathBuf, String> {
 }
 
 fn write_stdin(args: &Value) -> Value {
-    let Some(session_id) = args.get("session_id").and_then(Value::as_u64) else {
-        return json!({ "error": "missing session_id" });
+    let session_id = match optional_u64(args, "session_id") {
+        Ok(Some(session_id)) => session_id,
+        Ok(None) => return json!({ "error": "missing session_id" }),
+        Err(error) => return json!({ "error": error }),
     };
     let text = args
         .get("text")
+        .filter(|value| !value.is_null())
         .or_else(|| args.get("chars"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let yield_time = Duration::from_millis(optional_u64(args, "yield_time_ms").unwrap_or(1000));
+    let yield_time = match optional_u64(args, "yield_time_ms") {
+        Ok(yield_time) => Duration::from_millis(yield_time.unwrap_or(1000)),
+        Err(error) => return json!({ "session_id": session_id, "error": error }),
+    };
     match poll_or_write_session(session_id, text, yield_time) {
         Ok(value) => value,
         Err(error) => json!({ "session_id": session_id, "error": error }),
@@ -1260,16 +1281,32 @@ fn run_command_session(
 
     let stdin = child.stdin.take();
     let started = SystemTime::now();
-    emit(ToolExecutionEvent::Update(format!(
+    if let Err(error) = emit(ToolExecutionEvent::Update(format!(
         "started: {}",
         command_display(program, args)
-    )))?;
+    ))) {
+        abort_command(&mut child, &stdout_path, &stderr_path);
+        return Err(error);
+    }
 
     let wait_until = yield_time.min(timeout);
     loop {
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            let result = collect_command_result(status.code(), false, &stdout_path, &stderr_path);
-            return Ok(command_result_json(display_command, Ok(result)));
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let result = collect_command_result(
+                    status.code(),
+                    status_signal(&status),
+                    false,
+                    &stdout_path,
+                    &stderr_path,
+                );
+                return Ok(command_result_json(display_command, Ok(result)));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                abort_command(&mut child, &stdout_path, &stderr_path);
+                return Err(error.to_string());
+            }
         }
         if started.elapsed().unwrap_or_default() >= wait_until {
             break;
@@ -1313,6 +1350,7 @@ fn poll_or_write_session(
     yield_time: Duration,
 ) -> Result<Value, String> {
     let started_poll = SystemTime::now();
+    let mut wrote_stdin = false;
     loop {
         let mut finished = None;
         {
@@ -1324,32 +1362,35 @@ fn poll_or_write_session(
             };
             if session.started.elapsed().unwrap_or_default() >= session.timeout {
                 kill_child(&mut session.child);
-                finished = Some((true, None));
+                finished = Some((true, None, None));
             } else if let Some(status) = session
                 .child
                 .try_wait()
                 .map_err(|error| error.to_string())?
             {
-                finished = Some((false, status.code()));
+                finished = Some((false, status.code(), status_signal(&status)));
             }
-            if let Some((timed_out, code)) = finished {
+            if let Some((timed_out, code, signal)) = finished {
                 let session = sessions.remove(&session_id).expect("session exists");
                 let result = collect_command_result(
                     code,
+                    signal,
                     timed_out,
                     &session.stdout_path,
                     &session.stderr_path,
                 );
                 return Ok(command_result_json(&session.command, Ok(result)));
             }
-            if !text.is_empty() {
+            if !text.is_empty() && !wrote_stdin {
                 if let Some(stdin) = session.stdin.as_mut() {
                     if let Err(error) = stdin.write_all(text.as_bytes()).and_then(|_| stdin.flush())
                     {
                         if let Ok(Some(status)) = session.child.try_wait() {
+                            let signal = status_signal(&status);
                             let session = sessions.remove(&session_id).expect("session exists");
                             let result = collect_command_result(
                                 status.code(),
+                                signal,
                                 false,
                                 &session.stdout_path,
                                 &session.stderr_path,
@@ -1358,6 +1399,7 @@ fn poll_or_write_session(
                         }
                         return Err(error.to_string());
                     }
+                    wrote_stdin = true;
                 }
             }
         }
@@ -1386,6 +1428,7 @@ fn poll_or_write_session(
 
 fn collect_command_result(
     exit_code: Option<i32>,
+    signal: Option<i32>,
     timed_out: bool,
     stdout_path: &Path,
     stderr_path: &Path,
@@ -1396,10 +1439,32 @@ fn collect_command_result(
     let _ = fs::remove_file(stderr_path);
     CommandResult {
         exit_code,
+        signal,
         stdout,
         stderr,
         timed_out,
         truncated: stdout_truncated || stderr_truncated,
+    }
+}
+
+/// Kill a still-running child and drop its capture files; used on early
+/// returns (user interrupt, wait errors) so no orphan process is left behind.
+fn abort_command(child: &mut Child, stdout_path: &Path, stderr_path: &Path) {
+    kill_child(child);
+    let _ = fs::remove_file(stdout_path);
+    let _ = fs::remove_file(stderr_path);
+}
+
+fn status_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
     }
 }
 
@@ -1817,8 +1882,9 @@ fn apply_patch(
 
     match check {
         Ok(_) => {
+            let targets = patch_target_paths(patch, cwd);
             // Snapshot the patch's target files (pre-apply) so /rewind can undo it.
-            let _ = create_checkpoint(cwd, "auto-patch", &patch_target_paths(patch, cwd));
+            let _ = create_checkpoint(cwd, "auto-patch", &targets);
             let result = run_command_events(
                 "git",
                 &["apply", "--whitespace=nowarn", "-"],
@@ -1830,7 +1896,16 @@ fn apply_patch(
             let mut value = command_result_json("git apply", result);
             value["applied"] = json!(value.get("exit_code").and_then(Value::as_i64) == Some(0));
             if value["applied"].as_bool().unwrap_or(false) {
-                value["diff"] = json!(git_diff(cwd, None).unwrap_or_default());
+                // Diff only the files this patch touched, not the whole worktree.
+                let mut chunks = Vec::new();
+                for target in &targets {
+                    if let Ok(diff) = git_diff(cwd, Some(target)) {
+                        if !diff.trim().is_empty() {
+                            chunks.push(diff);
+                        }
+                    }
+                }
+                value["diff"] = json!(chunks.join("\n"));
             }
             value
         }
@@ -1844,7 +1919,10 @@ fn list_dir(args: &Value, cwd: &Path) -> Value {
         .and_then(Value::as_str)
         .map(|path| resolve_path(cwd, path))
         .unwrap_or_else(|| cwd.to_path_buf());
-    let limit = optional_usize(args, "limit").map(|limit| limit.max(1));
+    let limit = match optional_usize(args, "limit") {
+        Ok(limit) => limit.map(|limit| limit.max(1)),
+        Err(error) => return json!({ "error": error }),
+    };
 
     let entries = match fs::read_dir(&path) {
         Ok(entries) => entries,
@@ -1890,8 +1968,14 @@ fn ripgrep(args: &Value, cwd: &Path) -> Value {
         .and_then(Value::as_str)
         .map(|path| resolve_path(cwd, path))
         .unwrap_or_else(|| cwd.to_path_buf());
-    let limit = optional_usize(args, "limit").map(|limit| limit.max(1));
-    let context_lines = optional_usize(args, "contextLines").unwrap_or(0);
+    let limit = match optional_usize(args, "limit") {
+        Ok(limit) => limit.map(|limit| limit.max(1)),
+        Err(error) => return json!({ "error": error }),
+    };
+    let context_lines = match optional_usize(args, "contextLines") {
+        Ok(context_lines) => context_lines.unwrap_or(0),
+        Err(error) => return json!({ "error": error }),
+    };
 
     let mut command_args = vec![
         "--line-number".to_string(),
@@ -1921,12 +2005,26 @@ fn ripgrep(args: &Value, cwd: &Path) -> Value {
         command_args.push("--glob".to_string());
         command_args.push(glob.to_string());
     }
+    // -e keeps patterns that start with `-` from being parsed as flags.
+    command_args.push("-e".to_string());
     command_args.push(pattern.to_string());
     command_args.push(search_path.display().to_string());
 
     let arg_refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
     let result = run_command("rg", &arg_refs, cwd, Duration::from_secs(30));
     let mut value = command_result_json("rg", result);
+    // rg exit code 1 means "no matches", which is a valid result; 2+ is an error.
+    if value.get("exit_code").and_then(Value::as_i64) == Some(1) {
+        value["exit_code"] = json!(0);
+        if value
+            .get("stdout")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            value["stdout"] = json!("no matches found");
+        }
+    }
     if let (Some(stdout), Some(limit)) = (value.get("stdout").and_then(Value::as_str), limit) {
         let lines = stdout.lines().take(limit).collect::<Vec<_>>();
         let truncated = stdout.lines().count() > limit;
@@ -1970,7 +2068,10 @@ fn outline_file(args: &Value, cwd: &Path) -> Value {
         return json!({ "error": "missing path" });
     };
     let path = resolve_path(cwd, path);
-    let limit = optional_usize(args, "limit").unwrap_or(200).max(1);
+    let limit = match optional_usize(args, "limit") {
+        Ok(limit) => limit.unwrap_or(200).max(1),
+        Err(error) => return json!({ "error": error }),
+    };
     let content = match fs::read_to_string(&path) {
         Ok(content) => content,
         Err(error) => {
@@ -1978,18 +2079,20 @@ fn outline_file(args: &Value, cwd: &Path) -> Value {
         }
     };
     let mut symbols = Vec::new();
+    let mut truncated = false;
     for (index, line) in content.lines().enumerate() {
         if let Some(symbol) = symbol_from_line(line) {
-            symbols.push(json!({ "line": index + 1, "symbol": symbol }));
             if symbols.len() >= limit {
+                truncated = true;
                 break;
             }
+            symbols.push(json!({ "line": index + 1, "symbol": symbol }));
         }
     }
     json!({
         "path": path.display().to_string(),
         "symbols": symbols,
-        "truncated": content.lines().count() > limit && symbols.len() == limit,
+        "truncated": truncated,
     })
 }
 
@@ -2056,6 +2159,7 @@ fn decode_text_bytes(bytes: &[u8]) -> Option<(String, &'static str)> {
     if bytes.starts_with(&[0xfe, 0xff]) {
         return decode_utf16(&bytes[2..], false).map(|text| (text, "utf-16be"));
     }
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
     String::from_utf8(bytes.to_vec())
         .ok()
         .map(|text| (text, "utf-8"))
@@ -2178,7 +2282,9 @@ fn create_checkpoint(cwd: &Path, name: &str, paths: &[PathBuf]) -> io::Result<Va
                 bytes += content.len();
                 Value::String(content)
             }
-            Err(_) if abs.exists() => Value::Null,
+            // Existing but unreadable (e.g. non-UTF-8): mark it so restore
+            // skips it instead of misreading null as "did not exist yet".
+            Err(_) if abs.exists() => json!({ "unreadable": true }),
             Err(_) => Value::Null,
         };
         files.push(json!({ "path": rel, "content": content }));
@@ -2237,7 +2343,7 @@ fn prune_checkpoints(dir: &Path) {
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
         files.push((nanos, path, size));
     }
-    files.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    files.sort_by_key(|file| std::cmp::Reverse(file.0)); // newest first
     let mut kept = 0usize;
     let mut bytes = 0u64;
     for (_, path, size) in files {
@@ -2285,6 +2391,7 @@ pub(crate) fn restore_checkpoint(cwd: &Path, id: &str) -> io::Result<Value> {
         serde_json::from_str::<Value>(&fs::read_to_string(path)?).map_err(io::Error::other)?;
     let mut restored = Vec::new();
     let mut removed = Vec::new();
+    let mut skipped = Vec::new();
     for file in value
         .get("files")
         .and_then(Value::as_array)
@@ -2298,19 +2405,31 @@ pub(crate) fn restore_checkpoint(cwd: &Path, id: &str) -> io::Result<Value> {
         if !is_inside(cwd, &abs) {
             continue;
         }
-        if let Some(content) = file.get("content").and_then(Value::as_str) {
+        let content = file.get("content").unwrap_or(&Value::Null);
+        if let Some(content) = content.as_str() {
             if let Some(parent) = abs.parent() {
                 fs::create_dir_all(parent)?;
             }
             fs::write(&abs, content)?;
             mark_read(&abs);
             restored.push(rel.to_string());
-        } else if abs.exists() {
-            fs::remove_file(&abs)?;
-            removed.push(rel.to_string());
+        } else if content.is_null() {
+            if abs.exists() {
+                fs::remove_file(&abs)?;
+                removed.push(rel.to_string());
+            }
+        } else {
+            // Unreadable at checkpoint time: never delete, just report it.
+            skipped.push(rel.to_string());
         }
     }
-    Ok(json!({ "id": id, "restored": restored, "removed": removed }))
+    let mut result = json!({ "id": id, "restored": restored, "removed": removed });
+    if !skipped.is_empty() {
+        result["skipped"] = json!(skipped);
+        result["warning"] =
+            json!("some files could not be captured at checkpoint time and were left untouched");
+    }
+    Ok(result)
 }
 
 /// Reconstruct the working tree as of `t` (a turn's creation time): for every
@@ -2364,6 +2483,7 @@ pub(crate) fn restore_to_timestamp(cwd: &Path, t: u64) -> io::Result<Value> {
 
     let mut restored = Vec::new();
     let mut removed = Vec::new();
+    let mut skipped = Vec::new();
     for (rel, content) in earliest {
         let abs = resolve_path(cwd, &rel);
         if !is_inside(cwd, &abs) {
@@ -2376,12 +2496,23 @@ pub(crate) fn restore_to_timestamp(cwd: &Path, t: u64) -> io::Result<Value> {
             fs::write(&abs, text)?;
             mark_read(&abs);
             restored.push(rel);
-        } else if abs.exists() {
-            fs::remove_file(&abs)?;
-            removed.push(rel);
+        } else if content.is_null() {
+            if abs.exists() {
+                fs::remove_file(&abs)?;
+                removed.push(rel);
+            }
+        } else {
+            // Unreadable at checkpoint time: never delete, just report it.
+            skipped.push(rel);
         }
     }
-    Ok(json!({ "restored": restored, "removed": removed }))
+    let mut result = json!({ "restored": restored, "removed": removed });
+    if !skipped.is_empty() {
+        result["skipped"] = json!(skipped);
+        result["warning"] =
+            json!("some files could not be captured at checkpoint time and were left untouched");
+    }
+    Ok(result)
 }
 
 fn checkpoint_dir(cwd: &Path) -> PathBuf {
@@ -2405,6 +2536,7 @@ fn is_inside(root: &Path, path: &Path) -> bool {
 #[derive(Clone)]
 struct CommandResult {
     exit_code: Option<i32>,
+    signal: Option<i32>,
     stdout: String,
     stderr: String,
     timed_out: bool,
@@ -2457,32 +2589,40 @@ fn run_command_events(
     let started = SystemTime::now();
     let mut last_update = started;
     let mut timed_out = false;
-    emit(ToolExecutionEvent::Update(format!(
+    if let Err(error) = emit(ToolExecutionEvent::Update(format!(
         "started: {}",
         command_display(program, args)
-    )))?;
+    ))) {
+        abort_command(&mut child, &stdout_path, &stderr_path);
+        return Err(error);
+    }
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {}
-            Err(error) => return Err(error.to_string()),
+            Err(error) => {
+                abort_command(&mut child, &stdout_path, &stderr_path);
+                return Err(error.to_string());
+            }
         }
 
         if started.elapsed().unwrap_or_default() >= timeout {
             timed_out = true;
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_child(&mut child);
             break;
         }
         if last_update.elapsed().unwrap_or_default() >= COMMAND_UPDATE_INTERVAL {
             let (stdout, stdout_truncated) = read_output_file(&stdout_path);
             let (stderr, stderr_truncated) = read_output_file(&stderr_path);
-            emit(ToolExecutionEvent::Update(command_update_text(
+            if let Err(error) = emit(ToolExecutionEvent::Update(command_update_text(
                 &stdout,
                 &stderr,
                 stdout_truncated || stderr_truncated,
                 started.elapsed().unwrap_or_default(),
-            )))?;
+            ))) {
+                abort_command(&mut child, &stdout_path, &stderr_path);
+                return Err(error);
+            }
             last_update = SystemTime::now();
         }
         thread::sleep(Duration::from_millis(50));
@@ -2495,7 +2635,8 @@ fn run_command_events(
     let _ = fs::remove_file(stderr_path);
 
     Ok(CommandResult {
-        exit_code: status.and_then(|status| status.code()),
+        exit_code: status.as_ref().and_then(|status| status.code()),
+        signal: status.as_ref().and_then(status_signal),
         stdout,
         stderr,
         timed_out,
@@ -2505,14 +2646,25 @@ fn run_command_events(
 
 fn command_result_json(command: &str, result: Result<CommandResult, String>) -> Value {
     let mut value = match result {
-        Ok(result) => json!({
-            "command": command,
-            "exit_code": result.exit_code,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "timed_out": result.timed_out,
-            "truncated": result.truncated,
-        }),
+        Ok(result) => {
+            let mut value = json!({
+                "command": command,
+                "exit_code": result.exit_code,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "timed_out": result.timed_out,
+                "truncated": result.truncated,
+            });
+            // A missing exit code outside the timeout path means the command
+            // was killed; report it as an error instead of a silent success.
+            if result.exit_code.is_none() && !result.timed_out {
+                value["error"] = json!(match result.signal {
+                    Some(signal) => format!("command terminated by signal {signal}"),
+                    None => "command terminated without an exit code".to_string(),
+                });
+            }
+            value
+        }
         Err(error) => json!({ "command": command, "error": error }),
     };
     add_command_soft_hint(&mut value);
@@ -2942,23 +3094,52 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn optional_usize(args: &Value, key: &str) -> Option<usize> {
-    args.get(key)
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
+fn optional_usize(args: &Value, key: &str) -> Result<Option<usize>, String> {
+    Ok(optional_u64(args, key)?.and_then(|value| usize::try_from(value).ok()))
 }
 
-fn optional_u64(args: &Value, key: &str) -> Option<u64> {
-    args.get(key).and_then(Value::as_u64)
+/// `Ok(None)` when the key is absent or null. Accepts integer-valued floats
+/// (e.g. 30.0); anything else is a descriptive error instead of a silent default.
+fn optional_u64(args: &Value, key: &str) -> Result<Option<u64>, String> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(number) = value.as_u64() {
+        return Ok(Some(number));
+    }
+    if let Some(number) = value.as_f64() {
+        if number >= 0.0 && number.fract() == 0.0 && number <= u64::MAX as f64 {
+            return Ok(Some(number as u64));
+        }
+    }
+    Err(format!("{key} must be a non-negative integer, got {value}"))
 }
 
 fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
-    let path = PathBuf::from(path);
+    let path = expand_tilde(path);
     if path.is_absolute() {
         path
     } else {
         cwd.join(path)
     }
+}
+
+fn expand_tilde(path: &str) -> PathBuf {
+    if path != "~" && !path.starts_with("~/") {
+        return PathBuf::from(path);
+    }
+    let home_key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let Some(home) = env::var_os(home_key) else {
+        return PathBuf::from(path);
+    };
+    let mut expanded = PathBuf::from(home);
+    if let Some(rest) = path.strip_prefix("~/") {
+        expanded.push(rest);
+    }
+    expanded
 }
 
 #[cfg(test)]
@@ -3880,6 +4061,334 @@ mod tests {
 
         assert_eq!(value["symbols"][0]["symbol"], "pub struct App {}");
         assert_eq!(value["symbols"][2]["symbol"], "pub fn run() {}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn write_stdin_sends_input_only_once_per_call() {
+        let dir = test_dir("write-stdin-once");
+        fs::create_dir_all(&dir).unwrap();
+
+        let result = run_tool(
+            "bash",
+            &json!({
+                "command": "while read line; do echo \"got:$line\"; done",
+                "timeout": 10,
+                "yield_time_ms": 1
+            })
+            .to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        let session_id = value["session_id"].as_u64().unwrap();
+
+        let _ = run_tool(
+            "write_stdin",
+            &json!({ "session_id": session_id, "text": "hello\n", "yield_time_ms": 500 })
+                .to_string(),
+            &dir,
+        );
+        let result = run_tool(
+            "write_stdin",
+            &json!({ "session_id": session_id, "yield_time_ms": 300 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        let stdout = value["stdout"].as_str().unwrap();
+        assert_eq!(stdout.matches("got:hello").count(), 1, "{stdout:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hashline_edit_deletes_last_line_of_file_without_trailing_newline() {
+        let dir = test_dir("hashline-delete-last");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "a\nb\nc").unwrap();
+        let _ = run_tool("read", &json!({ "path": path }).to_string(), &dir);
+
+        let anchor = format!("3#{}", compute_line_hash(3, "c"));
+        let result = run_tool(
+            "hashline_edit",
+            &json!({
+                "path": path,
+                "edits": [{ "op": "replace", "pos": anchor, "lines": [] }]
+            })
+            .to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert!(value.get("error").is_none(), "{value}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a\nb");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn checkpoint_restore_skips_unreadable_files_instead_of_deleting() {
+        let dir = test_dir("checkpoint-unreadable");
+        let path = dir.join("binary.bin");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, [0xff, 0x00, 0x9f]).unwrap();
+
+        let created = create_checkpoint(&dir, "manual", std::slice::from_ref(&path)).unwrap();
+        let id = created["id"].as_str().unwrap();
+        let restored = restore_checkpoint(&dir, id).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), vec![0xff, 0x00, 0x9f]);
+        assert_eq!(restored["skipped"][0], "binary.bin");
+        assert_eq!(restored["removed"].as_array().unwrap().len(), 0);
+        assert!(restored["warning"].as_str().unwrap().contains("untouched"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restore_to_timestamp_skips_unreadable_files_instead_of_deleting() {
+        let dir = test_dir("restore-ts-unreadable");
+        let path = dir.join("binary.bin");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, [0xff, 0x00]).unwrap();
+
+        create_checkpoint(&dir, "manual", std::slice::from_ref(&path)).unwrap();
+        let restored = restore_to_timestamp(&dir, 0).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), vec![0xff, 0x00]);
+        assert_eq!(restored["skipped"][0], "binary.bin");
+        assert_eq!(restored["removed"].as_array().unwrap().len(), 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ripgrep_accepts_pattern_starting_with_dash() {
+        let dir = test_dir("rg-dash-pattern");
+        let path = dir.join("sample.rs");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "value->unwrap()\n").unwrap();
+
+        let result = run_tool(
+            "ripgrep",
+            &json!({ "pattern": "->unwrap", "path": path, "literal": true }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["exit_code"], 0, "{value}");
+        assert!(value["stdout"].as_str().unwrap().contains("->unwrap"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ripgrep_no_matches_is_success_not_error() {
+        let dir = test_dir("rg-no-match");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "haystack\n").unwrap();
+
+        let result = run_tool_with_events(
+            "ripgrep",
+            &json!({ "pattern": "definitely_not_present_xyz", "path": path }).to_string(),
+            &dir,
+            |_| Ok(()),
+        );
+        let value = serde_json::from_str::<Value>(&result.output).unwrap();
+
+        assert!(!result.is_error, "{value}");
+        assert_eq!(value["exit_code"], 0);
+        assert!(value["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("no matches found"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn interrupted_bash_kills_child_process() {
+        let dir = test_dir("bash-interrupt-kill");
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("marker.txt");
+
+        let result = run_tool_with_events(
+            "bash",
+            &json!({ "command": "sleep 0.4; echo done > marker.txt", "timeout": 10 }).to_string(),
+            &dir,
+            |_| Err("interrupted".to_string()),
+        );
+
+        assert!(result.is_error);
+        std::thread::sleep(Duration::from_millis(900));
+        assert!(!marker.exists(), "child kept running after interrupt");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn numeric_params_accept_integer_valued_floats_and_reject_fractions() {
+        assert_eq!(optional_u64(&json!({ "x": 30.0 }), "x"), Ok(Some(30)));
+        assert_eq!(optional_u64(&json!({ "x": 7 }), "x"), Ok(Some(7)));
+        assert_eq!(optional_u64(&json!({}), "x"), Ok(None));
+        assert_eq!(optional_u64(&json!({ "x": null }), "x"), Ok(None));
+        assert!(optional_u64(&json!({ "x": 1.5 }), "x").is_err());
+        assert!(optional_u64(&json!({ "x": -1 }), "x").is_err());
+        assert!(optional_u64(&json!({ "x": "3" }), "x").is_err());
+    }
+
+    #[test]
+    fn read_accepts_float_offset_and_limit() {
+        let dir = test_dir("read-float-params");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "one\ntwo\nthree\n").unwrap();
+
+        let result = run_tool(
+            "read",
+            &json!({ "path": path, "offset": 2.0, "limit": 1.0 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        assert_eq!(value["content"], "two\n");
+
+        let result = run_tool(
+            "read",
+            &json!({ "path": path, "limit": 1.5 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        assert!(value["error"].as_str().unwrap().contains("limit"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_killed_command_is_reported_as_error() {
+        let dir = test_dir("bash-signal");
+        fs::create_dir_all(&dir).unwrap();
+
+        let result = run_tool_with_events(
+            "bash",
+            &json!({ "command": "kill -9 $$", "timeout": 10 }).to_string(),
+            &dir,
+            |_| Ok(()),
+        );
+        let value = serde_json::from_str::<Value>(&result.output).unwrap();
+
+        assert!(result.is_error, "{value}");
+        assert!(value["exit_code"].is_null());
+        assert!(value["error"].as_str().unwrap().contains("signal 9"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn resolve_path_expands_tilde_to_home() {
+        let home = env::var("HOME").unwrap();
+        assert_eq!(
+            resolve_path(Path::new("/cwd"), "~/x"),
+            Path::new(&home).join("x")
+        );
+        assert_eq!(resolve_path(Path::new("/cwd"), "~"), PathBuf::from(&home));
+        assert_eq!(
+            resolve_path(Path::new("/cwd"), "~x"),
+            Path::new("/cwd").join("~x")
+        );
+    }
+
+    #[test]
+    fn decode_text_bytes_strips_utf8_bom() {
+        let (text, encoding) = decode_text_bytes(b"\xef\xbb\xbfhi\n").unwrap();
+        assert_eq!(text, "hi\n");
+        assert_eq!(encoding, "utf-8");
+    }
+
+    #[test]
+    fn outline_truncated_only_when_symbols_are_dropped() {
+        let dir = test_dir("outline-truncated");
+        let path = dir.join("lib.rs");
+        fs::create_dir_all(&dir).unwrap();
+        let filler = "// filler\n".repeat(300);
+        fs::write(&path, format!("fn one() {{}}\nfn two() {{}}\n{filler}")).unwrap();
+
+        let result = run_tool(
+            "outline",
+            &json!({ "path": path, "limit": 2 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        assert_eq!(value["truncated"], false, "{value}");
+
+        fs::write(&path, "fn one() {}\nfn two() {}\nfn three() {}\n").unwrap();
+        let result = run_tool(
+            "outline",
+            &json!({ "path": path, "limit": 2 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["symbols"].as_array().unwrap().len(), 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn apply_patch_diff_excludes_unrelated_workspace_changes() {
+        let dir = test_dir("apply-patch-scoped-diff");
+        fs::create_dir_all(&dir).unwrap();
+        run_command("git", &["init"], &dir, Duration::from_secs(30)).unwrap();
+        fs::write(dir.join("sample.txt"), "alpha\nbeta\n").unwrap();
+        fs::write(dir.join("unrelated.txt"), "junk\n").unwrap();
+
+        let patch = r#"diff --git a/sample.txt b/sample.txt
+--- a/sample.txt
++++ b/sample.txt
+@@ -1,2 +1,2 @@
+ alpha
+-beta
++gamma
+"#;
+        let result = run_tool("apply_patch", &json!({ "patch": patch }).to_string(), &dir);
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+
+        assert_eq!(value["applied"], true, "{value}");
+        let diff = value["diff"].as_str().unwrap();
+        assert!(diff.contains("sample.txt"));
+        assert!(!diff.contains("unrelated.txt"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_stdin_null_text_falls_back_to_chars() {
+        let dir = test_dir("write-stdin-null-text");
+        fs::create_dir_all(&dir).unwrap();
+        let command = if cfg!(windows) {
+            "$line = [Console]::In.ReadLine(); Write-Output $line"
+        } else {
+            "head -n 1"
+        };
+
+        let result = run_tool(
+            "exec_command",
+            &json!({ "cmd": command, "timeout": 5, "yield_time_ms": 1 }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        let session_id = value["session_id"].as_u64().unwrap();
+
+        let mut value = json!({ "running": true });
+        for index in 0..20 {
+            let args = if index == 0 {
+                json!({ "session_id": session_id, "text": null, "chars": "hello\n", "yield_time_ms": 250 })
+            } else {
+                json!({ "session_id": session_id, "yield_time_ms": 250 })
+            };
+            let result = run_tool("write_stdin", &args.to_string(), &dir);
+            value = serde_json::from_str::<Value>(&result).unwrap();
+            if value["running"] != true {
+                break;
+            }
+        }
+
+        assert_eq!(value["exit_code"], 0, "{value}");
+        assert!(value["stdout"].as_str().unwrap().contains("hello"));
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -48,6 +48,10 @@ pub enum EntryKind {
         call_id: String,
         name: String,
         output: String,
+        /// Image message extracted from the raw tool output (base64 payload is
+        /// stripped from `output` itself). Persisted so next-turn projection
+        /// re-attaches the same pixels the model saw during the turn.
+        image: Option<Value>,
     },
     PinnedSkill {
         name: String,
@@ -430,9 +434,7 @@ impl SessionStore {
             return self.checkout_before_user(id);
         }
         if label == ROOT_BRANCH {
-            self.leaf_id = self.branch_heads.get(ROOT_BRANCH).copied();
-            self.updated_at = now_secs();
-            return Ok(());
+            return self.switch_to(self.branch_heads.get(ROOT_BRANCH).copied());
         }
         let Some(id) = self.branch_heads.get(&label).copied() else {
             return Err(format!("branch not found: {label}"));
@@ -545,19 +547,14 @@ impl SessionStore {
         if let Some(summary) = &summary {
             items.push(compaction_summary_item(summary));
         }
-        for (index, entry) in branch.iter().enumerate() {
-            if index < keep_after || matches!(entry.kind, EntryKind::Compaction { .. }) {
-                continue;
-            }
-            if let Some(item) = context_item_for_entry(entry) {
-                items.push(item);
-                if let EntryKind::ToolOutput { output, .. } = &entry.kind {
-                    if let Some(image) = crate::tools::image_content_item(output) {
-                        items.push(image);
-                    }
-                }
-            }
-        }
+        let entries = branch
+            .iter()
+            .enumerate()
+            .filter(|(index, entry)| {
+                *index >= keep_after && !matches!(entry.kind, EntryKind::Compaction { .. })
+            })
+            .map(|(_, entry)| *entry);
+        append_projected_entries(&mut items, entries);
         sanitize_tool_pairs(items)
     }
 
@@ -606,30 +603,49 @@ impl SessionStore {
             fold_end = index;
         }
 
-        // Never split a tool group: if the kept tail would start with a
-        // function_call_output whose function_call is being folded, fold that
-        // output too (so it goes into the summary instead of becoming an orphan).
-        let folded_calls: HashSet<&str> = kept[..fold_end]
+        // The latest user message must stay verbatim: auto-compaction runs on
+        // the turn that carries it, and folding it would answer a summary
+        // instead of the actual prompt.
+        if let Some(last_user) = kept
             .iter()
-            .filter_map(|entry| match &entry.kind {
-                EntryKind::ResponseItem { item }
-                    if item.get("type").and_then(Value::as_str) == Some("function_call") =>
-                {
-                    item.get("call_id").and_then(Value::as_str)
+            .rposition(|entry| matches!(entry.kind, EntryKind::User { .. }))
+        {
+            fold_end = fold_end.min(last_user);
+        }
+
+        // Never split a tool group: a function_call and its output must fold or
+        // stay together, including parallel groups where the boundary could land
+        // between two calls of the same batch. Retreat the boundary to before
+        // any call whose output would remain in the kept tail.
+        let call_output_pairs: Vec<(usize, usize)> = {
+            let mut call_index: HashMap<&str, usize> = HashMap::new();
+            let mut pairs = Vec::new();
+            for (index, entry) in kept.iter().enumerate() {
+                match &entry.kind {
+                    EntryKind::ResponseItem { item }
+                        if item.get("type").and_then(Value::as_str) == Some("function_call") =>
+                    {
+                        if let Some(id) = item.get("call_id").and_then(Value::as_str) {
+                            call_index.insert(id, index);
+                        }
+                    }
+                    EntryKind::ToolOutput { call_id, .. } => {
+                        if let Some(call) = call_index.get(call_id.as_str()) {
+                            pairs.push((*call, index));
+                        }
+                    }
+                    _ => {}
                 }
-                _ => None,
-            })
-            .collect();
-        while fold_end < kept.len() {
-            let orphan_output = matches!(
-                &kept[fold_end].kind,
-                EntryKind::ToolOutput { call_id, .. } if folded_calls.contains(call_id.as_str())
-            );
-            if orphan_output {
-                fold_end += 1;
-            } else {
-                break;
             }
+            pairs
+        };
+        while let Some(retreat) = call_output_pairs
+            .iter()
+            .filter(|(call, output)| fold_end > *call && fold_end <= *output)
+            .map(|(call, _)| *call)
+            .min()
+        {
+            fold_end = retreat;
         }
 
         let fold = &kept[..fold_end];
@@ -648,12 +664,9 @@ impl SessionStore {
             }
         }
 
-        let kept_items = sanitize_tool_pairs(
-            kept[fold_end..]
-                .iter()
-                .filter_map(|entry| context_item_for_entry(entry))
-                .collect(),
-        );
+        let mut kept_projected = Vec::new();
+        append_projected_entries(&mut kept_projected, kept[fold_end..].iter().copied());
+        let kept_items = sanitize_tool_pairs(kept_projected);
 
         Some(CompactionPlan {
             folded_text,
@@ -760,7 +773,12 @@ impl SessionStore {
                 EntryKind::Branch { label } => Some(TranscriptItem::Branch(label.clone())),
                 EntryKind::User { content } => Some(TranscriptItem::User(content.clone())),
                 EntryKind::ResponseItem { item } => {
-                    if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    // Runtime-injected user items (reminders, subagent
+                    // messages) are never displayed live, so keep them out of
+                    // the reloaded transcript too.
+                    if item.get("type").and_then(Value::as_str) == Some("function_call")
+                        || item.get("role").and_then(Value::as_str) == Some("user")
+                    {
                         None
                     } else {
                         let text = extract_response_text(item);
@@ -781,8 +799,10 @@ impl SessionStore {
             .collect()
     }
 
+    // Saving must not bump `updated_at`: every content mutation already does,
+    // and bumping here would re-arm the idle resume-summary generator after
+    // each summary save, looping it forever.
     pub fn save_for_cwd(&mut self, profile_dir: &Path, cwd: &Path) -> io::Result<()> {
-        self.updated_at = now_secs();
         let dir = sessions_dir(profile_dir, cwd);
         fs::create_dir_all(&dir)?;
         let journal_path = dir.join(format!("{}.jsonl", self.session_id));
@@ -949,6 +969,9 @@ impl SessionStore {
             "leaf_id": self.leaf_id.map(|id| id.0),
             "next_id": self.next_id,
             "branch_heads": self.branch_heads_json(),
+            "resume_summary": self.resume_summary,
+            "resume_status": self.resume_summary_status.map(ThreadGoalStatus::as_str),
+            "resume_summary_updated_at": self.resume_summary_updated_at,
             "goal": self.goal.as_ref().map(goal_to_json)
         })
     }
@@ -1220,9 +1243,9 @@ fn sanitize_tool_pairs(items: Vec<Value>) -> Vec<Value> {
             _ => {}
         }
     }
-    items
-        .into_iter()
-        .filter(|item| {
+    let mut keep = items
+        .iter()
+        .map(|item| {
             let call_id = item.get("call_id").and_then(Value::as_str);
             match item.get("type").and_then(Value::as_str) {
                 Some("function_call") => call_id.is_some_and(|id| outputs.contains(id)),
@@ -1230,6 +1253,27 @@ fn sanitize_tool_pairs(items: Vec<Value>) -> Vec<Value> {
                 _ => true,
             }
         })
+        .collect::<Vec<_>>();
+    // A reasoning item whose following response item was dropped (orphan
+    // function_call) or is missing entirely makes the Responses API 400
+    // ("reasoning without its required following item"); drop it too.
+    let mut next_kept_type: Option<&str> = None;
+    for index in (0..items.len()).rev() {
+        let item_type = items[index].get("type").and_then(Value::as_str);
+        if keep[index]
+            && item_type == Some("reasoning")
+            && !matches!(next_kept_type, Some("function_call" | "message"))
+        {
+            keep[index] = false;
+        }
+        if keep[index] {
+            next_kept_type = item_type;
+        }
+    }
+    items
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(item, keep)| keep.then_some(item))
         .collect()
 }
 
@@ -1265,7 +1309,7 @@ fn render_entry_for_summary(entry: &SessionEntry) -> Option<String> {
                 if text.trim().is_empty() {
                     None
                 } else {
-                    Some(format!("Assistant: {text}"))
+                    Some(format!("{}: {text}", response_item_speaker(item)))
                 }
             }
         }
@@ -1298,7 +1342,8 @@ fn render_entry_for_resume_summary(entry: &SessionEntry) -> Option<String> {
                     None
                 } else {
                     Some(format!(
-                        "Assistant: {}",
+                        "{}: {}",
+                        response_item_speaker(item),
                         single_line_with_limit(text, SESSION_LABEL_MAX_CHARS)
                     ))
                 }
@@ -1315,6 +1360,43 @@ fn render_entry_for_resume_summary(entry: &SessionEntry) -> Option<String> {
         EntryKind::PinnedSkill { .. } | EntryKind::Branch { .. } | EntryKind::Compaction { .. } => {
             None
         }
+    }
+}
+
+/// Projects entries into request items. Images extracted from tool outputs
+/// ride behind their whole consecutive batch of outputs: within a turn every
+/// function_call_output of a batch is pushed before any image item (Anthropic
+/// wants tool_result blocks to lead the next user message), so projections
+/// must reproduce that order to stay cache-stable.
+fn append_projected_entries<'a>(
+    items: &mut Vec<Value>,
+    entries: impl Iterator<Item = &'a SessionEntry>,
+) {
+    let mut pending_images = Vec::new();
+    for entry in entries {
+        if let Some(item) = context_item_for_entry(entry) {
+            if !matches!(entry.kind, EntryKind::ToolOutput { .. }) {
+                items.append(&mut pending_images);
+            }
+            items.push(item);
+            if let EntryKind::ToolOutput {
+                image: Some(image), ..
+            } = &entry.kind
+            {
+                pending_images.push(image.clone());
+            }
+        }
+    }
+    items.append(&mut pending_images);
+}
+
+/// Summary-rendering label for a ResponseItem: runtime-injected items carry
+/// role "user" (reminders, subagent messages); everything else is assistant.
+fn response_item_speaker(item: &Value) -> &'static str {
+    if item.get("role").and_then(Value::as_str) == Some("user") {
+        "User"
+    } else {
+        "Assistant"
     }
 }
 
@@ -1444,11 +1526,13 @@ fn entry_to_json(entry: &SessionEntry) -> Value {
             call_id,
             name,
             output,
+            image,
         } => json!({
             "type": "tool_output",
             "call_id": call_id,
             "name": name,
-            "output": output
+            "output": output,
+            "image": image
         }),
         EntryKind::PinnedSkill { name, content } => {
             json!({ "type": "pinned_skill", "name": name, "content": content })
@@ -1499,6 +1583,10 @@ fn entry_from_json(value: &Value) -> Option<SessionEntry> {
             call_id: kind_value.get("call_id")?.as_str()?.to_string(),
             name: kind_value.get("name")?.as_str()?.to_string(),
             output: kind_value.get("output")?.as_str()?.to_string(),
+            image: kind_value
+                .get("image")
+                .filter(|value| !value.is_null())
+                .cloned(),
         },
         "pinned_skill" => EntryKind::PinnedSkill {
             name: kind_value.get("name")?.as_str()?.to_string(),
@@ -1824,11 +1912,13 @@ mod tests {
                 call_id: format!("a{turn}"),
                 name: "read".to_string(),
                 output: "x".repeat(60),
+                image: None,
             });
             session.append(EntryKind::ToolOutput {
                 call_id: format!("b{turn}"),
                 name: "read".to_string(),
                 output: "x".repeat(60),
+                image: None,
             });
             session.append(EntryKind::ResponseItem {
                 item: json!({ "type": "message", "content": [{ "type": "output_text", "text": "ok" }] }),
@@ -1880,7 +1970,10 @@ mod tests {
         let restored = entry_from_json(&value).expect("user_image entry round-trips");
         match restored.kind {
             EntryKind::UserImage { paths } => {
-                assert_eq!(paths, vec!["/tmp/a.png".to_string(), "/tmp/b.png".to_string()]);
+                assert_eq!(
+                    paths,
+                    vec!["/tmp/a.png".to_string(), "/tmp/b.png".to_string()]
+                );
             }
             _ => panic!("expected UserImage entry"),
         }
@@ -1923,6 +2016,7 @@ mod tests {
             call_id: "call_1".to_string(),
             name: "read".to_string(),
             output: "line\n".repeat(100),
+            image: None,
         });
         session.append(EntryKind::PinnedSkill {
             name: "review".to_string(),
@@ -2140,6 +2234,247 @@ mod tests {
         assert_eq!(loaded.tree_view().len(), 1);
         assert!(loaded.checkout("feature").is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resume_summary_survives_journal_round_trip() {
+        let root = test_dir("resume-summary-journal");
+        let profile = root.join("profile");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut session = SessionStore::new();
+        let session_id = session.session_id().to_string();
+
+        session.append(EntryKind::User {
+            content: "fix the bug".to_string(),
+        });
+        session.set_resume_summary(
+            Some("Working: fixing the bug".to_string()),
+            Some(ThreadGoalStatus::Active),
+            42,
+        );
+        session.save_for_cwd(&profile, &cwd).unwrap();
+        let loaded = SessionStore::load_for_cwd(&profile, &cwd, &session_id).unwrap();
+
+        assert_eq!(loaded.resume_summary(), Some("Working: fixing the bug"));
+        assert_eq!(
+            loaded.resume_summary_status(),
+            Some(ThreadGoalStatus::Active)
+        );
+        assert_eq!(loaded.resume_summary_updated_at(), Some(42));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tool_output_image_round_trips_through_projection_and_journal() {
+        let root = test_dir("tool-output-image-journal");
+        let profile = root.join("profile");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut session = SessionStore::new();
+        let session_id = session.session_id().to_string();
+
+        let image = json!({
+            "role": "user",
+            "content": [{ "type": "input_image", "image_url": "data:image/png;base64,QUJD" }]
+        });
+        session.append(EntryKind::ResponseItem {
+            item: json!({ "type": "function_call", "call_id": "c1", "name": "read", "arguments": "{}" }),
+        });
+        session.append(EntryKind::ResponseItem {
+            item: json!({ "type": "function_call", "call_id": "c2", "name": "read", "arguments": "{}" }),
+        });
+        session.append(EntryKind::ToolOutput {
+            call_id: "c1".to_string(),
+            name: "read".to_string(),
+            output: json!({ "kind": "image", "note": "attached separately" }).to_string(),
+            image: Some(image.clone()),
+        });
+        session.append(EntryKind::ToolOutput {
+            call_id: "c2".to_string(),
+            name: "read".to_string(),
+            output: "text output".to_string(),
+            image: None,
+        });
+
+        // In-turn ordering: every function_call_output of the batch first,
+        // then the image item.
+        let expected_types = |items: &[Value]| {
+            items
+                .iter()
+                .map(|item| {
+                    item.get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("user_image")
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        };
+        let items = session.request_context_items();
+        assert_eq!(
+            expected_types(&items),
+            [
+                "function_call",
+                "function_call",
+                "function_call_output",
+                "function_call_output",
+                "user_image"
+            ]
+        );
+        assert_eq!(items[4], image);
+
+        // The image survives the journal, so the next turn projects the same
+        // context this turn saw.
+        session.save_for_cwd(&profile, &cwd).unwrap();
+        let loaded = SessionStore::load_for_cwd(&profile, &cwd, &session_id).unwrap();
+        assert_eq!(loaded.request_context_items(), items);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn saving_resume_summary_does_not_bump_updated_at() {
+        let root = test_dir("resume-summary-save");
+        let profile = root.join("profile");
+        let cwd = root.join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut session = SessionStore::new();
+
+        session.append(EntryKind::User {
+            content: "work".to_string(),
+        });
+        session.updated_at = 100;
+        session.set_resume_summary(
+            Some("Working: task".to_string()),
+            Some(ThreadGoalStatus::Active),
+            200,
+        );
+        session.save_for_cwd(&profile, &cwd).unwrap();
+
+        // Persisting the summary must not advance updated_at, or the idle
+        // resume-summary generator would re-trigger after every save.
+        assert_eq!(session.updated_at(), 100);
+        assert_eq!(session.resume_summary_updated_at(), Some(200));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkout_root_clears_resume_summary() {
+        let mut session = SessionStore::new();
+        session.append(EntryKind::User {
+            content: "root work".to_string(),
+        });
+        session.set_resume_summary(
+            Some("Working: root work".to_string()),
+            Some(ThreadGoalStatus::Active),
+            10,
+        );
+
+        session.checkout(ROOT_BRANCH).unwrap();
+
+        assert!(session.resume_summary().is_none());
+        assert!(session.resume_summary_updated_at().is_none());
+    }
+
+    #[test]
+    fn sanitize_drops_reasoning_left_without_following_item() {
+        let items = vec![
+            json!({ "type": "reasoning", "id": "r1", "summary": [] }),
+            json!({ "type": "function_call", "call_id": "a", "name": "read", "arguments": "{}" }),
+            json!({ "type": "function_call_output", "call_id": "a", "output": "ok" }),
+            json!({ "type": "reasoning", "id": "r2", "summary": [] }),
+            json!({ "type": "function_call", "call_id": "b", "name": "read", "arguments": "{}" }),
+            json!({ "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }),
+            json!({ "type": "reasoning", "id": "r3", "summary": [] }),
+        ];
+
+        let out = sanitize_tool_pairs(items);
+
+        // r1's function_call survives, so r1 stays; r2's call was an orphan and
+        // r3 trails with no following item, so both go.
+        assert!(out.iter().any(|item| item["id"] == "r1"));
+        assert!(!out.iter().any(|item| item["id"] == "r2"));
+        assert!(!out.iter().any(|item| item["id"] == "r3"));
+        assert!(!out.iter().any(|item| item["call_id"] == "b"));
+    }
+
+    #[test]
+    fn compaction_preserves_tool_output_content_at_group_boundaries() {
+        let mut session = SessionStore::new();
+        let mut outputs = Vec::new();
+        for turn in 0..4 {
+            session.append(EntryKind::User {
+                content: format!("turn {turn} {}", "x".repeat(60)),
+            });
+            for call in ["a", "b"] {
+                session.append(EntryKind::ResponseItem {
+                    item: json!({ "type": "function_call", "call_id": format!("{call}{turn}"), "name": "read", "arguments": "{}" }),
+                });
+            }
+            for call in ["a", "b"] {
+                let call_id = format!("{call}{turn}");
+                let output = format!("OUT-{call_id} {}", "y".repeat(60));
+                session.append(EntryKind::ToolOutput {
+                    call_id: call_id.clone(),
+                    name: "read".to_string(),
+                    output: output.clone(),
+                    image: None,
+                });
+                outputs.push((call_id, output));
+            }
+        }
+        session.append(EntryKind::User {
+            content: "latest question".to_string(),
+        });
+
+        // Whatever the boundary, every tool output must survive: either folded
+        // into the summary text or kept verbatim with its function_call.
+        for keep in [10usize, 30, 60, 120, 240, 400] {
+            let Some(plan) = session.plan_compaction(keep, "gpt-5") else {
+                continue;
+            };
+            assert!(
+                tool_pairs_balanced(&plan.kept_items),
+                "keep_recent={keep} split a tool group"
+            );
+            for (call_id, output) in &outputs {
+                let kept = plan.kept_items.iter().any(|item| {
+                    item["type"] == "function_call_output" && item["call_id"] == call_id.as_str()
+                });
+                assert!(
+                    kept || plan.folded_text.contains(output),
+                    "keep_recent={keep} lost output of {call_id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_never_folds_latest_user_message() {
+        let mut session = SessionStore::new();
+        for turn in 0..3 {
+            session.append(EntryKind::User {
+                content: format!("old turn {turn} {}", "x".repeat(120)),
+            });
+            session.append(EntryKind::ResponseItem {
+                item: json!({ "type": "message", "content": [{ "type": "output_text", "text": "y".repeat(120) }] }),
+            });
+        }
+        session.append(EntryKind::User {
+            content: "CURRENT QUESTION".to_string(),
+        });
+        session.append(EntryKind::ResponseItem {
+            item: json!({ "type": "message", "content": [{ "type": "output_text", "text": "z".repeat(200) }] }),
+        });
+
+        let plan = session
+            .plan_compaction(1, "gpt-5")
+            .expect("older turns should be foldable");
+
+        assert!(!plan.folded_text.contains("CURRENT QUESTION"));
+        assert!(plan
+            .kept_items
+            .iter()
+            .any(|item| item.to_string().contains("CURRENT QUESTION")));
     }
 
     fn test_dir(name: &str) -> PathBuf {

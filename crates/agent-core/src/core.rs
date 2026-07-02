@@ -102,6 +102,10 @@ pub struct AgentCore {
     queued: VecDeque<(String, Vec<String>)>,
     running: bool,
     receiver: Option<Receiver<WorkerEvent>>,
+    /// Dedicated channel for the idle resume-summary worker; kept separate from
+    /// `receiver` so a new turn / session switch cannot orphan the worker and
+    /// leave `resume_summary_running` stuck.
+    resume_summary_receiver: Option<Receiver<WorkerEvent>>,
     goal_tool_receiver: Option<Receiver<GoalToolRequest>>,
     approval_receiver: Option<Receiver<ApprovalRequest>>,
     pending_approvals: HashMap<String, (mpsc::Sender<bool>, String)>,
@@ -143,6 +147,7 @@ impl AgentCore {
             queued: VecDeque::new(),
             running: false,
             receiver: None,
+            resume_summary_receiver: None,
             goal_tool_receiver: None,
             update_receiver: None,
             login_receiver: None,
@@ -334,16 +339,8 @@ impl AgentCore {
             events.push(AgentEvent::Status(format!("queued: {}", self.queued.len())));
             return events;
         }
-        if let Err(reason) = self.hooks.user_prompt_submit(&message, &self.cwd) {
-            events.push(AgentEvent::UserMessage(message));
-            events.push(AgentEvent::Error(format!(
-                "blocked by user_prompt_submit hook: {reason}"
-            )));
-            events.push(AgentEvent::Status("ready".to_string()));
-            return events;
-        }
         events.push(AgentEvent::UserMessage(message.clone()));
-        events.extend(self.start_turn(message, images));
+        events.extend(self.start_hooked_turn(message, images));
         events
     }
 
@@ -369,9 +366,7 @@ impl AgentCore {
         if !self.running || self.queued.is_empty() {
             return Vec::new();
         }
-
-        self.receiver = None;
-        self.running = false;
+        self.stop_current_turn();
         let Some((next, images)) = self.queued.pop_front() else {
             return Vec::new();
         };
@@ -380,14 +375,14 @@ impl AgentCore {
             AgentEvent::PendingMessages(self.pending_texts()),
             AgentEvent::UserMessage(next.clone()),
         ];
-        events.extend(self.start_turn(next, images));
+        events.extend(self.start_hooked_turn(next, images));
         events
     }
 
-    pub fn interrupt(&mut self) -> Vec<AgentEvent> {
-        if !self.running {
-            return Vec::new();
-        }
+    /// Stops the in-flight turn: signals the worker to abort, closes subagents,
+    /// and clears all per-turn channels and state. Shared by interrupt and steer
+    /// so the old turn's tools never run concurrently with a new one.
+    fn stop_current_turn(&mut self) {
         self.interrupt_flag.store(true, Ordering::SeqCst);
         self.subagent_manager.close_all();
         self.receiver = None;
@@ -398,6 +393,25 @@ impl AgentCore {
         self.goal_continuation_running = false;
         self.turn_started_at = None;
         self.turn_goal_tokens = 0;
+    }
+
+    /// Runs the user_prompt_submit hook before starting a turn. Every path that
+    /// starts a turn from user-authored input must go through this.
+    fn start_hooked_turn(&mut self, message: String, images: Vec<String>) -> Vec<AgentEvent> {
+        if let Err(reason) = self.hooks.user_prompt_submit(&message, &self.cwd) {
+            return vec![
+                AgentEvent::Error(format!("blocked by user_prompt_submit hook: {reason}")),
+                AgentEvent::Status("ready".to_string()),
+            ];
+        }
+        self.start_turn(message, images)
+    }
+
+    pub fn interrupt(&mut self) -> Vec<AgentEvent> {
+        if !self.running {
+            return Vec::new();
+        }
+        self.stop_current_turn();
         let mut events = vec![
             AgentEvent::Info("request interrupted".to_string()),
             AgentEvent::Status("interrupted".to_string()),
@@ -407,9 +421,9 @@ impl AgentCore {
     }
 
     pub fn handle_command(&mut self, input: &str) -> (bool, Vec<AgentEvent>) {
-        let mut parts = input.split_whitespace();
-        let command = parts.next().unwrap_or_default();
-        if let Some(events) = self.skill_command_events(command, input[command.len()..].trim()) {
+        let (command, args) = split_command_line(input);
+        let mut parts = args.split_whitespace();
+        if let Some(events) = self.skill_command_events(command, args.trim()) {
             return (false, events);
         }
         if !crate::commands::is_known(command) {
@@ -422,7 +436,7 @@ impl AgentCore {
         let events = match command {
             "/quit" | "/exit" => return (true, Vec::new()),
             "/help" | "/" => vec![AgentEvent::Info(crate::commands::help_line())],
-            "/login" => self.login_events(input[command.len()..].trim()),
+            "/login" => self.login_events(args.trim()),
             "/usage" => self.usage_events(),
             "/new" => self.new_session_events(),
             "/config" => vec![AgentEvent::Info(format!(
@@ -439,9 +453,9 @@ impl AgentCore {
             ))],
             "/model" => self.model_command_events(parts.collect()),
             "/tree" => vec![AgentEvent::TreeView(self.session.tree_view())],
-            "/trust" => self.trust_command_events(input[command.len()..].trim()),
+            "/trust" => self.trust_command_events(args.trim()),
             "/checkout" => {
-                let label = input[command.len()..].trim();
+                let label = args.trim();
                 if label.is_empty() {
                     vec![AgentEvent::TreeView(self.session.tree_view())]
                 } else {
@@ -462,7 +476,7 @@ impl AgentCore {
                 }
             }
             "/fork" => {
-                let label = input[command.len()..].trim();
+                let label = args.trim();
                 match self.session.fork(label) {
                     Ok(id) => {
                         let save_event = self.save_session_event();
@@ -479,7 +493,7 @@ impl AgentCore {
                 }
             }
             "/delete" => {
-                let label = input[command.len()..].trim();
+                let label = args.trim();
                 match self.session.delete_branch(label) {
                     Ok(()) => {
                         let save_event = self.save_session_event();
@@ -512,10 +526,10 @@ impl AgentCore {
             "/extensions" => self.extension_events(),
             "/context" => self.context_events(),
             "/stats" => self.stats_events(),
-            "/goal" => self.goal_command_events(input[command.len()..].trim()),
+            "/goal" => self.goal_command_events(args.trim()),
             "/doctor" => self.doctor_events(),
-            "/skills" => self.skills_events(input[command.len()..].trim()),
-            "/pin" => self.pin_skill_events(input[command.len()..].trim()),
+            "/skills" => self.skills_events(args.trim()),
+            "/pin" => self.pin_skill_events(args.trim()),
             "/compact" => self.compact_command_events(),
             // Reached only if a command is registered in `commands::COMMANDS` but
             // has no dispatch arm here — a wiring bug, surfaced explicitly.
@@ -676,7 +690,9 @@ impl AgentCore {
                 });
                 self.auth.save().map_err(|error| error.to_string())
             }
-            Err(error) => Err(format!("failed to refresh JuCode session: {error}. Run /login.")),
+            Err(error) => Err(format!(
+                "failed to refresh JuCode session: {error}. Run /login."
+            )),
         }
     }
 
@@ -706,7 +722,11 @@ impl AgentCore {
                 let currency = v.get("currency").and_then(Value::as_str).unwrap_or("");
                 lines.push(format!("账户: {email}"));
                 lines.push(format!("余额: {balance} {currency}"));
-                match v.get("active_plan").and_then(|p| p.get("name")).and_then(Value::as_str) {
+                match v
+                    .get("active_plan")
+                    .and_then(|p| p.get("name"))
+                    .and_then(Value::as_str)
+                {
                     Some(name) => lines.push(format!("套餐: {name}")),
                     None => lines.push("套餐: 无活跃套餐".to_string()),
                 }
@@ -715,11 +735,17 @@ impl AgentCore {
         }
 
         if let Ok(v) = oauth::get_json(&api, "/v1/oauth/usage", &token) {
-            if v.get("has_active_plan").and_then(Value::as_bool).unwrap_or(false) {
+            if v.get("has_active_plan")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 let used5 = v.get("used_5h").and_then(Value::as_str).unwrap_or("0");
                 let quota5 = v.get("quota_5h").and_then(Value::as_str).unwrap_or("0");
                 let usedm = v.get("used_monthly").and_then(Value::as_str).unwrap_or("0");
-                let quotam = v.get("quota_monthly").and_then(Value::as_str).unwrap_or("0");
+                let quotam = v
+                    .get("quota_monthly")
+                    .and_then(Value::as_str)
+                    .unwrap_or("0");
                 lines.push(format!("5h 用量: {used5} / {quota5}"));
                 lines.push(format!("月度用量: {usedm} / {quotam}"));
             }
@@ -815,7 +841,7 @@ impl AgentCore {
             format!("{command} {request}")
         };
         let mut events = vec![AgentEvent::UserMessage(display)];
-        events.extend(self.start_turn(message, Vec::new()));
+        events.extend(self.start_hooked_turn(message, Vec::new()));
         Some(events)
     }
 
@@ -842,26 +868,8 @@ impl AgentCore {
                     WorkerEvent::CompactionFailed(error) => {
                         events.push(AgentEvent::CompactionFailed(error));
                     }
-                    WorkerEvent::ResumeSummaryDone {
-                        summary,
-                        status,
-                        summarized_at,
-                    } => {
-                        self.resume_summary_running = false;
-                        self.session
-                            .set_resume_summary(Some(summary), Some(status), summarized_at);
-                        events.extend(self.save_session_event());
-                    }
-                    WorkerEvent::ResumeSummaryFailed(_error) => {
-                        self.resume_summary_running = false;
-                        self.session.set_resume_summary(
-                            None,
-                            self.session
-                                .goal()
-                                .map(|goal| normalize_resume_status(goal.status)),
-                            now_secs(),
-                        );
-                        events.extend(self.save_session_event());
+                    // Resume-summary events arrive only on resume_summary_receiver.
+                    WorkerEvent::ResumeSummaryDone { .. } | WorkerEvent::ResumeSummaryFailed(_) => {
                     }
                     WorkerEvent::CallStart => events.push(AgentEvent::Connecting),
                     WorkerEvent::Connected => events.push(AgentEvent::ThinkingStart),
@@ -902,6 +910,10 @@ impl AgentCore {
                             call_id: call_id.clone(),
                             name: name.clone(),
                             output: model_output.clone(),
+                            // The base64 payload is stripped from model_output;
+                            // keep the image item so next-turn projection can
+                            // re-attach the pixels the model saw this turn.
+                            image: crate::tools::image_content_item(&output),
                         });
                         events.extend(self.save_session_event());
                         events.push(self.context_usage_event());
@@ -918,6 +930,9 @@ impl AgentCore {
                         output_tokens,
                         reasoning_tokens,
                     } => {
+                        // Both providers deliver OpenAI subset semantics here
+                        // (cached_input_tokens ⊆ input_tokens); the Anthropic
+                        // parser normalizes its disjoint counts in llm.rs.
                         self.total_input_tokens += input_tokens;
                         self.total_cached_input_tokens += cached_input_tokens;
                         self.total_output_tokens += output_tokens;
@@ -966,6 +981,18 @@ impl AgentCore {
                         disconnected = true;
                         self.goal_tool_receiver = None;
                         events.push(AgentEvent::Error(error));
+                        events.push(self.context_usage_event());
+                        for message in self.hooks.stop(&self.cwd) {
+                            events.push(AgentEvent::Info(message));
+                        }
+                        if !self.queued.is_empty() {
+                            events.push(AgentEvent::PendingMessages(self.pending_texts()));
+                        }
+                        events.push(AgentEvent::Status(if self.queued.is_empty() {
+                            "ready".to_string()
+                        } else {
+                            format!("queued: {}", self.queued.len())
+                        }));
                     }
                 }
             }
@@ -975,6 +1002,7 @@ impl AgentCore {
         }
         events.extend(self.drain_subagent_events());
         events.extend(self.fold_subagent_usage());
+        events.extend(self.poll_resume_summary_events());
         if let Some(rx) = self.update_receiver.take() {
             match rx.try_recv() {
                 Ok(notice) => events.push(AgentEvent::Info(notice.message())),
@@ -1003,13 +1031,57 @@ impl AgentCore {
                 self.goal_continuation_running = false;
                 events.push(AgentEvent::PendingMessages(self.pending_texts()));
                 events.push(AgentEvent::UserMessage(next.clone()));
-                events.extend(self.start_turn(next, images));
+                events.extend(self.start_hooked_turn(next, images));
             } else if self.should_continue_goal() {
                 events.extend(self.start_goal_continuation());
             }
         }
 
         events
+    }
+
+    /// Drains the idle resume-summary worker. Its result is terminal, so the
+    /// receiver is dropped after the first event (or on disconnect).
+    fn poll_resume_summary_events(&mut self) -> Vec<AgentEvent> {
+        let Some(rx) = self.resume_summary_receiver.take() else {
+            return Vec::new();
+        };
+        match rx.try_recv() {
+            Ok(WorkerEvent::ResumeSummaryDone {
+                summary,
+                status,
+                summarized_at,
+            }) => {
+                self.resume_summary_running = false;
+                self.session
+                    .set_resume_summary(Some(summary), Some(status), summarized_at);
+                self.save_session_event()
+            }
+            Ok(WorkerEvent::ResumeSummaryFailed(_error)) => {
+                self.resume_summary_running = false;
+                self.session.set_resume_summary(
+                    None,
+                    self.session
+                        .goal()
+                        .map(|goal| normalize_resume_status(goal.status)),
+                    now_secs(),
+                );
+                self.save_session_event()
+            }
+            // The resume worker sends no other events.
+            Ok(_) => {
+                self.resume_summary_running = false;
+                Vec::new()
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.resume_summary_receiver = Some(rx);
+                Vec::new()
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.resume_summary_running = false;
+                Vec::new()
+            }
+        }
     }
 
     fn drain_subagent_events(&self) -> Vec<AgentEvent> {
@@ -1184,13 +1256,12 @@ impl AgentCore {
             &self.config.current_model_config(),
             self.config.compaction_threshold_percent,
         );
-        let compaction =
-            if should_auto_compact(context_tokens, model_context_budget) {
-                self.session
-                    .plan_compaction(COMPACTION_KEEP_RECENT_TOKENS, &self.config.model)
-            } else {
-                None
-            };
+        let compaction = if should_auto_compact(context_tokens, model_context_budget) {
+            self.session
+                .plan_compaction(COMPACTION_KEEP_RECENT_TOKENS, &self.config.model)
+        } else {
+            None
+        };
         let mut events = save_event;
         events.push(AgentEvent::ContextUsage {
             tokens: context_tokens as u64,
@@ -1695,7 +1766,7 @@ impl AgentCore {
             Err(_) => return,
         };
         let (tx, rx) = mpsc::channel();
-        self.receiver = Some(rx);
+        self.resume_summary_receiver = Some(rx);
         self.resume_summary_running = true;
         thread::spawn(move || {
             let system = "Summarize the current latest task in one sentence. Focus only on the most recent work. Start with either 'Working:' or 'Completed:'. Mention the concrete task or result, not background context. Ignore older finished tasks unless they matter to the current state. Keep it concise. Output only that one sentence.";
@@ -1738,6 +1809,9 @@ impl AgentCore {
         }
         self.queued.clear();
         self.receiver = None;
+        // Any in-flight resume summary belongs to the old session; drop it.
+        self.resume_summary_receiver = None;
+        self.resume_summary_running = false;
         self.session = SessionStore::new();
         let session_id = self.session.session_id().to_string();
         let save_event = self.save_session_event();
@@ -1847,7 +1921,9 @@ impl AgentCore {
     fn checkpoint_list_events(&self) -> Vec<AgentEvent> {
         let turns = self.session.user_turns();
         if turns.is_empty() {
-            return vec![AgentEvent::Info("no earlier turns to rewind to".to_string())];
+            return vec![AgentEvent::Info(
+                "no earlier turns to rewind to".to_string(),
+            )];
         }
         vec![AgentEvent::CheckpointView(
             turns
@@ -1967,6 +2043,9 @@ impl AgentCore {
             Ok(session) => {
                 self.queued.clear();
                 self.receiver = None;
+                // Any in-flight resume summary belongs to the old session; drop it.
+                self.resume_summary_receiver = None;
+                self.resume_summary_running = false;
                 self.goal_tool_receiver = None;
                 self.goal_continuation_running = false;
                 self.turn_started_at = None;
@@ -2045,8 +2124,7 @@ impl AgentCore {
         lines.push(format!("model: {}", self.config.model));
         lines.push(format!(
             "auth: {}",
-            if self.provider_api_key().is_some()
-                || env::var_os(&self.config.api_key_env).is_some()
+            if self.provider_api_key().is_some() || env::var_os(&self.config.api_key_env).is_some()
             {
                 "ok"
             } else {
@@ -2251,6 +2329,14 @@ fn mask_key(value: Option<&str>) -> String {
     }
 }
 
+/// Splits a command line into its command token and argument text, tolerating
+/// leading (including Unicode) whitespace so argument slicing stays correct.
+fn split_command_line(input: &str) -> (&str, &str) {
+    let input = input.trim_start();
+    let command = input.split_whitespace().next().unwrap_or("");
+    (command, &input[command.len()..])
+}
+
 fn current_utc_date() -> String {
     let days = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2269,29 +2355,29 @@ fn is_jucode_supported_model(model: &str) -> bool {
 
 fn jucode_model_config(model: &OAuthModel) -> ModelConfig {
     let is_claude = model.id.starts_with("claude-");
-    let (default_context_window, default_max_output_tokens, default_reasoning_efforts) = if is_claude
-    {
-        // Claude models support extended thinking, so offer the thinking-strength
-        // tiers (mapped to an Anthropic budget in llm.rs::anthropic_thinking_budget,
-        // or forwarded as `reasoning.effort` on the Responses path).
-        (
-            200_000,
-            crate::config::CLAUDE_MIN_MAX_OUTPUT_TOKENS,
-            crate::config::claude_thinking_tiers(),
-        )
-    } else {
-        (
-            400_000,
-            128_000,
-            vec![
-                "none".to_string(),
-                "low".to_string(),
-                "medium".to_string(),
-                "high".to_string(),
-                "xhigh".to_string(),
-            ],
-        )
-    };
+    let (default_context_window, default_max_output_tokens, default_reasoning_efforts) =
+        if is_claude {
+            // Claude models support extended thinking, so offer the thinking-strength
+            // tiers (mapped to an Anthropic budget in llm.rs::anthropic_thinking_budget,
+            // or forwarded as `reasoning.effort` on the Responses path).
+            (
+                200_000,
+                crate::config::CLAUDE_MIN_MAX_OUTPUT_TOKENS,
+                crate::config::claude_thinking_tiers(),
+            )
+        } else {
+            (
+                400_000,
+                128_000,
+                vec![
+                    "none".to_string(),
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "high".to_string(),
+                    "xhigh".to_string(),
+                ],
+            )
+        };
     let mut reasoning_efforts = model
         .reasoning_efforts
         .clone()
@@ -2461,6 +2547,24 @@ fn format_resume_detail(summary: &SessionSummary) -> String {
             "{status} · updated {} · entries {} · {}",
             summary.updated_at, summary.entries, summary.leaf
         ),
+    }
+}
+
+#[cfg(test)]
+mod command_parsing_tests {
+    use super::split_command_line;
+
+    #[test]
+    fn split_command_line_ignores_leading_unicode_whitespace() {
+        let (command, args) = split_command_line("\u{3000} \t/goal 完成任务");
+        assert_eq!(command, "/goal");
+        assert_eq!(args.trim(), "完成任务");
+    }
+
+    #[test]
+    fn split_command_line_handles_bare_command_and_empty_input() {
+        assert_eq!(split_command_line("/help"), ("/help", ""));
+        assert_eq!(split_command_line("   "), ("", ""));
     }
 }
 

@@ -28,6 +28,7 @@ const DEFAULT_SUBAGENT_MAX_OUTPUT_TOKENS: u64 = 4096;
 const RETRY_BACKOFF_BASE_MS: u64 = 250;
 const RETRY_BACKOFF_MAX_MS: u64 = 4_000;
 const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
+const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_EMPTY_RESPONSE_CONTINUATIONS: usize = 2;
 const EMPTY_RESPONSE_REMINDER: &str = "<runtime_reminder>\nYou have not produced visible progress yet. Continue the user's implementation task now: inspect only what is needed, make the required file changes, run a focused verification when possible, and do not end after exploration alone.\n</runtime_reminder>";
 
@@ -168,6 +169,47 @@ struct ToolCallResult {
     result: tools::ToolExecutionResult,
 }
 
+/// Aggregates a subagent's streamed events into the run result. A `Retrying`
+/// event means the in-flight response will replay its deltas from scratch, so
+/// text accumulated since the last `CallStart` is discarded to avoid
+/// duplicating it in the output returned to the parent model.
+#[derive(Default)]
+struct SubagentTurnStats {
+    output_text: String,
+    /// Byte offset in `output_text` where the in-flight response began.
+    response_start: usize,
+    tool_calls: u64,
+    tools_used: Vec<String>,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+}
+
+impl SubagentTurnStats {
+    fn record(&mut self, event: StreamEvent) {
+        match event {
+            StreamEvent::CallStart => self.response_start = self.output_text.len(),
+            StreamEvent::Retrying { .. } => self.output_text.truncate(self.response_start),
+            StreamEvent::Delta(delta) => self.output_text.push_str(&delta),
+            StreamEvent::ToolStart { name, .. } => {
+                self.tool_calls += 1;
+                self.tools_used.push(name);
+            }
+            StreamEvent::Usage {
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                ..
+            } => {
+                self.input_tokens += input_tokens;
+                self.cached_input_tokens += cached_input_tokens;
+                self.output_tokens += output_tokens;
+            }
+            _ => {}
+        }
+    }
+}
+
 enum ParallelToolMessage {
     Update {
         call_id: String,
@@ -235,7 +277,7 @@ impl OpenAiClient {
             {
                 return Err("subagent timed out".to_string());
             }
-            self.append_queued_subagent_messages(&mut input);
+            self.append_queued_subagent_messages(&mut input, &mut emit)?;
             emit(StreamEvent::CallStart)?;
             let output_items = match self.provider_kind {
                 ProviderKind::OpenAiResponses => {
@@ -259,7 +301,7 @@ impl OpenAiClient {
                     && empty_response_continuations < MAX_EMPTY_RESPONSE_CONTINUATIONS
                 {
                     empty_response_continuations += 1;
-                    input.push(runtime_reminder_item());
+                    inject_input_item(&mut input, runtime_reminder_item(), &mut emit)?;
                     continue;
                 }
                 return Ok(());
@@ -374,17 +416,7 @@ impl OpenAiClient {
             }
             tool_results.append(&mut blocked_results);
 
-            for tool_result in tool_results {
-                let image_item = tools::image_content_item(&tool_result.result.output);
-                input.push(json!({
-                    "type": "function_call_output",
-                    "call_id": tool_result.request.call_id,
-                    "output": tool_result.result.model_output
-                }));
-                if let Some(image_item) = image_item {
-                    input.push(image_item);
-                }
-            }
+            push_tool_result_items(&mut input, tool_results);
         }
     }
 
@@ -425,13 +457,7 @@ impl OpenAiClient {
         };
         let summary = match self.provider_kind {
             ProviderKind::OpenAiResponses => {
-                let body = json!({
-                    "model": self.model,
-                    "instructions": system,
-                    "reasoning": { "effort": self.reasoning_effort },
-                    "input": [{ "role": "user", "content": [{ "type": "input_text", "text": user }] }],
-                    "stream": true
-                });
+                let body = self.openai_summarize_body(system, user);
                 let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
                 let response = self.send_with_retry(&url, &body, &mut |_| Ok(()))?;
                 self.collect_text(response, false, &mut record_delta)?
@@ -454,6 +480,20 @@ impl OpenAiClient {
             return Err("summarization produced no output".to_string());
         }
         Ok(summary)
+    }
+
+    /// Body for the one-shot summarization call on the OpenAI Responses path.
+    /// Matches the main path's `store: false` and output cap.
+    fn openai_summarize_body(&self, system: &str, user: &str) -> Value {
+        json!({
+            "model": self.model,
+            "instructions": system,
+            "reasoning": { "effort": self.reasoning_effort },
+            "max_output_tokens": self.max_output_tokens.max(1),
+            "input": [{ "role": "user", "content": [{ "type": "input_text", "text": user }] }],
+            "store": false,
+            "stream": true
+        })
     }
 
     fn collect_text(
@@ -498,11 +538,10 @@ impl OpenAiClient {
         Ok(text)
     }
 
-    fn create_response_streaming(
-        &self,
-        input: Vec<Value>,
-        mut emit: impl FnMut(StreamEvent) -> Result<(), String>,
-    ) -> Result<Vec<Value>, String> {
+    /// Body for the main streaming call on the OpenAI Responses path.
+    /// `include` requests encrypted reasoning so multi-turn tool calls can
+    /// replay it under `store: false`.
+    fn openai_responses_body(&self, input: Vec<Value>) -> Value {
         // Request a reasoning summary so the thinking phase can stream content.
         // With effort "none" the model does not reason, so no summary is requested.
         let reasoning = if self.reasoning_effort == "none" {
@@ -510,7 +549,7 @@ impl OpenAiClient {
         } else {
             json!({ "effort": self.reasoning_effort, "summary": "auto" })
         };
-        let body = json!({
+        json!({
             "model": self.model,
             "instructions": self.system_prompt,
             "prompt_cache_key": self.prompt_cache_key,
@@ -519,14 +558,35 @@ impl OpenAiClient {
             "tools": self.tool_definitions(),
             "tool_choice": "auto",
             "parallel_tool_calls": true,
+            "max_output_tokens": self.max_output_tokens.max(1),
             "store": false,
+            "include": ["reasoning.encrypted_content"],
             "stream": true
-        });
+        })
+    }
 
+    fn create_response_streaming(
+        &self,
+        input: Vec<Value>,
+        mut emit: impl FnMut(StreamEvent) -> Result<(), String>,
+    ) -> Result<Vec<Value>, String> {
+        let body = self.openai_responses_body(input);
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
         let max_attempts = self.max_attempts();
         for attempt in 1..=max_attempts {
-            let response = self.send_with_retry(&url, &body, &mut emit)?;
+            // Single send per attempt: this loop owns all retries, so send and
+            // stream failures cannot multiply into nested retry rounds.
+            let response = match self.send_once(&url, &body) {
+                Ok(response) => response,
+                Err(error) if attempt < max_attempts && is_retryable_error(&error) => {
+                    emit(StreamEvent::Retrying {
+                        attempt: attempt + 1,
+                    })?;
+                    std::thread::sleep(retry_backoff(attempt));
+                    continue;
+                }
+                Err(error) => return handle_response_error(*error),
+            };
             emit(StreamEvent::Connected)?;
             let content_type = response
                 .header("content-type")
@@ -621,7 +681,19 @@ impl OpenAiClient {
         let url = anthropic_messages_url(&self.base_url);
         let max_attempts = self.max_attempts();
         for attempt in 1..=max_attempts {
-            let response = self.send_with_retry(&url, &body, &mut emit)?;
+            // Single send per attempt: this loop owns all retries, so send and
+            // stream failures cannot multiply into nested retry rounds.
+            let response = match self.send_once(&url, &body) {
+                Ok(response) => response,
+                Err(error) if attempt < max_attempts && is_retryable_error(&error) => {
+                    emit(StreamEvent::Retrying {
+                        attempt: attempt + 1,
+                    })?;
+                    std::thread::sleep(retry_backoff(attempt));
+                    continue;
+                }
+                Err(error) => return handle_response_error(*error),
+            };
             emit(StreamEvent::Connected)?;
             let content_type = response
                 .header("content-type")
@@ -669,58 +741,73 @@ impl OpenAiClient {
         unreachable!("streaming retry loop always returns")
     }
 
-    /// Send the request with the configured timeouts, retrying on transport errors
-    /// and 5xx responses. 4xx responses are returned immediately without retry.
+    /// Builds and sends the request once with the configured timeouts. Retry
+    /// policy belongs to the caller: streaming paths own their retry loop,
+    /// `send_with_retry` wraps this for one-shot calls.
+    fn send_once(&self, url: &str, body: &Value) -> Result<ureq::Response, Box<ureq::Error>> {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(self.connect_timeout)
+            .timeout_read(self.read_timeout)
+            .build();
+        let mut request = agent
+            .post(url)
+            .set("Accept", "text/event-stream")
+            .set("Content-Type", "application/json")
+            .set("session-id", &self.prompt_cache_key)
+            .set("thread-id", &self.prompt_cache_key)
+            .set("x-client-request-id", &self.prompt_cache_key);
+        // The official Anthropic API authenticates with x-api-key; gateways keep
+        // the Bearer scheme. anthropic-version is required on Anthropic requests.
+        if is_official_anthropic_url(url) {
+            request = request.set("x-api-key", &self.api_key);
+        } else {
+            request = request.set("Authorization", &format!("Bearer {}", self.api_key));
+        }
+        if self.provider_kind == ProviderKind::AnthropicMessages {
+            request = request.set("anthropic-version", ANTHROPIC_VERSION);
+        }
+        if let Some(turn_state) = self.turn_state.get() {
+            request = request.set(X_CODEX_TURN_STATE_HEADER, turn_state);
+        }
+        if cache_debug_enabled() {
+            eprintln!(
+                "[jucode-cache] send provider={:?} turn_state={}",
+                self.provider_kind,
+                self.turn_state.get().is_some()
+            );
+        }
+        let response = request.send_json(body.clone()).map_err(Box::new)?;
+        let saw_turn_state = capture_turn_state(&response, &self.turn_state);
+        if cache_debug_enabled() {
+            eprintln!(
+                "[jucode-cache] response turn_state_header={} turn_state_stored={}",
+                saw_turn_state,
+                self.turn_state.get().is_some()
+            );
+        }
+        Ok(response)
+    }
+
+    /// Send the request with the configured timeouts, retrying on transport
+    /// errors, 429, and 5xx responses. Other 4xx responses are returned
+    /// immediately without retry.
     fn send_with_retry(
         &self,
         url: &str,
         body: &Value,
         emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<ureq::Response, String> {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(self.connect_timeout)
-            .timeout_read(self.read_timeout)
-            .build();
         let max_attempts = self.max_attempts();
         for attempt in 1..=max_attempts {
-            let mut request = agent
-                .post(url)
-                .set("Authorization", &format!("Bearer {}", self.api_key))
-                .set("Accept", "text/event-stream")
-                .set("Content-Type", "application/json")
-                .set("session-id", &self.prompt_cache_key)
-                .set("thread-id", &self.prompt_cache_key)
-                .set("x-client-request-id", &self.prompt_cache_key);
-            if let Some(turn_state) = self.turn_state.get() {
-                request = request.set(X_CODEX_TURN_STATE_HEADER, turn_state);
-            }
-            if cache_debug_enabled() {
-                eprintln!(
-                    "[jucode-cache] send provider={:?} turn_state={}",
-                    self.provider_kind,
-                    self.turn_state.get().is_some()
-                );
-            }
-            let result = request.send_json(body.clone());
-            match result {
-                Ok(response) => {
-                    let saw_turn_state = capture_turn_state(&response, &self.turn_state);
-                    if cache_debug_enabled() {
-                        eprintln!(
-                            "[jucode-cache] response turn_state_header={} turn_state_stored={}",
-                            saw_turn_state,
-                            self.turn_state.get().is_some()
-                        );
-                    }
-                    return Ok(response);
-                }
+            match self.send_once(url, body) {
+                Ok(response) => return Ok(response),
                 Err(error) if attempt < max_attempts && is_retryable_error(&error) => {
                     emit(StreamEvent::Retrying {
                         attempt: attempt + 1,
                     })?;
                     std::thread::sleep(retry_backoff(attempt));
                 }
-                Err(error) => return handle_response_error(error),
+                Err(error) => return handle_response_error(*error),
             }
         }
         unreachable!("retry loop always returns a response or error")
@@ -888,8 +975,7 @@ impl OpenAiClient {
             .clamp(
                 512,
                 self.max_output_tokens
-                    .min(DEFAULT_SUBAGENT_MAX_OUTPUT_TOKENS)
-                    .max(512),
+                    .clamp(512, DEFAULT_SUBAGENT_MAX_OUTPUT_TOKENS),
             );
         let fork_turns = args
             .get("fork_turns")
@@ -942,12 +1028,7 @@ impl OpenAiClient {
 
         std::thread::spawn(move || {
             child_manager.mark_running(&child_path);
-            let mut output_text = String::new();
-            let mut tool_iters = 0u64;
-            let mut tools_used: Vec<String> = Vec::new();
-            let mut input_tokens = 0u64;
-            let mut cached_input_tokens = 0u64;
-            let mut output_tokens = 0u64;
+            let mut stats = SubagentTurnStats::default();
             let result = child.run_turn_events(child_input, &child_cwd, |event| {
                 if slot
                     .interrupt_flag
@@ -955,35 +1036,18 @@ impl OpenAiClient {
                 {
                     return Err("interrupted".to_string());
                 }
-                match event {
-                    StreamEvent::Delta(delta) => output_text.push_str(&delta),
-                    StreamEvent::ToolStart { name, .. } => {
-                        tool_iters += 1;
-                        tools_used.push(name);
-                    }
-                    StreamEvent::Usage {
-                        input_tokens: input,
-                        cached_input_tokens: cached,
-                        output_tokens: output,
-                        ..
-                    } => {
-                        input_tokens += input;
-                        cached_input_tokens += cached;
-                        output_tokens += output;
-                    }
-                    _ => {}
-                }
+                stats.record(event);
                 Ok(())
             });
             let elapsed_ms = started.elapsed().as_millis() as u64;
             let run_result = SubagentRunResult {
-                summary: truncate_subagent_output(&output_text),
-                partial_output: truncate_subagent_output(&output_text),
-                tool_calls: tool_iters,
-                tools_used,
-                input_tokens,
-                cached_input_tokens,
-                output_tokens,
+                summary: truncate_subagent_output(&stats.output_text),
+                partial_output: truncate_subagent_output(&stats.output_text),
+                tool_calls: stats.tool_calls,
+                tools_used: stats.tools_used,
+                input_tokens: stats.input_tokens,
+                cached_input_tokens: stats.cached_input_tokens,
+                output_tokens: stats.output_tokens,
                 elapsed_ms,
                 model,
             };
@@ -1062,19 +1126,25 @@ impl OpenAiClient {
         manager.close_agent(&self.agent_path, target)
     }
 
-    fn append_queued_subagent_messages(&self, input: &mut Vec<Value>) {
+    fn append_queued_subagent_messages(
+        &self,
+        input: &mut Vec<Value>,
+        emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
+    ) -> Result<(), String> {
         let Some(manager) = &self.subagent_manager else {
-            return;
+            return Ok(());
         };
         for message in manager.drain_messages(&self.agent_path) {
-            input.push(json!({
+            let item = json!({
                 "role": "user",
                 "content": [{
                     "type": "input_text",
                     "text": format!("<subagent_message>\n{message}\n</subagent_message>")
                 }]
-            }));
+            });
+            inject_input_item(input, item, emit)?;
         }
+        Ok(())
     }
 
     fn run_goal_tool(&self, name: &str, arguments: &str) -> Option<tools::ToolExecutionResult> {
@@ -1415,11 +1485,35 @@ fn approval_summary(name: &str, arguments: &str) -> String {
     let args = serde_json::from_str::<Value>(arguments).unwrap_or(Value::Null);
     let field = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_string);
     match name {
-        "bash" | "execute" | "exec_command" | "shell_command" => {
-            field("command").or_else(|| field("cmd")).unwrap_or_default()
-        }
+        "bash" | "execute" | "exec_command" | "shell_command" => field("command")
+            .or_else(|| field("cmd"))
+            .unwrap_or_default(),
         _ => field("path").unwrap_or_default(),
     }
+}
+
+/// Appends a batch of tool results to the model input: every
+/// function_call_output first, then any extracted image items. Anthropic
+/// requires all tool_result blocks to lead the next user message, so an image
+/// must never sit between two outputs. Failed calls carry `is_error` so the
+/// Anthropic conversion can surface it; the OpenAI sanitizer strips it.
+fn push_tool_result_items(input: &mut Vec<Value>, tool_results: Vec<ToolCallResult>) {
+    let mut image_items = Vec::new();
+    for tool_result in tool_results {
+        if let Some(image_item) = tools::image_content_item(&tool_result.result.output) {
+            image_items.push(image_item);
+        }
+        let mut item = json!({
+            "type": "function_call_output",
+            "call_id": tool_result.request.call_id,
+            "output": tool_result.result.model_output
+        });
+        if tool_result.result.is_error {
+            item["is_error"] = json!(true);
+        }
+        input.push(item);
+    }
+    input.append(&mut image_items);
 }
 
 fn emit_tool_output(
@@ -1638,16 +1732,25 @@ fn estimate_text_tokens(text: &str) -> u64 {
     u64::max(1, chars.div_ceil(4))
 }
 
+/// Resolves the Messages endpoint from the configured base URL. A base that
+/// already ends in `/v1` (any host) or targets the official Anthropic host
+/// gets the plain `/v1/messages` path; other bases are treated as gateways
+/// with an `/anthropic/v1` mount.
 fn anthropic_messages_url(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
-    if base.ends_with("/anthropic") {
+    if base.ends_with("/v1") {
+        return format!("{base}/messages");
+    }
+    if base.ends_with("/anthropic") || is_official_anthropic_url(base) {
         return format!("{base}/v1/messages");
     }
-    if let Some(root) = base.strip_suffix("/v1") {
-        format!("{root}/anthropic/v1/messages")
-    } else {
-        format!("{base}/anthropic/v1/messages")
-    }
+    format!("{base}/anthropic/v1/messages")
+}
+
+/// True when the URL targets the official Anthropic API host.
+fn is_official_anthropic_url(url: &str) -> bool {
+    url.strip_prefix("https://api.anthropic.com")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 fn is_anthropic_model(model: &str) -> bool {
@@ -1656,6 +1759,9 @@ fn is_anthropic_model(model: &str) -> bool {
 
 fn responses_input_to_anthropic_messages(input: &[Value], include_thinking: bool) -> Vec<Value> {
     let mut messages = Vec::new();
+    // Calls whose arguments never parsed as JSON must not be replayed as normal
+    // tool_use blocks; their tool_result is skipped too so pairs stay balanced.
+    let mut skipped_call_ids: HashSet<String> = HashSet::new();
     for item in input {
         if item.get("role").and_then(Value::as_str) == Some("user") {
             let text = response_content_text(item, "input_text");
@@ -1701,6 +1807,18 @@ fn responses_input_to_anthropic_messages(input: &[Value], include_thinking: bool
                     );
                 }
             }
+            "redacted_thinking" => {
+                let data = item.get("data").and_then(Value::as_str).unwrap_or_default();
+                // Redacted thinking carries opaque data instead of a signature and
+                // must be replayed verbatim or the API rejects the history.
+                if include_thinking && !data.is_empty() {
+                    push_anthropic_content(
+                        &mut messages,
+                        "assistant",
+                        json!({ "type": "redacted_thinking", "data": data }),
+                    );
+                }
+            }
             "message" => {
                 let text = response_content_text(item, "output_text");
                 if !text.is_empty() {
@@ -1720,11 +1838,21 @@ fn responses_input_to_anthropic_messages(input: &[Value], include_thinking: bool
                 if id.is_empty() || name.is_empty() {
                     continue;
                 }
-                let input = item
+                let arguments = item
                     .get("arguments")
                     .and_then(Value::as_str)
-                    .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
-                    .unwrap_or_else(|| json!({}));
+                    .unwrap_or_default();
+                let input = if arguments.trim().is_empty() {
+                    json!({})
+                } else {
+                    match serde_json::from_str::<Value>(arguments) {
+                        Ok(input) => input,
+                        Err(_) => {
+                            skipped_call_ids.insert(id.to_string());
+                            continue;
+                        }
+                    }
+                };
                 push_anthropic_content(
                     &mut messages,
                     "assistant",
@@ -1736,18 +1864,19 @@ fn responses_input_to_anthropic_messages(input: &[Value], include_thinking: bool
                     .get("call_id")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if id.is_empty() {
+                if id.is_empty() || skipped_call_ids.contains(id) {
                     continue;
                 }
                 let output = item
                     .get("output")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                push_anthropic_content(
-                    &mut messages,
-                    "user",
-                    json!({ "type": "tool_result", "tool_use_id": id, "content": output }),
-                );
+                let mut block =
+                    json!({ "type": "tool_result", "tool_use_id": id, "content": output });
+                if item.get("is_error").and_then(Value::as_bool) == Some(true) {
+                    block["is_error"] = json!(true);
+                }
+                push_anthropic_content(&mut messages, "user", block);
             }
             _ => {}
         }
@@ -1815,11 +1944,27 @@ fn runtime_reminder_item() -> Value {
     })
 }
 
-/// Retry on transport errors (timeouts, dropped connections, DNS) and on 5xx
-/// responses. 4xx responses are client errors and are never retried.
+/// Injects a runtime item (reminder, queued subagent message) into the model
+/// input and mirrors it to the session via `emit`, so next-turn projection
+/// matches what this turn actually sent. Injections happen outside the
+/// stream-retry loops in `create_*_streaming`, so each one is emitted exactly
+/// once even when the surrounding request is retried.
+fn inject_input_item(
+    input: &mut Vec<Value>,
+    item: Value,
+    emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
+) -> Result<(), String> {
+    emit(StreamEvent::ResponseItem(item.clone()))?;
+    input.push(item);
+    Ok(())
+}
+
+/// Retry on transport errors (timeouts, dropped connections, DNS), 429 rate
+/// limits, and 5xx responses. Other 4xx responses are client errors and are
+/// never retried.
 fn is_retryable_error(error: &ureq::Error) -> bool {
     match error {
-        ureq::Error::Status(code, _) => *code >= 500,
+        ureq::Error::Status(code, _) => *code == 429 || *code >= 500,
         ureq::Error::Transport(_) => true,
     }
 }
@@ -1865,6 +2010,7 @@ fn is_stream_decode_error(message: &str) -> bool {
         "broken pipe",
         "tls close_notify",
         "stream closed before response.completed",
+        "stream closed before message_stop",
         "unexpected end of file",
         "unexpected eof",
         "unexpected-eof",
@@ -1876,7 +2022,26 @@ fn is_stream_decode_error(message: &str) -> bool {
 }
 
 fn is_retryable_stream_error(message: &str) -> bool {
-    is_stream_decode_error(message) || is_retryable_response_failed(message)
+    is_stream_decode_error(message)
+        || is_retryable_response_failed(message)
+        || is_retryable_anthropic_error(message)
+}
+
+/// Anthropic in-stream `error` events for transient conditions are safe to
+/// re-send; other error types (invalid_request, authentication, ...) are not.
+fn is_retryable_anthropic_error(message: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(message) else {
+        return false;
+    };
+    if value.get("type").and_then(Value::as_str) != Some("error") {
+        return false;
+    }
+    let kind = value
+        .get("error")
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    matches!(kind, "overloaded_error" | "api_error")
 }
 
 fn is_retryable_response_failed(message: &str) -> bool {
@@ -1910,15 +2075,20 @@ fn sanitize_openai_input(input: Vec<Value>) -> Vec<Value> {
 }
 
 fn sanitize_openai_input_item(mut item: Value) -> Option<Value> {
-    // Anthropic-only "thinking" items are not valid OpenAI Responses input.
-    if item.get("type").and_then(Value::as_str) == Some("thinking") {
+    // Anthropic-only thinking items are not valid OpenAI Responses input.
+    if matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("thinking") | Some("redacted_thinking")
+    ) {
         return None;
     }
     // Response item ids are service-owned metadata. Replaying them makes the
     // request prefix less stable and differs from Codex, which does not
-    // serialize ids back into Responses input.
+    // serialize ids back into Responses input. is_error is a local annotation
+    // for the Anthropic conversion; the Responses API rejects unknown fields.
     if let Value::Object(map) = &mut item {
         map.remove("id");
+        map.remove("is_error");
     }
     Some(item)
 }
@@ -1975,8 +2145,7 @@ fn read_sse_output(
     if !data_lines.is_empty() {
         let data = data_lines.join("\n");
         if data != "[DONE]" {
-            completed =
-                handle_sse_data(&data, &mut emit, &mut output_items, &mut streamed_calls)?;
+            completed = handle_sse_data(&data, &mut emit, &mut output_items, &mut streamed_calls)?;
         }
     }
 
@@ -2053,7 +2222,9 @@ fn handle_sse_data(
                 output_items.push(item);
             }
         }
-        "response.completed" if output_items.is_empty() => {
+        // `response.incomplete` is a normal terminal event (e.g. max_output_tokens
+        // reached): accept the parsed output instead of failing the stream.
+        "response.completed" | "response.incomplete" if output_items.is_empty() => {
             if let Some(response) = event.get("response") {
                 if let Some(usage) = extract_usage(response) {
                     emit(StreamEvent::Usage {
@@ -2077,7 +2248,7 @@ fn handle_sse_data(
             }
             return Ok(true);
         }
-        "response.completed" => {
+        "response.completed" | "response.incomplete" => {
             if let Some(response) = event.get("response") {
                 if let Some(usage) = extract_usage(response) {
                     emit(StreamEvent::Usage {
@@ -2090,7 +2261,7 @@ fn handle_sse_data(
             }
             return Ok(true);
         }
-        "response.failed" => {
+        "response.failed" | "error" => {
             return Err(event.to_string());
         }
         _ => {}
@@ -2105,6 +2276,11 @@ struct AnthropicStreamState {
     input_tokens: u64,
     cached_input_tokens: u64,
     output_tokens: u64,
+    stop_reason: String,
+    /// Name of a tool_use block whose accumulated arguments never parsed as
+    /// JSON (typically a max_tokens truncation). Turns the stream into an
+    /// error at message_stop instead of executing a broken call.
+    invalid_tool_use: Option<String>,
 }
 
 struct AnthropicBlock {
@@ -2114,6 +2290,11 @@ struct AnthropicBlock {
     text: String,
     arguments: String,
     signature: String,
+    /// Full tool_use input from `content_block_start`; compatible gateways may
+    /// send it complete without any `input_json_delta` events.
+    input: Value,
+    /// Opaque payload of a `redacted_thinking` block.
+    data: String,
 }
 
 fn read_anthropic_sse_output(
@@ -2122,6 +2303,7 @@ fn read_anthropic_sse_output(
 ) -> Result<Vec<Value>, String> {
     let mut state = AnthropicStreamState::default();
     let mut data_lines = Vec::new();
+    let mut completed = false;
     let reader = BufReader::new(reader);
 
     for line in reader.lines() {
@@ -2135,14 +2317,19 @@ fn read_anthropic_sse_output(
             let data = data_lines.join("\n");
             data_lines.clear();
             if handle_anthropic_sse_data(&data, &mut emit, &mut state)? {
+                completed = true;
                 break;
             }
         }
     }
 
-    if !data_lines.is_empty() {
+    if !completed && !data_lines.is_empty() {
         let data = data_lines.join("\n");
-        let _ = handle_anthropic_sse_data(&data, &mut emit, &mut state)?;
+        completed = handle_anthropic_sse_data(&data, &mut emit, &mut state)?;
+    }
+
+    if !completed {
+        return Err("stream closed before message_stop".to_string());
     }
 
     Ok(state.output_items)
@@ -2163,14 +2350,9 @@ fn handle_anthropic_sse_data(
             let usage = event
                 .get("message")
                 .and_then(|message| message.get("usage"));
-            state.input_tokens = usage
-                .and_then(|usage| usage.get("input_tokens"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            state.cached_input_tokens = usage
-                .and_then(|usage| usage.get("cache_read_input_tokens"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
+            let (input_tokens, cached_input_tokens) = normalize_anthropic_usage(usage);
+            state.input_tokens = input_tokens;
+            state.cached_input_tokens = cached_input_tokens;
         }
         "content_block_start" => {
             let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
@@ -2201,6 +2383,12 @@ fn handle_anthropic_sse_data(
                     arguments: String::new(),
                     signature: block
                         .get("signature")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    input: block.get("input").cloned().unwrap_or(Value::Null),
+                    data: block
+                        .get("data")
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
@@ -2245,13 +2433,24 @@ fn handle_anthropic_sse_data(
         "content_block_stop" => {
             let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
             if let Some(block) = state.blocks.remove(&index) {
-                if let Some(item) = anthropic_block_to_response_item(block) {
+                if block.kind == "tool_use"
+                    && serde_json::from_str::<Value>(&anthropic_tool_use_arguments(&block)).is_err()
+                {
+                    state.invalid_tool_use = Some(block.name);
+                } else if let Some(item) = anthropic_block_to_response_item(block) {
                     emit(StreamEvent::ResponseItem(item.clone()))?;
                     state.output_items.push(item);
                 }
             }
         }
         "message_delta" => {
+            if let Some(stop_reason) = event
+                .get("delta")
+                .and_then(|delta| delta.get("stop_reason"))
+                .and_then(Value::as_str)
+            {
+                state.stop_reason = stop_reason.to_string();
+            }
             state.output_tokens = event
                 .get("usage")
                 .and_then(|usage| usage.get("output_tokens"))
@@ -2259,6 +2458,16 @@ fn handle_anthropic_sse_data(
                 .unwrap_or(state.output_tokens);
         }
         "message_stop" => {
+            if let Some(name) = state.invalid_tool_use.take() {
+                let stop_reason = if state.stop_reason.is_empty() {
+                    "unknown"
+                } else {
+                    state.stop_reason.as_str()
+                };
+                return Err(format!(
+                    "tool_use '{name}' arguments are not valid JSON (stop_reason: {stop_reason}); dropping truncated tool call"
+                ));
+            }
             emit(StreamEvent::Usage {
                 input_tokens: state.input_tokens,
                 cached_input_tokens: state.cached_input_tokens,
@@ -2294,15 +2503,10 @@ fn emit_anthropic_message(
         }
     }
     if let Some(usage) = message.get("usage") {
+        let (input_tokens, cached_input_tokens) = normalize_anthropic_usage(Some(usage));
         emit(StreamEvent::Usage {
-            input_tokens: usage
-                .get("input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            cached_input_tokens: usage
-                .get("cache_read_input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+            input_tokens,
+            cached_input_tokens,
             output_tokens: usage
                 .get("output_tokens")
                 .and_then(Value::as_u64)
@@ -2311,6 +2515,24 @@ fn emit_anthropic_message(
         })?;
     }
     Ok(output_items)
+}
+
+/// Normalizes Anthropic usage to OpenAI semantics: OpenAI's `cached_tokens` is
+/// a subset of `input_tokens`, while Anthropic's `input_tokens` excludes both
+/// `cache_read_input_tokens` and `cache_creation_input_tokens` (disjoint
+/// counts). Downstream consumers subtract `cached_input_tokens` from
+/// `input_tokens`, so report total = input + cache_read + cache_creation and
+/// cached = cache_read. Cache-creation tokens are priced as regular input.
+fn normalize_anthropic_usage(usage: Option<&Value>) -> (u64, u64) {
+    let field = |key: &str| {
+        usage
+            .and_then(|usage| usage.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let cache_read = field("cache_read_input_tokens");
+    let total_input = field("input_tokens") + cache_read + field("cache_creation_input_tokens");
+    (total_input, cache_read)
 }
 
 fn anthropic_block_to_response_item(block: AnthropicBlock) -> Option<Value> {
@@ -2327,13 +2549,36 @@ fn anthropic_block_to_response_item(block: AnthropicBlock) -> Option<Value> {
             "thinking": block.text,
             "signature": block.signature
         })),
-        "tool_use" => Some(json!({
-            "type": "function_call",
-            "call_id": block.id,
-            "name": block.name,
-            "arguments": normalized_arguments(&block.arguments)
+        // Redacted thinking must be preserved verbatim (via its opaque data)
+        // or replaying the history is rejected by the API.
+        "redacted_thinking" if !block.data.is_empty() => Some(json!({
+            "type": "redacted_thinking",
+            "data": block.data
         })),
+        "tool_use" => {
+            let arguments = anthropic_tool_use_arguments(&block);
+            Some(json!({
+                "type": "function_call",
+                "call_id": block.id,
+                "name": block.name,
+                "arguments": arguments
+            }))
+        }
         _ => None,
+    }
+}
+
+/// Resolves a streamed tool_use block's arguments: streamed `input_json_delta`
+/// fragments win; otherwise a complete non-empty `input` object delivered in
+/// `content_block_start` (some gateways skip deltas); otherwise `{}`.
+fn anthropic_tool_use_arguments(block: &AnthropicBlock) -> String {
+    let trimmed = block.arguments.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    match &block.input {
+        Value::Object(map) if !map.is_empty() => block.input.to_string(),
+        _ => "{}".to_string(),
     }
 }
 
@@ -2361,6 +2606,17 @@ fn anthropic_content_block_to_response_item(block: &Value) -> Option<Value> {
                     "thinking": block.get("thinking").and_then(Value::as_str).unwrap_or_default(),
                     "signature": signature
                 }))
+            }
+        }
+        "redacted_thinking" => {
+            let data = block
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if data.is_empty() {
+                None
+            } else {
+                Some(json!({ "type": "redacted_thinking", "data": data }))
             }
         }
         "tool_use" => Some(json!({
@@ -2442,7 +2698,10 @@ fn backfill_function_call(
 
     if let Value::Object(map) = &mut item {
         if is_blank(map, "name") {
-            if let Some(name) = streamed.map(|call| call.name.as_str()).filter(|n| !n.is_empty()) {
+            if let Some(name) = streamed
+                .map(|call| call.name.as_str())
+                .filter(|n| !n.is_empty())
+            {
                 map.insert("name".to_string(), Value::String(name.to_string()));
             }
         }
@@ -2719,6 +2978,27 @@ mod tests {
     }
 
     #[test]
+    fn injected_input_items_are_emitted_for_session_persistence() {
+        // Runtime injections (reminders, queued subagent messages) must reach
+        // the session via emit, or the next turn's projection would miss an
+        // item the model already saw this turn.
+        let mut input = vec![json!({ "role": "user", "content": [] })];
+        let mut emitted = Vec::new();
+        inject_input_item(&mut input, runtime_reminder_item(), &mut |event| {
+            emitted.push(event);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(input.len(), 2);
+        assert_eq!(emitted.len(), 1);
+        match &emitted[0] {
+            StreamEvent::ResponseItem(item) => assert_eq!(item, &input[1]),
+            other => panic!("expected ResponseItem, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parallel_policy_requires_multiple_safe_builtin_tools() {
         let read = ToolCallRequest {
             call_id: "read_1".to_string(),
@@ -2747,7 +3027,7 @@ mod tests {
         };
 
         assert!(should_run_parallel_tools(&[read.clone(), rg]));
-        assert!(!should_run_parallel_tools(&[read.clone()]));
+        assert!(!should_run_parallel_tools(std::slice::from_ref(&read)));
         assert!(!should_run_parallel_tools(&[read.clone(), write]));
         assert!(!should_run_parallel_tools(&[read.clone(), subagent]));
         // Shell tools are not parallel-safe: a batch of commands serializes.
@@ -2875,10 +3155,167 @@ mod tests {
     }
 
     #[test]
-    fn retry_policy_skips_4xx_and_allows_5xx() {
+    fn anthropic_stream_without_message_stop_is_a_retryable_error() {
+        let sse = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        );
+        let error = read_anthropic_sse_output(sse.as_bytes(), |_| Ok(()))
+            .expect_err("truncated stream should fail");
+
+        assert!(error.contains("stream closed before message_stop"));
+        assert!(is_retryable_stream_error(&error));
+    }
+
+    #[test]
+    fn openai_incomplete_response_accepts_parsed_output() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial answer\"}]}}\n\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":3,\"output_tokens\":7}}}\n\n",
+        );
+        let mut usage_seen = false;
+        let items = read_sse_output(sse.as_bytes(), |event| {
+            if matches!(event, StreamEvent::Usage { .. }) {
+                usage_seen = true;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "message");
+        assert!(usage_seen);
+    }
+
+    #[test]
+    fn openai_stream_error_event_is_a_non_retryable_error() {
+        let sse =
+            "data: {\"type\":\"error\",\"code\":\"invalid_api_key\",\"message\":\"bad key\"}\n\n";
+        let error = read_sse_output(sse.as_bytes(), |_| Ok(()))
+            .expect_err("in-stream error event should fail");
+
+        assert!(error.contains("invalid_api_key"));
+        assert!(!is_retryable_stream_error(&error));
+    }
+
+    #[test]
+    fn anthropic_truncated_tool_use_errors_instead_of_executing() {
+        let sse = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"write\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"a.txt\\\",\\\"content\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":9}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mut items_emitted = 0;
+        let error = read_anthropic_sse_output(sse.as_bytes(), |event| {
+            if matches!(event, StreamEvent::ResponseItem(_)) {
+                items_emitted += 1;
+            }
+            Ok(())
+        })
+        .expect_err("truncated tool_use should fail");
+
+        assert!(error.contains("write"));
+        assert!(error.contains("max_tokens"));
+        assert_eq!(items_emitted, 0);
+        assert!(!is_retryable_stream_error(&error));
+    }
+
+    #[test]
+    fn anthropic_tool_use_input_from_block_start_used_without_deltas() {
+        let sse = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"read\",\"input\":{\"path\":\"Cargo.toml\"}}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let items = read_anthropic_sse_output(sse.as_bytes(), |_| Ok(())).unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "function_call");
+        let parsed: Value = serde_json::from_str(items[0]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["path"], "Cargo.toml");
+    }
+
+    #[test]
+    fn anthropic_redacted_thinking_is_preserved_and_replayed() {
+        let sse = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-bytes\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let items = read_anthropic_sse_output(sse.as_bytes(), |_| Ok(())).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "redacted_thinking");
+        assert_eq!(items[0]["data"], "opaque-bytes");
+
+        // Non-streaming path preserves the block too.
+        let block = json!({ "type": "redacted_thinking", "data": "opaque-bytes" });
+        let item = anthropic_content_block_to_response_item(&block).unwrap();
+        assert_eq!(item["type"], "redacted_thinking");
+
+        // Projection back to Anthropic messages replays it verbatim.
+        let messages = responses_input_to_anthropic_messages(&items, true);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"][0]["type"], "redacted_thinking");
+        assert_eq!(messages[0]["content"][0]["data"], "opaque-bytes");
+
+        // The OpenAI path must not see Anthropic-only items.
+        assert!(sanitize_openai_input(items).is_empty());
+    }
+
+    #[test]
+    fn anthropic_transient_stream_errors_are_retryable() {
+        assert!(is_retryable_stream_error(
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#
+        ));
+        assert!(is_retryable_stream_error(
+            r#"{"type":"error","error":{"type":"api_error","message":"Internal server error"}}"#
+        ));
+        assert!(!is_retryable_stream_error(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad request"}}"#
+        ));
+    }
+
+    #[test]
+    fn invalid_function_call_arguments_skip_tool_use_and_matching_result() {
+        let input = vec![
+            json!({
+                "type": "function_call",
+                "call_id": "call_bad",
+                "name": "write",
+                "arguments": "{\"path\":\"a.txt\",\"content"
+            }),
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_bad",
+                "output": "error"
+            }),
+            json!({
+                "type": "function_call",
+                "call_id": "call_ok",
+                "name": "read",
+                "arguments": ""
+            }),
+        ];
+
+        let messages = responses_input_to_anthropic_messages(&input, false);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"][0]["type"], "tool_use");
+        assert_eq!(messages[0]["content"][0]["id"], "call_ok");
+        assert_eq!(messages[0]["content"][0]["input"], json!({}));
+    }
+
+    #[test]
+    fn retry_policy_retries_429_and_5xx_but_not_other_4xx() {
         assert!(!is_retryable_error(&ureq::Error::Status(
             400,
             ureq::Response::new(400, "Bad Request", "").unwrap()
+        )));
+        assert!(is_retryable_error(&ureq::Error::Status(
+            429,
+            ureq::Response::new(429, "Too Many Requests", "").unwrap()
         )));
         assert!(is_retryable_error(&ureq::Error::Status(
             500,
@@ -2921,15 +3358,92 @@ mod tests {
     }
 
     #[test]
-    fn builds_anthropic_messages_url_from_openai_or_anthropic_base() {
+    fn anthropic_usage_is_normalized_to_openai_subset_semantics() {
+        // Anthropic reports input, cache_read and cache_creation disjointly;
+        // normalized: input = 10 + 90 + 20 = 120, cached = 90.
+        let sse = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":90,\"cache_creation_input_tokens\":20}}}\n\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let mut usage = None;
+        read_anthropic_sse_output(sse.as_bytes(), |event| {
+            if let StreamEvent::Usage {
+                input_tokens,
+                cached_input_tokens,
+                ..
+            } = event
+            {
+                usage = Some((input_tokens, cached_input_tokens));
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(usage, Some((120, 90)));
+
+        // The non-streaming path normalizes identically.
+        let message = json!({
+            "content": [],
+            "usage": {
+                "input_tokens": 10,
+                "cache_read_input_tokens": 90,
+                "cache_creation_input_tokens": 20,
+                "output_tokens": 5
+            }
+        });
+        let mut usage = None;
+        emit_anthropic_message(&message, &mut |event| {
+            if let StreamEvent::Usage {
+                input_tokens,
+                cached_input_tokens,
+                ..
+            } = event
+            {
+                usage = Some((input_tokens, cached_input_tokens));
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(usage, Some((120, 90)));
+    }
+
+    #[test]
+    fn builds_anthropic_messages_url_for_gateway_and_official_bases() {
         assert_eq!(
-            anthropic_messages_url("https://api.jucode.cn/v1"),
+            anthropic_messages_url("https://api.jucode.cn"),
             "https://api.jucode.cn/anthropic/v1/messages"
         );
         assert_eq!(
             anthropic_messages_url("https://api.jucode.cn/anthropic"),
             "https://api.jucode.cn/anthropic/v1/messages"
         );
+        // A base already ending in /v1 exposes the endpoint directly.
+        assert_eq!(
+            anthropic_messages_url("https://api.jucode.cn/v1"),
+            "https://api.jucode.cn/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://api.anthropic.com/v1/"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn official_anthropic_host_is_detected_exactly() {
+        assert!(is_official_anthropic_url("https://api.anthropic.com"));
+        assert!(is_official_anthropic_url(
+            "https://api.anthropic.com/v1/messages"
+        ));
+        assert!(!is_official_anthropic_url(
+            "https://api.jucode.cn/anthropic/v1/messages"
+        ));
+        assert!(!is_official_anthropic_url(
+            "https://api.anthropic.com.evil.example/v1/messages"
+        ));
     }
 
     fn test_dir(name: &str) -> PathBuf {
@@ -2968,6 +3482,130 @@ mod tests {
         assert_eq!(forked[1]["call_id"], "done_1");
         assert!(response_content_text(&forked[2], "input_text").contains("inspect"));
         assert!(!forked.iter().any(|item| item["call_id"] == "pending_1"));
+    }
+
+    fn test_client() -> OpenAiClient {
+        OpenAiClient::from_config(OpenAiClientConfig {
+            model: "test-model".to_string(),
+            protocol: "responses".to_string(),
+            reasoning_effort: "medium".to_string(),
+            model_reasoning_efforts: Vec::new(),
+            system_prompt: "system".to_string(),
+            prompt_cache_key: "cache-key".to_string(),
+            extensions: ExtensionRegistry::load(&[], Path::new("."), Path::new(".")),
+            base_url: "https://api.jucode.cn/v1".to_string(),
+            max_output_tokens: 2048,
+            api_key: Some("test-key"),
+            api_key_env: "JUCODE_TEST_API_KEY",
+            retry_attempts: 1,
+            connect_timeout: Duration::from_secs(1),
+            read_timeout: Duration::from_secs(1),
+            goal_tool_tx: None,
+            approval_tx: None,
+            subagent_manager: None,
+            hooks: Hooks::default(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn openai_responses_body_sets_output_cap_store_and_reasoning_include() {
+        let body = test_client().openai_responses_body(Vec::new());
+
+        assert_eq!(body["max_output_tokens"], 2048);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn openai_summarize_body_sets_store_false_and_output_cap() {
+        let body = test_client().openai_summarize_body("sys", "user");
+
+        assert_eq!(body["store"], false);
+        assert_eq!(body["max_output_tokens"], 2048);
+    }
+
+    #[test]
+    fn retrying_event_discards_replayed_subagent_deltas() {
+        let mut stats = SubagentTurnStats::default();
+        stats.record(StreamEvent::CallStart);
+        stats.record(StreamEvent::Delta("first ".to_string()));
+        stats.record(StreamEvent::CallStart);
+        stats.record(StreamEvent::Delta("dup".to_string()));
+        stats.record(StreamEvent::Retrying { attempt: 2 });
+        stats.record(StreamEvent::Delta("second".to_string()));
+
+        assert_eq!(stats.output_text, "first second");
+    }
+
+    #[test]
+    fn tool_result_images_follow_all_function_call_outputs() {
+        let image_output =
+            json!({ "kind": "image", "mime": "image/png", "base64": "aGk=" }).to_string();
+        let results = vec![
+            ToolCallResult {
+                request: ToolCallRequest {
+                    call_id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                result: tools::ToolExecutionResult {
+                    output: image_output,
+                    model_output: "image attached".to_string(),
+                    is_error: false,
+                },
+            },
+            ToolCallResult {
+                request: ToolCallRequest {
+                    call_id: "call_2".to_string(),
+                    name: "read".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                result: tools::ToolExecutionResult {
+                    output: "text".to_string(),
+                    model_output: "text".to_string(),
+                    is_error: true,
+                },
+            },
+        ];
+        let mut input = Vec::new();
+
+        push_tool_result_items(&mut input, results);
+
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0].get("is_error"), None);
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_2");
+        assert_eq!(input[1]["is_error"], true);
+        assert_eq!(input[2]["content"][0]["type"], "input_image");
+    }
+
+    #[test]
+    fn error_function_call_output_maps_to_anthropic_is_error() {
+        let input = vec![
+            json!({ "type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}" }),
+            json!({ "type": "function_call_output", "call_id": "call_1", "output": "boom", "is_error": true }),
+        ];
+
+        let messages = responses_input_to_anthropic_messages(&input, false);
+
+        assert_eq!(messages[1]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[1]["content"][0]["is_error"], true);
+    }
+
+    #[test]
+    fn sanitizer_strips_is_error_annotation_for_openai() {
+        let sanitized = sanitize_openai_input(vec![json!({
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "boom",
+            "is_error": true
+        })]);
+
+        assert_eq!(sanitized.len(), 1);
+        assert!(sanitized[0].get("is_error").is_none());
+        assert_eq!(sanitized[0]["output"], "boom");
     }
 
     #[test]

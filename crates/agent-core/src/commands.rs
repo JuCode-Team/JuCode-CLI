@@ -17,29 +17,167 @@ pub struct CommandSpec {
 }
 
 pub const COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "/help", aliases: &["/"], args: "", description: "Show available commands", advanced: false },
-    CommandSpec { name: "/login", aliases: &[], args: "[web-url] [api-url]", description: "Sign in to JuCode (OAuth)", advanced: false },
-    CommandSpec { name: "/usage", aliases: &[], args: "", description: "Show plan, balance, usage and recent calls", advanced: false },
-    CommandSpec { name: "/new", aliases: &[], args: "", description: "Start a new session", advanced: false },
-    CommandSpec { name: "/model", aliases: &[], args: "[model] [effort]", description: "Show or switch the model", advanced: false },
-    CommandSpec { name: "/tree", aliases: &[], args: "", description: "Show the conversation tree", advanced: false },
-    CommandSpec { name: "/trust", aliases: &[], args: "[yes|no|repo]", description: "Trust this project's local resources", advanced: false },
-    CommandSpec { name: "/resume", aliases: &[], args: "[session-id]", description: "List or resume sessions", advanced: false },
-    CommandSpec { name: "/rewind", aliases: &["/undo"], args: "[turn-id]", description: "Rewind conversation and files to an earlier turn", advanced: false },
-    CommandSpec { name: "/approve", aliases: &[], args: "<call-id> <allow|deny> [always]", description: "Respond to a tool approval request", advanced: true },
-    CommandSpec { name: "/context", aliases: &[], args: "", description: "Show context usage", advanced: false },
-    CommandSpec { name: "/goal", aliases: &[], args: "[objective|pause|resume|blocked|complete|clear]", description: "Manage the session goal", advanced: false },
-    CommandSpec { name: "/doctor", aliases: &[], args: "", description: "Run environment diagnostics", advanced: false },
-    CommandSpec { name: "/skills", aliases: &[], args: "[list|install <id>|sync]", description: "Manage skills", advanced: false },
-    CommandSpec { name: "/pin", aliases: &[], args: "<skill>", description: "Pin a skill for the session", advanced: false },
-    CommandSpec { name: "/compact", aliases: &[], args: "", description: "Compact context now", advanced: false },
-    CommandSpec { name: "/quit", aliases: &["/exit"], args: "", description: "Quit", advanced: false },
-    CommandSpec { name: "/config", aliases: &[], args: "", description: "Show current configuration", advanced: true },
-    CommandSpec { name: "/checkout", aliases: &[], args: "<id>", description: "Check out a conversation node", advanced: true },
-    CommandSpec { name: "/fork", aliases: &[], args: "<id>", description: "Fork a branch from a node", advanced: true },
-    CommandSpec { name: "/delete", aliases: &[], args: "<id>", description: "Delete a branch", advanced: true },
-    CommandSpec { name: "/extensions", aliases: &[], args: "", description: "List configured extensions", advanced: true },
-    CommandSpec { name: "/stats", aliases: &[], args: "", description: "Show context statistics", advanced: true },
+    CommandSpec {
+        name: "/help",
+        aliases: &["/"],
+        args: "",
+        description: "Show available commands",
+        advanced: false,
+    },
+    CommandSpec {
+        name: "/login",
+        aliases: &[],
+        args: "[web-url] [api-url]",
+        description: "Sign in to JuCode (OAuth)",
+        advanced: false,
+    },
+    CommandSpec {
+        name: "/usage",
+        aliases: &[],
+        args: "",
+        description: "Show plan, balance, usage and recent calls",
+        advanced: false,
+    },
+    CommandSpec {
+        name: "/new",
+        aliases: &[],
+        args: "",
+        description: "Start a new session",
+        advanced: false,
+    },
+    CommandSpec {
+        name: "/model",
+        aliases: &[],
+        args: "[model] [effort]",
+        description: "Show or switch the model",
+        advanced: false,
+    },
+    CommandSpec {
+        name: "/tree",
+        aliases: &[],
+        args: "",
+        description: "Show the conversation tree",
+        advanced: false,
+    },
+    CommandSpec {
+        name: "/trust",
+        aliases: &[],
+        args: "[yes|no|repo]",
+        description: "Trust this project's local resources",
+        advanced: false,
+    },
+    CommandSpec {
+        name: "/resume",
+        aliases: &[],
+        args: "[session-id]",
+        description: "List or resume sessions",
+        advanced: false,
+    },
+    CommandSpec {
+        name: "/rewind",
+        aliases: &["/undo"],
+        args: "[turn-id]",
+        description: "Rewind conversation and files to an earlier turn",
+        advanced: false,
+    },
+    CommandSpec {
+        name: "/approve",
+        aliases: &[],
+        args: "<call-id> <allow|deny> [always]",
+        description: "Respond to a tool approval request",
+        advanced: true,
+    },
+    CommandSpec {
+        name: "/context",
+        aliases: &[],
+        args: "",
+        description: "Show context usage",
+        advanced: false,
+    },
+    CommandSpec {
+        name: "/goal",
+        aliases: &[],
+        args: "[objective|pause|resume|blocked|complete|clear]",
+        description: "Manage the session goal",
+        advanced: false,
+    },
+    CommandSpec {
+        name: "/doctor",
+        aliases: &[],
+        args: "",
+        description: "Run environment diagnostics",
+        advanced: false,
+    },
+    CommandSpec {
+        name: "/skills",
+        aliases: &[],
+        args: "[list|install <id>|sync]",
+        description: "Manage skills",
+        advanced: false,
+    },
+    CommandSpec {
+        name: "/pin",
+        aliases: &[],
+        args: "<skill>",
+        description: "Pin a skill for the session",
+        advanced: false,
+    },
+    CommandSpec {
+        name: "/compact",
+        aliases: &[],
+        args: "",
+        description: "Compact context now",
+        advanced: false,
+    },
+    CommandSpec {
+        name: "/quit",
+        aliases: &["/exit"],
+        args: "",
+        description: "Quit",
+        advanced: false,
+    },
+    CommandSpec {
+        name: "/config",
+        aliases: &[],
+        args: "",
+        description: "Show current configuration",
+        advanced: true,
+    },
+    CommandSpec {
+        name: "/checkout",
+        aliases: &[],
+        args: "<id>",
+        description: "Check out a conversation node",
+        advanced: true,
+    },
+    CommandSpec {
+        name: "/fork",
+        aliases: &[],
+        args: "<id>",
+        description: "Fork a branch from a node",
+        advanced: true,
+    },
+    CommandSpec {
+        name: "/delete",
+        aliases: &[],
+        args: "<id>",
+        description: "Delete a branch",
+        advanced: true,
+    },
+    CommandSpec {
+        name: "/extensions",
+        aliases: &[],
+        args: "",
+        description: "List configured extensions",
+        advanced: true,
+    },
+    CommandSpec {
+        name: "/stats",
+        aliases: &[],
+        args: "",
+        description: "Show context statistics",
+        advanced: true,
+    },
 ];
 
 /// Whether `command` is a recognized built-in (by canonical name or alias).
@@ -73,7 +211,11 @@ mod tests {
     fn commands_are_unique_and_known() {
         let mut seen = std::collections::HashSet::new();
         for spec in COMMANDS {
-            assert!(spec.name.starts_with('/'), "{} must start with /", spec.name);
+            assert!(
+                spec.name.starts_with('/'),
+                "{} must start with /",
+                spec.name
+            );
             assert!(seen.insert(spec.name), "duplicate command {}", spec.name);
             assert!(is_known(spec.name));
             for alias in spec.aliases {
