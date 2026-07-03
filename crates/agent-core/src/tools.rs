@@ -261,6 +261,46 @@ pub fn definitions() -> Vec<Value> {
     ])
 }
 
+/// Tool definition for the JuCode Desktop built-in browser panel. Not part of
+/// `definitions()`: it is only offered when the CLI runs under the desktop app
+/// (JUCODE_DESKTOP is set), wired conditionally in the LLM client.
+pub fn browser_open_definition() -> Value {
+    with_function_tool_defaults(vec![json!({
+        "type": "function",
+        "name": "browser_open",
+        "description": "Open a URL in the JuCode Desktop built-in browser panel so the user can see the page. Use this to show the user a website, local dev server, or documentation page. The page opens in a side panel next to the chat.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "The URL to open. Must start with http:// or https://." }
+            },
+            "required": ["url"],
+            "additionalProperties": false
+        }
+    })])
+    .pop()
+    .expect("browser_open definition exists")
+}
+
+fn browser_open(args: &Value) -> Value {
+    browser_open_with_desktop(args, std::env::var("JUCODE_DESKTOP").is_ok())
+}
+
+/// The desktop UI watches the tool event stream and performs the actual
+/// navigation; the CLI only validates the URL and acknowledges the call.
+fn browser_open_with_desktop(args: &Value, desktop: bool) -> Value {
+    if !desktop {
+        return json!({ "error": "browser_open is only available when running inside JuCode Desktop" });
+    }
+    let Some(url) = args.get("url").and_then(Value::as_str) else {
+        return json!({ "error": "url must start with http:// or https://" });
+    };
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return json!({ "error": "url must start with http:// or https://" });
+    }
+    json!({ "opened": true, "url": url })
+}
+
 fn with_function_tool_defaults(mut definitions: Vec<Value>) -> Vec<Value> {
     for definition in &mut definitions {
         if definition.get("type").and_then(Value::as_str) == Some("function") {
@@ -307,6 +347,7 @@ pub fn run_tool_with_events(
         "ripgrep" => ripgrep(&args, cwd),
         "outline" => outline_file(&args, cwd),
         "checkpoint" => checkpoint_tool(&args, cwd),
+        "browser_open" => browser_open(&args),
         _ => json!({ "error": format!("unknown tool: {name}") }),
     };
     tool_result(name, result, cwd)
@@ -3145,6 +3186,38 @@ fn expand_tilde(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_open_definition_matches_tool_name_and_schema() {
+        let definition = browser_open_definition();
+        assert_eq!(definition["type"], "function");
+        assert_eq!(definition["name"], "browser_open");
+        assert_eq!(definition["strict"], false);
+        assert_eq!(definition["parameters"]["required"], json!(["url"]));
+        assert_eq!(definition["parameters"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn browser_open_errors_outside_desktop() {
+        let value = browser_open_with_desktop(&json!({ "url": "https://example.com" }), false);
+        assert_eq!(
+            value["error"],
+            "browser_open is only available when running inside JuCode Desktop"
+        );
+    }
+
+    #[test]
+    fn browser_open_validates_url_and_acknowledges() {
+        let missing = browser_open_with_desktop(&json!({}), true);
+        assert_eq!(missing["error"], "url must start with http:// or https://");
+
+        let invalid = browser_open_with_desktop(&json!({ "url": "ftp://example.com" }), true);
+        assert_eq!(invalid["error"], "url must start with http:// or https://");
+
+        let opened = browser_open_with_desktop(&json!({ "url": "https://example.com" }), true);
+        assert_eq!(opened["opened"], true);
+        assert_eq!(opened["url"], "https://example.com");
+    }
 
     #[test]
     fn image_read_projects_note_and_builds_image_message() {

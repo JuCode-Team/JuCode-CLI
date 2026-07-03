@@ -1180,29 +1180,33 @@ impl AgentCore {
         } else {
             Vec::new()
         };
+        let mut prompt_tools = vec![
+            "read",
+            "str_replace",
+            "hashline_edit",
+            "write",
+            "apply_patch",
+            "bash",
+            "write_stdin",
+            "ls",
+            "ripgrep",
+            "outline",
+            "checkpoint",
+            "spawn_agent",
+            "wait_agent",
+            "list_agents",
+            "send_message",
+            "close_agent",
+        ];
+        if std::env::var("JUCODE_DESKTOP").is_ok() {
+            prompt_tools.push("browser_open");
+        }
         let system_prompt = build_system_prompt(
             &base_prompt,
             &PromptContext {
                 date: current_utc_date(),
                 cwd: self.cwd.clone(),
-                tools: vec![
-                    "read",
-                    "str_replace",
-                    "hashline_edit",
-                    "write",
-                    "apply_patch",
-                    "bash",
-                    "write_stdin",
-                    "ls",
-                    "ripgrep",
-                    "outline",
-                    "checkpoint",
-                    "spawn_agent",
-                    "wait_agent",
-                    "list_agents",
-                    "send_message",
-                    "close_agent",
-                ],
+                tools: prompt_tools,
                 project_instructions,
                 skills,
             },

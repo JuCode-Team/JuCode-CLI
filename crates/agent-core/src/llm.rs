@@ -815,6 +815,9 @@ impl OpenAiClient {
 
     fn tool_definitions(&self) -> Vec<Value> {
         let mut definitions = tools::definitions();
+        if std::env::var("JUCODE_DESKTOP").is_ok() {
+            definitions.push(tools::browser_open_definition());
+        }
         if self.allow_subagents && self.subagent_manager.is_some() {
             definitions.extend(subagent_definitions());
         }
