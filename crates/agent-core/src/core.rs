@@ -1,12 +1,13 @@
 use crate::{
-    config::{profile_dir, AuthStore, Config, JucodeTokens, ModelConfig},
+    config::{profile_dir, ApprovalMode, AuthStore, Config, JucodeTokens, ModelConfig},
     event::{AgentEvent, CommandView, GoalView, ModelOptionView, PlanItem, SessionListItemView},
     extensions::ExtensionRegistry,
     hooks::Hooks,
     llm::{
-        ApprovalRequest, GoalToolRequest, OpenAiClient, OpenAiClientConfig, StreamEvent,
-        ToolGoalResponse,
+        ApprovalDecision, ApprovalRequest, GoalToolRequest, OpenAiClient, OpenAiClientConfig,
+        StreamEvent, ToolGoalResponse,
     },
+    mcp::McpManager,
     oauth::{self, OAuthLoginResult, OAuthModel},
     prompt::{
         build_system_prompt, discover_project_instructions, discover_skills, skill_commands,
@@ -41,6 +42,15 @@ use std::{
 const COMPACTION_KEEP_RECENT_TOKENS: usize = 20_000;
 const RESUME_SUMMARY_IDLE_SECONDS: u64 = 5 * 60;
 const RESUME_SUMMARY_MODEL: &str = "gpt-5.4-mini";
+
+/// A gated tool call parked until the client answers `/approve` (or the serve
+/// `approve` op). `hunk_ids` are the selectable hunks of an edit call; empty
+/// means only whole-call decisions are valid.
+struct PendingApproval {
+    response_tx: mpsc::Sender<ApprovalDecision>,
+    name: String,
+    hunk_ids: Vec<String>,
+}
 
 #[derive(Debug)]
 enum WorkerEvent {
@@ -108,8 +118,14 @@ pub struct AgentCore {
     resume_summary_receiver: Option<Receiver<WorkerEvent>>,
     goal_tool_receiver: Option<Receiver<GoalToolRequest>>,
     approval_receiver: Option<Receiver<ApprovalRequest>>,
-    pending_approvals: HashMap<String, (mpsc::Sender<bool>, String)>,
+    pending_approvals: HashMap<String, PendingApproval>,
+    /// Per-session "always allow" tool names, shared by the main agent and all
+    /// subagents (their requests arrive on the same channel). It can only
+    /// loosen the approval mode, never tighten it.
     approved_tools: HashSet<String>,
+    /// Session approval mode; starts from config and is switched by /approvals
+    /// or the serve `set_approval_mode` op (session-only, not persisted).
+    approval_mode: ApprovalMode,
     update_receiver: Option<Receiver<UpdateNotice>>,
     login_receiver: Option<Receiver<Result<OAuthLoginResult, String>>>,
     total_input_tokens: u64,
@@ -126,6 +142,7 @@ pub struct AgentCore {
     project_trusted: bool,
     hooks: Hooks,
     plan: Vec<PlanItem>,
+    mcp: McpManager,
 }
 
 impl AgentCore {
@@ -138,8 +155,16 @@ impl AgentCore {
             true
         };
         let hooks = Hooks::load(&profile_dir()?, &cwd, project_trusted);
+        let config = Config::load_or_create().inspect_err(|error| {
+            crate::log_error!("config", "failed to load config", error = error.to_string());
+        })?;
+        let approval_mode = config.approval_mode;
+        // Enabled MCP servers connect on background threads; the agent is
+        // usable immediately and their tools appear once connected.
+        let mcp = McpManager::default();
+        mcp.start(&config.mcp_servers, &cwd);
         Ok(Self {
-            config: Config::load_or_create()?,
+            config,
             auth: AuthStore::load_or_create()?,
             session: SessionStore::new(),
             profile_dir: profile_dir()?,
@@ -168,6 +193,8 @@ impl AgentCore {
             approval_receiver: None,
             pending_approvals: HashMap::new(),
             approved_tools: HashSet::new(),
+            approval_mode,
+            mcp,
         })
     }
 
@@ -185,6 +212,10 @@ impl AgentCore {
             },
             self.model_status_event(),
             self.command_list_event(),
+            self.approval_mode_event(),
+            // Servers still connecting report state "connecting"; a follow-up
+            // event is emitted from poll_events when their state settles.
+            self.mcp_servers_event(),
         ];
         if trust::project_has_local_resources(&self.cwd)
             && self.trust.decision_for(&self.cwd).is_none()
@@ -517,13 +548,13 @@ impl AgentCore {
                 None => self.checkpoint_list_events(),
                 Some(id) => self.checkpoint_restore_events(id),
             },
-            "/approve" => {
-                let call_id = parts.next().unwrap_or_default();
-                let allow = parts.next() == Some("allow");
-                let always = parts.next() == Some("always");
-                self.approve_events(call_id, allow, always)
-            }
+            "/approve" => match parse_approve_args(args.trim()) {
+                Ok((call_id, allow, always, hunks)) => self.approve(&call_id, allow, always, hunks),
+                Err(error) => vec![AgentEvent::Error(error)],
+            },
+            "/approvals" => self.approvals_command_events(args.trim()),
             "/extensions" => self.extension_events(),
+            "/mcp" => self.mcp_command_events(args.trim()),
             "/context" => self.context_events(),
             "/stats" => self.stats_events(),
             "/goal" => self.goal_command_events(args.trim()),
@@ -682,6 +713,7 @@ impl AgentCore {
         }
         match oauth::refresh(&self.config.jucode_api_url, &refresh_token) {
             Ok(t) => {
+                crate::log_info!("oauth", "refreshed jucode access token");
                 self.auth.set_jucode_tokens(JucodeTokens {
                     access_token: t.access_token,
                     refresh_token: t.refresh_token,
@@ -690,9 +722,12 @@ impl AgentCore {
                 });
                 self.auth.save().map_err(|error| error.to_string())
             }
-            Err(error) => Err(format!(
-                "failed to refresh JuCode session: {error}. Run /login."
-            )),
+            Err(error) => {
+                crate::log_error!("oauth", "token refresh failed", error = error.clone());
+                Err(format!(
+                    "failed to refresh JuCode session: {error}. Run /login."
+                ))
+            }
         }
     }
 
@@ -1022,6 +1057,12 @@ impl AgentCore {
         }
         events.extend(self.poll_goal_tool_requests());
         events.extend(self.poll_approval_requests());
+        for message in self.mcp.drain_messages() {
+            events.push(AgentEvent::Info(message));
+        }
+        if self.mcp.take_dirty() {
+            events.push(self.mcp_servers_event());
+        }
         if self.should_generate_resume_summary() {
             self.start_resume_summary();
         }
@@ -1192,6 +1233,7 @@ impl AgentCore {
             "ripgrep",
             "outline",
             "checkpoint",
+            "web_fetch",
             "spawn_agent",
             "wait_agent",
             "list_agents",
@@ -1234,6 +1276,7 @@ impl AgentCore {
                 &self.cwd,
                 self.config.profile_dir(),
             ),
+            mcp: self.mcp.clone(),
             base_url: self.config.base_url.clone(),
             max_output_tokens: self.config.current_model_config().max_output_tokens,
             api_key: self.provider_api_key(),
@@ -1243,6 +1286,7 @@ impl AgentCore {
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: Some(goal_tool_tx),
             approval_tx: Some(approval_tx),
+            approval_mode: self.approval_mode,
             subagent_manager: Some(self.subagent_manager.clone()),
             hooks: self.hooks.clone(),
         }) else {
@@ -1464,6 +1508,7 @@ impl AgentCore {
             system_prompt: String::new(),
             prompt_cache_key: self.session.session_id().to_string(),
             extensions: ExtensionRegistry::load(&[], &self.cwd, self.config.profile_dir()),
+            mcp: McpManager::default(),
             base_url: self.config.base_url.clone(),
             max_output_tokens: self.config.compact_model_config().max_output_tokens,
             api_key: self.provider_api_key(),
@@ -1473,6 +1518,7 @@ impl AgentCore {
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: None,
             approval_tx: None,
+            approval_mode: self.approval_mode,
             subagent_manager: None,
             hooks: Hooks::default(),
         })
@@ -1501,6 +1547,7 @@ impl AgentCore {
             system_prompt: String::new(),
             prompt_cache_key: self.session.session_id().to_string(),
             extensions: ExtensionRegistry::load(&[], &self.cwd, self.config.profile_dir()),
+            mcp: McpManager::default(),
             base_url: self.config.base_url.clone(),
             max_output_tokens,
             api_key: self.provider_api_key(),
@@ -1510,6 +1557,7 @@ impl AgentCore {
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: None,
             approval_tx: None,
+            approval_mode: self.approval_mode,
             subagent_manager: None,
             hooks: Hooks::default(),
         })
@@ -1567,44 +1615,111 @@ impl AgentCore {
         events
     }
 
-    /// Drain pending tool-approval requests from the worker. Allowlisted tools
-    /// are auto-approved; the rest surface an ApprovalRequest and park their
-    /// responder until the client decides.
+    /// Drain pending tool-approval requests from the worker (main agent and
+    /// subagents share the channel). Requests are auto-approved when the tool
+    /// is allowlisted or the current approval mode no longer gates it (a mode
+    /// loosened mid-run applies immediately); the rest surface an
+    /// ApprovalRequest and park their responder until the client decides.
     fn poll_approval_requests(&mut self) -> Vec<AgentEvent> {
         let Some(rx) = self.approval_receiver.take() else {
             return Vec::new();
         };
         let mut events = Vec::new();
         while let Ok(request) = rx.try_recv() {
-            if self.approved_tools.contains(&request.name) {
-                let _ = request.response_tx.send(true);
+            if self.approved_tools.contains(&request.name)
+                || !self.approval_mode.requires_approval(&request.name)
+            {
+                let _ = request.response_tx.send(ApprovalDecision::allow_all());
                 continue;
             }
+            let hunk_ids = request
+                .hunks
+                .as_ref()
+                .map(|hunks| hunks.iter().map(|hunk| hunk.id.clone()).collect())
+                .unwrap_or_default();
             events.push(AgentEvent::ApprovalRequest {
                 call_id: request.call_id.clone(),
                 name: request.name.clone(),
                 summary: request.summary.clone(),
+                subagent_id: request.subagent_id.clone(),
+                hunks: request.hunks,
             });
-            self.pending_approvals
-                .insert(request.call_id, (request.response_tx, request.name));
+            self.pending_approvals.insert(
+                request.call_id,
+                PendingApproval {
+                    response_tx: request.response_tx,
+                    name: request.name,
+                    hunk_ids,
+                },
+            );
         }
         self.approval_receiver = Some(rx);
         events
     }
 
-    /// Forward the client's allow/deny decision to the parked tool call. With
-    /// `always`, the tool is added to the per-session allowlist.
-    fn approve_events(&mut self, call_id: &str, allow: bool, always: bool) -> Vec<AgentEvent> {
-        let Some((response_tx, name)) = self.pending_approvals.remove(call_id) else {
-            return vec![AgentEvent::Error(
-                "no pending approval for that call".to_string(),
-            )];
-        };
-        if allow && always {
-            self.approved_tools.insert(name);
+    fn approval_mode_event(&self) -> AgentEvent {
+        AgentEvent::ApprovalMode {
+            mode: self.approval_mode.as_str().to_string(),
         }
-        let _ = response_tx.send(allow);
-        Vec::new()
+    }
+
+    /// Switch the session approval mode (also used by the serve
+    /// `set_approval_mode` op and the `--approval-mode` flag).
+    pub fn set_approval_mode(&mut self, mode: ApprovalMode) -> Vec<AgentEvent> {
+        self.approval_mode = mode;
+        vec![
+            AgentEvent::Status(format!("approval mode: {}", mode.as_str())),
+            self.approval_mode_event(),
+        ]
+    }
+
+    /// `/approvals [mode]` — show the current mode, or switch it for this session.
+    fn approvals_command_events(&mut self, arg: &str) -> Vec<AgentEvent> {
+        if arg.is_empty() {
+            return vec![
+                AgentEvent::Info(format!(
+                    "approval mode: {}\n\
+                     read-only  - file edits and shell commands ask for approval (default)\n\
+                     auto-edit  - file edits run freely; shell commands still ask\n\
+                     full-auto  - everything runs without asking\n\
+                     Switch with /approvals <mode>; a change applies to new turns and can\n\
+                     only loosen (never tighten) gating of an in-flight turn.",
+                    self.approval_mode.as_str()
+                )),
+                self.approval_mode_event(),
+            ];
+        }
+        match ApprovalMode::parse(arg) {
+            Ok(mode) => self.set_approval_mode(mode),
+            Err(error) => vec![AgentEvent::Error(format!(
+                "usage: /approvals [read-only|auto-edit|full-auto] ({error})"
+            ))],
+        }
+    }
+
+    /// Forward the client's allow/deny decision to the parked tool call. With
+    /// `always`, the tool is added to the per-session allowlist. `hunks`
+    /// restricts an allow to a subset of an edit call's hunk ids (also used by
+    /// the serve `approve` op). On a validation error the request stays
+    /// pending so the client can retry with a corrected command.
+    pub fn approve(
+        &mut self,
+        call_id: &str,
+        allow: bool,
+        always: bool,
+        hunks: Option<Vec<String>>,
+    ) -> Vec<AgentEvent> {
+        match resolve_approval_decision(
+            &mut self.pending_approvals,
+            &mut self.approved_tools,
+            call_id,
+            allow,
+            always,
+            hunks,
+        ) {
+            Ok(()) => Vec::new(),
+            Err(error) => vec![AgentEvent::Error(error)],
+        }
     }
 
     fn poll_goal_tool_requests(&mut self) -> Vec<AgentEvent> {
@@ -1790,9 +1905,17 @@ impl AgentCore {
     fn save_session_event(&mut self) -> Vec<AgentEvent> {
         match self.session.save_for_cwd(&self.profile_dir, &self.cwd) {
             Ok(()) => Vec::new(),
-            Err(error) => vec![AgentEvent::Error(format!(
-                "failed to save session: {error}"
-            ))],
+            Err(error) => {
+                crate::log_error!(
+                    "session",
+                    "failed to save session",
+                    session = self.session.session_id(),
+                    error = error.to_string()
+                );
+                vec![AgentEvent::Error(format!(
+                    "failed to save session: {error}"
+                ))]
+            }
         }
     }
 
@@ -2063,9 +2186,17 @@ impl AgentCore {
                     AgentEvent::Status(format!("resumed session {}", self.session.session_id())),
                 ]
             }
-            Err(error) => vec![AgentEvent::Error(format!(
-                "failed to resume {session_id}: {error}"
-            ))],
+            Err(error) => {
+                crate::log_error!(
+                    "session",
+                    "failed to load session",
+                    session = session_id,
+                    error = error.to_string()
+                );
+                vec![AgentEvent::Error(format!(
+                    "failed to resume {session_id}: {error}"
+                ))]
+            }
         }
     }
 
@@ -2138,6 +2269,7 @@ impl AgentCore {
         lines.push(format!("cwd: {}", self.cwd.display()));
         lines.push(format!("git: {}", command_ok("git", "--version")));
         lines.push(format!("rg: {}", command_ok("rg", "--version")));
+        lines.push(crate::logging::doctor_line());
         match discover_project_instructions(&self.cwd) {
             Ok(instructions) => lines.push(format!(
                 "project instructions: {} file(s)",
@@ -2160,6 +2292,7 @@ impl AgentCore {
             ));
             lines.extend(self.extension_info_lines());
         }
+        lines.push(self.mcp.doctor_line());
         vec![AgentEvent::Info(lines.join("\n"))]
     }
 
@@ -2214,6 +2347,152 @@ impl AgentCore {
                 ));
             }
         }
+        events
+    }
+
+    /// `/mcp` — list servers; `tools <server>`, `reload <server>`,
+    /// `enable|disable <server>` subcommands.
+    fn mcp_command_events(&mut self, args: &str) -> Vec<AgentEvent> {
+        let mut parts = args.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (None, _) => vec![AgentEvent::Info(self.mcp_list_lines())],
+            (Some("tools"), Some(server)) => vec![self.mcp_tools_info(server)],
+            (Some("reload"), Some(server)) => match self.mcp.reload(server, &self.cwd) {
+                Ok(()) => vec![AgentEvent::Status(format!(
+                    "reconnecting MCP server {server}"
+                ))],
+                Err(error) => vec![AgentEvent::Error(error)],
+            },
+            (Some(action @ ("enable" | "disable")), Some(server)) => {
+                self.mcp_toggle(server, action == "enable")
+            }
+            _ => vec![AgentEvent::Error(
+                "usage: /mcp [tools|reload|enable|disable] [server]".to_string(),
+            )],
+        }
+    }
+
+    fn mcp_list_lines(&self) -> String {
+        let views = self.mcp.views();
+        if views.is_empty() {
+            return "mcp: no servers configured (add mcp_servers to config.json)".to_string();
+        }
+        views
+            .iter()
+            .map(|server| {
+                let mut line = format!("{} ({}): {}", server.name, server.transport, server.state);
+                match (&server.error, server.state.as_str()) {
+                    (Some(error), _) => line.push_str(&format!(" - {error}")),
+                    (None, "connected") => {
+                        line.push_str(&format!(", {} tool(s)", server.tools.len()))
+                    }
+                    _ => {}
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn mcp_tools_info(&self, server: &str) -> AgentEvent {
+        let Some(view) = self.mcp.views().into_iter().find(|v| v.name == server) else {
+            return AgentEvent::Error(format!("unknown MCP server: {server}"));
+        };
+        if view.state != "connected" {
+            return AgentEvent::Info(format!("MCP server {server}: {}", view.state));
+        }
+        if view.tools.is_empty() {
+            return AgentEvent::Info(format!("MCP server {server}: no tools"));
+        }
+        let lines = view
+            .tools
+            .iter()
+            .map(|tool| {
+                if tool.description.is_empty() {
+                    format!(
+                        "{} ({})",
+                        tool.name,
+                        crate::mcp::mcp_tool_name(server, &tool.name)
+                    )
+                } else {
+                    format!(
+                        "{} ({}) - {}",
+                        tool.name,
+                        crate::mcp::mcp_tool_name(server, &tool.name),
+                        tool.description
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        AgentEvent::Info(format!("MCP server {server} tools:\n{lines}"))
+    }
+
+    pub fn mcp_servers_event(&self) -> AgentEvent {
+        AgentEvent::McpServers {
+            servers: self.mcp.views(),
+        }
+    }
+
+    /// Add or update one MCP server from a full config entry (serve `mcp_set`).
+    pub fn mcp_set(&mut self, entry: &Value) -> Vec<AgentEvent> {
+        let config = match crate::config::parse_mcp_server_value(entry) {
+            Ok(config) => config,
+            Err(error) => return vec![AgentEvent::Error(error)],
+        };
+        match self
+            .config
+            .mcp_servers
+            .iter_mut()
+            .find(|existing| existing.name == config.name)
+        {
+            Some(existing) => *existing = config.clone(),
+            None => self.config.mcp_servers.push(config.clone()),
+        }
+        if let Err(error) = self.config.save() {
+            return vec![AgentEvent::Error(format!("failed to save config: {error}"))];
+        }
+        self.mcp.upsert(config, &self.cwd);
+        vec![self.mcp_servers_event()]
+    }
+
+    /// Remove one MCP server by name, persisting the change (serve `mcp_remove`).
+    pub fn mcp_remove(&mut self, name: &str) -> Vec<AgentEvent> {
+        let before = self.config.mcp_servers.len();
+        self.config.mcp_servers.retain(|server| server.name != name);
+        if self.config.mcp_servers.len() == before && !self.mcp.contains(name) {
+            return vec![AgentEvent::Error(format!("unknown MCP server: {name}"))];
+        }
+        if let Err(error) = self.config.save() {
+            return vec![AgentEvent::Error(format!("failed to save config: {error}"))];
+        }
+        self.mcp.remove(name);
+        vec![self.mcp_servers_event()]
+    }
+
+    /// Enable/disable one MCP server, persisting the change (serve `mcp_toggle`
+    /// and `/mcp enable|disable`).
+    pub fn mcp_toggle(&mut self, name: &str, enabled: bool) -> Vec<AgentEvent> {
+        let Some(server) = self
+            .config
+            .mcp_servers
+            .iter_mut()
+            .find(|server| server.name == name)
+        else {
+            return vec![AgentEvent::Error(format!("unknown MCP server: {name}"))];
+        };
+        server.enabled = enabled;
+        if let Err(error) = self.config.save() {
+            return vec![AgentEvent::Error(format!("failed to save config: {error}"))];
+        }
+        if let Err(error) = self.mcp.set_enabled(name, enabled, &self.cwd) {
+            return vec![AgentEvent::Error(error)];
+        }
+        let mut events = vec![AgentEvent::Status(format!(
+            "MCP server {name} {}",
+            if enabled { "enabled" } else { "disabled" }
+        ))];
+        events.push(self.mcp_servers_event());
         events
     }
 
@@ -2551,6 +2830,305 @@ fn format_resume_detail(summary: &SessionSummary) -> String {
             "{status} · updated {} · entries {} · {}",
             summary.updated_at, summary.entries, summary.leaf
         ),
+    }
+}
+
+const APPROVE_USAGE: &str = "usage: /approve <call-id> <allow|deny> [always] [--hunks id1,id2]";
+
+/// `(call_id, allow, always, hunks)` parsed from an approval command.
+type ParsedApprove = (String, bool, bool, Option<Vec<String>>);
+
+/// Parses `/approve <call-id> <allow|deny> [always|once] [--hunks id1,id2]`.
+/// `always` allowlists the tool for the session and is incompatible with
+/// `--hunks`; `--hunks` requires `allow`.
+fn parse_approve_args(args: &str) -> Result<ParsedApprove, String> {
+    let mut parts = args.split_whitespace();
+    let call_id = parts
+        .next()
+        .ok_or_else(|| APPROVE_USAGE.to_string())?
+        .to_string();
+    let allow = match parts.next() {
+        Some("allow") => true,
+        Some("deny") => false,
+        _ => return Err(APPROVE_USAGE.to_string()),
+    };
+    let mut always = false;
+    let mut hunks = None;
+    while let Some(token) = parts.next() {
+        match token {
+            "always" => always = true,
+            // The TUI picker submits "allow once" for a one-shot allow.
+            "once" => {}
+            "--hunks" => {
+                let list = parts.next().ok_or_else(|| {
+                    "--hunks requires a comma-separated list of hunk ids".to_string()
+                })?;
+                hunks = Some(parse_hunk_id_list(list)?);
+            }
+            other => match other.strip_prefix("--hunks=") {
+                Some(list) => hunks = Some(parse_hunk_id_list(list)?),
+                None => return Err(format!("unexpected token '{other}'; {APPROVE_USAGE}")),
+            },
+        }
+    }
+    if hunks.is_some() {
+        if always {
+            return Err(
+                "--hunks cannot be combined with always; approve the whole call to allowlist the tool"
+                    .to_string(),
+            );
+        }
+        if !allow {
+            return Err(
+                "--hunks requires allow; use plain deny to reject the whole call".to_string(),
+            );
+        }
+    }
+    Ok((call_id, allow, always, hunks))
+}
+
+fn parse_hunk_id_list(list: &str) -> Result<Vec<String>, String> {
+    let ids = list
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Err("--hunks requires at least one hunk id".to_string());
+    }
+    Ok(ids)
+}
+
+/// Validates and forwards an approval decision to the parked tool call.
+/// Errors leave the request pending (nothing is removed or sent), so a typo
+/// in a hunk id never denies or approves the call as a side effect.
+fn resolve_approval_decision(
+    pending_approvals: &mut HashMap<String, PendingApproval>,
+    approved_tools: &mut HashSet<String>,
+    call_id: &str,
+    allow: bool,
+    always: bool,
+    hunks: Option<Vec<String>>,
+) -> Result<(), String> {
+    let pending = pending_approvals
+        .get(call_id)
+        .ok_or_else(|| "no pending approval for that call".to_string())?;
+    if let Some(requested) = &hunks {
+        if always {
+            return Err(
+                "--hunks cannot be combined with always; approve the whole call to allowlist the tool"
+                    .to_string(),
+            );
+        }
+        if !allow {
+            return Err(
+                "--hunks requires allow; use plain deny to reject the whole call".to_string(),
+            );
+        }
+        if pending.hunk_ids.is_empty() {
+            return Err(format!(
+                "call {call_id} does not support hunk selection; use plain allow or deny"
+            ));
+        }
+        if requested.is_empty() {
+            return Err("--hunks requires at least one hunk id".to_string());
+        }
+        for id in requested {
+            if !pending.hunk_ids.contains(id) {
+                return Err(format!(
+                    "unknown hunk id '{id}'; valid ids: {}",
+                    pending.hunk_ids.join(", ")
+                ));
+            }
+        }
+    }
+    let pending = pending_approvals
+        .remove(call_id)
+        .expect("pending approval checked above");
+    if allow && always {
+        approved_tools.insert(pending.name);
+    }
+    let approved_hunks = hunks.map(|ids| {
+        let mut seen = HashSet::new();
+        ids.into_iter()
+            .filter(|id| seen.insert(id.clone()))
+            .collect()
+    });
+    let _ = pending.response_tx.send(ApprovalDecision {
+        allow,
+        approved_hunks,
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod approval_decision_tests {
+    use super::*;
+    use std::sync::mpsc::TryRecvError;
+
+    fn pending(
+        hunk_ids: &[&str],
+    ) -> (HashMap<String, PendingApproval>, Receiver<ApprovalDecision>) {
+        let (response_tx, response_rx) = mpsc::channel();
+        let mut map = HashMap::new();
+        map.insert(
+            "call_1".to_string(),
+            PendingApproval {
+                response_tx,
+                name: "apply_patch".to_string(),
+                hunk_ids: hunk_ids.iter().map(|id| id.to_string()).collect(),
+            },
+        );
+        (map, response_rx)
+    }
+
+    #[test]
+    fn approve_parses_plain_allow_deny_always_and_hunks() {
+        assert_eq!(
+            parse_approve_args("call_1 allow").unwrap(),
+            ("call_1".to_string(), true, false, None)
+        );
+        assert_eq!(
+            parse_approve_args("call_1 allow once").unwrap(),
+            ("call_1".to_string(), true, false, None)
+        );
+        assert_eq!(
+            parse_approve_args("call_1 allow always").unwrap(),
+            ("call_1".to_string(), true, true, None)
+        );
+        assert_eq!(
+            parse_approve_args("call_1 deny").unwrap(),
+            ("call_1".to_string(), false, false, None)
+        );
+        let with_hunks = parse_approve_args("call_1 allow --hunks f0h1,f0h3").unwrap();
+        assert_eq!(
+            with_hunks,
+            (
+                "call_1".to_string(),
+                true,
+                false,
+                Some(vec!["f0h1".to_string(), "f0h3".to_string()])
+            )
+        );
+        assert_eq!(
+            parse_approve_args("call_1 allow --hunks=f1h2").unwrap().3,
+            Some(vec!["f1h2".to_string()])
+        );
+    }
+
+    #[test]
+    fn approve_parsing_rejects_bad_syntax_and_incompatible_flags() {
+        assert!(parse_approve_args("").unwrap_err().contains("usage"));
+        assert!(parse_approve_args("call_1").unwrap_err().contains("usage"));
+        assert!(parse_approve_args("call_1 maybe")
+            .unwrap_err()
+            .contains("usage"));
+        assert!(parse_approve_args("call_1 allow --hunks")
+            .unwrap_err()
+            .contains("comma-separated"));
+        assert!(parse_approve_args("call_1 allow --hunks ,")
+            .unwrap_err()
+            .contains("at least one hunk id"));
+        assert!(parse_approve_args("call_1 allow always --hunks f0h1")
+            .unwrap_err()
+            .contains("cannot be combined with always"));
+        assert!(parse_approve_args("call_1 deny --hunks f0h1")
+            .unwrap_err()
+            .contains("requires allow"));
+    }
+
+    #[test]
+    fn unknown_hunk_id_fails_the_command_and_keeps_the_request_pending() {
+        let (mut pending_approvals, response_rx) = pending(&["f0h1", "f0h2"]);
+        let mut approved_tools = HashSet::new();
+
+        let error = resolve_approval_decision(
+            &mut pending_approvals,
+            &mut approved_tools,
+            "call_1",
+            true,
+            false,
+            Some(vec!["f9h9".to_string()]),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("unknown hunk id 'f9h9'"), "{error}");
+        assert!(error.contains("f0h1, f0h2"), "{error}");
+        assert!(
+            pending_approvals.contains_key("call_1"),
+            "request must stay pending"
+        );
+        assert_eq!(response_rx.try_recv().unwrap_err(), TryRecvError::Empty);
+    }
+
+    #[test]
+    fn hunk_subset_approval_sends_a_deduplicated_selection() {
+        let (mut pending_approvals, response_rx) = pending(&["f0h1", "f0h2"]);
+        let mut approved_tools = HashSet::new();
+
+        resolve_approval_decision(
+            &mut pending_approvals,
+            &mut approved_tools,
+            "call_1",
+            true,
+            false,
+            Some(vec![
+                "f0h2".to_string(),
+                "f0h2".to_string(),
+                "f0h1".to_string(),
+            ]),
+        )
+        .unwrap();
+
+        let decision = response_rx.recv().unwrap();
+        assert!(decision.allow);
+        assert_eq!(
+            decision.approved_hunks,
+            Some(vec!["f0h2".to_string(), "f0h1".to_string()])
+        );
+        assert!(pending_approvals.is_empty());
+        assert!(approved_tools.is_empty(), "--hunks never allowlists");
+    }
+
+    #[test]
+    fn hunk_selection_is_rejected_for_calls_without_hunks() {
+        let (mut pending_approvals, _response_rx) = pending(&[]);
+        let mut approved_tools = HashSet::new();
+
+        let error = resolve_approval_decision(
+            &mut pending_approvals,
+            &mut approved_tools,
+            "call_1",
+            true,
+            false,
+            Some(vec!["f0h1".to_string()]),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("does not support hunk selection"), "{error}");
+        assert!(pending_approvals.contains_key("call_1"));
+    }
+
+    #[test]
+    fn whole_call_allow_always_still_allowlists_the_tool() {
+        let (mut pending_approvals, response_rx) = pending(&["f0h1"]);
+        let mut approved_tools = HashSet::new();
+
+        resolve_approval_decision(
+            &mut pending_approvals,
+            &mut approved_tools,
+            "call_1",
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+
+        assert!(approved_tools.contains("apply_patch"));
+        let decision = response_rx.recv().unwrap();
+        assert!(decision.allow);
+        assert!(decision.approved_hunks.is_none());
     }
 }
 

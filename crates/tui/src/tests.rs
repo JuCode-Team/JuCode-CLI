@@ -835,6 +835,32 @@ fn tool_output_preview_prefers_diff_field() {
 }
 
 #[test]
+fn tool_output_preview_appends_rejected_hunk_count_after_partial_approval() {
+    let output = serde_json::json!({
+        "diff": "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n",
+        "applied_hunks": ["f0h2"],
+        "rejected_hunks": ["f0h1", "f0h3"],
+    })
+    .to_string();
+
+    let preview = tool_output_preview("str_replace", &output, false);
+    let visible_preview = strip_ansi(&preview);
+
+    // The diff shows only the applied hunks, plus a rejected-count line.
+    assert!(visible_preview.contains("1 +  new"));
+    assert!(visible_preview.contains("2 hunk(s) rejected by user (not applied)"));
+
+    // A whole-call approval (nothing rejected) adds no such line.
+    let full = serde_json::json!({
+        "diff": "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n",
+        "applied_hunks": ["f0h1"],
+        "rejected_hunks": [],
+    })
+    .to_string();
+    assert!(!strip_ansi(&tool_output_preview("str_replace", &full, false)).contains("rejected"));
+}
+
+#[test]
 fn tool_output_preview_keeps_additions_after_large_removals() {
     let removals = (0..30)
         .map(|index| format!("-old line {index}"))

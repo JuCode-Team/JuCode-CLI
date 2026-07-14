@@ -783,6 +783,7 @@ impl<R: TuiRuntime> TuiApp<R> {
             }
             KeyCode::Esc => {
                 self.state.picker_view = None;
+                self.state.show_next_queued_approval();
                 false
             }
             KeyCode::Up => {
@@ -837,11 +838,13 @@ impl<R: TuiRuntime> TuiApp<R> {
                     .and_then(PickerState::selected_command)
                 else {
                     self.state.picker_view = None;
+                    self.state.show_next_queued_approval();
                     return false;
                 };
                 self.state.picker_view = None;
                 let (_, events) = self.runtime.handle_command(&command);
                 self.apply_events(events);
+                self.state.show_next_queued_approval();
                 false
             }
             _ => false,

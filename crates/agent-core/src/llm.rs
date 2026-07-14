@@ -1,6 +1,9 @@
 use crate::{
+    config::ApprovalMode,
     extensions::ExtensionRegistry,
     hooks::Hooks,
+    hunks::{self, HunkView},
+    mcp::McpManager,
     session::extract_response_text,
     subagents::{
         SubagentManager, SubagentRunResult, SubagentSpawn, MAX_LIVE_SUBAGENTS, MAX_SUBAGENT_DEPTH,
@@ -57,6 +60,7 @@ pub struct OpenAiClient {
     prompt_cache_key: String,
     turn_state: Arc<OnceLock<String>>,
     extensions: ExtensionRegistry,
+    mcp: McpManager,
     base_url: String,
     max_output_tokens: u64,
     retry_attempts: usize,
@@ -68,6 +72,10 @@ pub struct OpenAiClient {
     provider_kind: ProviderKind,
     goal_tool_tx: Option<Sender<GoalToolRequest>>,
     approval_tx: Option<Sender<ApprovalRequest>>,
+    /// Which tool classes this client gates on the approval channel. Captured
+    /// at client construction (turn start / subagent spawn) and never changed
+    /// mid-run; loosening a running turn happens core-side instead.
+    approval_mode: ApprovalMode,
     subagent_manager: Option<SubagentManager>,
     agent_path: String,
     agent_depth: u64,
@@ -84,6 +92,7 @@ pub struct OpenAiClientConfig<'a> {
     pub system_prompt: String,
     pub prompt_cache_key: String,
     pub extensions: ExtensionRegistry,
+    pub mcp: McpManager,
     pub base_url: String,
     pub max_output_tokens: u64,
     pub api_key: Option<&'a str>,
@@ -93,6 +102,7 @@ pub struct OpenAiClientConfig<'a> {
     pub read_timeout: Duration,
     pub goal_tool_tx: Option<Sender<GoalToolRequest>>,
     pub approval_tx: Option<Sender<ApprovalRequest>>,
+    pub approval_mode: ApprovalMode,
     pub subagent_manager: Option<SubagentManager>,
     pub hooks: Hooks,
 }
@@ -111,7 +121,37 @@ pub struct ApprovalRequest {
     pub call_id: String,
     pub name: String,
     pub summary: String,
-    pub response_tx: Sender<bool>,
+    /// Path of the subagent that issued the call; None for the main agent.
+    pub subagent_id: Option<String>,
+    /// Hunk breakdown for edit tools, computed before anything is applied so
+    /// the client can approve a subset. None means whole-call decisions only.
+    pub hunks: Option<Vec<HunkView>>,
+    pub response_tx: Sender<ApprovalDecision>,
+}
+
+/// The user's answer to an [`ApprovalRequest`].
+#[derive(Debug, Clone)]
+pub struct ApprovalDecision {
+    pub allow: bool,
+    /// With `allow`, Some(ids) applies only the listed hunks of an edit tool
+    /// call; None approves the whole call.
+    pub approved_hunks: Option<Vec<String>>,
+}
+
+impl ApprovalDecision {
+    pub fn allow_all() -> Self {
+        Self {
+            allow: true,
+            approved_hunks: None,
+        }
+    }
+
+    pub fn deny() -> Self {
+        Self {
+            allow: false,
+            approved_hunks: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -244,6 +284,7 @@ impl OpenAiClient {
             prompt_cache_key: config.prompt_cache_key,
             turn_state: Arc::new(OnceLock::new()),
             extensions: config.extensions,
+            mcp: config.mcp,
             base_url: config.base_url,
             max_output_tokens: config.max_output_tokens,
             retry_attempts: config.retry_attempts,
@@ -255,6 +296,7 @@ impl OpenAiClient {
             provider_kind,
             goal_tool_tx: config.goal_tool_tx,
             approval_tx: config.approval_tx,
+            approval_mode: config.approval_mode,
             subagent_manager: config.subagent_manager,
             agent_path: "/root".to_string(),
             agent_depth: 0,
@@ -371,9 +413,18 @@ impl OpenAiClient {
 
             // Gate side-effecting tools on a user decision before any execution,
             // so the prompt happens one at a time even when calls run in parallel.
+            // A partial (hunk-subset) approval rewrites the call's arguments to
+            // the approved hunks and records what was rejected for the result.
             let mut approved_requests = Vec::new();
-            for request in allowed_requests {
-                if self.needs_approval(&request.name) && !self.request_approval(&request) {
+            let mut partial_approvals: BTreeMap<String, (Vec<String>, Vec<String>)> =
+                BTreeMap::new();
+            for mut request in allowed_requests {
+                if !self.needs_approval(&request.name) {
+                    approved_requests.push(request);
+                    continue;
+                }
+                let decision = self.request_approval(&request, cwd);
+                if !decision.allow {
                     emit(StreamEvent::ToolStart {
                         call_id: request.call_id.clone(),
                         name: request.name.clone(),
@@ -381,8 +432,32 @@ impl OpenAiClient {
                     let result = approval_denied_result();
                     emit_tool_output(&request, &result, &mut emit)?;
                     blocked_results.push(ToolCallResult { request, result });
-                } else {
-                    approved_requests.push(request);
+                    continue;
+                }
+                match decision.approved_hunks {
+                    None => approved_requests.push(request),
+                    Some(approved) => {
+                        match hunks::filter_edit_call(&request.name, &request.arguments, &approved)
+                        {
+                            Ok(filtered) => {
+                                request.arguments = filtered.arguments;
+                                partial_approvals.insert(
+                                    request.call_id.clone(),
+                                    (filtered.applied, filtered.rejected),
+                                );
+                                approved_requests.push(request);
+                            }
+                            Err(error) => {
+                                emit(StreamEvent::ToolStart {
+                                    call_id: request.call_id.clone(),
+                                    name: request.name.clone(),
+                                })?;
+                                let result = hunk_selection_failed_result(&error);
+                                emit_tool_output(&request, &result, &mut emit)?;
+                                blocked_results.push(ToolCallResult { request, result });
+                            }
+                        }
+                    }
                 }
             }
             let allowed_requests = approved_requests;
@@ -402,8 +477,20 @@ impl OpenAiClient {
                         call_id: request.call_id.clone(),
                         name: request.name.clone(),
                     })?;
-                    let result =
+                    let mut result =
                         self.run_tool_call(&request, cwd, &input, &pending_call_ids, &mut emit);
+                    // Edit tools are never parallel-safe, so a partially
+                    // approved call always lands here; tell the model exactly
+                    // which hunks were applied and which the user rejected.
+                    if let Some((applied, rejected)) = partial_approvals.remove(&request.call_id) {
+                        result.output =
+                            hunks::merge_selective_summary(&result.output, &applied, &rejected);
+                        result.model_output = hunks::merge_selective_summary(
+                            &result.model_output,
+                            &applied,
+                            &rejected,
+                        );
+                    }
                     emit_tool_output(&request, &result, &mut emit)?;
                     results.push(ToolCallResult { request, result });
                 }
@@ -579,6 +666,12 @@ impl OpenAiClient {
             let response = match self.send_once(&url, &body) {
                 Ok(response) => response,
                 Err(error) if attempt < max_attempts && is_retryable_error(&error) => {
+                    crate::log_warn!(
+                        "llm",
+                        "retrying request",
+                        attempt = attempt + 1,
+                        error = error.to_string()
+                    );
                     emit(StreamEvent::Retrying {
                         attempt: attempt + 1,
                     })?;
@@ -646,6 +739,12 @@ impl OpenAiClient {
                     return Ok(output_items);
                 }
                 Err(error) if attempt < max_attempts && is_retryable_stream_error(&error) => {
+                    crate::log_warn!(
+                        "llm",
+                        "retrying after stream error",
+                        attempt = attempt + 1,
+                        error = error.clone()
+                    );
                     emit(StreamEvent::Retrying {
                         attempt: attempt + 1,
                     })?;
@@ -686,6 +785,12 @@ impl OpenAiClient {
             let response = match self.send_once(&url, &body) {
                 Ok(response) => response,
                 Err(error) if attempt < max_attempts && is_retryable_error(&error) => {
+                    crate::log_warn!(
+                        "llm",
+                        "retrying request",
+                        attempt = attempt + 1,
+                        error = error.to_string()
+                    );
                     emit(StreamEvent::Retrying {
                         attempt: attempt + 1,
                     })?;
@@ -730,6 +835,12 @@ impl OpenAiClient {
                     return Ok(output_items);
                 }
                 Err(error) if attempt < max_attempts && is_retryable_stream_error(&error) => {
+                    crate::log_warn!(
+                        "llm",
+                        "retrying after stream error",
+                        attempt = attempt + 1,
+                        error = error.clone()
+                    );
                     emit(StreamEvent::Retrying {
                         attempt: attempt + 1,
                     })?;
@@ -802,6 +913,12 @@ impl OpenAiClient {
             match self.send_once(url, body) {
                 Ok(response) => return Ok(response),
                 Err(error) if attempt < max_attempts && is_retryable_error(&error) => {
+                    crate::log_warn!(
+                        "llm",
+                        "retrying request",
+                        attempt = attempt + 1,
+                        error = error.to_string()
+                    );
                     emit(StreamEvent::Retrying {
                         attempt: attempt + 1,
                     })?;
@@ -822,6 +939,7 @@ impl OpenAiClient {
             definitions.extend(subagent_definitions());
         }
         definitions.extend(self.extensions.definitions());
+        definitions.extend(self.mcp.definitions());
         if self.goal_tool_tx.is_some() {
             definitions.extend(goal_tool_definitions());
             definitions.push(plan_tool_definition());
@@ -892,6 +1010,18 @@ impl OpenAiClient {
             pending_call_ids,
         ) {
             result
+        } else if request.name.starts_with("mcp__") {
+            match self.mcp.run_tool(&request.name, &request.arguments) {
+                Some((output, is_error)) => tools::ToolExecutionResult {
+                    model_output: tools::project_model_output(&request.name, &output, cwd),
+                    output,
+                    is_error,
+                },
+                None => json_tool_result(
+                    json!({ "error": format!("unknown MCP tool: {}", request.name) }),
+                    true,
+                ),
+            }
         } else {
             tools::run_tool_with_events(&request.name, &request.arguments, cwd, |event| {
                 let tools::ToolExecutionEvent::Update(output) = event;
@@ -1012,6 +1142,7 @@ impl OpenAiClient {
             prompt_cache_key: self.prompt_cache_key.clone(),
             turn_state: Arc::clone(&self.turn_state),
             extensions: self.extensions.clone(),
+            mcp: self.mcp.clone(),
             base_url: self.base_url.clone(),
             max_output_tokens,
             retry_attempts: self.retry_attempts,
@@ -1022,13 +1153,25 @@ impl OpenAiClient {
             deadline: Some(started + Duration::from_secs(timeout_secs)),
             provider_kind: self.provider_kind,
             goal_tool_tx: None,
-            approval_tx: None,
+            // The child shares the parent's approval channel and inherits the
+            // parent's mode as of spawn time; a later /approvals switch does
+            // not retarget live subagents (their requests can still be
+            // auto-approved core-side if the live mode is looser).
+            approval_tx: self.approval_tx.clone(),
+            approval_mode: self.approval_mode,
             subagent_manager: Some(manager.clone()),
             agent_path: child_path.clone(),
             agent_depth: child_depth,
             hooks: self.hooks.clone(),
         };
 
+        crate::log_info!(
+            "subagent",
+            "spawned",
+            task = task_name,
+            model = model.clone(),
+            path = child_path.clone()
+        );
         std::thread::spawn(move || {
             child_manager.mark_running(&child_path);
             let mut stats = SubagentTurnStats::default();
@@ -1126,7 +1269,11 @@ impl OpenAiClient {
         let args = serde_json::from_str::<Value>(arguments)
             .map_err(|error| format!("invalid JSON arguments: {error}"))?;
         let target = required_str(&args, "target")?;
-        manager.close_agent(&self.agent_path, target)
+        let result = manager.close_agent(&self.agent_path, target);
+        if result.is_ok() {
+            crate::log_info!("subagent", "closed", target = target);
+        }
+        result
     }
 
     fn append_queued_subagent_messages(
@@ -1187,30 +1334,30 @@ impl OpenAiClient {
         })
     }
 
-    /// Tools whose side effects warrant a user decision before they run:
-    /// shell execution and file mutations. Only gated when an approval handler
-    /// is wired (interactive serve / TUI), never for subagents.
+    /// Tools whose side effects warrant a user decision before they run under
+    /// this client's approval mode. Only gated when an approval handler is
+    /// wired (interactive serve / TUI); the class-per-mode policy lives in
+    /// `ApprovalMode::requires_approval`. Requests that do go out may still be
+    /// auto-approved core-side by the session allowlist or a looser live mode.
     fn needs_approval(&self, name: &str) -> bool {
-        self.approval_tx.is_some()
-            && matches!(
-                name,
-                "bash"
-                    | "execute"
-                    | "exec_command"
-                    | "shell_command"
-                    | "write"
-                    | "edit"
-                    | "str_replace"
-                    | "hashline_edit"
-                    | "apply_patch"
-            )
+        if self.approval_tx.is_none() {
+            return false;
+        }
+        // MCP tools consult the server's readOnlyHint annotation; a tool
+        // without a cached hint falls through to the conservative name check.
+        if let Some(read_only_hint) = self.mcp.tool_read_only_hint(name) {
+            return self.approval_mode.requires_approval_for_mcp(read_only_hint);
+        }
+        self.approval_mode.requires_approval(name)
     }
 
     /// Blocks until the core forwards the user's decision. A dropped channel
     /// (interrupt / no handler) is treated as a denial so the worker unblocks.
-    fn request_approval(&self, request: &ToolCallRequest) -> bool {
+    /// Edit tool calls carry their hunk breakdown so the decision may approve
+    /// only a subset of the change.
+    fn request_approval(&self, request: &ToolCallRequest, cwd: &Path) -> ApprovalDecision {
         let Some(tx) = &self.approval_tx else {
-            return true;
+            return ApprovalDecision::allow_all();
         };
         let (response_tx, response_rx) = mpsc::channel();
         if tx
@@ -1218,13 +1365,17 @@ impl OpenAiClient {
                 call_id: request.call_id.clone(),
                 name: request.name.clone(),
                 summary: approval_summary(&request.name, &request.arguments),
+                subagent_id: (self.agent_depth > 0).then(|| self.agent_path.clone()),
+                hunks: hunks::plan_edit_hunks(&request.name, &request.arguments, cwd),
                 response_tx,
             })
             .is_err()
         {
-            return false;
+            return ApprovalDecision::deny();
         }
-        response_rx.recv().unwrap_or(false)
+        response_rx
+            .recv()
+            .unwrap_or_else(|_| ApprovalDecision::deny())
     }
 }
 
@@ -1471,6 +1622,20 @@ fn hook_blocked_result(reason: &str) -> tools::ToolExecutionResult {
     }
 }
 
+/// The user's hunk selection could not be applied to the call (e.g. the patch
+/// no longer splits); nothing was executed.
+fn hunk_selection_failed_result(error: &str) -> tools::ToolExecutionResult {
+    let output = json!({
+        "error": format!("selective approval failed: {error}. The call was not executed; ask the user how to proceed or retry with a smaller change.")
+    })
+    .to_string();
+    tools::ToolExecutionResult {
+        model_output: output.clone(),
+        output,
+        is_error: true,
+    }
+}
+
 fn approval_denied_result() -> tools::ToolExecutionResult {
     let output = json!({
         "error": "denied by user: the user declined to run this tool call. Do not retry it; ask how to proceed or try a different approach."
@@ -1491,6 +1656,7 @@ fn approval_summary(name: &str, arguments: &str) -> String {
         "bash" | "execute" | "exec_command" | "shell_command" => field("command")
             .or_else(|| field("cmd"))
             .unwrap_or_default(),
+        "write_stdin" => field("text").or_else(|| field("chars")).unwrap_or_default(),
         _ => field("path").unwrap_or_default(),
     }
 }
@@ -1721,9 +1887,13 @@ fn handle_response_error<T>(error: ureq::Error) -> Result<T, String> {
             let body = response
                 .into_string()
                 .unwrap_or_else(|_| "<failed to read error body>".to_string());
+            crate::log_error!("llm", "http request failed", status = code);
             Err(format!("LLM API returned HTTP {code}: {body}"))
         }
-        error => Err(error.to_string()),
+        error => {
+            crate::log_error!("llm", "http request failed", error = error.to_string());
+            Err(error.to_string())
+        }
     }
 }
 
@@ -3496,6 +3666,7 @@ mod tests {
             system_prompt: "system".to_string(),
             prompt_cache_key: "cache-key".to_string(),
             extensions: ExtensionRegistry::load(&[], Path::new("."), Path::new(".")),
+            mcp: McpManager::default(),
             base_url: "https://api.jucode.cn/v1".to_string(),
             max_output_tokens: 2048,
             api_key: Some("test-key"),
@@ -3505,10 +3676,182 @@ mod tests {
             read_timeout: Duration::from_secs(1),
             goal_tool_tx: None,
             approval_tx: None,
+            approval_mode: ApprovalMode::default(),
             subagent_manager: None,
             hooks: Hooks::default(),
         })
         .unwrap()
+    }
+
+    fn approval_test_client(
+        mode: ApprovalMode,
+        approval_tx: Option<Sender<ApprovalRequest>>,
+    ) -> OpenAiClient {
+        let mut client = test_client();
+        client.approval_mode = mode;
+        client.approval_tx = approval_tx;
+        client
+    }
+
+    #[test]
+    fn needs_approval_follows_mode_per_tool_class() {
+        let (tx, _rx) = mpsc::channel();
+        let cases = [
+            (ApprovalMode::ReadOnly, "bash", true),
+            (ApprovalMode::ReadOnly, "write_stdin", true),
+            (ApprovalMode::ReadOnly, "write", true),
+            (ApprovalMode::ReadOnly, "apply_patch", true),
+            (ApprovalMode::ReadOnly, "read", false),
+            (ApprovalMode::AutoEdit, "bash", true),
+            (ApprovalMode::AutoEdit, "str_replace", false),
+            (ApprovalMode::AutoEdit, "hashline_edit", false),
+            (ApprovalMode::FullAuto, "bash", false),
+            (ApprovalMode::FullAuto, "write", false),
+        ];
+        for (mode, tool, expected) in cases {
+            let client = approval_test_client(mode, Some(tx.clone()));
+            assert_eq!(
+                client.needs_approval(tool),
+                expected,
+                "{tool} under {}",
+                mode.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn needs_approval_is_disabled_without_a_handler() {
+        let client = approval_test_client(ApprovalMode::ReadOnly, None);
+        assert!(!client.needs_approval("bash"));
+    }
+
+    #[test]
+    fn mcp_tools_gate_by_read_only_hint() {
+        let (tx, _rx) = mpsc::channel();
+        let tools = json!([
+            { "name": "lookup", "inputSchema": { "type": "object" },
+              "annotations": { "readOnlyHint": true } },
+            { "name": "mutate", "inputSchema": { "type": "object" } }
+        ]);
+        let cases = [
+            (ApprovalMode::ReadOnly, "mcp__srv__lookup", true),
+            (ApprovalMode::ReadOnly, "mcp__srv__mutate", true),
+            (ApprovalMode::AutoEdit, "mcp__srv__lookup", false),
+            (ApprovalMode::AutoEdit, "mcp__srv__mutate", true),
+            (ApprovalMode::FullAuto, "mcp__srv__lookup", false),
+            (ApprovalMode::FullAuto, "mcp__srv__mutate", false),
+            // Unknown MCP names have no hint and gate conservatively.
+            (ApprovalMode::AutoEdit, "mcp__other__tool", true),
+        ];
+        for (mode, tool, expected) in cases {
+            let mut client = approval_test_client(mode, Some(tx.clone()));
+            client.mcp =
+                crate::mcp::test_support::manager_with_tools("srv", tools.clone(), json!({}));
+            assert_eq!(
+                client.needs_approval(tool),
+                expected,
+                "{tool} under {}",
+                mode.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_approval_request_carries_subagent_id_and_blocks_for_answer() {
+        let (tx, rx) = mpsc::channel();
+        let mut client = approval_test_client(ApprovalMode::ReadOnly, Some(tx));
+        client.agent_path = "/root/worker".to_string();
+        client.agent_depth = 1;
+
+        let responder = thread::spawn(move || {
+            let request: ApprovalRequest = rx.recv().unwrap();
+            assert_eq!(request.name, "bash");
+            assert_eq!(request.subagent_id.as_deref(), Some("/root/worker"));
+            assert_eq!(request.summary, "rm -rf build");
+            assert!(request.hunks.is_none(), "non-edit tools carry no hunks");
+            request
+                .response_tx
+                .send(ApprovalDecision::allow_all())
+                .unwrap();
+        });
+
+        let decision = client.request_approval(
+            &ToolCallRequest {
+                call_id: "call_1".to_string(),
+                name: "bash".to_string(),
+                arguments: json!({ "command": "rm -rf build" }).to_string(),
+            },
+            Path::new("."),
+        );
+        assert!(decision.allow);
+        assert!(decision.approved_hunks.is_none());
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn main_agent_approval_request_has_no_subagent_id_and_denies_on_drop() {
+        let (tx, rx) = mpsc::channel();
+        let client = approval_test_client(ApprovalMode::ReadOnly, Some(tx));
+
+        let responder = thread::spawn(move || {
+            let request: ApprovalRequest = rx.recv().unwrap();
+            assert_eq!(request.subagent_id, None);
+            // Dropping the responder (interrupt / handler gone) must deny.
+            drop(request);
+        });
+
+        let decision = client.request_approval(
+            &ToolCallRequest {
+                call_id: "call_2".to_string(),
+                name: "write".to_string(),
+                arguments: json!({ "path": "a.txt" }).to_string(),
+            },
+            Path::new("."),
+        );
+        assert!(!decision.allow);
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn edit_tool_approval_request_carries_hunks_and_returns_the_subset() {
+        let dir = std::env::temp_dir().join(format!(
+            "jucode-llm-approval-hunks-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "old\n").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let client = approval_test_client(ApprovalMode::ReadOnly, Some(tx));
+
+        let responder = thread::spawn(move || {
+            let request: ApprovalRequest = rx.recv().unwrap();
+            let hunks = request.hunks.as_ref().expect("write must carry hunks");
+            assert_eq!(hunks.len(), 1, "write is a single all-or-nothing hunk");
+            assert_eq!(hunks[0].id, "f0h1");
+            request
+                .response_tx
+                .send(ApprovalDecision {
+                    allow: true,
+                    approved_hunks: Some(vec!["f0h1".to_string()]),
+                })
+                .unwrap();
+        });
+
+        let decision = client.request_approval(
+            &ToolCallRequest {
+                call_id: "call_3".to_string(),
+                name: "write".to_string(),
+                arguments: json!({ "path": "a.txt", "content": "new\n" }).to_string(),
+            },
+            &dir,
+        );
+        assert!(decision.allow);
+        assert_eq!(decision.approved_hunks, Some(vec!["f0h1".to_string()]));
+        responder.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

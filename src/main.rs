@@ -1,4 +1,4 @@
-use jucode_agent_core::{AgentCore, AgentEvent};
+use jucode_agent_core::{AgentCore, AgentEvent, ApprovalMode};
 use jucode_tui::{TuiApp, TuiRuntime};
 use serde_json::{json, Value};
 use std::{
@@ -56,14 +56,22 @@ impl TuiRuntime for Runtime {
 }
 
 fn main() -> io::Result<()> {
+    jucode_agent_core::logging::init_global();
     let mut args = env::args().skip(1).collect::<Vec<_>>();
+    let approval_mode = match take_approval_mode_flag(&mut args) {
+        Ok(mode) => mode,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
     if args.first().map(String::as_str) == Some("--headless") {
         args.remove(0);
-        let code = run_headless(args)?;
+        let code = run_headless(args, approval_mode)?;
         std::process::exit(code);
     }
     if args.first().map(String::as_str) == Some("serve") {
-        let code = run_serve()?;
+        let code = run_serve(approval_mode)?;
         std::process::exit(code);
     }
     if args.first().map(String::as_str) == Some("providers") {
@@ -88,17 +96,62 @@ fn main() -> io::Result<()> {
         std::process::exit(0);
     }
     let mut core = AgentCore::new()?;
+    if let Some(mode) = approval_mode {
+        // Startup events (emitted by the TUI) will reflect the switched mode.
+        let _ = core.set_approval_mode(mode);
+    }
     core.start_update_check();
     TuiApp::new(Runtime(core)).run()
 }
 
-fn run_headless(args: Vec<String>) -> io::Result<i32> {
+/// Extracts `--approval-mode <mode>` (or `--approval-mode=<mode>`) from `args`.
+fn take_approval_mode_flag(args: &mut Vec<String>) -> Result<Option<ApprovalMode>, String> {
+    let Some(index) = args
+        .iter()
+        .position(|arg| arg == "--approval-mode" || arg.starts_with("--approval-mode="))
+    else {
+        return Ok(None);
+    };
+    let arg = args.remove(index);
+    let value = match arg.strip_prefix("--approval-mode=") {
+        Some(value) => value.to_string(),
+        None => {
+            if index >= args.len() {
+                return Err(
+                    "--approval-mode requires a value: read-only, auto-edit, or full-auto"
+                        .to_string(),
+                );
+            }
+            args.remove(index)
+        }
+    };
+    ApprovalMode::parse(&value).map(Some)
+}
+
+fn run_headless(args: Vec<String>, approval_mode: Option<ApprovalMode>) -> io::Result<i32> {
     let mut prompt = args.join(" ");
     if prompt.trim().is_empty() {
         io::stdin().read_to_string(&mut prompt)?;
     }
     let mut core = AgentCore::new()?;
     let mut stdout = io::stdout();
+    // Headless reads no further stdin, so approval prompts could never be
+    // answered; it therefore always runs full-auto and rejects tighter modes.
+    if let Some(mode) = approval_mode {
+        if mode != ApprovalMode::FullAuto {
+            write_event(
+                &mut stdout,
+                AgentEvent::Error(format!(
+                    "--approval-mode {} is not supported in --headless mode: approvals cannot be answered, so headless always runs full-auto",
+                    mode.as_str()
+                )),
+            )?;
+            return Ok(2);
+        }
+    }
+    for event in core.set_approval_mode(ApprovalMode::FullAuto) {
+        write_event(&mut stdout, event)?;
+    }
     let mut done = false;
     let mut stats = HeadlessStats::default();
     let started = Instant::now();
@@ -139,8 +192,12 @@ fn run_headless(args: Vec<String>) -> io::Result<i32> {
 /// Reads newline-delimited JSON commands on stdin and emits the engine's
 /// `AgentEvent` stream as newline-delimited JSON on stdout (same schema as
 /// `--headless`). Runs until stdin closes or a `shutdown`/`/quit` command.
-fn run_serve() -> io::Result<i32> {
+fn run_serve(approval_mode: Option<ApprovalMode>) -> io::Result<i32> {
     let mut core = AgentCore::new()?;
+    if let Some(mode) = approval_mode {
+        // Set before startup_events so the startup approval_mode event reflects it.
+        let _ = core.set_approval_mode(mode);
+    }
     core.start_update_check();
     let mut stdout = io::stdout();
 
@@ -204,6 +261,11 @@ fn handle_serve_line(
     let value = match serde_json::from_str::<Value>(line) {
         Ok(value) => value,
         Err(error) => {
+            jucode_agent_core::log_warn!(
+                "serve",
+                "failed to parse command line",
+                error = error.to_string()
+            );
             write_event(
                 stdout,
                 AgentEvent::Error(format!("invalid command: {error}")),
@@ -243,13 +305,93 @@ fn handle_serve_line(
         }
         "steer" => core.steer(),
         "interrupt" => core.interrupt(),
+        // Structured twin of the `/approve` text command (GUI convenience):
+        // {"op":"approve","call_id":"...","decision":"allow|deny",
+        //  "hunks":["f0h1"],"always":false} — routes to the same handler.
+        "approve" => match parse_approve_op(&value) {
+            Ok((call_id, allow, always, hunks)) => core.approve(&call_id, allow, always, hunks),
+            Err(error) => vec![AgentEvent::Error(error)],
+        },
+        "set_approval_mode" => {
+            let mode = value
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match ApprovalMode::parse(mode) {
+                Ok(mode) => core.set_approval_mode(mode),
+                Err(error) => vec![AgentEvent::Error(error)],
+            }
+        }
+        "mcp_list" => vec![core.mcp_servers_event()],
+        "mcp_set" => match value.get("server") {
+            Some(server) => core.mcp_set(server),
+            None => vec![AgentEvent::Error(
+                "mcp_set requires a server object".to_string(),
+            )],
+        },
+        "mcp_remove" => match value.get("name").and_then(Value::as_str) {
+            Some(name) => core.mcp_remove(name),
+            None => vec![AgentEvent::Error("mcp_remove requires name".to_string())],
+        },
+        "mcp_toggle" => {
+            match (
+                value.get("name").and_then(Value::as_str),
+                value.get("enabled").and_then(Value::as_bool),
+            ) {
+                (Some(name), Some(enabled)) => core.mcp_toggle(name, enabled),
+                _ => vec![AgentEvent::Error(
+                    "mcp_toggle requires name and enabled".to_string(),
+                )],
+            }
+        }
         "shutdown" => return Ok(true),
-        other => vec![AgentEvent::Error(format!("unknown op: {other}"))],
+        other => {
+            jucode_agent_core::log_warn!("serve", "unknown op", op = other);
+            vec![AgentEvent::Error(format!("unknown op: {other}"))]
+        }
     };
     for event in events {
         write_event(stdout, event)?;
     }
     Ok(false)
+}
+
+/// `(call_id, allow, always, hunks)` parsed from the serve `approve` op.
+type ParsedApprove = (String, bool, bool, Option<Vec<String>>);
+
+/// Parses the serve `approve` op into `(call_id, allow, always, hunks)`.
+/// Combination rules (always vs hunks, unknown ids) are validated by
+/// `AgentCore::approve` so text and structured paths behave identically.
+fn parse_approve_op(value: &Value) -> Result<ParsedApprove, String> {
+    let call_id = value
+        .get("call_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| "approve requires call_id".to_string())?;
+    let allow = match value.get("decision").and_then(Value::as_str) {
+        Some("allow") => true,
+        Some("deny") => false,
+        _ => return Err("approve requires decision: allow or deny".to_string()),
+    };
+    let always = value
+        .get("always")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let hunks = match value.get("hunks") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(items)) => {
+            let mut ids = Vec::new();
+            for item in items {
+                match item.as_str().map(str::trim) {
+                    Some(id) if !id.is_empty() => ids.push(id.to_string()),
+                    _ => return Err("hunks must be an array of hunk id strings".to_string()),
+                }
+            }
+            Some(ids)
+        }
+        Some(_) => return Err("hunks must be an array of hunk id strings".to_string()),
+    };
+    Ok((call_id.to_string(), allow, always, hunks))
 }
 
 fn write_event(stdout: &mut impl Write, event: AgentEvent) -> io::Result<()> {
@@ -320,7 +462,9 @@ fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
         AgentEvent::TreeView(_) => "tree_view",
         AgentEvent::ResumeView(_) => "resume_view",
         AgentEvent::CheckpointView(_) => "checkpoint_view",
+        AgentEvent::McpServers { .. } => "mcp_servers",
         AgentEvent::ApprovalRequest { .. } => "approval_request",
+        AgentEvent::ApprovalMode { .. } => "approval_mode",
         AgentEvent::TrustPrompt { .. } => "trust_prompt",
         AgentEvent::ModelView { .. } => "model_view",
         AgentEvent::CommandList(_) => "command_list",
@@ -493,15 +637,47 @@ fn event_json(event: AgentEvent) -> Value {
                 json!({ "id": item.id, "label": item.label, "detail": item.detail })
             }).collect::<Vec<_>>()
         }),
+        AgentEvent::McpServers { servers } => json!({
+            "type": "mcp_servers",
+            "servers": servers.into_iter().map(|server| {
+                let mut entry = json!({
+                    "name": server.name,
+                    "transport": server.transport,
+                    "state": server.state,
+                    "tools": server.tools.into_iter().map(|tool| {
+                        json!({ "name": tool.name, "description": tool.description })
+                    }).collect::<Vec<_>>(),
+                });
+                if let Some(error) = server.error {
+                    entry["error"] = json!(error);
+                }
+                entry
+            }).collect::<Vec<_>>()
+        }),
         AgentEvent::ApprovalRequest {
             call_id,
             name,
             summary,
+            subagent_id,
+            hunks,
         } => json!({
             "type": "approval_request",
             "call_id": call_id,
             "name": name,
             "summary": summary,
+            "subagent_id": subagent_id,
+            // Edit tools: the selectable hunks of the pending change; answer
+            // with the `approve` op (or /approve --hunks) to apply a subset.
+            "hunks": hunks.map(|hunks| hunks.into_iter().map(|hunk| json!({
+                "id": hunk.id,
+                "file": hunk.file,
+                "header": hunk.header,
+                "lines": hunk.lines,
+            })).collect::<Vec<_>>()),
+        }),
+        AgentEvent::ApprovalMode { mode } => json!({
+            "type": "approval_mode",
+            "mode": mode,
         }),
         AgentEvent::TrustPrompt { cwd, repo_root } => json!({
             "type": "trust_prompt",
@@ -589,5 +765,97 @@ mod tests {
         assert_eq!(value["context_tokens"], 99);
         assert_eq!(value["tool_calls"], 3);
         assert_eq!(value["elapsed_ms"], 123);
+    }
+
+    #[test]
+    fn approve_op_round_trips_decision_always_and_hunks() {
+        let op = json!({
+            "op": "approve",
+            "call_id": "call_9",
+            "decision": "allow",
+            "hunks": ["f0h1", "f1h2"],
+            "always": false,
+        });
+        assert_eq!(
+            parse_approve_op(&op).unwrap(),
+            (
+                "call_9".to_string(),
+                true,
+                false,
+                Some(vec!["f0h1".to_string(), "f1h2".to_string()])
+            )
+        );
+
+        let plain_deny = json!({ "op": "approve", "call_id": "call_9", "decision": "deny" });
+        assert_eq!(
+            parse_approve_op(&plain_deny).unwrap(),
+            ("call_9".to_string(), false, false, None)
+        );
+
+        let always = json!({
+            "op": "approve", "call_id": "call_9", "decision": "allow", "always": true,
+            "hunks": null,
+        });
+        assert_eq!(
+            parse_approve_op(&always).unwrap(),
+            ("call_9".to_string(), true, true, None)
+        );
+    }
+
+    #[test]
+    fn approve_op_rejects_missing_fields_and_bad_hunks() {
+        let missing_call = json!({ "op": "approve", "decision": "allow" });
+        assert!(parse_approve_op(&missing_call)
+            .unwrap_err()
+            .contains("call_id"));
+
+        let bad_decision = json!({ "op": "approve", "call_id": "c", "decision": "maybe" });
+        assert!(parse_approve_op(&bad_decision)
+            .unwrap_err()
+            .contains("allow or deny"));
+
+        let bad_hunks =
+            json!({ "op": "approve", "call_id": "c", "decision": "allow", "hunks": [1] });
+        assert!(parse_approve_op(&bad_hunks)
+            .unwrap_err()
+            .contains("array of hunk id strings"));
+
+        let bad_hunks_type =
+            json!({ "op": "approve", "call_id": "c", "decision": "allow", "hunks": "f0h1" });
+        assert!(parse_approve_op(&bad_hunks_type)
+            .unwrap_err()
+            .contains("array"));
+    }
+
+    #[test]
+    fn approval_request_event_serializes_hunks_for_the_wire() {
+        let event = AgentEvent::ApprovalRequest {
+            call_id: "call_7".to_string(),
+            name: "apply_patch".to_string(),
+            summary: "src/lib.rs".to_string(),
+            subagent_id: None,
+            hunks: Some(vec![jucode_agent_core::HunkView {
+                id: "f0h1".to_string(),
+                file: "src/lib.rs".to_string(),
+                header: "@@ -1,3 +1,3 @@".to_string(),
+                lines: vec![" a".to_string(), "-b".to_string(), "+B".to_string()],
+            }]),
+        };
+
+        let value = event_json(event);
+        assert_eq!(value["type"], "approval_request");
+        assert_eq!(value["hunks"][0]["id"], "f0h1");
+        assert_eq!(value["hunks"][0]["file"], "src/lib.rs");
+        assert_eq!(value["hunks"][0]["header"], "@@ -1,3 +1,3 @@");
+        assert_eq!(value["hunks"][0]["lines"][2], "+B");
+
+        let plain = AgentEvent::ApprovalRequest {
+            call_id: "call_8".to_string(),
+            name: "bash".to_string(),
+            summary: "ls".to_string(),
+            subagent_id: None,
+            hunks: None,
+        };
+        assert_eq!(event_json(plain)["hunks"], Value::Null);
     }
 }

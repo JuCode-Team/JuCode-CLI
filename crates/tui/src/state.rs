@@ -20,6 +20,9 @@ pub(super) struct TuiState {
     pub(super) commands: Vec<CommandCandidate>,
     pub(super) completion_index: usize,
     pub(super) picker_view: Option<PickerState>,
+    /// Approval requests waiting behind the currently shown picker; with
+    /// subagents several can be pending at once. (call_id, name, summary).
+    pub(super) queued_approvals: Vec<(String, String, String)>,
     pub(super) pending_messages: Vec<String>,
     pub(super) reset_screen: bool,
 }
@@ -53,6 +56,7 @@ impl Default for TuiState {
             commands: default_commands(),
             completion_index: 0,
             picker_view: None,
+            queued_approvals: Vec::new(),
             pending_messages: Vec::new(),
             reset_screen: false,
         }
@@ -358,8 +362,35 @@ impl TuiState {
                     call_id,
                     name,
                     summary,
+                    subagent_id,
+                    hunks,
                 } => {
-                    self.picker_view = Some(PickerState::approval(call_id, name, summary));
+                    // Show which subagent asked; main-agent requests are unprefixed.
+                    let summary = match subagent_id {
+                        Some(id) => format!("[agent {id}] {summary}"),
+                        None => summary,
+                    };
+                    // Hunk-by-hunk selection is a GUI feature; the TUI picker
+                    // stays whole-call allow/deny but surfaces the hunk count
+                    // (a partial decision can still be typed:
+                    // /approve <call-id> allow --hunks f0h1,f0h2).
+                    let summary = match hunks.as_deref() {
+                        Some(hunks) if !hunks.is_empty() => {
+                            format!("{summary} ({} hunks)", hunks.len())
+                        }
+                        _ => summary,
+                    };
+                    if self.picker_view.is_some() {
+                        self.queued_approvals.push((call_id, name, summary));
+                    } else {
+                        self.picker_view = Some(PickerState::approval(call_id, name, summary));
+                    }
+                    true
+                }
+                AgentEvent::ApprovalMode { mode } => {
+                    self.chat
+                        .push(ChatLine::System(format!("approval mode: {mode}")));
+                    self.mark_history_dirty();
                     true
                 }
                 AgentEvent::TrustPrompt { cwd, repo_root } => {
@@ -389,6 +420,9 @@ impl TuiState {
                     self.mark_history_dirty();
                     true
                 }
+                // Structured MCP state is for GUI front-ends; the TUI relies on
+                // the accompanying Info lines (and /mcp) instead.
+                AgentEvent::McpServers { .. } => false,
                 AgentEvent::Transcript(items) => {
                     self.replace_transcript(items);
                     true
@@ -410,6 +444,15 @@ impl TuiState {
             };
         }
         changed
+    }
+
+    /// Surface the next queued approval request once no picker is showing.
+    pub(super) fn show_next_queued_approval(&mut self) {
+        if self.picker_view.is_some() || self.queued_approvals.is_empty() {
+            return;
+        }
+        let (call_id, name, summary) = self.queued_approvals.remove(0);
+        self.picker_view = Some(PickerState::approval(call_id, name, summary));
     }
 
     pub(super) fn apply_status(&mut self, status: String) -> bool {

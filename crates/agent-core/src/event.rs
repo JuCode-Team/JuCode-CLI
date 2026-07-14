@@ -1,3 +1,5 @@
+use crate::hunks::HunkView;
+
 #[derive(Debug, Clone)]
 pub struct TreeNodeView {
     pub id: String,
@@ -29,6 +31,22 @@ pub struct CommandView {
     pub marker: Option<String>,
     pub args: String,
     pub description: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpToolView {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServerView {
+    pub name: String,
+    pub transport: String,
+    /// "connected" | "connecting" | "failed" | "disabled"
+    pub state: String,
+    pub error: Option<String>,
+    pub tools: Vec<McpToolView>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,8 +163,23 @@ pub enum AgentEvent {
         call_id: String,
         name: String,
         summary: String,
+        /// Path of the subagent that issued the gated call; None for the main agent.
+        subagent_id: Option<String>,
+        /// Hunk breakdown of a gated edit tool call; the client may answer
+        /// with a subset of these ids to apply only part of the change. None
+        /// for non-edit tools (or when planning failed): whole-call only.
+        hunks: Option<Vec<HunkView>>,
+    },
+    /// The session's current tool approval mode (emitted on startup and on change).
+    ApprovalMode {
+        mode: String,
     },
     CheckpointView(Vec<SessionListItemView>),
+    /// Configured MCP servers with their connection state and tools (emitted
+    /// at startup, on state changes, and after every mcp_* serve mutation).
+    McpServers {
+        servers: Vec<McpServerView>,
+    },
     Transcript(Vec<TranscriptItem>),
     Info(String),
     Error(String),

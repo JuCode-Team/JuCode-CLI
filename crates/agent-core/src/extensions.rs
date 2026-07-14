@@ -47,7 +47,15 @@ impl ExtensionRegistry {
                         definition,
                     }))
                 }
-                Err(error) => errors.push((extension.name.clone(), error)),
+                Err(error) => {
+                    crate::log_error!(
+                        "extensions",
+                        "extension failed to initialize",
+                        extension = extension.name.clone(),
+                        error = error.clone()
+                    );
+                    errors.push((extension.name.clone(), error));
+                }
             }
         }
         Self {
@@ -250,6 +258,15 @@ fn call_extension_tool(
         }),
         cwd,
     )
+    .inspect_err(|error| {
+        crate::log_error!(
+            "extensions",
+            "extension tool call failed",
+            extension = extension.name.clone(),
+            tool = name,
+            error = error.clone()
+        );
+    })
 }
 
 fn send_extension_request(

@@ -258,6 +258,7 @@ pub fn definitions() -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
+        crate::web_fetch::definition(),
     ])
 }
 
@@ -347,6 +348,7 @@ pub fn run_tool_with_events(
         "ripgrep" => ripgrep(&args, cwd),
         "outline" => outline_file(&args, cwd),
         "checkpoint" => checkpoint_tool(&args, cwd),
+        "web_fetch" => crate::web_fetch::run(&args),
         "browser_open" => browser_open(&args),
         _ => json!({ "error": format!("unknown tool: {name}") }),
     };
@@ -356,6 +358,12 @@ pub fn run_tool_with_events(
 fn tool_result(name: &str, value: Value, cwd: &Path) -> ToolExecutionResult {
     let output = value.to_string();
     let model_output = project_model_output(name, &output, cwd);
+    // Log the tool name and a brief error only; arguments and file contents
+    // must never reach the log.
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        let brief = error.chars().take(200).collect::<String>();
+        crate::log_warn!("tools", "tool error", tool = name, error = brief);
+    }
     ToolExecutionResult {
         is_error: value.get("error").is_some()
             || value
@@ -615,25 +623,10 @@ fn hashline_edit_file(args: &Value, cwd: &Path) -> Value {
         }
     };
 
-    let edits = match parse_hashline_edits(raw_edits) {
-        Ok(edits) => edits,
+    let output = match apply_hashline_edits_preview(&original, raw_edits) {
+        Ok(output) => output,
         Err(error) => return json!({ "path": path.display().to_string(), "error": error }),
     };
-
-    let line_index = LineIndex::new(&original);
-    if let Err(error) = validate_hashline_anchors(&edits, &line_index) {
-        return json!({ "path": path.display().to_string(), "error": error });
-    }
-
-    let spans = match resolve_hashline_spans(&edits, &original, &line_index) {
-        Ok(spans) => spans,
-        Err(error) => return json!({ "path": path.display().to_string(), "error": error }),
-    };
-
-    let mut output = original.clone();
-    for span in spans.iter().rev() {
-        output.replace_range(span.start..span.end, &span.replacement);
-    }
 
     let _ = create_checkpoint(cwd, "auto-hashline-edit", std::slice::from_ref(&path));
     match fs::write(&path, &output) {
@@ -645,7 +638,7 @@ fn hashline_edit_file(args: &Value, cwd: &Path) -> Value {
                 changed.and_then(|(first, last)| post_edit_anchor_block(&output, first, last));
             json!({
                 "path": path.display().to_string(),
-                "edits": edits.len(),
+                "edits": raw_edits.len(),
                 "written_bytes": output.len(),
                 "diff": diff.unwrap_or_default(),
                 "anchors": anchors.unwrap_or_default(),
@@ -695,6 +688,24 @@ fn write_file(args: &Value, cwd: &Path) -> Value {
         }
         Err(error) => json!({ "path": path.display().to_string(), "error": error.to_string() }),
     }
+}
+
+/// Applies hashline edits to `original` without touching the filesystem.
+/// Shared by `hashline_edit` itself and hunk planning for selective approval
+/// (which previews each edit in isolation).
+pub(crate) fn apply_hashline_edits_preview(
+    original: &str,
+    raw_edits: &[Value],
+) -> Result<String, String> {
+    let edits = parse_hashline_edits(raw_edits)?;
+    let line_index = LineIndex::new(original);
+    validate_hashline_anchors(&edits, &line_index)?;
+    let spans = resolve_hashline_spans(&edits, original, &line_index)?;
+    let mut output = original.to_string();
+    for span in spans.iter().rev() {
+        output.replace_range(span.start..span.end, &span.replacement);
+    }
+    Ok(output)
 }
 
 fn parse_hashline_edits(raw_edits: &[Value]) -> Result<Vec<HashlineEdit>, String> {
@@ -1063,7 +1074,7 @@ fn format_hashline(line_number: usize, line: &str) -> String {
     )
 }
 
-fn compute_line_hash(line_number: usize, line: &str) -> String {
+pub(crate) fn compute_line_hash(line_number: usize, line: &str) -> String {
     let normalized = line.trim_end_matches('\r').trim_end();
     let seed = if normalized.chars().any(|ch| ch.is_alphanumeric()) {
         0
@@ -2755,7 +2766,12 @@ fn add_command_soft_hint(value: &mut Value) {
     }
 }
 
-fn unified_diff_for_file(cwd: &Path, path: &Path, original: &str, updated: &str) -> Option<String> {
+pub(crate) fn unified_diff_for_file(
+    cwd: &Path,
+    path: &Path,
+    original: &str,
+    updated: &str,
+) -> Option<String> {
     if original == updated {
         return None;
     }
@@ -3159,7 +3175,7 @@ fn optional_u64(args: &Value, key: &str) -> Result<Option<u64>, String> {
     Err(format!("{key} must be a non-negative integer, got {value}"))
 }
 
-fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
+pub(crate) fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
     let path = expand_tilde(path);
     if path.is_absolute() {
         path
@@ -3684,7 +3700,8 @@ mod tests {
                 "ls",
                 "ripgrep",
                 "outline",
-                "checkpoint"
+                "checkpoint",
+                "web_fetch"
             ]
         );
         assert!(tools

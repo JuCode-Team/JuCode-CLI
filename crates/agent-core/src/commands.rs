@@ -83,9 +83,16 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/approve",
         aliases: &[],
-        args: "<call-id> <allow|deny> [always]",
-        description: "Respond to a tool approval request",
+        args: "<call-id> <allow|deny> [always] [--hunks id1,id2]",
+        description: "Respond to a tool approval request (optionally only some hunks)",
         advanced: true,
+    },
+    CommandSpec {
+        name: "/approvals",
+        aliases: &[],
+        args: "[read-only|auto-edit|full-auto]",
+        description: "Show or switch the tool approval mode",
+        advanced: false,
     },
     CommandSpec {
         name: "/context",
@@ -172,6 +179,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         advanced: true,
     },
     CommandSpec {
+        name: "/mcp",
+        aliases: &[],
+        args: "[tools|reload|enable|disable] [server]",
+        description: "Manage MCP servers",
+        advanced: false,
+    },
+    CommandSpec {
         name: "/stats",
         aliases: &[],
         args: "",
@@ -238,5 +252,17 @@ mod tests {
             assert!(is_known(name), "{name} must be registered");
         }
         assert!(!is_known("/bogus"));
+    }
+
+    #[test]
+    fn approvals_command_is_registered_and_in_help() {
+        assert!(is_known("/approvals"));
+        assert!(help_line().contains("/approvals [read-only|auto-edit|full-auto]"));
+    }
+
+    #[test]
+    fn mcp_command_is_registered_and_in_help() {
+        assert!(is_known("/mcp"));
+        assert!(help_line().contains("/mcp [tools|reload|enable|disable] [server]"));
     }
 }

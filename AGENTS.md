@@ -21,7 +21,7 @@ Use Rust 2021 idioms and rustfmt defaults. Prefer small functions with direct co
 
 Performance and lightweight behavior are the first priorities. Do not introduce heavy dependencies, framework layers, or broad abstractions without concrete need. Do not add multiple fallback paths just to make a feature appear to work without evidence; prefer one explicit, testable path and clear error handling.
 
-This project does not implement MCP. Build extensibility around skills only. Sub-agent functionality is built in, so do not design a separate subsystem for it.
+This project implements a standard MCP client (stdio and streamable HTTP transports, no tokio — blocking I/O plus threads) alongside skills; MCP support must stay dependency-light (hand-rolled JSON-RPC over serde_json, HTTP via the existing blocking `ureq`). See `docs/mcp.md`. Sub-agent functionality is built in, so do not design a separate subsystem for it.
 
 ## TUI Guidelines
 

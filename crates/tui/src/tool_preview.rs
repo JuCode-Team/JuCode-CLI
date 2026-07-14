@@ -20,13 +20,32 @@ pub(crate) fn tool_output_preview(name: &str, output: &str, running: bool) -> St
     }
     if is_edit_tool(name) {
         if let Some(diff) = diff_from_tool_output(output) {
-            return edit_diff_view(&diff);
+            return with_rejected_hunks_line(edit_diff_view(&diff), output);
         }
     }
     if let Some(diff) = diff_from_tool_output(output) {
-        return diff_preview(&diff);
+        return with_rejected_hunks_line(diff_preview(&diff), output);
     }
     limited_preview(output)
+}
+
+/// After a partial (hunk-subset) approval the tool's diff already contains
+/// only the applied hunks; append a count of the user-rejected ones so the
+/// preview does not read as the full requested change.
+fn with_rejected_hunks_line(preview: String, output: &str) -> String {
+    let rejected = serde_json::from_str::<serde_json::Value>(output)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("rejected_hunks")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+        })
+        .unwrap_or(0);
+    if rejected == 0 {
+        return preview;
+    }
+    format!("{preview}\n{DIM}{rejected} hunk(s) rejected by user (not applied){RESET_STYLE}")
 }
 
 pub(crate) fn compact_tool_preview(name: &str, output: &str, running: bool) -> String {

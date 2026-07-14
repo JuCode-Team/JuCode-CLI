@@ -53,6 +53,99 @@ const DEFAULT_READ_TIMEOUT_SECONDS: u64 = 300;
 /// Percentage of the model's context window at which older turns are compacted.
 const DEFAULT_COMPACTION_THRESHOLD_PERCENT: u64 = 75;
 const DEFAULT_COMPACT_REASONING_EFFORT: &str = "low";
+/// Default per-call timeout for MCP servers; overridable per server.
+pub const DEFAULT_MCP_TIMEOUT_SECONDS: u64 = 60;
+
+/// Engine-level tool approval mode. The single decision point for which tool
+/// calls need a user decision is [`ApprovalMode::requires_approval`]; every
+/// other layer (client-side gating, core-side auto-approval) defers to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApprovalMode {
+    /// Every mutating tool (file edits and shell/stdin) requires approval.
+    #[default]
+    ReadOnly,
+    /// File-editing tools run without approval; shell/stdin still ask.
+    AutoEdit,
+    /// Everything runs without approval.
+    FullAuto,
+}
+
+impl ApprovalMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::AutoEdit => "auto-edit",
+            Self::FullAuto => "full-auto",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "read-only" => Ok(Self::ReadOnly),
+            "auto-edit" => Ok(Self::AutoEdit),
+            "full-auto" => Ok(Self::FullAuto),
+            other => Err(format!(
+                "unknown approval mode '{other}': use read-only, auto-edit, or full-auto"
+            )),
+        }
+    }
+
+    /// Whether a call to `tool_name` needs a user decision under this mode.
+    pub fn requires_approval(&self, tool_name: &str) -> bool {
+        // MCP tools are untrusted by default. Without the readOnlyHint in
+        // hand this gates conservatively; hint-aware callers use
+        // `requires_approval_for_mcp` instead.
+        if is_mcp_tool(tool_name) {
+            return self.requires_approval_for_mcp(false);
+        }
+        if is_shell_tool(tool_name) {
+            return *self != Self::FullAuto;
+        }
+        if is_edit_tool(tool_name) {
+            return *self == Self::ReadOnly;
+        }
+        // Network egress can exfiltrate local context, so the strictest mode
+        // still asks; both auto modes already accept broader side effects.
+        if is_network_tool(tool_name) {
+            return *self == Self::ReadOnly;
+        }
+        false
+    }
+
+    /// Approval policy for MCP tools, given the server's `readOnlyHint`
+    /// annotation: read-only asks for everything, auto-edit asks unless the
+    /// tool is marked read-only, full-auto never asks.
+    pub fn requires_approval_for_mcp(&self, read_only_hint: bool) -> bool {
+        match self {
+            Self::ReadOnly => true,
+            Self::AutoEdit => !read_only_hint,
+            Self::FullAuto => false,
+        }
+    }
+}
+
+/// Whether a tool name belongs to an MCP server (`mcp__<server>__<tool>`).
+pub(crate) fn is_mcp_tool(name: &str) -> bool {
+    name.starts_with("mcp__")
+}
+
+fn is_shell_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "bash" | "execute" | "exec_command" | "shell_command" | "write_stdin"
+    )
+}
+
+fn is_edit_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "write" | "edit" | "str_replace" | "hashline_edit" | "apply_patch"
+    )
+}
+
+fn is_network_tool(name: &str) -> bool {
+    matches!(name, "web_fetch")
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -74,7 +167,9 @@ pub struct Config {
     pub read_timeout_seconds: u64,
     pub compaction_threshold_percent: u64,
     pub include_project_instructions: bool,
+    pub approval_mode: ApprovalMode,
     pub extensions: Vec<ExtensionConfig>,
+    pub mcp_servers: Vec<McpServerConfig>,
     path: PathBuf,
 }
 
@@ -83,6 +178,47 @@ pub struct ExtensionConfig {
     pub name: String,
     pub command: String,
     pub lazy: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpTransportKind {
+    Stdio,
+    Http,
+}
+
+impl McpTransportKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Http => "http",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "" | "stdio" => Ok(Self::Stdio),
+            "http" => Ok(Self::Http),
+            other => Err(format!(
+                "unknown MCP transport '{other}': use stdio or http"
+            )),
+        }
+    }
+}
+
+/// One `mcp_servers` entry in config.json.
+#[derive(Debug, Clone)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub transport: McpTransportKind,
+    /// stdio: executable plus args/env for the spawned server process.
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    /// http: endpoint URL plus extra request headers (e.g. Authorization).
+    pub url: String,
+    pub headers: BTreeMap<String, String>,
+    pub enabled: bool,
+    pub timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -149,7 +285,9 @@ impl Config {
                 read_timeout_seconds: DEFAULT_READ_TIMEOUT_SECONDS,
                 compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
                 include_project_instructions: true,
+                approval_mode: ApprovalMode::default(),
                 extensions: Vec::new(),
+                mcp_servers: Vec::new(),
                 path,
             };
             config.save()?;
@@ -226,7 +364,9 @@ impl Config {
             )
             .clamp(10, 95),
             include_project_instructions: read_bool(&value, "include_project_instructions", true),
+            approval_mode: read_approval_mode(&value)?,
             extensions: read_extensions(&value),
+            mcp_servers: read_mcp_servers(&value),
             path,
         };
         config.save()?;
@@ -255,7 +395,9 @@ impl Config {
             "read_timeout_seconds": self.read_timeout_seconds,
             "compaction_threshold_percent": self.compaction_threshold_percent,
             "include_project_instructions": self.include_project_instructions,
-            "extensions": self.extensions.iter().map(extension_config_value).collect::<Vec<_>>()
+            "approval_mode": self.approval_mode.as_str(),
+            "extensions": self.extensions.iter().map(extension_config_value).collect::<Vec<_>>(),
+            "mcp_servers": self.mcp_servers.iter().map(mcp_server_config_value).collect::<Vec<_>>()
         });
         fs::write(
             &self.path,
@@ -395,6 +537,25 @@ fn read_u64(value: &Value, key: &str, default: u64) -> u64 {
     value.get(key).and_then(Value::as_u64).unwrap_or(default)
 }
 
+/// Optional `approval_mode` in config.json; absent/empty defaults to read-only,
+/// an unknown value is a hard load error rather than a silent fallback.
+fn read_approval_mode(value: &Value) -> io::Result<ApprovalMode> {
+    let raw = value
+        .get("approval_mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty());
+    match raw {
+        None => Ok(ApprovalMode::default()),
+        Some(raw) => ApprovalMode::parse(raw).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid approval_mode in config.json: {error}"),
+            )
+        }),
+    }
+}
+
 fn read_bool(value: &Value, key: &str, default: bool) -> bool {
     value.get(key).and_then(Value::as_bool).unwrap_or(default)
 }
@@ -532,6 +693,115 @@ fn read_extensions(value: &Value) -> Vec<ExtensionConfig> {
             })
         })
         .collect()
+}
+
+fn read_mcp_servers(value: &Value) -> Vec<McpServerConfig> {
+    let Some(servers) = value.get("mcp_servers").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut configs: Vec<McpServerConfig> = Vec::new();
+    for entry in servers {
+        match parse_mcp_server_value(entry) {
+            Ok(config) if configs.iter().any(|c| c.name == config.name) => {
+                crate::log_warn!("mcp", "duplicate server name in config", name = config.name);
+            }
+            Ok(config) => configs.push(config),
+            Err(error) => {
+                crate::log_warn!("mcp", "skipping invalid mcp_servers entry", error = error);
+            }
+        }
+    }
+    configs
+}
+
+/// Parse and validate one `mcp_servers` entry (also used by the serve
+/// `mcp_set` op). Names must match `^[A-Za-z0-9_-]+$`; stdio entries need a
+/// command, http entries a URL.
+pub fn parse_mcp_server_value(entry: &Value) -> Result<McpServerConfig, String> {
+    let name = entry
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if !is_valid_mcp_name(name) {
+        return Err(format!(
+            "invalid MCP server name '{name}': use letters, digits, '_' or '-'"
+        ));
+    }
+    let transport =
+        McpTransportKind::parse(entry.get("transport").and_then(Value::as_str).unwrap_or(""))?;
+    let command = read_string(entry, "command", "");
+    let url = read_string(entry, "url", "");
+    match transport {
+        McpTransportKind::Stdio if command.is_empty() => {
+            return Err(format!(
+                "MCP server {name}: stdio transport requires command"
+            ));
+        }
+        McpTransportKind::Http if url.is_empty() => {
+            return Err(format!("MCP server {name}: http transport requires url"));
+        }
+        _ => {}
+    }
+    Ok(McpServerConfig {
+        name: name.to_string(),
+        transport,
+        command,
+        args: read_string_array(entry, "args"),
+        env: read_string_map(entry, "env"),
+        url,
+        headers: read_string_map(entry, "headers"),
+        enabled: read_bool(entry, "enabled", true),
+        timeout_seconds: read_u64(entry, "timeout_seconds", DEFAULT_MCP_TIMEOUT_SECONDS)
+            .clamp(1, 3600),
+    })
+}
+
+fn is_valid_mcp_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn read_string_array(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn read_string_map(value: &Value, key: &str) -> BTreeMap<String, String> {
+    value
+        .get(key)
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn mcp_server_config_value(server: &McpServerConfig) -> Value {
+    json!({
+        "name": server.name,
+        "transport": server.transport.as_str(),
+        "command": server.command,
+        "args": server.args,
+        "env": server.env,
+        "url": server.url,
+        "headers": server.headers,
+        "enabled": server.enabled,
+        "timeout_seconds": server.timeout_seconds,
+    })
 }
 
 fn model_config_value(model: &ModelConfig) -> Value {
@@ -904,11 +1174,196 @@ mod tests {
             read_timeout_seconds: DEFAULT_READ_TIMEOUT_SECONDS,
             compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
             include_project_instructions: true,
+            approval_mode: ApprovalMode::default(),
             extensions: Vec::new(),
+            mcp_servers: Vec::new(),
             path: PathBuf::from("config.json"),
         };
 
         assert_eq!(config.current_model_config().max_output_tokens, 10);
         assert_eq!(config.compact_model_config().max_output_tokens, 20);
+    }
+
+    #[test]
+    fn approval_mode_parses_wire_names_and_rejects_unknown() {
+        assert_eq!(
+            ApprovalMode::parse("read-only").unwrap(),
+            ApprovalMode::ReadOnly
+        );
+        assert_eq!(
+            ApprovalMode::parse("auto-edit").unwrap(),
+            ApprovalMode::AutoEdit
+        );
+        assert_eq!(
+            ApprovalMode::parse("full-auto").unwrap(),
+            ApprovalMode::FullAuto
+        );
+        assert_eq!(
+            ApprovalMode::parse(" full-auto ").unwrap().as_str(),
+            "full-auto"
+        );
+        let error = ApprovalMode::parse("yolo").unwrap_err();
+        assert!(error.contains("yolo"));
+        assert!(error.contains("read-only, auto-edit, or full-auto"));
+    }
+
+    #[test]
+    fn approval_mode_gates_each_tool_class() {
+        let shell_tools = [
+            "bash",
+            "execute",
+            "exec_command",
+            "shell_command",
+            "write_stdin",
+        ];
+        let edit_tools = [
+            "write",
+            "edit",
+            "str_replace",
+            "hashline_edit",
+            "apply_patch",
+        ];
+        let network_tools = ["web_fetch"];
+        let free_tools = ["read", "ls", "ripgrep", "outline", "spawn_agent"];
+
+        for tool in shell_tools {
+            assert!(ApprovalMode::ReadOnly.requires_approval(tool), "{tool}");
+            assert!(ApprovalMode::AutoEdit.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::FullAuto.requires_approval(tool), "{tool}");
+        }
+        for tool in edit_tools {
+            assert!(ApprovalMode::ReadOnly.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::AutoEdit.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::FullAuto.requires_approval(tool), "{tool}");
+        }
+        for tool in network_tools {
+            assert!(ApprovalMode::ReadOnly.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::AutoEdit.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::FullAuto.requires_approval(tool), "{tool}");
+        }
+        for tool in free_tools {
+            assert!(!ApprovalMode::ReadOnly.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::AutoEdit.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::FullAuto.requires_approval(tool), "{tool}");
+        }
+    }
+
+    #[test]
+    fn mcp_approval_matrix_follows_read_only_hint() {
+        // Non-read-only MCP tools gate like shell tools; read-only-hinted
+        // tools run freely in auto-edit but still ask in read-only.
+        assert!(ApprovalMode::ReadOnly.requires_approval_for_mcp(false));
+        assert!(ApprovalMode::ReadOnly.requires_approval_for_mcp(true));
+        assert!(ApprovalMode::AutoEdit.requires_approval_for_mcp(false));
+        assert!(!ApprovalMode::AutoEdit.requires_approval_for_mcp(true));
+        assert!(!ApprovalMode::FullAuto.requires_approval_for_mcp(false));
+        assert!(!ApprovalMode::FullAuto.requires_approval_for_mcp(true));
+    }
+
+    #[test]
+    fn requires_approval_gates_mcp_names_conservatively() {
+        // Without the hint, the shared name-based check treats every MCP tool
+        // as mutating.
+        assert!(ApprovalMode::ReadOnly.requires_approval("mcp__files__read"));
+        assert!(ApprovalMode::AutoEdit.requires_approval("mcp__files__read"));
+        assert!(!ApprovalMode::FullAuto.requires_approval("mcp__files__read"));
+    }
+
+    #[test]
+    fn mcp_server_entries_parse_and_validate() {
+        let stdio = parse_mcp_server_value(&json!({
+            "name": "files",
+            "command": "mcp-files",
+            "args": ["--root", "."],
+            "env": { "DEBUG": "1" },
+            "timeout_seconds": 5
+        }))
+        .unwrap();
+        assert_eq!(stdio.name, "files");
+        assert_eq!(stdio.transport, McpTransportKind::Stdio);
+        assert_eq!(stdio.args, vec!["--root", "."]);
+        assert_eq!(stdio.env.get("DEBUG").map(String::as_str), Some("1"));
+        assert!(stdio.enabled);
+        assert_eq!(stdio.timeout_seconds, 5);
+
+        let http = parse_mcp_server_value(&json!({
+            "name": "search",
+            "transport": "http",
+            "url": "https://example.com/mcp",
+            "headers": { "Authorization": "Bearer x" },
+            "enabled": false
+        }))
+        .unwrap();
+        assert_eq!(http.transport, McpTransportKind::Http);
+        assert!(!http.enabled);
+        assert_eq!(http.timeout_seconds, DEFAULT_MCP_TIMEOUT_SECONDS);
+
+        // Invalid name, missing command/url, unknown transport.
+        assert!(parse_mcp_server_value(&json!({ "name": "bad name", "command": "x" })).is_err());
+        assert!(parse_mcp_server_value(&json!({ "name": "", "command": "x" })).is_err());
+        assert!(parse_mcp_server_value(&json!({ "name": "a" })).is_err());
+        assert!(parse_mcp_server_value(&json!({ "name": "a", "transport": "http" })).is_err());
+        assert!(
+            parse_mcp_server_value(&json!({ "name": "a", "transport": "ws", "url": "u" })).is_err()
+        );
+    }
+
+    #[test]
+    fn mcp_servers_round_trip_through_json() {
+        let original = McpServerConfig {
+            name: "files".to_string(),
+            transport: McpTransportKind::Http,
+            command: String::new(),
+            args: vec!["-v".to_string()],
+            env: BTreeMap::from([("A".to_string(), "1".to_string())]),
+            url: "https://example.com/mcp".to_string(),
+            headers: BTreeMap::from([("Authorization".to_string(), "Bearer t".to_string())]),
+            enabled: false,
+            timeout_seconds: 30,
+        };
+        let value = json!({ "mcp_servers": [mcp_server_config_value(&original)] });
+        let parsed = read_mcp_servers(&value);
+        assert_eq!(parsed.len(), 1);
+        let parsed = &parsed[0];
+        assert_eq!(parsed.name, original.name);
+        assert_eq!(parsed.transport, original.transport);
+        assert_eq!(parsed.args, original.args);
+        assert_eq!(parsed.env, original.env);
+        assert_eq!(parsed.url, original.url);
+        assert_eq!(parsed.headers, original.headers);
+        assert_eq!(parsed.enabled, original.enabled);
+        assert_eq!(parsed.timeout_seconds, original.timeout_seconds);
+    }
+
+    #[test]
+    fn invalid_and_duplicate_mcp_entries_are_skipped() {
+        let value = json!({ "mcp_servers": [
+            { "name": "ok", "command": "run" },
+            { "name": "ok", "command": "run-again" },
+            { "name": "no command" },
+            "not-an-object"
+        ]});
+        let parsed = read_mcp_servers(&value);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].command, "run");
+    }
+
+    #[test]
+    fn read_approval_mode_defaults_and_validates() {
+        assert_eq!(
+            read_approval_mode(&json!({})).unwrap(),
+            ApprovalMode::ReadOnly
+        );
+        assert_eq!(
+            read_approval_mode(&json!({ "approval_mode": "" })).unwrap(),
+            ApprovalMode::ReadOnly
+        );
+        assert_eq!(
+            read_approval_mode(&json!({ "approval_mode": "auto-edit" })).unwrap(),
+            ApprovalMode::AutoEdit
+        );
+        let error = read_approval_mode(&json!({ "approval_mode": "bogus" })).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("approval_mode"));
     }
 }
