@@ -39,14 +39,14 @@ JuCode is written in Rust and uses the workspace binary name `jucode`.
 
 ## Configuration
 
-On first run, JuCode creates its configuration under the user profile directory. By default it targets an OpenAI-compatible API:
+On first run, JuCode creates its configuration under the user profile directory. By default it targets the JuCode gateway (an OpenAI-compatible Responses API):
 
-- default provider: `openai`
-- default model: `gpt-5`
-- default API base URL: `https://api.openai.com/v1`
+- default provider: `jucode`
+- default model: `gpt-5.5`
+- default API base URL: `https://api.jucode.cn/v1`
 - default API key environment variable: `OPENAI_API_KEY`
 
-Set your key before running:
+Sign in with `/login` to use the JuCode gateway, or set an API key and point the config at any OpenAI-compatible endpoint (`openai` and `deepseek` are built in; Anthropic-protocol models are supported via the `protocol` setting):
 
 ```bash
 export OPENAI_API_KEY="..."
@@ -56,8 +56,8 @@ jucode
 You can switch model and reasoning effort inside the TUI:
 
 ```text
-/model gpt-5 medium
-/model gpt-5 low
+/model gpt-5.5 medium
+/model gpt-5.4-mini low
 ```
 
 The config also supports custom OpenAI-compatible base URLs, retry settings, model metadata, project-instruction discovery, and optional extensions.
@@ -149,7 +149,7 @@ The following numbers come from the local `agent-eval` **test set** run on 2026-
 - one greenfield TypeScript library task;
 - one greenfield frontend dashboard task.
 
-The comparison used the same evaluation harness data currently stored in `/Users/han/dev/projects/jucode/agent-eval/results/aggregate_test.json`. Treat these as a reproducible local snapshot, not a universal public benchmark.
+The comparison used the `agent-eval` harness's aggregated test-set results (the harness lives in a separate internal repository and is not included here). Treat these as a reproducible local snapshot, not a universal public benchmark.
 
 | Agent | Passed | Input + output tokens | Output tokens | Reasoning tokens | Raw cache rate | Filtered cache rate |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |

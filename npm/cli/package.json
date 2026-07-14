@@ -1,6 +1,6 @@
 {
   "name": "@jucode/cli",
-  "version": "0.1.4",
+  "version": "0.1.10",
   "description": "JuCode native CLI",
   "license": "Apache-2.0",
   "publishConfig": {
@@ -13,10 +13,10 @@
     "bin/jucode.cjs"
   ],
   "optionalDependencies": {
-    "@jucode/cli-linux-x64": "0.1.4",
-    "@jucode/cli-win32-x64": "0.1.4",
-    "@jucode/cli-darwin-arm64": "0.1.4",
-    "@jucode/cli-darwin-x64": "0.1.4"
+    "@jucode/cli-linux-x64": "0.1.10",
+    "@jucode/cli-win32-x64": "0.1.10",
+    "@jucode/cli-darwin-arm64": "0.1.10",
+    "@jucode/cli-darwin-x64": "0.1.10"
   },
   "engines": {
     "node": ">=18"

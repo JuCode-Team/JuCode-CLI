@@ -241,14 +241,20 @@ GUI                         jucode serve
 - 图片附件端到端（模型读出图中文字、跨轮记得、非法路径跳过、写入 JSONL）。
 - 工作区测试全绿（187 passed）。
 
+### 已由桌面端（JuCode-Desktop）落地覆盖
+
+以下 M1 时未验证的项，现已由 JuCode-Desktop 在真实使用路径中覆盖（2026-07 对照更新）：
+
+- 真机 OAuth 往返：桌面端设置向导走引擎 `/login` + 轮询 `auth.json`，完整登录/登出已在用。
+- `/resume`（列表 + 恢复）、`/tree`→`/checkout`、`/fork`、`/delete`：桌面端历史/分支选择器基于这些命令实现。
+- `subagent_lifecycle`（状态 chips）、`compaction_*`、`approval_request`、`trust_prompt`、
+  `tool_update`：均已在桌面端 `ChatState` 事件归约器中消费并有 UI 呈现。
+- 图片/附件：桌面端按协议约定先落盘临时文件再传路径（粘贴/拖拽/截屏统一处理）。
+- 前端选择器状态机：桌面端自建（命令面板、历史/分支选择器），引擎侧仅认最终文本命令，与设计一致。
+- stdout 管道断开 / 引擎崩溃：桌面端实现崩溃自动重启并恢复会话（连续重启上限 3 次）。
+
 ### 仍未覆盖 / 未实测
 
-- 真机 OAuth 往返（弹浏览器、回调落地）——仅验证了“不阻塞”，未跑完整登录。
-- `/resume`（列表 + 恢复）、`/fork`、`/delete`——代码路径与 checkout 同族，低风险但未单测。
-- `compaction_*`（需超长上下文触发）、`subagent_lifecycle`（需模型 spawn_agent）、
-  `retrying`（需网络抖动）、`tool_update`（需特定工具）——事件已序列化，但未在真实流程触发验证。
-- 图片/附件：粘贴的图片需前端先落盘再传路径（拖拽的文件天然有路径）；协议只接受本地文件路径，不接受内联 base64。
-- 前端选择器状态机（tree/model/resume 导航、fork/delete 命名、effort 循环）在 tui crate，
-  GUI 需自建；引擎侧只认最终的 `/checkout` `/model` 等文本命令。
-- `command_list` 未列出 `/config /checkout /fork /delete /extensions /stats`，前端需自行知晓。
-- stdout 管道被前端关闭时 serve 以 `BrokenPipe` 错误退出（行为正确，但未做静默处理）。
+- `retrying`（需网络抖动）——事件已序列化，未在真实流程触发验证。
+- `command_list` 未列出 `/config /checkout /fork /delete /extensions /stats`，前端需自行知晓
+  （桌面端命令面板目前硬编码补齐，长期应由引擎补全 `command_list`）。
