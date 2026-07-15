@@ -58,6 +58,14 @@ impl TuiRuntime for Runtime {
 fn main() -> io::Result<()> {
     jucode_agent_core::logging::init_global();
     let mut args = env::args().skip(1).collect::<Vec<_>>();
+    // Before anything that may touch the terminal: `--version` must work in
+    // TTY-less contexts (CI release guard, the desktop's check_backend probe).
+    if args.iter().any(|a| a == "--version" || a == "-V")
+        || args.first().map(String::as_str) == Some("version")
+    {
+        println!("jucode {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let approval_mode = match take_approval_mode_flag(&mut args) {
         Ok(mode) => mode,
         Err(error) => {

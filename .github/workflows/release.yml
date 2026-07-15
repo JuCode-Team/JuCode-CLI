@@ -36,6 +36,25 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target.rust_target }}
 
+      # Guard against the v0.1.10 incident: the npm package version is stamped
+      # from the tag / dispatch input, so a binary built from a checkout whose
+      # Cargo.toml wasn't bumped would ship mislabeled — and its self-update
+      # check would nag users forever. Fail the release instead.
+      - name: Verify binary version matches the release version
+        shell: bash
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            expected="${{ inputs.release_version }}"
+          else
+            expected="${GITHUB_REF_NAME#v}"
+          fi
+          actual="$(./target/${{ matrix.target.rust_target }}/release/${{ matrix.target.binary_name }} --version | awk '{print $NF}')"
+          echo "expected=${expected} actual=${actual}"
+          if [ "${actual}" != "${expected}" ]; then
+            echo "::error::built binary reports ${actual} but the release is ${expected} — bump Cargo.toml (and commit) before tagging"
+            exit 1
+          fi
+
       - name: Stage artifact
         shell: bash
         run: |

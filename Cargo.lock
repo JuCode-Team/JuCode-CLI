@@ -517,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "jucode-cli"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "jucode-agent-core",
  "jucode-tui",
