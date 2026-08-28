@@ -1,12 +1,19 @@
 use flate2::read::GzDecoder;
 use serde_json::Value;
 use std::{
+    collections::BTreeSet,
     fs,
     io::{self, Cursor, Read},
     path::{Component, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tar::Archive;
 use zip::ZipArchive;
+
+const MAX_PACKAGE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_EXTRACTED_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_PACKAGE_FILES: usize = 4096;
+const SKILL_STATE_FILE: &str = "skills-state.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketplaceSkill {
@@ -52,6 +59,7 @@ pub fn install_marketplace_skill(profile_dir: &Path, skill: &MarketplaceSkill) -
     } else {
         install_inline_skill(&dir, skill)?;
     }
+    set_skill_enabled(profile_dir, &skill.id, true)?;
     Ok(())
 }
 
@@ -64,6 +72,73 @@ pub fn install_default_skills(profile_dir: &Path, marketplace: &Marketplace) -> 
         }
     }
     Ok(installed)
+}
+
+pub fn uninstall_skill(profile_dir: &Path, id: &str) -> io::Result<bool> {
+    let skills_dir = profile_dir.join("skills");
+    let target = skills_dir.join(safe_skill_dir(id));
+    if !target.exists() {
+        return Ok(false);
+    }
+    ensure_direct_child(&skills_dir, &target)?;
+    fs::remove_dir_all(&target)?;
+    set_skill_enabled(profile_dir, id, true)?;
+    Ok(true)
+}
+
+pub fn set_skill_enabled(profile_dir: &Path, id: &str, enabled: bool) -> io::Result<()> {
+    let id = safe_skill_dir(id);
+    let mut disabled = read_disabled_skills(profile_dir)?;
+    if enabled {
+        disabled.remove(&id);
+    } else {
+        disabled.insert(id);
+    }
+    write_disabled_skills(profile_dir, &disabled)
+}
+
+pub fn is_skill_path_enabled(profile_dir: &Path, path: &Path) -> io::Result<bool> {
+    let root = profile_dir.join("skills");
+    let Ok(relative) = path.strip_prefix(&root) else {
+        return Ok(true);
+    };
+    let Some(Component::Normal(id)) = relative.components().next() else {
+        return Ok(true);
+    };
+    let Some(id) = id.to_str() else {
+        return Ok(false);
+    };
+    Ok(!read_disabled_skills(profile_dir)?.contains(id))
+}
+
+pub fn installed_skill_ids(profile_dir: &Path) -> io::Result<Vec<String>> {
+    let root = profile_dir.join("skills");
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let disabled = read_disabled_skills(profile_dir)?;
+    let mut installed = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.path().join("SKILL.md").exists() {
+            let id = entry.file_name().to_string_lossy().to_string();
+            installed.push(if disabled.contains(&id) {
+                format!("{id} (disabled)")
+            } else {
+                id
+            });
+        }
+    }
+    installed.sort();
+    Ok(installed)
+}
+
+pub fn skill_installed(profile_dir: &Path, id: &str) -> bool {
+    profile_dir
+        .join("skills")
+        .join(safe_skill_dir(id))
+        .join("SKILL.md")
+        .exists()
 }
 
 pub fn parse_marketplace(value: &Value) -> Result<Marketplace, String> {
@@ -150,26 +225,35 @@ fn read_string(value: &Value, key: &str) -> Option<String> {
 }
 
 fn install_inline_skill(dir: &Path, skill: &MarketplaceSkill) -> io::Result<()> {
-    replace_dir(dir)?;
-    fs::write(dir.join("SKILL.md"), normalized_content(skill))
+    let staging = staging_dir(dir, "inline");
+    recreate_dir(&staging)?;
+    if let Err(error) = fs::write(staging.join("SKILL.md"), normalized_content(skill)) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    atomic_replace_dir(&staging, dir)
 }
 
 fn install_skill_package(dir: &Path, skill: &MarketplaceSkill, url: &str) -> io::Result<()> {
+    let expected = skill.package_sha256.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "marketplace package is missing required package_sha256",
+        )
+    })?;
     let bytes = download_skill_package(url)?;
-    if let Some(expected) = &skill.package_sha256 {
-        verify_sha256(&bytes, expected)?;
-    }
-    let temp_dir = dir.with_extension("tmp-install");
-    replace_dir(&temp_dir)?;
+    verify_sha256(&bytes, expected)?;
+    let temp_dir = staging_dir(dir, "extract");
+    recreate_dir(&temp_dir)?;
     let package_type = skill
         .package_type
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| infer_package_type(url));
-    match package_type {
-        "zip" => extract_zip(&bytes, &temp_dir)?,
-        "tar.gz" | "tgz" => extract_tar_gz(&bytes, &temp_dir)?,
+    let extract_result = match package_type {
+        "zip" => extract_zip(&bytes, &temp_dir),
+        "tar.gz" | "tgz" => extract_tar_gz(&bytes, &temp_dir),
         other => {
             let _ = fs::remove_dir_all(&temp_dir);
             return Err(io::Error::new(
@@ -177,33 +261,58 @@ fn install_skill_package(dir: &Path, skill: &MarketplaceSkill, url: &str) -> io:
                 format!("unsupported skill package type: {other}"),
             ));
         }
+    };
+    if let Err(error) = extract_result {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(error);
     }
-    let root = find_skill_root(&temp_dir).ok_or_else(|| {
-        io::Error::new(
+    let Some(root) = find_skill_root(&temp_dir) else {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "skill package does not contain SKILL.md",
-        )
-    })?;
-    replace_dir(dir)?;
-    copy_dir_contents(&root, dir)?;
-    let _ = fs::remove_dir_all(temp_dir);
-    Ok(())
+        ));
+    };
+    let staging = if root == temp_dir {
+        temp_dir
+    } else {
+        let ready = staging_dir(dir, "ready");
+        recreate_dir(&ready)?;
+        if let Err(error) = copy_dir_contents(&root, &ready) {
+            let _ = fs::remove_dir_all(&temp_dir);
+            let _ = fs::remove_dir_all(&ready);
+            return Err(error);
+        }
+        let _ = fs::remove_dir_all(&temp_dir);
+        ready
+    };
+    atomic_replace_dir(&staging, dir)
 }
 
 fn download_skill_package(url: &str) -> io::Result<Vec<u8>> {
     if let Some(path) = url.strip_prefix("file://") {
-        return fs::read(path);
+        return read_bounded(fs::File::open(path)?);
     }
     if !url.contains("://") {
-        return fs::read(url);
+        return read_bounded(fs::File::open(url)?);
     }
     let response = ureq::get(url)
         .timeout(std::time::Duration::from_secs(60))
         .call()
         .map_err(|error| io::Error::other(error.to_string()))?;
-    let mut reader = response.into_reader();
+    read_bounded(response.into_reader())
+}
+
+fn read_bounded(reader: impl Read) -> io::Result<Vec<u8>> {
+    let mut reader = reader.take((MAX_PACKAGE_BYTES + 1) as u64);
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_PACKAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("skill package exceeds {MAX_PACKAGE_BYTES} byte limit"),
+        ));
+    }
     Ok(bytes)
 }
 
@@ -236,11 +345,37 @@ fn infer_package_type(url: &str) -> &str {
 fn extract_zip(bytes: &[u8], dest: &Path) -> io::Result<()> {
     let cursor = Cursor::new(bytes);
     let mut archive = ZipArchive::new(cursor).map_err(zip_err)?;
+    if archive.len() > MAX_PACKAGE_FILES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("skill package exceeds {MAX_PACKAGE_FILES} file limit"),
+        ));
+    }
+    let mut extracted_bytes = 0_u64;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).map_err(zip_err)?;
-        let Some(path) = safe_archive_path(file.name()) else {
-            continue;
-        };
+        if let Some(mode) = file.unix_mode() {
+            let file_type = mode & 0o170000;
+            if file_type != 0 && file_type != 0o100000 && file_type != 0o040000 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "skill package links and special files are not allowed",
+                ));
+            }
+        }
+        extracted_bytes = extracted_bytes.saturating_add(file.size());
+        if extracted_bytes > MAX_EXTRACTED_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("extracted skill exceeds {MAX_EXTRACTED_BYTES} byte limit"),
+            ));
+        }
+        let path = safe_archive_path(file.name()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsafe path in skill package: {}", file.name()),
+            )
+        })?;
         let out = dest.join(path);
         if file.is_dir() {
             fs::create_dir_all(&out)?;
@@ -274,12 +409,36 @@ fn apply_zip_permissions(_file: &zip::read::ZipFile<'_>, _path: &Path) -> io::Re
 fn extract_tar_gz(bytes: &[u8], dest: &Path) -> io::Result<()> {
     let gz = GzDecoder::new(Cursor::new(bytes));
     let mut archive = Archive::new(gz);
-    for entry in archive.entries()? {
+    let mut extracted_bytes = 0_u64;
+    for (index, entry) in archive.entries()?.enumerate() {
+        if index >= MAX_PACKAGE_FILES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("skill package exceeds {MAX_PACKAGE_FILES} file limit"),
+            ));
+        }
         let mut entry = entry?;
         let path = entry.path()?;
-        let Some(safe) = safe_path_components(&path) else {
-            continue;
-        };
+        let safe = safe_path_components(&path).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsafe path in skill package: {}", path.display()),
+            )
+        })?;
+        let entry_type = entry.header().entry_type();
+        if !entry_type.is_file() && !entry_type.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "skill package links and special files are not allowed",
+            ));
+        }
+        extracted_bytes = extracted_bytes.saturating_add(entry.header().size()?);
+        if extracted_bytes > MAX_EXTRACTED_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("extracted skill exceeds {MAX_EXTRACTED_BYTES} byte limit"),
+            ));
+        }
         let out = dest.join(safe);
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent)?;
@@ -345,11 +504,86 @@ fn preserve_file_permissions(src: &Path, dest: &Path) -> io::Result<()> {
     fs::set_permissions(dest, fs::metadata(src)?.permissions())
 }
 
-fn replace_dir(dir: &Path) -> io::Result<()> {
+fn recreate_dir(dir: &Path) -> io::Result<()> {
     if dir.exists() {
         fs::remove_dir_all(dir)?;
     }
     fs::create_dir_all(dir)
+}
+
+fn staging_dir(dir: &Path, label: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("skill");
+    dir.with_file_name(format!(".{name}-{label}-{nonce}"))
+}
+
+fn atomic_replace_dir(staging: &Path, destination: &Path) -> io::Result<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "skill has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let backup = staging_dir(destination, "backup");
+    let had_destination = destination.exists();
+    if had_destination {
+        fs::rename(destination, &backup)?;
+    }
+    if let Err(error) = fs::rename(staging, destination) {
+        if had_destination {
+            let _ = fs::rename(&backup, destination);
+        }
+        let _ = fs::remove_dir_all(staging);
+        return Err(error);
+    }
+    if had_destination {
+        let _ = fs::remove_dir_all(backup);
+    }
+    Ok(())
+}
+
+fn ensure_direct_child(parent: &Path, child: &Path) -> io::Result<()> {
+    if child.parent() == Some(parent) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "skill path escapes skills directory",
+        ))
+    }
+}
+
+fn read_disabled_skills(profile_dir: &Path) -> io::Result<BTreeSet<String>> {
+    let path = profile_dir.join(SKILL_STATE_FILE);
+    if !path.exists() {
+        return Ok(BTreeSet::new());
+    }
+    let content = fs::read_to_string(path)?;
+    let value = serde_json::from_str::<Value>(&content).unwrap_or_else(|_| Value::Null);
+    Ok(value
+        .get("disabled")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect())
+}
+
+fn write_disabled_skills(profile_dir: &Path, disabled: &BTreeSet<String>) -> io::Result<()> {
+    fs::create_dir_all(profile_dir)?;
+    let path = profile_dir.join(SKILL_STATE_FILE);
+    let temp = profile_dir.join(format!(".{SKILL_STATE_FILE}.tmp"));
+    let value = serde_json::json!({ "disabled": disabled });
+    fs::write(
+        &temp,
+        format!("{}\n", serde_json::to_string_pretty(&value)?),
+    )?;
+    fs::rename(temp, path)
 }
 
 fn zip_err(error: zip::result::ZipError) -> io::Error {
@@ -392,6 +626,7 @@ fn safe_skill_dir(id: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use sha2::Digest;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::{
@@ -460,13 +695,14 @@ mod tests {
                 ("bundle/scripts/run.sh", "#!/bin/sh\necho ok\n"),
             ],
         );
+        let package_hash = format!("{:x}", sha2::Sha256::digest(fs::read(&package).unwrap()));
         let skill = MarketplaceSkill {
             id: "packaged".to_string(),
             name: "Packaged".to_string(),
             description: "Packaged skill".to_string(),
             content: String::new(),
             package_url: Some(format!("file://{}", package.display())),
-            package_sha256: None,
+            package_sha256: Some(package_hash),
             package_type: Some("zip".to_string()),
             tags: vec![],
             enabled: true,
@@ -490,6 +726,115 @@ mod tests {
             0o755
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn package_install_requires_sha256_and_preserves_existing_skill() {
+        let root = test_dir("jucode-package-sha-test");
+        let package = root.join("skill.zip");
+        let installed = root.join("skills/packaged");
+        fs::create_dir_all(&installed).unwrap();
+        fs::write(installed.join("SKILL.md"), "old content").unwrap();
+        create_zip(
+            &package,
+            &[(
+                "SKILL.md",
+                "---\nname: packaged\ndescription: New\n---\nnew",
+            )],
+        );
+        let skill = MarketplaceSkill {
+            id: "packaged".to_string(),
+            name: "Packaged".to_string(),
+            description: "Packaged skill".to_string(),
+            content: String::new(),
+            package_url: Some(format!("file://{}", package.display())),
+            package_sha256: None,
+            package_type: Some("zip".to_string()),
+            tags: vec![],
+            enabled: true,
+            updated_at: String::new(),
+        };
+
+        let error = install_marketplace_skill(&root, &skill).unwrap_err();
+
+        assert!(error.to_string().contains("package_sha256"));
+        assert_eq!(
+            fs::read_to_string(installed.join("SKILL.md")).unwrap(),
+            "old content"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unsafe_archive_path_is_rejected_without_replacing_existing_skill() {
+        let root = test_dir("jucode-package-escape-test");
+        let package = root.join("skill.zip");
+        let installed = root.join("skills/packaged");
+        fs::create_dir_all(&installed).unwrap();
+        fs::write(installed.join("SKILL.md"), "old content").unwrap();
+        create_zip(
+            &package,
+            &[
+                (
+                    "SKILL.md",
+                    "---\nname: packaged\ndescription: New\n---\nnew",
+                ),
+                ("../escape.sh", "bad"),
+            ],
+        );
+        let hash = format!("{:x}", sha2::Sha256::digest(fs::read(&package).unwrap()));
+        let skill = MarketplaceSkill {
+            id: "packaged".to_string(),
+            name: "Packaged".to_string(),
+            description: "Packaged skill".to_string(),
+            content: String::new(),
+            package_url: Some(format!("file://{}", package.display())),
+            package_sha256: Some(hash),
+            package_type: Some("zip".to_string()),
+            tags: vec![],
+            enabled: true,
+            updated_at: String::new(),
+        };
+
+        let error = install_marketplace_skill(&root, &skill).unwrap_err();
+
+        assert!(error.to_string().contains("unsafe path"));
+        assert_eq!(
+            fs::read_to_string(installed.join("SKILL.md")).unwrap(),
+            "old content"
+        );
+        assert!(!root.join("escape.sh").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lifecycle_enable_disable_and_uninstall_updates_state() {
+        let root = test_dir("jucode-skill-lifecycle-test");
+        let installed = root.join("skills/review");
+        fs::create_dir_all(&installed).unwrap();
+        fs::write(
+            installed.join("SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\n",
+        )
+        .unwrap();
+
+        assert!(skill_installed(&root, "review"));
+        assert!(is_skill_path_enabled(&root, &installed.join("SKILL.md")).unwrap());
+        set_skill_enabled(&root, "review", false).unwrap();
+        assert!(!is_skill_path_enabled(&root, &installed.join("SKILL.md")).unwrap());
+        assert_eq!(installed_skill_ids(&root).unwrap(), ["review (disabled)"]);
+        set_skill_enabled(&root, "review", true).unwrap();
+        assert!(is_skill_path_enabled(&root, &installed.join("SKILL.md")).unwrap());
+        assert!(uninstall_skill(&root, "review").unwrap());
+        assert!(!skill_installed(&root, "review"));
+        assert!(!uninstall_skill(&root, "review").unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn package_download_has_a_hard_size_limit() {
+        let error = read_bounded(Cursor::new(vec![0_u8; MAX_PACKAGE_BYTES + 1])).unwrap_err();
+        assert!(error.to_string().contains("byte limit"));
     }
 
     fn test_dir(prefix: &str) -> PathBuf {

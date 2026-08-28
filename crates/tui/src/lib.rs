@@ -166,7 +166,7 @@ impl From<CommandView> for CommandCandidate {
 fn default_commands() -> Vec<CommandCandidate> {
     [
         "/help", "/login", "/new", "/model", "/tree", "/trust", "/resume", "/context", "/doctor",
-        "/skills", "/pin", "/goal", "/compact", "/quit",
+        "/skills", "/mcp", "/pin", "/goal", "/compact", "/quit",
     ]
     .iter()
     .map(|command| CommandCandidate {

@@ -91,7 +91,13 @@ pub fn discover_skills(
     project_trusted: bool,
 ) -> io::Result<Vec<SkillPromptItem>> {
     let mut skills = Vec::new();
-    read_skills_dir(&profile_dir.join("skills"), &mut skills)?;
+    let mut global_skills = Vec::new();
+    read_skills_dir(&profile_dir.join("skills"), &mut global_skills)?;
+    for skill in global_skills {
+        if crate::skills::is_skill_path_enabled(profile_dir, &skill.path)? {
+            skills.push(skill);
+        }
+    }
     if project_trusted {
         read_skills_dir(&cwd.join(".jucode").join("skills"), &mut skills)?;
     }
@@ -438,6 +444,47 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].command, "/code-review");
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disabled_global_skills_are_hidden_but_trusted_project_skills_load() {
+        let root = std::env::temp_dir().join(format!(
+            "jucode-skill-sources-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let profile = root.join("profile");
+        let cwd = root.join("repo");
+        let global = profile.join("skills/global");
+        let project = cwd.join(".jucode/skills/project");
+        fs::create_dir_all(&global).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            global.join("SKILL.md"),
+            "---\nname: global\ndescription: Global\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join("SKILL.md"),
+            "---\nname: project\ndescription: Project\n---\n",
+        )
+        .unwrap();
+        crate::skills::set_skill_enabled(&profile, "global", false).unwrap();
+
+        let trusted = discover_skills(&profile, &cwd, true).unwrap();
+        let untrusted = discover_skills(&profile, &cwd, false).unwrap();
+
+        assert_eq!(
+            trusted
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            ["project"]
+        );
+        assert!(untrusted.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 }
