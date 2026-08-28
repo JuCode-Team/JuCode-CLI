@@ -302,6 +302,28 @@ impl AgentCore {
                 description: entry.skill.description,
             }));
         }
+        if let Ok(custom) = crate::custom_commands::discover_custom_commands(
+            self.config.profile_dir(),
+            &self.cwd,
+            self.project_trusted,
+        ) {
+            // Built-ins and skills win on name collisions; only add the rest.
+            let taken = commands
+                .iter()
+                .map(|existing| existing.command.clone())
+                .collect::<HashSet<_>>();
+            commands.extend(
+                custom
+                    .into_iter()
+                    .filter(|entry| !taken.contains(&entry.command))
+                    .map(|entry| CommandView {
+                        command: entry.command,
+                        marker: Some(if entry.project_scoped { "PROJ" } else { "CMD" }.to_string()),
+                        args: "[args]".to_string(),
+                        description: entry.description,
+                    }),
+            );
+        }
         AgentEvent::CommandList(commands)
     }
 
@@ -458,6 +480,9 @@ impl AgentCore {
             return (false, events);
         }
         if !crate::commands::is_known(command) {
+            if let Some(events) = self.custom_command_events(command, args.trim()) {
+                return (false, events);
+            }
             return (
                 false,
                 vec![AgentEvent::Error(format!("unknown command: {command}"))],
@@ -860,6 +885,42 @@ impl AgentCore {
             Err(error) => {
                 return Some(vec![AgentEvent::Error(format!(
                     "failed to read skill: {error}"
+                ))])
+            }
+        };
+        if self.running {
+            self.queued.push_back((message, Vec::new()));
+            return Some(vec![
+                AgentEvent::PendingMessages(self.pending_texts()),
+                AgentEvent::Status(format!("queued: {}", self.queued.len())),
+            ]);
+        }
+        let display = if request.is_empty() {
+            command.to_string()
+        } else {
+            format!("{command} {request}")
+        };
+        let mut events = vec![AgentEvent::UserMessage(display)];
+        events.extend(self.start_hooked_turn(message, Vec::new()));
+        Some(events)
+    }
+
+    /// Dispatch a user-defined command from `~/.jucode/commands` or a trusted
+    /// project's `.jucode/commands`: the Markdown body becomes the user prompt.
+    fn custom_command_events(&mut self, command: &str, request: &str) -> Option<Vec<AgentEvent>> {
+        let commands = crate::custom_commands::discover_custom_commands(
+            self.config.profile_dir(),
+            &self.cwd,
+            self.project_trusted,
+        )
+        .ok()?;
+        let custom = commands.into_iter().find(|entry| entry.command == command)?;
+        let message = match crate::custom_commands::command_message(&custom, request) {
+            Ok(message) => message,
+            Err(error) => {
+                return Some(vec![AgentEvent::Error(format!(
+                    "failed to read command file {}: {error}",
+                    custom.path.display()
                 ))])
             }
         };

@@ -1,6 +1,7 @@
 mod commands;
 mod config;
 mod core;
+pub mod custom_commands;
 pub mod event;
 mod extensions;
 mod hooks;
