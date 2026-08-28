@@ -204,7 +204,10 @@ fn handle_message(
                     stdout,
                     &id,
                     METHOD_NOT_FOUND,
-                    &format!("{} is not supported by jucode acp", method.unwrap_or_default()),
+                    &format!(
+                        "{} is not supported by jucode acp",
+                        method.unwrap_or_default()
+                    ),
                 )?;
             }
         }
@@ -510,7 +513,10 @@ mod tests {
         let response = initialize_response(&json!(1));
         assert_eq!(response["id"], 1);
         assert_eq!(response["result"]["protocolVersion"], 1);
-        assert_eq!(response["result"]["agentCapabilities"]["loadSession"], false);
+        assert_eq!(
+            response["result"]["agentCapabilities"]["loadSession"],
+            false
+        );
         assert_eq!(
             response["result"]["agentCapabilities"]["promptCapabilities"]["image"],
             true
@@ -520,11 +526,9 @@ mod tests {
 
     #[test]
     fn assistant_and_reasoning_deltas_map_to_chunks() {
-        let message = session_update_for_event(
-            "sess-1",
-            &AgentEvent::AssistantDelta("hello".to_string()),
-        )
-        .unwrap();
+        let message =
+            session_update_for_event("sess-1", &AgentEvent::AssistantDelta("hello".to_string()))
+                .unwrap();
         assert_eq!(message["method"], "session/update");
         assert_eq!(message["params"]["sessionId"], "sess-1");
         assert_eq!(
@@ -533,11 +537,9 @@ mod tests {
         );
         assert_eq!(message["params"]["update"]["content"]["text"], "hello");
 
-        let thought = session_update_for_event(
-            "sess-1",
-            &AgentEvent::ReasoningDelta("hmm".to_string()),
-        )
-        .unwrap();
+        let thought =
+            session_update_for_event("sess-1", &AgentEvent::ReasoningDelta("hmm".to_string()))
+                .unwrap();
         assert_eq!(
             thought["params"]["update"]["sessionUpdate"],
             "agent_thought_chunk"

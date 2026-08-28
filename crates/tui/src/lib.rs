@@ -15,8 +15,8 @@ mod ui_builder;
 
 use git_bar::GitStatusTracker;
 use input::{paste_burst_render_delay, InputBuffer, PasteBurst, PasteCharDecision, PasteFlush};
-use local_shell::{local_shell_command, LocalShellRunner};
 use jucode_agent_core::{AgentEvent, CommandView, TranscriptItem};
+use local_shell::{local_shell_command, LocalShellRunner};
 use picker::{PickerState, TreePromptAction};
 use ratatui::crossterm::{
     cursor::{Hide, Show},
@@ -581,8 +581,7 @@ impl<R: TuiRuntime> TuiApp<R> {
                 self.flush_paste_burst_before_non_plain_input();
                 let count = self.completion_rows_len();
                 if count > 0 {
-                    self.state.completion_index =
-                        (self.state.completion_index + count - 1) % count;
+                    self.state.completion_index = (self.state.completion_index + count - 1) % count;
                 } else {
                     self.input.move_up(modifiers.contains(KeyModifiers::SHIFT));
                 }

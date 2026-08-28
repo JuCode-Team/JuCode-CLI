@@ -1171,7 +1171,11 @@ impl OpenAiClient {
             model: model.clone(),
             reasoning_effort,
             model_reasoning_efforts: self.model_reasoning_efforts.clone(),
-            system_prompt: subagent_system_prompt(&self.system_prompt, &child_path, &workspace.root),
+            system_prompt: subagent_system_prompt(
+                &self.system_prompt,
+                &child_path,
+                &workspace.root,
+            ),
             prompt_cache_key: self.prompt_cache_key.clone(),
             turn_state: Arc::clone(&self.turn_state),
             extensions: self.extensions.clone(),

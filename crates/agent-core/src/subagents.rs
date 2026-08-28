@@ -523,7 +523,7 @@ impl SubagentManager {
     /// parent can fold it into its cumulative totals. Returns each result once.
     pub(crate) fn drain_finished_usage(&self) -> Vec<SubagentRunResult> {
         let mut state = self.inner.state.lock().unwrap();
-        state.finished_usage.drain(..).collect()
+        std::mem::take(&mut state.finished_usage)
     }
 
     fn resolve_existing_target(
@@ -829,12 +829,7 @@ mod tests {
         let status = Command::new("git")
             .arg("-C")
             .arg(repo)
-            .args([
-                "-c",
-                "user.email=test@example.com",
-                "-c",
-                "user.name=test",
-            ])
+            .args(["-c", "user.email=test@example.com", "-c", "user.name=test"])
             .args(args)
             .output()
             .unwrap();

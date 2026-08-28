@@ -7,7 +7,7 @@
 use std::{
     path::{Path, PathBuf},
     process::Command,
-    sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError},
+    sync::mpsc::{sync_channel, Receiver, SyncSender},
     time::Duration,
 };
 
@@ -73,7 +73,11 @@ pub(crate) fn read_git_status(dir: &Path) -> Option<GitStatus> {
 }
 
 fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).current_dir(dir).output().ok()?;
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -102,11 +106,8 @@ impl GitStatusTracker {
     /// Latest reading, if a new one arrived since the last poll.
     pub(crate) fn poll(&self) -> Option<Option<GitStatus>> {
         let mut latest = None;
-        loop {
-            match self.rx.try_recv() {
-                Ok(status) => latest = Some(status),
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-            }
+        while let Ok(status) = self.rx.try_recv() {
+            latest = Some(status);
         }
         latest
     }

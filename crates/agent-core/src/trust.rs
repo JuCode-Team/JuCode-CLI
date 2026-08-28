@@ -80,7 +80,9 @@ impl TrustStore {
 /// instructions, and therefore require a trust decision before loading.
 pub fn project_has_local_resources(cwd: &Path) -> bool {
     let base = cwd.join(".jucode");
-    base.join("skills").exists() || base.join("hooks.json").exists() || base.join("commands").exists()
+    base.join("skills").exists()
+        || base.join("hooks.json").exists()
+        || base.join("commands").exists()
 }
 
 /// The nearest ancestor of `cwd` that holds the `.git` marker, offered as a

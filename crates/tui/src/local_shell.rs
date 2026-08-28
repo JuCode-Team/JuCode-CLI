@@ -5,7 +5,7 @@
 
 use std::{
     process::Command,
-    sync::mpsc::{channel, Receiver, Sender, TryRecvError},
+    sync::mpsc::{channel, Receiver, Sender},
 };
 
 /// Cap on stored shell output so a runaway command cannot bloat the history.
@@ -63,11 +63,8 @@ impl LocalShellRunner {
 
     pub(crate) fn poll(&mut self) -> Vec<LocalShellResult> {
         let mut results = Vec::new();
-        loop {
-            match self.rx.try_recv() {
-                Ok(result) => results.push(result),
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-            }
+        while let Ok(result) = self.rx.try_recv() {
+            results.push(result);
         }
         results
     }

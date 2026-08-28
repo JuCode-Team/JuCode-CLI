@@ -2,10 +2,7 @@
 //! fuzzy file picker fed by `rg --files` (gitignore-aware) when available,
 //! falling back to `git ls-files` and then a capped directory walk.
 
-use std::{
-    path::Path,
-    process::Command,
-};
+use std::{path::Path, process::Command};
 
 /// Cap on the indexed file list; beyond this the picker still works but only
 /// over the first entries the lister produced.
@@ -20,7 +17,14 @@ pub(crate) const MAX_MENTION_MATCHES: usize = 8;
 pub(crate) fn mention_token(text_before_cursor: &str) -> Option<(usize, String)> {
     let token_start = text_before_cursor
         .rfind(char::is_whitespace)
-        .map(|index| index + text_before_cursor[index..].chars().next().unwrap().len_utf8())
+        .map(|index| {
+            index
+                + text_before_cursor[index..]
+                    .chars()
+                    .next()
+                    .unwrap()
+                    .len_utf8()
+        })
         .unwrap_or(0);
     let token = &text_before_cursor[token_start..];
     let query = token.strip_prefix('@')?;

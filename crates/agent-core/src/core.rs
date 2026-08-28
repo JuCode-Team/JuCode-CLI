@@ -171,8 +171,7 @@ impl AgentCore {
         mcp.start(&config.mcp_servers, &cwd);
         let session = SessionStore::new();
         // A fresh session id is unique, so this only fails on IO problems.
-        let session_lock =
-            SessionLock::acquire(&profile_dir()?, &cwd, session.session_id()).ok();
+        let session_lock = SessionLock::acquire(&profile_dir()?, &cwd, session.session_id()).ok();
         Ok(Self {
             config,
             auth: AuthStore::load_or_create()?,
@@ -959,7 +958,9 @@ impl AgentCore {
             self.project_trusted,
         )
         .ok()?;
-        let custom = commands.into_iter().find(|entry| entry.command == command)?;
+        let custom = commands
+            .into_iter()
+            .find(|entry| entry.command == command)?;
         let message = match crate::custom_commands::command_message(&custom, request) {
             Ok(message) => message,
             Err(error) => {

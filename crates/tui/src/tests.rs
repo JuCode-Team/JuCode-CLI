@@ -1365,9 +1365,11 @@ fn bang_input_runs_locally_and_never_reaches_the_model() {
     assert!(app.runtime.submitted.is_empty(), "must not go to the model");
     assert!(app.runtime.commands.is_empty());
     assert!(app.input.text().is_empty());
-    assert!(app.state.chat.iter().any(
-        |line| matches!(line, ChatLine::User(text) if text == "!echo tui-local-shell")
-    ));
+    assert!(app
+        .state
+        .chat
+        .iter()
+        .any(|line| matches!(line, ChatLine::User(text) if text == "!echo tui-local-shell")));
     assert!(app.state.chat.iter().any(|line| matches!(
         line,
         ChatLine::Tool { name, running: true, .. } if name == "! echo tui-local-shell"
@@ -1378,10 +1380,12 @@ fn bang_input_runs_locally_and_never_reaches_the_model() {
         for result in app.local_shell.poll() {
             app.state.finish_local_shell(result);
         }
-        if app.state.chat.iter().any(|line| matches!(
-            line,
-            ChatLine::Tool { output, running: false, .. } if output.contains("tui-local-shell")
-        )) {
+        if app.state.chat.iter().any(|line| {
+            matches!(
+                line,
+                ChatLine::Tool { output, running: false, .. } if output.contains("tui-local-shell")
+            )
+        }) {
             finished = true;
             break;
         }
