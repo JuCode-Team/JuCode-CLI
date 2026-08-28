@@ -118,8 +118,9 @@ fn encrypt(plaintext: &str, key: &SecretKey) -> io::Result<String> {
     let mut nonce = [0_u8; NONCE_LEN];
     getrandom::getrandom(&mut nonce)
         .map_err(|error| io::Error::other(format!("failed to generate secret nonce: {error}")))?;
+    let cipher_nonce = Nonce::from(nonce);
     let sealed = cipher
-        .encrypt(Nonce::from_slice(&nonce), plaintext.as_bytes())
+        .encrypt(&cipher_nonce, plaintext.as_bytes())
         .map_err(|_| io::Error::other("failed to encrypt secret"))?;
     let mut blob = Vec::with_capacity(NONCE_LEN + sealed.len());
     blob.extend_from_slice(&nonce);
@@ -141,9 +142,12 @@ fn decrypt(envelope: &str, key: &SecretKey) -> io::Result<String> {
         return Err(invalid_data("malformed jcenc1 envelope: truncated"));
     }
     let (nonce, sealed) = blob.split_at(NONCE_LEN);
+    let nonce = <[u8; NONCE_LEN]>::try_from(nonce)
+        .map(Nonce::from)
+        .map_err(|_| invalid_data("malformed jcenc1 envelope: invalid nonce"))?;
     let cipher = ChaCha20Poly1305::new(key.into());
     let plaintext = cipher
-        .decrypt(Nonce::from_slice(nonce), sealed)
+        .decrypt(&nonce, sealed)
         .map_err(|_| invalid_data("authentication failed"))?;
     String::from_utf8(plaintext)
         .map_err(|error| invalid_data(format!("decrypted secret is not UTF-8: {error}")))
