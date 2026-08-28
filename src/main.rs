@@ -136,6 +136,15 @@ fn take_approval_mode_flag(args: &mut Vec<String>) -> Result<Option<ApprovalMode
     ApprovalMode::parse(&value).map(Some)
 }
 
+/// The approval mode a headless run uses. Headless reads no further stdin, so
+/// approval prompts can never be answered interactively; instead of silently
+/// running full-auto (the old behavior), headless defaults to the safest mode
+/// and auto-denies gated tool calls. Loosen explicitly with
+/// `--approval-mode auto-edit` or `--approval-mode full-auto`.
+fn headless_approval_mode(flag: Option<ApprovalMode>) -> ApprovalMode {
+    flag.unwrap_or(ApprovalMode::ReadOnly)
+}
+
 fn run_headless(args: Vec<String>, approval_mode: Option<ApprovalMode>) -> io::Result<i32> {
     let mut prompt = args.join(" ");
     if prompt.trim().is_empty() {
@@ -143,33 +152,24 @@ fn run_headless(args: Vec<String>, approval_mode: Option<ApprovalMode>) -> io::R
     }
     let mut core = AgentCore::new()?;
     let mut stdout = io::stdout();
-    // Headless reads no further stdin, so approval prompts could never be
-    // answered; it therefore always runs full-auto and rejects tighter modes.
-    if let Some(mode) = approval_mode {
-        if mode != ApprovalMode::FullAuto {
-            write_event(
-                &mut stdout,
-                AgentEvent::Error(format!(
-                    "--approval-mode {} is not supported in --headless mode: approvals cannot be answered, so headless always runs full-auto",
-                    mode.as_str()
-                )),
-            )?;
-            return Ok(2);
-        }
-    }
-    for event in core.set_approval_mode(ApprovalMode::FullAuto) {
+    for event in core.set_approval_mode(headless_approval_mode(approval_mode)) {
         write_event(&mut stdout, event)?;
     }
     let mut done = false;
     let mut stats = HeadlessStats::default();
     let started = Instant::now();
+    let mut pending_denials = Vec::new();
     for event in core.submit_user_message(prompt) {
         if matches!(event, AgentEvent::Error(_)) {
             done = true;
         }
+        if let AgentEvent::ApprovalRequest { call_id, name, .. } = &event {
+            pending_denials.push((call_id.clone(), name.clone()));
+        }
         record_headless_event(&event, &mut stats);
         write_event(&mut stdout, event)?;
     }
+    auto_deny_approvals(&mut core, &mut stdout, &mut stats, &mut pending_denials)?;
     while !done {
         let events = core.poll_events();
         for event in events {
@@ -178,9 +178,13 @@ fn run_headless(args: Vec<String>, approval_mode: Option<ApprovalMode>) -> io::R
             {
                 done = true;
             }
+            if let AgentEvent::ApprovalRequest { call_id, name, .. } = &event {
+                pending_denials.push((call_id.clone(), name.clone()));
+            }
             record_headless_event(&event, &mut stats);
             write_event(&mut stdout, event)?;
         }
+        auto_deny_approvals(&mut core, &mut stdout, &mut stats, &mut pending_denials)?;
         thread::sleep(Duration::from_millis(50));
     }
     stats.status = if stats.last_error.is_some() {
@@ -193,6 +197,29 @@ fn run_headless(args: Vec<String>, approval_mode: Option<ApprovalMode>) -> io::R
         final_result_json(&stats, started.elapsed().as_millis() as u64),
     )?;
     Ok(if stats.last_error.is_some() { 1 } else { 0 })
+}
+
+/// Denies every approval request surfaced by a headless run: nobody can
+/// answer them, so blocking would hang the turn. The model receives the
+/// denial as the tool result and can adapt or finish.
+fn auto_deny_approvals(
+    core: &mut AgentCore,
+    stdout: &mut impl Write,
+    stats: &mut HeadlessStats,
+    pending: &mut Vec<(String, String)>,
+) -> io::Result<()> {
+    for (call_id, name) in pending.drain(..) {
+        let info = AgentEvent::Info(format!(
+            "auto-denying {name} ({call_id}): approvals cannot be answered in --headless mode; rerun with --approval-mode auto-edit or full-auto to allow this class of tools"
+        ));
+        record_headless_event(&info, stats);
+        write_event(stdout, info)?;
+        for event in core.approve(&call_id, false, false, None) {
+            record_headless_event(&event, stats);
+            write_event(stdout, event)?;
+        }
+    }
+    Ok(())
 }
 
 /// Persistent bidirectional protocol mode for GUI/IDE front-ends.
@@ -773,6 +800,19 @@ mod tests {
         assert_eq!(value["context_tokens"], 99);
         assert_eq!(value["tool_calls"], 3);
         assert_eq!(value["elapsed_ms"], 123);
+    }
+
+    #[test]
+    fn headless_defaults_to_read_only_and_honors_explicit_flag() {
+        assert_eq!(headless_approval_mode(None), ApprovalMode::ReadOnly);
+        assert_eq!(
+            headless_approval_mode(Some(ApprovalMode::AutoEdit)),
+            ApprovalMode::AutoEdit
+        );
+        assert_eq!(
+            headless_approval_mode(Some(ApprovalMode::FullAuto)),
+            ApprovalMode::FullAuto
+        );
     }
 
     #[test]
