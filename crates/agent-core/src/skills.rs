@@ -583,7 +583,28 @@ fn write_disabled_skills(profile_dir: &Path, disabled: &BTreeSet<String>) -> io:
         &temp,
         format!("{}\n", serde_json::to_string_pretty(&value)?),
     )?;
-    fs::rename(temp, path)
+    match fs::rename(&temp, &path) {
+        Ok(()) => Ok(()),
+        Err(error) if path.exists() => {
+            let backup = profile_dir.join(format!(".{SKILL_STATE_FILE}.backup"));
+            let _ = fs::remove_file(&backup);
+            fs::rename(&path, &backup)?;
+            if let Err(move_error) = fs::rename(&temp, &path) {
+                let _ = fs::rename(&backup, &path);
+                let _ = fs::remove_file(&temp);
+                return Err(io::Error::new(
+                    move_error.kind(),
+                    format!("{error}; replacement failed: {move_error}"),
+                ));
+            }
+            let _ = fs::remove_file(backup);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(temp);
+            Err(error)
+        }
+    }
 }
 
 fn zip_err(error: zip::result::ZipError) -> io::Error {

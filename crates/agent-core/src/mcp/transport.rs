@@ -763,10 +763,25 @@ fn persist_oauth_tokens(path: &Path, server: &str, tokens: &McpOAuthTokens) -> R
         fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
             .map_err(|error| error.to_string())?;
     }
-    fs::rename(&temp, path).map_err(|error| {
-        let _ = fs::remove_file(&temp);
-        error.to_string()
-    })
+    match fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(error) if path.exists() => {
+            let backup = path.with_extension("json.oauth-backup");
+            let _ = fs::remove_file(&backup);
+            fs::rename(path, &backup).map_err(|move_error| move_error.to_string())?;
+            if let Err(move_error) = fs::rename(&temp, path) {
+                let _ = fs::rename(&backup, path);
+                let _ = fs::remove_file(&temp);
+                return Err(format!("{error}; replacement failed: {move_error}"));
+            }
+            let _ = fs::remove_file(backup);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            Err(error.to_string())
+        }
+    }
 }
 
 /// Read SSE events (concatenated `data:` lines per event) until `found`
