@@ -1,7 +1,10 @@
 #[cfg(feature = "bench")]
 pub mod bench_support;
+mod git_bar;
 mod input;
+mod local_shell;
 mod markdown;
+mod mention;
 mod picker;
 mod state;
 mod terminal_renderer;
@@ -10,7 +13,9 @@ mod tests;
 mod tool_preview;
 mod ui_builder;
 
+use git_bar::GitStatusTracker;
 use input::{paste_burst_render_delay, InputBuffer, PasteBurst, PasteCharDecision, PasteFlush};
+use local_shell::{local_shell_command, LocalShellRunner};
 use jucode_agent_core::{AgentEvent, CommandView, TranscriptItem};
 use picker::{PickerState, TreePromptAction};
 use ratatui::crossterm::{
@@ -143,6 +148,7 @@ pub(crate) struct BottomStatus<'a> {
     pub(crate) provider: &'a str,
     pub(crate) model: &'a str,
     pub(crate) reasoning_effort: &'a str,
+    pub(crate) git: Option<&'a git_bar::GitStatus>,
     pub(crate) context_tokens: u64,
     pub(crate) context_window: u64,
     pub(crate) cost: f64,
@@ -286,6 +292,39 @@ fn compact_home_path(path: &str) -> String {
     }
 }
 
+/// If a paste is a single existing image-file path (optionally quoted or a
+/// `file://` URL, as terminals produce for drag-and-drop), returns the path.
+pub(crate) fn pasted_image_path(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return None;
+    }
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+        })
+        .unwrap_or(trimmed);
+    let path = unquoted.strip_prefix("file://").unwrap_or(unquoted);
+    let extension = std::path::Path::new(path)
+        .extension()?
+        .to_str()?
+        .to_ascii_lowercase();
+    if !matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+    ) {
+        return None;
+    }
+    if !std::path::Path::new(path).is_file() {
+        return None;
+    }
+    Some(path.to_string())
+}
+
 /// Number of transcript lines a PageUp/PageDown moves the viewport, one screen minus a
 /// little overlap so context carries across the jump. Falls back if the size query fails.
 fn scroll_page_size() -> usize {
@@ -317,6 +356,7 @@ pub struct TuiApp<R> {
     input: InputBuffer,
     paste_burst: PasteBurst,
     state: TuiState,
+    local_shell: LocalShellRunner,
     /// Lines the transcript viewport is lifted above the live tail (PageUp/PageDown).
     /// Zero follows live output; the renderer clamps it to the available range.
     scroll_offset: usize,
@@ -392,6 +432,7 @@ impl<R: TuiRuntime> TuiApp<R> {
             input: InputBuffer::default(),
             paste_burst: PasteBurst::default(),
             state: TuiState::default(),
+            local_shell: LocalShellRunner::default(),
             scroll_offset: 0,
         };
         let events = app.runtime.startup_events();
@@ -402,6 +443,9 @@ impl<R: TuiRuntime> TuiApp<R> {
     pub fn run(mut self) -> io::Result<()> {
         let _guard = TerminalGuard::enter()?;
         let mut renderer = TerminalRenderer::new()?;
+        let git_tracker = GitStatusTracker::start(
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        );
         let now = Instant::now();
         let mut frames = FrameScheduler::new(now);
         let mut next_progress_at = now + PROGRESS_INTERVAL;
@@ -414,6 +458,16 @@ impl<R: TuiRuntime> TuiApp<R> {
             }
             let status_event = self.runtime.model_status_event();
             if self.apply_events(vec![status_event]) {
+                frames.request_now(now);
+            }
+            if let Some(status) = git_tracker.poll() {
+                if self.state.git_status != status {
+                    self.state.git_status = status;
+                    frames.request_now(now);
+                }
+            }
+            for result in self.local_shell.poll() {
+                self.state.finish_local_shell(result);
                 frames.request_now(now);
             }
 
@@ -525,12 +579,10 @@ impl<R: TuiRuntime> TuiApp<R> {
             }
             KeyCode::Up => {
                 self.flush_paste_burst_before_non_plain_input();
-                if self.command_completion_active() {
-                    let count = self.state.command_matches(&self.input).len();
-                    if count > 0 {
-                        self.state.completion_index =
-                            (self.state.completion_index + count - 1) % count;
-                    }
+                let count = self.completion_rows_len();
+                if count > 0 {
+                    self.state.completion_index =
+                        (self.state.completion_index + count - 1) % count;
                 } else {
                     self.input.move_up(modifiers.contains(KeyModifiers::SHIFT));
                 }
@@ -538,11 +590,9 @@ impl<R: TuiRuntime> TuiApp<R> {
             }
             KeyCode::Down => {
                 self.flush_paste_burst_before_non_plain_input();
-                if self.command_completion_active() {
-                    let count = self.state.command_matches(&self.input).len();
-                    if count > 0 {
-                        self.state.completion_index = (self.state.completion_index + 1) % count;
-                    }
+                let count = self.completion_rows_len();
+                if count > 0 {
+                    self.state.completion_index = (self.state.completion_index + 1) % count;
                 } else {
                     self.input
                         .move_down(modifiers.contains(KeyModifiers::SHIFT));
@@ -609,6 +659,8 @@ impl<R: TuiRuntime> TuiApp<R> {
                 self.flush_paste_burst_before_non_plain_input();
                 if self.command_completion_active() {
                     self.complete_selected_command();
+                } else {
+                    self.complete_selected_mention();
                 }
                 false
             }
@@ -652,11 +704,22 @@ impl<R: TuiRuntime> TuiApp<R> {
                     self.complete_selected_command();
                     return false;
                 }
+                if self.complete_selected_mention() {
+                    return false;
+                }
 
                 let submitted = self.input.text().trim().to_string();
                 self.input.clear();
                 self.state.completion_index = 0;
                 if submitted.is_empty() {
+                    return false;
+                }
+
+                // `!command` is a local shell escape: run it on this machine,
+                // never send it to the model.
+                if let Some(command) = local_shell_command(&submitted) {
+                    let call_id = self.local_shell.spawn(command);
+                    self.state.begin_local_shell(&call_id, command);
                     return false;
                 }
 
@@ -679,6 +742,13 @@ impl<R: TuiRuntime> TuiApp<R> {
 
     fn handle_paste(&mut self, text: &str) {
         self.paste_burst.clear_after_explicit_paste();
+        // A pasted (or drag-and-dropped) image file path is attached directly
+        // instead of inserted as text; terminals deliver file drops as paths.
+        if let Some(path) = pasted_image_path(text) {
+            let (_, events) = self.runtime.handle_command(&format!("/image {path}"));
+            self.apply_events(events);
+            return;
+        }
         self.input.push_paste(text);
         self.clamp_completion_index();
     }
@@ -869,6 +939,35 @@ impl<R: TuiRuntime> TuiApp<R> {
 
     fn complete_selected_command(&mut self) {
         self.state.complete_selected_command(&mut self.input);
+    }
+
+    fn completion_rows_len(&mut self) -> usize {
+        self.state.completion_rows(&self.input).len()
+    }
+
+    /// Replaces the `@token` before the cursor with the selected file mention.
+    /// Returns true when a completion was applied.
+    fn complete_selected_mention(&mut self) -> bool {
+        let matches = self.state.mention_matches(&self.input);
+        let Some(path) = matches.get(self.state.completion_index) else {
+            return false;
+        };
+        let tail = self.input.tail_chars_before_cursor();
+        let Some((token_chars, query)) = mention::mention_token(&tail) else {
+            return false;
+        };
+        // The query already is the selected path: nothing to complete, let
+        // Enter submit instead of demanding a second keypress.
+        if *path == query {
+            return false;
+        }
+        let path = path.clone();
+        for _ in 0..token_chars {
+            self.input.pop();
+        }
+        self.input.push_text(&format!("@{path} "));
+        self.state.completion_index = 0;
+        true
     }
 
     fn apply_events(&mut self, events: Vec<AgentEvent>) -> bool {

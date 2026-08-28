@@ -130,6 +130,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         advanced: false,
     },
     CommandSpec {
+        name: "/image",
+        aliases: &[],
+        args: "<path>",
+        description: "Attach an image to your next message",
+        advanced: false,
+    },
+    CommandSpec {
         name: "/compact",
         aliases: &[],
         args: "",
@@ -264,5 +271,11 @@ mod tests {
     fn mcp_command_is_registered_and_in_help() {
         assert!(is_known("/mcp"));
         assert!(help_line().contains("/mcp [tools|reload|enable|disable] [server]"));
+    }
+
+    #[test]
+    fn image_command_is_registered_and_in_help() {
+        assert!(is_known("/image"));
+        assert!(help_line().contains("/image <path>"));
     }
 }

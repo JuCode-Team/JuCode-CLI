@@ -92,6 +92,19 @@ impl InputBuffer {
         out
     }
 
+    /// The contiguous run of plainly-typed chars immediately before the cursor
+    /// (stops at a large-paste placeholder). Used for `@` mention detection.
+    pub(crate) fn tail_chars_before_cursor(&self) -> String {
+        let mut chars = Vec::new();
+        for index in (0..self.cursor).rev() {
+            match &self.cells[index] {
+                Cell::Char(ch) => chars.push(*ch),
+                Cell::LargePaste(_) => break,
+            }
+        }
+        chars.into_iter().rev().collect()
+    }
+
     /// Normalized selection range `[start, end)` over cell indices, or `None` when empty.
     pub(crate) fn selection(&self) -> Option<(usize, usize)> {
         let anchor = self.anchor?;

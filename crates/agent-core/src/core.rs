@@ -113,6 +113,9 @@ pub struct AgentCore {
     profile_dir: PathBuf,
     cwd: PathBuf,
     queued: VecDeque<(String, Vec<String>)>,
+    /// Image paths staged with `/image <path>`; attached to (and drained by)
+    /// the next submitted user message.
+    pending_images: Vec<String>,
     running: bool,
     receiver: Option<Receiver<WorkerEvent>>,
     /// Dedicated channel for the idle resume-summary worker; kept separate from
@@ -178,6 +181,7 @@ impl AgentCore {
             profile_dir: profile_dir()?,
             cwd,
             queued: VecDeque::new(),
+            pending_images: Vec::new(),
             running: false,
             receiver: None,
             resume_summary_receiver: None,
@@ -393,7 +397,11 @@ impl AgentCore {
         message: String,
         images: Vec<String>,
     ) -> Vec<AgentEvent> {
-        let (images, mut events) = self.validate_image_attachments(images);
+        // Images staged with /image ride along with the next message from any
+        // front-end (TUI, serve, acp), merged before explicit attachments.
+        let mut merged = std::mem::take(&mut self.pending_images);
+        merged.extend(images);
+        let (images, mut events) = self.validate_image_attachments(merged);
         if self.running {
             self.queued.push_back((message, images));
             events.push(AgentEvent::PendingMessages(self.pending_texts()));
@@ -594,6 +602,7 @@ impl AgentCore {
             "/doctor" => self.doctor_events(),
             "/skills" => self.skills_events(args.trim()),
             "/pin" => self.pin_skill_events(args.trim()),
+            "/image" => self.image_command_events(args.trim()),
             "/compact" => self.compact_command_events(),
             // Reached only if a command is registered in `commands::COMMANDS` but
             // has no dispatch arm here — a wiring bug, surfaced explicitly.
@@ -602,6 +611,34 @@ impl AgentCore {
             ))],
         };
         (false, events)
+    }
+
+    /// `/image <path>`: stage an image so it is attached to the next submitted
+    /// user message. Without an argument, lists what is currently staged.
+    fn image_command_events(&mut self, arg: &str) -> Vec<AgentEvent> {
+        let path = arg.trim().trim_matches('"').trim_matches('\'');
+        if path.is_empty() {
+            return if self.pending_images.is_empty() {
+                vec![AgentEvent::Info(
+                    "usage: /image <path> — attach an image to your next message".to_string(),
+                )]
+            } else {
+                vec![AgentEvent::Info(format!(
+                    "staged images (sent with your next message):\n{}",
+                    self.pending_images.join("\n")
+                ))]
+            };
+        }
+        match crate::tools::image_attachment_error(std::path::Path::new(path)) {
+            Some(error) => vec![AgentEvent::Error(format!("cannot attach {error}"))],
+            None => {
+                self.pending_images.push(path.to_string());
+                vec![AgentEvent::Info(format!(
+                    "attached {path}; it will be sent with your next message ({} staged)",
+                    self.pending_images.len()
+                ))]
+            }
+        }
     }
 
     fn skills_events(&mut self, arg: &str) -> Vec<AgentEvent> {
