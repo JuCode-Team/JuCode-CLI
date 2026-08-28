@@ -150,8 +150,8 @@ fn is_network_tool(name: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub provider: String,
-    /// Wire protocol override: "responses" | "anthropic". Empty falls back to the
-    /// per-model heuristic (claude-* → anthropic, else responses).
+    /// Wire protocol override: "responses" | "anthropic" | "chat". Empty falls
+    /// back to the per-model heuristic (claude-* → anthropic, else responses).
     pub protocol: String,
     pub model: String,
     pub reasoning_effort: String,
@@ -851,141 +851,55 @@ pub(crate) fn is_thinking_disabled(efforts: &[String]) -> bool {
     efforts.is_empty() || efforts.iter().all(|effort| effort == "none")
 }
 
-fn default_model_configs() -> Vec<ModelConfig> {
-    [
-        (
-            "gpt-5.5",
-            272_000,
-            128_000,
-            &["none", "low", "medium", "high", "xhigh"][..],
-        ),
-        (
-            "gpt-5.4",
-            272_000,
-            128_000,
-            &["none", "low", "medium", "high", "xhigh"],
-        ),
-        (
-            "gpt-5.4-mini",
-            400_000,
-            128_000,
-            &["none", "low", "medium", "high", "xhigh"],
-        ),
-        (
-            "gpt-5.3-codex",
-            400_000,
-            128_000,
-            &["low", "medium", "high", "xhigh"],
-        ),
-        (
-            "gpt-5.2",
-            400_000,
-            128_000,
-            &["none", "low", "medium", "high", "xhigh"],
-        ),
-    ]
-    .iter()
-    .map(
-        |(name, context_window, max_output_tokens, reasoning_efforts)| ModelConfig {
-            name: (*name).to_string(),
-            context_window: *context_window,
-            max_output_tokens: *max_output_tokens,
-            reasoning_efforts: reasoning_efforts
-                .iter()
-                .map(|value| value.to_string())
-                .collect(),
-            input_cost: 0.0,
-            cached_input_cost: 0.0,
-            output_cost: 0.0,
-        },
-    )
-    .collect()
+fn model_config_from_template(model: &jucode_vendor::ModelTemplate) -> ModelConfig {
+    ModelConfig {
+        name: model.name.to_string(),
+        context_window: model.context_window,
+        max_output_tokens: model.max_output_tokens,
+        reasoning_efforts: model
+            .reasoning_efforts
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        input_cost: 0.0,
+        cached_input_cost: 0.0,
+        output_cost: 0.0,
+    }
 }
 
-/// A built-in provider: its default API base URL and the models it serves.
-/// Add an entry here to ship a new provider; users can still override base_url
-/// and models in the config file.
-struct ProviderTemplate {
-    id: &'static str,
-    base_url: &'static str,
-    /// Wire protocol: "responses" (OpenAI Responses API) or "anthropic" (Messages API).
-    protocol: &'static str,
-    models: fn() -> Vec<ModelConfig>,
-}
-
-fn default_providers() -> Vec<ProviderTemplate> {
-    vec![
-        // The jucode gateway speaks the OpenAI Responses API and serves the gpt-5
-        // family (plus claude-* models, which users configure by name).
-        ProviderTemplate {
-            id: "jucode",
-            base_url: "https://api.jucode.cn/v1",
-            protocol: "responses",
-            models: default_model_configs,
-        },
-        // DeepSeek exposes an Anthropic-compatible endpoint; route via Messages.
-        ProviderTemplate {
-            id: "deepseek",
-            base_url: "https://api.deepseek.com/anthropic",
-            protocol: "anthropic",
-            models: deepseek_model_configs,
-        },
-    ]
-}
-
-/// Built-in providers as (id, default base_url, protocol) — for UIs to offer a picker.
+/// Built-in providers as (id, default base_url, protocol) — for UIs to offer a
+/// picker. Templates (base URLs, protocols, models) live in the vendor crate.
 pub fn builtin_providers() -> Vec<(String, String, String)> {
-    default_providers()
-        .into_iter()
+    jucode_vendor::templates()
+        .iter()
         .map(|p| {
             (
                 p.id.to_string(),
                 p.base_url.to_string(),
-                p.protocol.to_string(),
+                p.protocol.as_str().to_string(),
             )
         })
         .collect()
 }
 
-/// Default model table for a provider, falling back to the openai set.
+/// Default model table for a provider, falling back to the jucode set.
 pub fn models_for_provider(id: &str) -> Vec<ModelConfig> {
-    default_providers()
-        .into_iter()
-        .find(|p| p.id == id)
-        .map(|p| (p.models)())
-        .unwrap_or_else(default_model_configs)
+    jucode_vendor::providers::template(id)
+        .or_else(|| jucode_vendor::providers::template("jucode"))
+        .map(|p| p.models.iter().map(model_config_from_template).collect())
+        .unwrap_or_default()
 }
 
 fn default_base_url_for_provider(id: &str) -> Option<&'static str> {
-    default_providers()
-        .into_iter()
-        .find(|p| p.id == id)
-        .map(|p| p.base_url)
-}
-
-fn deepseek_model_configs() -> Vec<ModelConfig> {
-    [
-        ("deepseek-v4-pro", 1_000_000, 384_000),
-        ("deepseek-v4-flash", 1_000_000, 384_000),
-    ]
-    .iter()
-    .map(|(name, context_window, max_output_tokens)| ModelConfig {
-        name: (*name).to_string(),
-        context_window: *context_window,
-        max_output_tokens: *max_output_tokens,
-        reasoning_efforts: vec!["high".to_string(), "max".to_string()],
-        input_cost: 0.0,
-        cached_input_cost: 0.0,
-        output_cost: 0.0,
-    })
-    .collect()
+    jucode_vendor::providers::template(id).map(|p| p.base_url)
 }
 
 fn default_model_config(name: &str) -> ModelConfig {
-    default_providers()
-        .into_iter()
-        .flat_map(|p| (p.models)())
+    jucode_vendor::templates()
+        .iter()
+        .flat_map(|p| p.models.iter())
         .find(|entry| entry.name == name)
+        .map(model_config_from_template)
         .unwrap_or_else(|| ModelConfig {
             name: name.to_string(),
             context_window: 400_000,
@@ -1091,6 +1005,32 @@ mod tests {
     fn cost_for_zero_prices_is_free() {
         let model = default_model_config("gpt-5.4");
         assert_eq!(model.cost_for(1_000, 100, 1_000), 0.0);
+    }
+
+    #[test]
+    fn builtin_providers_expose_vendor_templates_with_models() {
+        // `jucode providers` prints this list; it must include the chat-based
+        // templates alongside the original responses/anthropic ones.
+        let providers = builtin_providers();
+        let ids: Vec<&str> = providers.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["jucode", "openai", "deepseek", "ollama", "openrouter"]
+        );
+        for (id, base_url, protocol) in &providers {
+            assert!(!base_url.is_empty(), "{id}");
+            assert!(
+                matches!(protocol.as_str(), "responses" | "anthropic" | "chat"),
+                "{id}: {protocol}"
+            );
+            assert!(!models_for_provider(id).is_empty(), "{id}");
+        }
+    }
+
+    #[test]
+    fn models_for_unknown_provider_fall_back_to_jucode_set() {
+        let fallback = models_for_provider("some-custom-gateway");
+        assert!(fallback.iter().any(|m| m.name == "gpt-5.5"));
     }
 
     #[test]
