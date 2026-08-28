@@ -226,7 +226,8 @@ fn filter_patch_call(arguments: &str, approved: &HashSet<&str>) -> Result<Filter
 fn plan_write(args: &Value, cwd: &Path) -> Option<Vec<HunkView>> {
     let path = args.get("path").and_then(Value::as_str)?;
     let content = args.get("content").and_then(Value::as_str)?;
-    let path = tools::resolve_path(cwd, path);
+    // Paths outside the workspace get no preview; the tool itself rejects them.
+    let path = tools::workspace_path(cwd, path).ok()?;
     let original = fs::read_to_string(&path).unwrap_or_default();
     if original == content {
         return None;
@@ -247,7 +248,8 @@ fn plan_str_replace(args: &Value, cwd: &Path) -> Option<Vec<HunkView>> {
     if edits.is_empty() {
         return None;
     }
-    let path = tools::resolve_path(cwd, path);
+    // Paths outside the workspace get no preview; the tool itself rejects them.
+    let path = tools::workspace_path(cwd, path).ok()?;
     let original = fs::read_to_string(&path).ok()?;
 
     let mut views = Vec::new();
@@ -281,7 +283,8 @@ fn plan_hashline_edit(args: &Value, cwd: &Path) -> Option<Vec<HunkView>> {
     if edits.is_empty() {
         return None;
     }
-    let path = tools::resolve_path(cwd, path);
+    // Paths outside the workspace get no preview; the tool itself rejects them.
+    let path = tools::workspace_path(cwd, path).ok()?;
     let original = fs::read_to_string(&path).ok()?;
 
     let mut views = Vec::new();

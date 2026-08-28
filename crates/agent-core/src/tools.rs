@@ -393,7 +393,10 @@ fn read_file(args: &Value, cwd: &Path) -> Value {
         return json!({ "error": "missing path" });
     };
 
-    let path = resolve_path(cwd, path);
+    let path = match workspace_path(cwd, path) {
+        Ok(path) => path,
+        Err(error) => return json!({ "error": error }),
+    };
     let offset = match optional_usize(args, "offset") {
         Ok(offset) => offset.unwrap_or(1).max(1),
         Err(error) => return json!({ "error": error }),
@@ -508,7 +511,10 @@ fn str_replace_file(args: &Value, cwd: &Path) -> Value {
         return json!({ "error": "edits must not be empty" });
     }
 
-    let path = resolve_path(cwd, path);
+    let path = match workspace_path(cwd, path) {
+        Ok(path) => path,
+        Err(error) => return json!({ "error": error }),
+    };
     if !has_read(&path) {
         return json!({
             "path": path.display().to_string(),
@@ -608,7 +614,10 @@ fn hashline_edit_file(args: &Value, cwd: &Path) -> Value {
         return json!({ "error": "edits must not be empty" });
     }
 
-    let path = resolve_path(cwd, path);
+    let path = match workspace_path(cwd, path) {
+        Ok(path) => path,
+        Err(error) => return json!({ "error": error }),
+    };
     if !has_read(&path) {
         return json!({
             "path": path.display().to_string(),
@@ -656,7 +665,10 @@ fn write_file(args: &Value, cwd: &Path) -> Value {
         return json!({ "error": "missing content" });
     };
 
-    let path = resolve_path(cwd, path);
+    let path = match workspace_path(cwd, path) {
+        Ok(path) => path,
+        Err(error) => return json!({ "error": error }),
+    };
     let exists = path.exists();
     if exists && !has_read(&path) {
         return json!({
@@ -1917,6 +1929,14 @@ fn apply_patch(
     if patch.trim().is_empty() {
         return json!({ "error": "patch must not be empty" });
     }
+    // Workspace path policy: reject the whole patch when any target escapes
+    // the workspace, before anything is checked or applied.
+    let targets = patch_target_paths(patch, cwd);
+    for target in &targets {
+        if let Err(error) = ensure_in_workspace(cwd, target) {
+            return json!({ "error": error });
+        }
+    }
 
     let check = run_command_events(
         "git",
@@ -1934,7 +1954,6 @@ fn apply_patch(
 
     match check {
         Ok(_) => {
-            let targets = patch_target_paths(patch, cwd);
             // Snapshot the patch's target files (pre-apply) so /rewind can undo it.
             let _ = create_checkpoint(cwd, "auto-patch", &targets);
             let result = run_command_events(
@@ -1966,11 +1985,13 @@ fn apply_patch(
 }
 
 fn list_dir(args: &Value, cwd: &Path) -> Value {
-    let path = args
-        .get("path")
-        .and_then(Value::as_str)
-        .map(|path| resolve_path(cwd, path))
-        .unwrap_or_else(|| cwd.to_path_buf());
+    let path = match args.get("path").and_then(Value::as_str) {
+        Some(path) => match workspace_path(cwd, path) {
+            Ok(path) => path,
+            Err(error) => return json!({ "error": error }),
+        },
+        None => cwd.to_path_buf(),
+    };
     let limit = match optional_usize(args, "limit") {
         Ok(limit) => limit.map(|limit| limit.max(1)),
         Err(error) => return json!({ "error": error }),
@@ -2119,7 +2140,10 @@ fn outline_file(args: &Value, cwd: &Path) -> Value {
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return json!({ "error": "missing path" });
     };
-    let path = resolve_path(cwd, path);
+    let path = match workspace_path(cwd, path) {
+        Ok(path) => path,
+        Err(error) => return json!({ "error": error }),
+    };
     let limit = match optional_usize(args, "limit") {
         Ok(limit) => limit.unwrap_or(200).max(1),
         Err(error) => return json!({ "error": error }),
@@ -2155,14 +2179,19 @@ fn checkpoint_tool(args: &Value, cwd: &Path) -> Value {
         .unwrap_or_default();
     match action {
         "create" => {
-            let paths = args
+            let mut paths = Vec::new();
+            for path in args
                 .get("paths")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
                 .filter_map(Value::as_str)
-                .map(|path| resolve_path(cwd, path))
-                .collect::<Vec<_>>();
+            {
+                match workspace_path(cwd, path) {
+                    Ok(path) => paths.push(path),
+                    Err(error) => return json!({ "error": error }),
+                }
+            }
             if paths.is_empty() {
                 return json!({ "error": "checkpoint create requires paths" });
             }
@@ -3184,6 +3213,69 @@ pub(crate) fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
     } else {
         cwd.join(path)
     }
+}
+
+/// Resolve `path` and enforce the workspace path policy: file tools only
+/// operate on paths inside the workspace root (`cwd`). This is a permission
+/// policy (resolve + prefix check), not an OS sandbox — shell commands are
+/// intentionally not gated. Symlinks in the existing part of the path are
+/// resolved before the check, so a symlink pointing outside the workspace is
+/// rejected too.
+pub(crate) fn workspace_path(cwd: &Path, path: &str) -> Result<PathBuf, String> {
+    let resolved = resolve_path(cwd, path);
+    ensure_in_workspace(cwd, &resolved)?;
+    Ok(resolved)
+}
+
+/// Errors when `resolved` escapes the workspace root after resolving
+/// symlinks in its existing prefix and `.`/`..` components lexically in the
+/// (necessarily symlink-free) non-existent remainder.
+pub(crate) fn ensure_in_workspace(cwd: &Path, resolved: &Path) -> Result<(), String> {
+    let workspace = cwd.canonicalize().map_err(|error| {
+        format!(
+            "cannot resolve the workspace root {}: {error}",
+            cwd.display()
+        )
+    })?;
+    let normalized = normalize_for_policy(resolved);
+    if normalized == workspace || normalized.starts_with(&workspace) {
+        Ok(())
+    } else {
+        Err(format!(
+            "path escapes the workspace: {} resolves outside {}. File tools only operate on paths inside the workspace.",
+            resolved.display(),
+            workspace.display()
+        ))
+    }
+}
+
+/// Canonicalizes the deepest existing ancestor of `path` (resolving symlinks
+/// and `..`), then applies the remaining non-existent components lexically.
+fn normalize_for_policy(path: &Path) -> PathBuf {
+    let (base, remainder) = deepest_canonical_ancestor(path);
+    let mut normalized = base;
+    for component in remainder.components() {
+        match component {
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            // CurDir is dropped; RootDir/Prefix cannot appear in a stripped
+            // remainder.
+            _ => {}
+        }
+    }
+    normalized
+}
+
+fn deepest_canonical_ancestor(path: &Path) -> (PathBuf, PathBuf) {
+    for ancestor in path.ancestors() {
+        if let Ok(canonical) = ancestor.canonicalize() {
+            let remainder = path.strip_prefix(ancestor).unwrap_or(Path::new(""));
+            return (canonical, remainder.to_path_buf());
+        }
+    }
+    (path.to_path_buf(), PathBuf::new())
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
@@ -4372,6 +4464,103 @@ mod tests {
     }
 
     #[cfg(not(windows))]
+    #[test]
+    fn workspace_path_allows_inside_and_rejects_outside() {
+        let dir = env::temp_dir().join(format!("jucode-policy-basic-{}", std::process::id()));
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("inside.txt"), "ok").unwrap();
+
+        assert!(workspace_path(&dir, "inside.txt").is_ok());
+        assert!(workspace_path(&dir, "sub/../inside.txt").is_ok());
+        assert!(workspace_path(&dir, "new/dir/file.txt").is_ok());
+        assert!(workspace_path(&dir, &dir.join("inside.txt").display().to_string()).is_ok());
+
+        let error = workspace_path(&dir, "../escape.txt").unwrap_err();
+        assert!(error.contains("escapes the workspace"), "{error}");
+        assert!(workspace_path(&dir, "/etc/passwd").is_err());
+        assert!(workspace_path(&dir, "sub/../../escape.txt").is_err());
+        // `..` inside a not-yet-existing prefix must not escape either.
+        assert!(workspace_path(&dir, "missing/../../escape.txt").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_tools_reject_paths_outside_the_workspace() {
+        let dir = env::temp_dir().join(format!("jucode-policy-tools-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let cases: [(&str, Value); 7] = [
+            ("read", json!({ "path": "/etc/passwd" })),
+            ("write", json!({ "path": "../escape.txt", "content": "x" })),
+            (
+                "str_replace",
+                json!({ "path": "/etc/passwd", "edits": [{ "oldText": "a", "newText": "b" }] }),
+            ),
+            (
+                "hashline_edit",
+                json!({ "path": "/etc/passwd", "edits": [{ "op": "append", "lines": "x" }] }),
+            ),
+            ("ls", json!({ "path": ".." })),
+            ("outline", json!({ "path": "/etc/passwd" })),
+            (
+                "checkpoint",
+                json!({ "action": "create", "name": "cp", "paths": ["../escape.txt"] }),
+            ),
+        ];
+        for (tool, args) in cases {
+            let result = run_tool(tool, &args.to_string(), &dir);
+            let value = serde_json::from_str::<Value>(&result).unwrap();
+            let error = value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(error.contains("escapes the workspace"), "{tool}: {result}");
+        }
+        assert!(!dir.parent().unwrap().join("escape.txt").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_patch_rejects_targets_outside_the_workspace() {
+        let dir = env::temp_dir().join(format!("jucode-policy-patch-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let patch = "--- /dev/null\n+++ b/../evil.txt\n@@ -0,0 +1 @@\n+evil\n";
+        let result = run_tool("apply_patch", &json!({ "patch": patch }).to_string(), &dir);
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        let error = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(error.contains("escapes the workspace"), "{result}");
+        assert!(!dir.parent().unwrap().join("evil.txt").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_tools_reject_symlinks_that_point_outside_the_workspace() {
+        let outside = env::temp_dir().join(format!("jucode-policy-outside-{}", std::process::id()));
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        let dir = env::temp_dir().join(format!("jucode-policy-symlink-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+
+        let result = run_tool(
+            "read",
+            &json!({ "path": "link/secret.txt" }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        let error = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(error.contains("escapes the workspace"), "{result}");
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
     #[test]
     fn resolve_path_expands_tilde_to_home() {
         let home = env::var("HOME").unwrap();
