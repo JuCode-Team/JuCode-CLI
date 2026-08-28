@@ -89,9 +89,18 @@ Useful commands:
 /skills install <id>          install a skill
 /skills sync                  sync default skills
 /pin <skill>                  keep a skill in current session context
+/image <path>                 attach an image to your next message
 /compact                      compact older conversation context
 /quit                         exit
 ```
+
+Other TUI conveniences:
+
+- **`!` shell escape** — input starting with `!` (for example `!git log -3`) runs in your local shell and shows its output in the history; it is never sent to the model.
+- **`@` file mentions** — type `@` plus a few characters to fuzzy-pick a project file (gitignore-aware via `rg --files`, falling back to `git ls-files` or a capped walk); Tab/Enter inserts the path.
+- **Git status bar** — the bottom bar shows the current branch with a `*` dirty marker, refreshed by a cheap cached `git` call on a background thread.
+- **Custom commands** — Markdown prompt files in `~/.jucode/commands/*.md` appear as `/name` commands; project-local `.jucode/commands/*.md` load after you trust the project (same gate as skills). `$ARGUMENTS` in the file body is replaced with whatever you type after the command.
+- **Images** — paste or drag-and-drop an image file path into the TUI (it attaches automatically), or use `/image <path>`.
 
 ### Headless mode
 
@@ -107,7 +116,19 @@ You can also pipe the task through stdin:
 cat task.md | jucode --headless
 ```
 
-This mode is useful for evaluation harnesses and reproducible agent experiments.
+Headless defaults to the safest approval mode (`read-only`), and any tool call that would need interactive approval is denied automatically instead of hanging the run. Opt in to unattended edits or shell commands explicitly:
+
+```bash
+jucode --headless --approval-mode full-auto "Fix the failing test"
+```
+
+The `final_result` event reports the effective `approval_mode` and how many approvals were auto-denied.
+
+This mode is useful for evaluation harnesses and reproducible agent experiments. A minimal in-repo harness lives in [`evals/`](evals/README.md).
+
+### ACP mode (`jucode acp`)
+
+`jucode acp` speaks the [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio) so ACP-capable editors such as Zed can drive JuCode as an external agent. It maps prompts, streaming message/thought chunks, tool-call progress, plan updates, cancellation, and permission requests; features ACP cannot express (session loading, hunk-subset approvals, the conversation tree) are explicitly rejected rather than half-implemented. `jucode serve` (the native newline-JSON protocol) is unchanged and remains the richer interface.
 
 ## Agent tools
 
