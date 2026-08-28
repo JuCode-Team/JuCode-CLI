@@ -1287,6 +1287,8 @@ impl AgentCore {
             goal_tool_tx: Some(goal_tool_tx),
             approval_tx: Some(approval_tx),
             approval_mode: self.approval_mode,
+            edit_tools: self.config.edit_tools.clone(),
+            enable_browser_open: self.config.enable_browser_open,
             subagent_manager: Some(self.subagent_manager.clone()),
             hooks: self.hooks.clone(),
         }) else {
@@ -1519,6 +1521,9 @@ impl AgentCore {
             goal_tool_tx: None,
             approval_tx: None,
             approval_mode: self.approval_mode,
+            // Summarization clients never expose or execute tools.
+            edit_tools: Vec::new(),
+            enable_browser_open: false,
             subagent_manager: None,
             hooks: Hooks::default(),
         })
@@ -1558,6 +1563,9 @@ impl AgentCore {
             goal_tool_tx: None,
             approval_tx: None,
             approval_mode: self.approval_mode,
+            // Summarization clients never expose or execute tools.
+            edit_tools: Vec::new(),
+            enable_browser_open: false,
             subagent_manager: None,
             hooks: Hooks::default(),
         })
