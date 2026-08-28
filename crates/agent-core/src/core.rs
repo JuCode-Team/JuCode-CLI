@@ -14,8 +14,8 @@ use crate::{
         skill_message, skill_pin_message, PromptContext,
     },
     session::{
-        compaction_summary_item, ContextStatistics, EntryKind, SessionStore, SessionSummary,
-        ThreadGoal, ThreadGoalStatus,
+        compaction_summary_item, ContextStatistics, EntryKind, SessionLock, SessionStore,
+        SessionSummary, ThreadGoal, ThreadGoalStatus,
     },
     skills,
     subagents::SubagentManager,
@@ -107,6 +107,9 @@ pub struct AgentCore {
     config: Config,
     auth: AuthStore,
     session: SessionStore,
+    /// Held for the lifetime of the active session so a second process cannot
+    /// resume it and interleave journal appends. Released on session switch.
+    session_lock: Option<SessionLock>,
     profile_dir: PathBuf,
     cwd: PathBuf,
     queued: VecDeque<(String, Vec<String>)>,
@@ -163,10 +166,15 @@ impl AgentCore {
         // usable immediately and their tools appear once connected.
         let mcp = McpManager::default();
         mcp.start(&config.mcp_servers, &cwd);
+        let session = SessionStore::new();
+        // A fresh session id is unique, so this only fails on IO problems.
+        let session_lock =
+            SessionLock::acquire(&profile_dir()?, &cwd, session.session_id()).ok();
         Ok(Self {
             config,
             auth: AuthStore::load_or_create()?,
-            session: SessionStore::new(),
+            session,
+            session_lock,
             profile_dir: profile_dir()?,
             cwd,
             queued: VecDeque::new(),
@@ -2001,6 +2009,10 @@ impl AgentCore {
         self.resume_summary_receiver = None;
         self.resume_summary_running = false;
         self.session = SessionStore::new();
+        // Release the old session's lock and hold the new one.
+        self.session_lock = None;
+        self.session_lock =
+            SessionLock::acquire(&self.profile_dir, &self.cwd, self.session.session_id()).ok();
         let session_id = self.session.session_id().to_string();
         let save_event = self.save_session_event();
         vec![
@@ -2227,6 +2239,21 @@ impl AgentCore {
                 "cannot resume a session while a response is running".to_string(),
             )];
         }
+        if session_id == self.session.session_id() {
+            return vec![AgentEvent::Status(format!(
+                "already on session {session_id}"
+            ))];
+        }
+        // Take the target session's lock before loading so two processes can
+        // never resume (and append to) the same journal concurrently.
+        let lock = match SessionLock::acquire(&self.profile_dir, &self.cwd, session_id) {
+            Ok(lock) => lock,
+            Err(error) => {
+                return vec![AgentEvent::Error(format!(
+                    "cannot resume {session_id}: {error}"
+                ))]
+            }
+        };
         match SessionStore::load_for_cwd(&self.profile_dir, &self.cwd, session_id) {
             Ok(session) => {
                 self.queued.clear();
@@ -2239,6 +2266,8 @@ impl AgentCore {
                 self.turn_started_at = None;
                 self.turn_goal_tokens = 0;
                 self.session = session;
+                // Release the previous session's lock only after the switch.
+                self.session_lock = Some(lock);
                 vec![
                     AgentEvent::Transcript(self.session.transcript_items()),
                     AgentEvent::PendingMessages(Vec::new()),
