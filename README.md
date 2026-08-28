@@ -46,7 +46,7 @@ On first run, JuCode creates its configuration under the user profile directory.
 - default API base URL: `https://api.jucode.cn/v1`
 - default API key environment variable: `OPENAI_API_KEY`
 
-Sign in with `/login` to use the JuCode gateway, or set an API key and point the config at any OpenAI-compatible endpoint (`openai` and `deepseek` are built in; Anthropic-protocol models are supported via the `protocol` setting):
+Sign in with `/login` to use the JuCode gateway, or set an API key and point the config at any OpenAI-compatible endpoint. The built-in provider templates are `jucode` and `deepseek`; other vendors (for example OpenAI) work by setting `base_url`, `model`, and `api_key_env` manually — dedicated vendor templates are separate future work. Anthropic-protocol models are supported via the `protocol` setting:
 
 ```bash
 export OPENAI_API_KEY="..."
@@ -61,6 +61,18 @@ You can switch model and reasoning effort inside the TUI:
 ```
 
 The config also supports custom OpenAI-compatible base URLs, retry settings, model metadata, project-instruction discovery, and optional extensions.
+
+### Edit tools (`edit_tools`)
+
+The default edit tool is `hashline_edit`; the other edit tools are off unless you enable them. The `edit_tools` array in `config.json` controls which edit tools the model sees (and may execute):
+
+```json
+"edit_tools": ["hashline_edit", "str_replace", "write", "apply_patch"]
+```
+
+Valid names are `hashline_edit`, `str_replace` (alias `edit`), `write`, and `apply_patch`. Omitting the field enables only `hashline_edit`; an empty array disables all edit tools. Disabled edit tools are not sent to the model and return a clear error if called anyway. Non-edit tools (`read`, `bash`, `ls`, `ripgrep`, `outline`, `checkpoint`, and so on) are not affected by this field. The desktop-only `browser_open` tool can be switched off with `"enable_browser_open": false`.
+
+File tools (read/write/edit/ls/outline/checkpoint/apply_patch) only operate on paths inside the working directory: absolute paths, `..`, and symlinks that resolve outside the workspace are rejected with a clear error. This is a path policy, not an OS sandbox — shell commands are not restricted by it.
 
 ## Usage
 
@@ -97,8 +109,16 @@ Useful commands:
 
 Headless mode emits JSONL events and finishes with a `final_result` event containing status, usage, context, tool-call counts, and elapsed time.
 
+Headless runs default to the `read-only` approval mode: tool calls that would need interactive approval (edits, shell commands) are auto-denied with a clear message instead of hanging. Pass `--approval-mode` explicitly for tasks that change files or run commands:
+
 ```bash
-jucode --headless "Fix the failing test and verify the focused suite"
+jucode --headless --approval-mode full-auto "Fix the failing test and verify the focused suite"
+```
+
+Read-only tasks work without a flag:
+
+```bash
+jucode --headless "List the repository structure and stop."
 ```
 
 You can also pipe the task through stdin:
@@ -116,10 +136,10 @@ JuCode exposes a small set of direct tools to the model:
 | Tool | Purpose |
 | --- | --- |
 | `read` | Read text, image metadata/payload, or binary metadata. Supports `offset` and `limit`. |
-| `str_replace` | Apply exact targeted replacements after reading a file. |
-| `hashline_edit` | Patch lines using stable `LINE#HASH` anchors from `read`. |
-| `write` | Create new files or overwrite previously read files. |
-| `apply_patch` | Apply a unified patch when targeted edits are awkward. |
+| `hashline_edit` | Patch lines using stable `LINE#HASH` anchors from `read`. The only edit tool enabled by default. |
+| `str_replace` | Apply exact targeted replacements after reading a file. Off by default; enable via `edit_tools`. |
+| `write` | Create new files or overwrite previously read files. Off by default; enable via `edit_tools`. |
+| `apply_patch` | Apply a unified patch when targeted edits are awkward. Off by default; enable via `edit_tools`. |
 | `bash` / `exec_command` | Run shell commands with timeout, sessions, output truncation, and progress updates. |
 | `write_stdin` | Poll or send input to a running shell session. |
 | `ls` | List directory entries. |
