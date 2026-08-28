@@ -163,9 +163,12 @@ impl AgentCore {
         // usable immediately and their tools appear once connected.
         let mcp = McpManager::default();
         mcp.start(&config.mcp_servers, &cwd);
+        let auth = AuthStore::load_or_create(config.encrypt_secrets).inspect_err(|error| {
+            crate::log_error!("auth", "failed to load auth", error = error.to_string());
+        })?;
         Ok(Self {
             config,
-            auth: AuthStore::load_or_create()?,
+            auth,
             session: SessionStore::new(),
             profile_dir: profile_dir()?,
             cwd,
@@ -688,9 +691,8 @@ impl AgentCore {
         // ~/.jucode/auth.json and may have rotated the (single-use) refresh
         // token out-of-band; picking up its tokens avoids refreshing with a
         // stale token and getting a spurious "session expired".
-        if let Ok(fresh) = AuthStore::load_or_create() {
-            self.auth = fresh;
-        }
+        self.auth = AuthStore::load_or_create(self.config.encrypt_secrets)
+            .map_err(|error| format!("failed to reload auth.json: {error}"))?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())

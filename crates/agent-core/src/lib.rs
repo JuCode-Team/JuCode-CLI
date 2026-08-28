@@ -10,6 +10,7 @@ pub mod logging;
 mod mcp;
 mod oauth;
 mod prompt;
+mod secrets;
 mod session;
 pub mod skills;
 mod subagents;
