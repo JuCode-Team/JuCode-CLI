@@ -1,5 +1,14 @@
 # JuCode CLI 编码代理审计报告
 
+## Owner decisions (2026-08-28)
+
+以下决定覆盖本文后续历史审计中的建议口径，后文现状描述仅作为基线证据。
+
+- **Must do:** config 控制编辑工具且默认仅启用 `hashline_edit`；在轻量 vendor package 中手写 provider 协议（含 Chat Completions，无 `genai`/`tokio`）；补齐 MCP prompts/resources/OAuth 与完整 Skills；打造优秀且写隔离的 subagents；完善 TUI（`@`、`!`、自定义 slash commands、git 状态栏、图像粘贴）、headless、reliability engineering、崩溃安全 session journal，以及可复现的 Codex 对比 eval。
+- **协议与工程:** 新增 CLI ACP server；embed protocol 仍在评估，不得声称它会替换 `serve`，双轨运行较可能；同时补齐 `serve` 文档/version、README/CI、config/auth 原子写，并将 `browser_open` 移出 core。
+- **权限:** workspace 路径边界只是 BASIC permission，不是 sandbox；headless mutation 默认要求显式 `--full-auto`；approval 只保留 `ReadOnly`/`AutoEdit`/`FullAuto` 三档。
+- **明确非目标:** 任何 sandbox（包括 OS sandbox、Landlock、Seatbelt、`bwrap`、`sandbox_command`）、持久化命令 pattern 权限规则，以及 LSP/DAP。multi-root 推迟。
+
 > 审计基线:`main@0758fef`(Release v0.1.11)。对照对象:Codex CLI、PI、Oh My PI(omp)、OpenCode。
 > 结论先行:**JuCode CLI 是一个高质量、可用的编码代理 harness,但不是 Codex-complete。差距在安全(sandbox)、协议覆盖、可靠性工程,不在 agent 核心。**
 

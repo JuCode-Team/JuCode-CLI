@@ -1,100 +1,88 @@
-# JuCode CLI 差距清单(可编辑)
+# JuCode CLI 差距清单（已锁定）
 
-> 配套文档:`docs/coding-agent-audit.md`(审计基线 `main@0758fef` / v0.1.11)。
-> 用法:勾选 `[x]` 表示"确定要做";`[ ]` 表示待你拍板或可选。Status 是**现状**,Level 是专家建议的优先级。
-> 已预勾选的均为专家一致认为无争议的 must-have。
+> 配套文档：`docs/coding-agent-audit.md`（审计基线 `main@0758fef` / v0.1.11）。
+> Owner decisions 已于 2026-08-28 锁定。`[x]` 表示接受并纳入计划；`[ ]` 仅表示明确否决或推迟，不再表示“待拍板”。
 
 ## 清单
 
 | 做? | ID | 功能 | Status | Level | Notes |
 |---|---|---|---|---|---|
-| [x] | F2 | Chat Completions 协议支持 | missing | must | `crates/agent-core/src/llm.rs` 现仅有 Responses + Anthropic Messages;Chat Completions 是 Ollama/vLLM/网关的事实标准。技术路线见 D2 |
-| [x] | F8 | serve/headless 协议参考文档 + version 字段 | partial | must | 协议本体在 `src/main.rs`(`run_serve`/`handle_serve_line`)已实现,但无文档、无版本协商,embedder 无法做兼容性判断 |
-| [x] | F9 | TUI `@` 文件提及补全 | missing | must | `crates/tui/src/input.rs` 无实现;Codex/OpenCode 均有,是最常用的上下文注入交互 |
-| [x] | F13 | README/文档事实性修正 | partial | must | README.md:49 声称 `openai` 内置;`config.rs:916` 的 `default_providers()` 只有 `jucode`+`deepseek`。改文档或补模板,二选一但必须一致 |
-| [x] | F17 | PR CI(fmt/test/clippy) | missing | must | `.github/workflows/` 只有 release 流水线;`cargo clippy -- -D warnings` 现有 2 个 error,先修再上门禁。与 G24 同一项 |
-| [x] | G02 | 工作区文件边界 / 路径策略 | missing | must | 文件工具(`tools.rs` 的 read/write/str_replace 等)无 cwd 边界检查,可读写任意绝对路径。Sol 定为安全 must |
-| [x] | G04 | headless 更安全的默认(取消隐式 full-auto) | missing | must | `src/main.rs:153`:headless 强制 full-auto 且拒绝 `--approval-mode`。方向见 D6 |
-| [x] | G09 | config/auth 原子写 + 坏 JSON 显式报错 | missing | must | `config.rs:451` 坏 JSON 时 `unwrap_or_else(|_| json!({}))` 静默重置(可能丢密钥);`save()` 非原子(无 tmp+rename)。见 D8 |
-| [x] | G23 | 将 `browser_open` 移出 core | done(错位) | must | `tools.rs:268` 桌面限定工具却在 core 工具表;与"排除 browser-use"冲突。移到 Desktop extension(`extensions.rs` 机制已具备)后从 core 删除 |
-| [x] | G24 | CI(同 F17) | missing | must | 与 F17 合并执行 |
-| [ ] | F1 | OS 级 sandbox | missing | should | 见 D1,与 G01 同一项。Landlock(Linux)/Seatbelt(macOS),Codex 对标项 |
-| [ ] | F3 | 更多 provider 内置模板 | partial | optional | 现仅 2 个模板;F2 落地后大多数 provider 可经 Chat Completions 直连,模板需求下降 |
-| [ ] | F4 | 持久化权限规则 | missing | should | 现 `/approve` 的 always 仅会话内生效;命令模式级持久规则见 D4 |
-| [ ] | F5 | MCP prompts | missing | optional | `mcp/client.rs` 现仅 tools/list + tools/call |
-| [ ] | F6 | MCP resources | missing | optional | 现仅在 tools/call 结果中展平 embedded resource |
-| [ ] | F7 | MCP HTTP OAuth | missing | should | streamable HTTP 传输已有(`mcp/transport.rs`),缺授权流程;远程 MCP 服务日益要求 OAuth |
-| [ ] | F10 | `!` 用户 shell 直通 | missing | should | TUI 惯例交互,实现小 |
-| [ ] | F11 | 自定义 prompt 命令 | missing | optional | 用户自定义 slash 命令(`commands.rs` 现为静态表) |
-| [ ] | F12 | git 感知状态栏 | missing | optional | 分支/脏状态展示,纯 TUI 增强 |
-| [ ] | F14 | ACP adapter | missing | later | 见 D3;仅当需要 Zed/JetBrains 编辑器渠道时做 |
-| [ ] | F15 | CLI 内置 LSP | missing | later | 见 D5;专家建议不做内置,走 hook/MCP |
-| [ ] | F16 | multi-root 工作区 | missing | later | 会话与路径策略(G02)都需先支持单 root 边界 |
-| [ ] | F18 | TUI 图像粘贴 UX | partial | optional | 图像附件后端已有(`tools.rs` 的 `image_attachment_part`),缺终端粘贴交互 |
-| [ ] | G01 | OS 级 sandbox(同 F1) | missing | should | 与 F1 合并决策,见 D1 |
-| [ ] | G05 | 进程组管理 / PTY | partial | should | `exec_command`/`write_stdin` 已有;缺进程组级清理,孤儿进程风险 |
-| [ ] | G06 | 会话级 kill(清理所有子进程) | missing | should | 与 G05 同域,中断/退出时统一收割 |
-| [ ] | G07 | 崩溃安全的会话 journal | partial | should | `session.rs` JSONL 追加写,无 fsync/截断恢复;进程被杀可能留半行。见 D8 |
-| [ ] | G20 | subagent 写隔离 | missing | should | `subagents.rs` 子代理共享 cwd 无约束,见 D7 |
-| [ ] | G25 | in-repo eval harness | missing | should | README 的 token 对比数据不可复现;最小任务集 + 脚本即可起步 |
-| [ ] | G26 | LLM 请求重试/退避审计 | partial | optional | `retry_attempts` 配置已有,缺对流中断(SSE 半途断开)的恢复策略(Sol 可靠性项) |
-| [ ] | G27 | 工具输出截断/大小上限统一策略 | partial | optional | 各工具截断逻辑分散在 `tools.rs`,建议统一预算(Sol 可靠性项) |
+| [x] | F2 | Chat Completions 协议支持 | missing | must | 作为 vendor package 的手写协议之一；复用阻塞 I/O，不引入 `genai`/`tokio` |
+| [x] | F3 | 完善 providers | partial | must | 在独立 vendor package 中手写 Responses、Anthropic Messages、Chat Completions 等协议与 provider 适配 |
+| [x] | F5 | MCP prompts | missing | must | 补齐标准 MCP prompts 能力 |
+| [x] | F6 | MCP resources | missing | must | 补齐 resources 的发现、读取、订阅及结果表达 |
+| [x] | F7 | MCP HTTP OAuth | missing | must | 为 streamable HTTP 补齐 OAuth 流程 |
+| [x] | F8 | `serve` 协议参考文档 + version 字段 | partial | must | 文档化现有 NDJSON 协议并加入版本；不会在评估完成前声称 ACP 将替换 `serve` |
+| [x] | F9 | TUI `@` 文件提及补全 | missing | must | 完成文件选择、补全和上下文注入体验 |
+| [x] | F10 | TUI `!` shell 直通 | missing | must | 提供惯例 shell 交互 |
+| [x] | F11 | 自定义 slash 命令 | missing | must | 支持用户配置的 prompt/slash commands |
+| [x] | F12 | git 感知状态栏 | missing | must | 展示分支和工作树状态 |
+| [x] | F13 | README/文档事实性修正 | partial | must | 使 provider、能力和使用说明与实现一致 |
+| [x] | F14 | CLI ACP server | missing | must | 作为附加协议入口实现；embed 方案仍在评估，较可能与 `serve` 双轨运行 |
+| [ ] | F15 | LSP/DAP | missing | non-goal | 明确不做，不内置 LSP/DAP 子系统 |
+| [ ] | F16 | multi-root 工作区 | missing | later | 暂缓；先完成单 workspace 的 BASIC 路径边界 |
+| [x] | F17 | PR CI（fmt/test/clippy） | missing | must | 修复现有问题后增加 PR 门禁；与 G24 同一项 |
+| [x] | F18 | TUI 图像粘贴 UX | partial | must | 基于已有图像附件后端补齐终端粘贴交互 |
+| [x] | F19 | 编辑工具可配置 | missing | must | 默认仅启用 `hashline_edit`；`str_replace`、`write`、`apply_patch` 默认关闭，用户可显式启用 |
+| [x] | F20 | 完整 Skills | partial | must | 补齐发现、安装、加载、调用、更新及错误处理的完整体验 |
+| [ ] | F1 | 任意 sandbox | missing | non-goal | 不做 OS sandbox、Landlock、Seatbelt、`bwrap` 或 `sandbox_command` |
+| [ ] | F4 | 持久化命令模式权限规则 | missing | non-goal | 保持 `ReadOnly`/`AutoEdit`/`FullAuto` 三种 approval mode，不增加跨会话命令 pattern |
+| [ ] | G01 | 任意 sandbox（同 F1） | missing | non-goal | 与 F1 合并决策；不实现任何 sandbox 路线 |
+| [x] | G02 | workspace 文件路径边界 | missing | must | 作为 BASIC permission 实现；它是应用层边界检查，不是 sandbox，也不得包装成 sandbox |
+| [x] | G04 | headless 完善及安全默认 | missing | must | 默认不隐式 full-auto；执行 mutation 必须显式传 `--full-auto`，同时完善 headless 能力 |
+| [x] | G05 | 进程组管理 / PTY | partial | must | 补齐可靠清理、退出和孤儿进程处理 |
+| [x] | G06 | 会话级 kill | missing | must | 中断或退出时统一收割子进程 |
+| [x] | G07 | 崩溃安全的 session journal | partial | must | 加固 JSONL 写入、同步、尾部半行检测及恢复 |
+| [x] | G09 | config/auth 原子写 + 坏 JSON 显式报错 | missing | must | 使用临时文件 + rename，禁止损坏 JSON 静默重置 |
+| [x] | G20 | 优秀 subagents + 写隔离 | partial | must | 提升委派、结果汇总和可观测性，并确保 subagent 写入相互隔离 |
+| [x] | G23 | 将 `browser_open` 移出 core | done（错位） | must | 改由 Desktop extension 注入并从 core 工具表删除 |
+| [x] | G24 | CI（同 F17） | missing | must | 与 F17 合并执行 |
+| [x] | G25 | 可复现的 Codex 对比 eval | missing | must | 提交固定任务集、运行脚本、指标和基线，替代不可复现的快照结论 |
+| [x] | G26 | LLM 请求重试/退避与流中断恢复 | partial | must | 纳入整体 reliability engineering |
+| [x] | G27 | 工具输出截断/大小上限统一策略 | partial | must | 纳入整体 reliability engineering |
 
-## 需要你拍板的技术方向
+## 已否决
 
-以下 8 个决策相互关联(D1↔D4↔D6,D2↔F2/F3,D7↔G20,D8↔G07/G09),每项给出选项、专家推荐与代价。
+- **Sandbox（F1/G01）**：任何 OS sandbox、Landlock、Seatbelt、`bwrap`、`sandbox_command` 均为明确非目标。workspace 路径边界只是 BASIC permission。
+- **持久化命令规则（F4）**：不增加命令 pattern 的持久 allow/deny 规则；只保留三种 approval mode。
+- **LSP/DAP（F15）**：不实现内置或独立的 LSP/DAP 子系统。
 
-### D1 沙箱路线(对应 F1/G01)
+`F16` multi-root 未进入本轮计划，待单 workspace 路径边界稳定后再评估。
 
-- **A:OS 原生 sandbox**——Linux Landlock + macOS Seatbelt(Codex 同款路线)。最强隔离;代价是平台分裂(Windows 无对应物)、实现量最大、需处理 sandbox 内 PATH/网络策略。
-- **B:仅权限规则**——纯应用层(路径边界 + 命令模式规则),跨平台一致、零依赖;但对恶意/失控命令无硬防护,`bash -c "curl | sh"` 类逃逸拦不住。
-- **C:`sandbox_command` 前缀**——配置一个包裹命令(如 `bwrap ...`/`sandbox-exec -p ...`),JuCode 只负责拼接。实现量最小(改 `tools.rs` 的 shell 执行路径即可),把选择权交给用户;代价是默认不安全、体验依赖用户环境。
-- **推荐:C 立即做 + B 永远做(它同时是 G02 的载体)+ A 从 Linux(Landlock)先做。三者不互斥,是分层关系。**
+## 已锁定的技术方向
 
-### D2 Provider 扩展路线(对应 F2/F3)
+### D1 权限边界
 
-- **A:手写 Chat Completions 客户端**——在 `llm.rs` 现有 `ureq` 阻塞 SSE 框架上加第三种协议分支。与"无 tokio、手写协议"宪法完全一致;代价是自己维护协议细节(工具调用格式、SSE 事件差异)。
-- **B:引入 genai crate**——25+ provider 一步到位(已核实);但 genai 极可能拖入 tokio 与整棵异步依赖树,**直接违反 AGENTS.md 宪法**,且丢失对请求体/重试的精细控制。
-- **C:gateway-only**——只走 jucode 网关,由网关做协议适配。CLI 零改动;代价是绑死自家服务,开源可信度与自带 key 用户全部流失。
-- **推荐:A。** Chat Completions 是三种协议里最简单的,`llm.rs` 已有的 Anthropic 分支证明多协议结构成立。
+实现单 workspace 的文件路径边界，并明确标记为 BASIC permission。它不提供进程隔离能力，也不构成 sandbox。任何 sandbox 实现或可配置命令包装器均不在范围内。
 
-### D3 嵌入协议(对应 F8/F14)
+### D2 Provider 与协议
 
-- **A:保持 NDJSON serve**——现有 `jucode serve` 补文档 + version 字段(即 F8)。实现量最小,协议自主可控。
-- **B:另加 `jucode acp` adapter**——在 serve 之外加一个 ACP 翻译层,获得 Zed/JetBrains 渠道(ACP 由 Zed 发起、JetBrains 跟进,已核实);代价是维护两套协议映射。
-- **C:用 ACP 替换 serve**——协议归一;但 ACP 尚在演进,且会破坏现有 Desktop(jucode-desktop 走 serve)集成。
-- **推荐:A 现在做,B 在确认需要编辑器渠道后做。永远不做 C。**
+创建轻量 vendor package，手写 provider 协议和适配，继续使用 blocking I/O + threads。Chat Completions 是该 package 的组成部分；禁止引入 `genai` 或 `tokio`。
 
-### D4 权限粒度(对应 F4)
+### D3 MCP 与 Skills
 
-- **A:保持 3 档**——`ReadOnly`/`AutoEdit`/`FullAuto`(config.rs:63)不动。零成本;但用户每个会话重复审批同类命令,体验落后于 Codex/OpenCode。
-- **B:命令模式持久规则**——如 `allow: ["cargo test", "git status"]` 持久化到配置,`/approve always` 升级为跨会话。实现集中在 `trust.rs`;代价是规则匹配语义要设计好(前缀?glob?)。
-- **C:Codex 式 policy + sandbox 联动**——审批策略与沙箱强度联动(如 sandbox 内自动放行)。最完整;但强依赖 D1-A 落地。
-- **推荐:先 B,D1 的 OS sandbox 落地后再演进到 C。**
+MCP 必须从 tools-only 补齐 prompts、resources 和 HTTP OAuth。Skills 必须形成完整、可靠的端到端体验，而不是只保留 marketplace 安装入口。
 
-### D5 LSP/DAP
+### D4 嵌入协议
 
-- **A:不做**——保持现状(`outline` 工具已覆盖部分符号需求)。
-- **B:内置 LSP 客户端**——诊断/跳转喂给模型;但 LSP 客户端是重型子系统(进程管理、能力协商、增量同步),与轻量宪法冲突。
-- **C:hook 配方 + MCP**——用 `post_tool_use` hook 跑 `cargo check`/tsc 等把诊断注入,复杂需求交给社区 LSP MCP server。几乎零核心代码。
-- **推荐:C。DAP 不做(任何选项下)。**
+为现有 `serve` 编写协议文档并加入 version，同时新增 CLI ACP server。embed protocol 仍在评估；当前不得声明 ACP 将替换 `serve`，双轨运行是较可能的方向。
 
-### D6 headless 默认权限(对应 G04)
+### D5 权限模式与 headless
 
-- **A:默认拒绝,需显式 `--full-auto`**——mutating 工具在 headless 下直接失败,除非用户显式授权。安全默认,CI 脚本加一个 flag 即可迁移。
-- **B:policy 文件**——headless 读取项目内策略文件决定放行范围。灵活;但在 D4-B 落地前是重复建设。
-- **C:保持隐式 full-auto**——现状(main.rs:153)。零成本,但任何人 `cat task.md | jucode --headless` 就是无审批任意执行,是审计中最尖锐的安全项。
-- **推荐:A。** B 可在 D4-B 之后作为增强。
+保持 `ReadOnly`、`AutoEdit`、`FullAuto` 三档，不做持久化命令 pattern。headless 默认不得隐式 full-auto，写入或执行必须显式传 `--full-auto`。
 
-### D7 subagent 写权限(对应 G20)
+### D6 编辑工具
 
-- **A:默认只读**——子代理默认 `ReadOnly`,需主代理显式升级。改动集中在 `subagents.rs` spawn 路径;探索类子代理(占多数)零感知。
-- **B:共享 cwd + 写锁**——允许写但串行化;实现锁语义复杂,且防不了逻辑冲突(两个子代理改同一文件的不同轮次)。
-- **C:每 subagent 一个 git worktree**——物理隔离最干净(OpenCode 方向);但引入 git 依赖假设、合并回主树的策略复杂。
-- **推荐:先做 A。** C 留作后续可选增强,B 不建议。
+编辑工具列表由 config 控制。默认只启用 `hashline_edit`；`str_replace`、`write`、`apply_patch` 默认关闭，但允许用户逐项开启。
 
-### D8 会话存储(对应 G07/G09)
+### D7 Subagents
 
-- **A:加固 JSONL**——原子写(tmp+rename)、追加后按需 fsync、加载时容忍尾部半行并截断恢复。改动集中在 `session.rs`/`config.rs`,零新依赖。
-- **B:迁移 SQLite**——事务性最好;但引入 rusqlite/C 依赖,违背轻量宪法,且现有 journal 树结构(分支/rewind)迁移成本高。
-- **推荐:A。** JSONL 的问题全部可以在应用层修好,SQLite 解决的是这里不存在的并发写问题。
+将 subagent 质量、委派体验、结果汇总和写隔离作为同一项 must-have。具体隔离机制需满足并发写入互不污染，不以 sandbox 为前提。
+
+### D8 可靠性与持久化
+
+系统化完成进程生命周期、请求重试、流中断恢复、输出预算和错误可观测性。保留 JSONL session journal 并实现崩溃安全恢复；config/auth 使用原子写，损坏数据必须显式报错。
+
+### D9 TUI、评测与工程
+
+完成 `@` 文件、`!` shell、自定义 slash commands、git 状态栏和图像粘贴；提供可复现的 Codex 对比 eval；修复 README/CI；将 `browser_open` 移出 core。
