@@ -38,6 +38,16 @@ pub trait McpTransport: Send + Sync {
 type PendingMap = Arc<Mutex<HashMap<u64, mpsc::Sender<Result<Value, String>>>>>;
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
+struct ReaderContext {
+    server: String,
+    writer: SharedWriter,
+    pending: PendingMap,
+    tools_list_changed: Arc<AtomicBool>,
+    prompts_list_changed: Arc<AtomicBool>,
+    resources_list_changed: Arc<AtomicBool>,
+    root_uri: String,
+}
+
 /// JSON-RPC 2.0 peer over any byte stream pair: monotonic request ids, a
 /// reader thread routing responses to waiting callers, minimal handling of
 /// server-initiated traffic (`ping` answered, other requests rejected,
@@ -64,14 +74,16 @@ impl JsonRpcPeer {
         let prompts_list_changed = Arc::new(AtomicBool::new(false));
         let resources_list_changed = Arc::new(AtomicBool::new(false));
         spawn_reader(
-            server.to_string(),
             reader,
-            Arc::clone(&writer),
-            Arc::clone(&pending),
-            Arc::clone(&tools_list_changed),
-            Arc::clone(&prompts_list_changed),
-            Arc::clone(&resources_list_changed),
-            root_uri(root),
+            ReaderContext {
+                server: server.to_string(),
+                writer: Arc::clone(&writer),
+                pending: Arc::clone(&pending),
+                tools_list_changed: Arc::clone(&tools_list_changed),
+                prompts_list_changed: Arc::clone(&prompts_list_changed),
+                resources_list_changed: Arc::clone(&resources_list_changed),
+                root_uri: root_uri(root),
+            },
         );
         Self {
             writer,
@@ -149,16 +161,7 @@ fn write_json_line(writer: &Mutex<Box<dyn Write + Send>>, message: &Value) -> Re
     writer.flush().map_err(|error| error.to_string())
 }
 
-fn spawn_reader(
-    server: String,
-    reader: impl Read + Send + 'static,
-    writer: SharedWriter,
-    pending: PendingMap,
-    tools_list_changed: Arc<AtomicBool>,
-    prompts_list_changed: Arc<AtomicBool>,
-    resources_list_changed: Arc<AtomicBool>,
-    root_uri: String,
-) {
+fn spawn_reader(reader: impl Read + Send + 'static, context: ReaderContext) {
     thread::spawn(move || {
         let mut lines = BufReader::new(reader).lines();
         while let Some(Ok(line)) = lines.next() {
@@ -169,53 +172,38 @@ fn spawn_reader(
                 crate::log_warn!(
                     "mcp",
                     "discarding non-JSON line from server",
-                    server = server.clone()
+                    server = context.server.clone()
                 );
                 continue;
             };
-            dispatch_incoming(
-                &server,
-                message,
-                &writer,
-                &pending,
-                &tools_list_changed,
-                &prompts_list_changed,
-                &resources_list_changed,
-                &root_uri,
-            );
+            dispatch_incoming(message, &context);
         }
         // EOF: unblock every waiting request by dropping its sender.
-        if let Ok(mut pending) = pending.lock() {
+        if let Ok(mut pending) = context.pending.lock() {
             pending.clear();
         }
-        crate::log_debug!("mcp", "reader thread finished", server = server);
+        crate::log_debug!("mcp", "reader thread finished", server = context.server);
     });
 }
 
-fn dispatch_incoming(
-    server: &str,
-    message: Value,
-    writer: &Mutex<Box<dyn Write + Send>>,
-    pending: &Mutex<HashMap<u64, mpsc::Sender<Result<Value, String>>>>,
-    tools_list_changed: &AtomicBool,
-    prompts_list_changed: &AtomicBool,
-    resources_list_changed: &AtomicBool,
-    root_uri: &str,
-) {
+fn dispatch_incoming(message: Value, context: &ReaderContext) {
     let Some(method) = message.get("method").and_then(Value::as_str) else {
-        route_response(server, &message, pending);
+        route_response(&context.server, &message, &context.pending);
         return;
     };
     match message.get("id").filter(|id| !id.is_null()) {
         Some(id) => {
-            let _ = write_json_line(writer, &server_request_reply(server, method, id, root_uri));
+            let _ = write_json_line(
+                &context.writer,
+                &server_request_reply(&context.server, method, id, &context.root_uri),
+            );
         }
         None => handle_notification(
-            server,
+            &context.server,
             method,
-            tools_list_changed,
-            prompts_list_changed,
-            resources_list_changed,
+            &context.tools_list_changed,
+            &context.prompts_list_changed,
+            &context.resources_list_changed,
         ),
     }
 }

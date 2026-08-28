@@ -782,11 +782,11 @@ mod tests {
         );
         let names = manager
             .definitions()
-            .iter()
-            .filter_map(|definition| definition["name"].as_str())
+            .into_iter()
+            .filter_map(|definition| definition["name"].as_str().map(str::to_string))
             .collect::<Vec<_>>();
-        assert!(names.contains(&"mcp__docs__list_resources"));
-        assert!(names.contains(&"mcp__docs__read_resource"));
+        assert!(names.contains(&"mcp__docs__list_resources".to_string()));
+        assert!(names.contains(&"mcp__docs__read_resource".to_string()));
         let (listed, list_error) = manager.run_tool("mcp__docs__list_resources", "{}").unwrap();
         assert!(!list_error);
         assert!(listed.contains("guide.md"));

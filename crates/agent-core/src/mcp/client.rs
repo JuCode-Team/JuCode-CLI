@@ -823,6 +823,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{FakeState, FakeTransport};
     use super::*;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn initialize_sends_handshake_then_initialized_notification() {

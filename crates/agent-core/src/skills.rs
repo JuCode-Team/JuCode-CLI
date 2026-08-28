@@ -563,7 +563,7 @@ fn read_disabled_skills(profile_dir: &Path) -> io::Result<BTreeSet<String>> {
         return Ok(BTreeSet::new());
     }
     let content = fs::read_to_string(path)?;
-    let value = serde_json::from_str::<Value>(&content).unwrap_or_else(|_| Value::Null);
+    let value = serde_json::from_str::<Value>(&content).unwrap_or(Value::Null);
     Ok(value
         .get("disabled")
         .and_then(Value::as_array)
