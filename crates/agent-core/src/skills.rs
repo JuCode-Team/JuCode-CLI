@@ -14,6 +14,30 @@ const MAX_PACKAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_PACKAGE_FILES: usize = 4096;
 const SKILL_STATE_FILE: &str = "skills-state.json";
+pub const ANTHROPIC_SKILLS_URL: &str = "https://github.com/anthropics/skills";
+const ANTHROPIC_SKILLS_INDEX: &str = include_str!("anthropic-skills-index.json");
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraSkill {
+    pub id: String,
+    pub path: String,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExcludedSkill {
+    pub id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraSkillSource {
+    pub name: String,
+    pub repository: String,
+    pub revision: String,
+    pub skills: Vec<ExtraSkill>,
+    pub excluded: Vec<ExcludedSkill>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketplaceSkill {
@@ -46,6 +70,171 @@ pub fn fetch_marketplace(api_url: &str, api_key: Option<&str>) -> Result<Marketp
         .into_json::<Value>()
         .map_err(|error| error.to_string())?;
     parse_marketplace(&value)
+}
+
+pub fn fetch_extra_skill_source(spec: &str) -> Result<Option<ExtraSkillSource>, String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Ok(None);
+    }
+    if spec == "anthropic" || normalize_repository_url(spec) == ANTHROPIC_SKILLS_URL {
+        let value = serde_json::from_str(ANTHROPIC_SKILLS_INDEX)
+            .map_err(|error| format!("invalid bundled Anthropic skills index: {error}"))?;
+        return parse_extra_skill_index(&value).map(Some);
+    }
+
+    let (owner, repository) = github_repository_parts(spec)?;
+    let api_url = format!("https://api.github.com/repos/{owner}/{repository}/contents/skills");
+    let response = ureq::get(&api_url)
+        .set("Accept", "application/vnd.github+json")
+        .set("User-Agent", "jucode-cli")
+        .timeout(std::time::Duration::from_secs(30))
+        .call()
+        .map_err(|error| error.to_string())?;
+    let value = response
+        .into_json::<Value>()
+        .map_err(|error| error.to_string())?;
+    parse_github_skills_directory(&value, &format!("https://github.com/{owner}/{repository}"))
+        .map(Some)
+}
+
+pub fn install_extra_skill(
+    profile_dir: &Path,
+    source: &ExtraSkillSource,
+    skill: &ExtraSkill,
+) -> io::Result<()> {
+    validate_source_skill(skill)?;
+    let (owner, repository) = github_repository_parts(&source.repository)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let revision = if source.revision.is_empty() {
+        "HEAD"
+    } else {
+        validate_revision(&source.revision)?;
+        source.revision.as_str()
+    };
+    let url = format!(
+        "https://raw.githubusercontent.com/{owner}/{repository}/{revision}/{}",
+        skill.path
+    );
+    let bytes = download_skill_package(&url)?;
+    if let Some(expected) = skill.sha256.as_deref() {
+        verify_sha256(&bytes, expected)?;
+    }
+    let content = String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SKILL.md is not UTF-8"))?;
+    if !content.trim_start().starts_with("---") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "downloaded SKILL.md is missing frontmatter",
+        ));
+    }
+    let marketplace_skill = MarketplaceSkill {
+        id: skill.id.clone(),
+        name: skill.id.clone(),
+        description: format!("Skill from {}", source.name),
+        content,
+        package_url: None,
+        package_sha256: None,
+        package_type: None,
+        tags: Vec::new(),
+        enabled: true,
+        updated_at: String::new(),
+    };
+    install_marketplace_skill(profile_dir, &marketplace_skill)
+}
+
+pub fn parse_extra_skill_index(value: &Value) -> Result<ExtraSkillSource, String> {
+    let name = read_string(value, "name").ok_or_else(|| "source index missing name".to_string())?;
+    let repository = read_string(value, "repository")
+        .ok_or_else(|| "source index missing repository".to_string())?;
+    github_repository_parts(&repository)?;
+    let revision = read_string(value, "revision").unwrap_or_default();
+    if !revision.is_empty() {
+        validate_revision(&revision).map_err(|error| error.to_string())?;
+    }
+    let skill_values = value
+        .get("skills")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "source index missing skills".to_string())?;
+    let mut skills = Vec::with_capacity(skill_values.len());
+    for item in skill_values {
+        let id = read_string(item, "id").ok_or_else(|| "source skill missing id".to_string())?;
+        let path =
+            read_string(item, "path").ok_or_else(|| format!("source skill {id} missing path"))?;
+        let skill = ExtraSkill {
+            id,
+            path,
+            sha256: read_string(item, "sha256"),
+        };
+        validate_source_skill(&skill).map_err(|error| error.to_string())?;
+        if skills
+            .iter()
+            .any(|existing: &ExtraSkill| existing.id == skill.id)
+        {
+            return Err(format!("duplicate source skill id: {}", skill.id));
+        }
+        skills.push(skill);
+    }
+    let excluded = value
+        .get("excluded")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|item| {
+            let id =
+                read_string(item, "id").ok_or_else(|| "excluded skill missing id".to_string())?;
+            validate_skill_id(&id).map_err(|error| error.to_string())?;
+            let reason = read_string(item, "reason")
+                .ok_or_else(|| format!("excluded skill {id} missing reason"))?;
+            Ok(ExcludedSkill { id, reason })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if excluded
+        .iter()
+        .any(|item| skills.iter().any(|skill| skill.id == item.id))
+    {
+        return Err("a source skill cannot be both available and excluded".to_string());
+    }
+    Ok(ExtraSkillSource {
+        name,
+        repository: normalize_repository_url(&repository),
+        revision,
+        skills,
+        excluded,
+    })
+}
+
+pub fn parse_github_skills_directory(
+    value: &Value,
+    repository: &str,
+) -> Result<ExtraSkillSource, String> {
+    github_repository_parts(repository)?;
+    let entries = value
+        .as_array()
+        .ok_or_else(|| "GitHub skills directory response is not an array".to_string())?;
+    let mut skills = Vec::new();
+    for entry in entries {
+        if entry.get("type").and_then(Value::as_str) != Some("dir") {
+            continue;
+        }
+        let Some(id) = entry.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        validate_skill_id(id).map_err(|error| error.to_string())?;
+        skills.push(ExtraSkill {
+            id: id.to_string(),
+            path: format!("skills/{id}/SKILL.md"),
+            sha256: None,
+        });
+    }
+    skills.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(ExtraSkillSource {
+        name: github_repository_parts(repository)?.1,
+        repository: normalize_repository_url(repository),
+        revision: String::new(),
+        skills,
+        excluded: Vec::new(),
+    })
 }
 
 pub fn install_marketplace_skill(profile_dir: &Path, skill: &MarketplaceSkill) -> io::Result<()> {
@@ -623,6 +812,81 @@ fn normalized_content(skill: &MarketplaceSkill) -> String {
     }
 }
 
+fn validate_source_skill(skill: &ExtraSkill) -> io::Result<()> {
+    validate_skill_id(&skill.id)?;
+    let expected = format!("skills/{}/SKILL.md", skill.id);
+    if skill.path != expected
+        || safe_archive_path(&skill.path).as_deref() != Some(Path::new(&expected))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsafe source path for skill {}: {}", skill.id, skill.path),
+        ));
+    }
+    if let Some(hash) = skill.sha256.as_deref() {
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid sha256 for source skill {}", skill.id),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_skill_id(id: &str) -> io::Result<()> {
+    if id.is_empty()
+        || id.starts_with('-')
+        || id.ends_with('-')
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsafe source skill id: {id}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_revision(revision: &str) -> io::Result<&str> {
+    if revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(revision)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source revision must be a 40-character Git commit SHA",
+        ))
+    }
+}
+
+fn normalize_repository_url(url: &str) -> String {
+    url.trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_string()
+}
+
+fn github_repository_parts(url: &str) -> Result<(String, String), String> {
+    let normalized = normalize_repository_url(url);
+    let path = normalized
+        .strip_prefix("https://github.com/")
+        .ok_or_else(|| "extra_skills_source must be an HTTPS GitHub repository URL".to_string())?;
+    let parts = path.split('/').collect::<Vec<_>>();
+    if parts.len() != 2
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+    {
+        return Err("extra_skills_source must name one GitHub owner/repository".to_string());
+    }
+    Ok((parts[0].to_string(), parts[1].to_string()))
+}
+
 fn safe_skill_dir(id: &str) -> String {
     let mut output = String::new();
     let mut previous_dash = false;
@@ -674,6 +938,72 @@ mod tests {
             Some("https://example.com/skill.zip")
         );
         assert_eq!(marketplace.default_skill_ids, vec!["review", "off"]);
+    }
+
+    #[test]
+    fn parses_bundled_anthropic_index_and_excludes_document_skills() {
+        let value = serde_json::from_str(ANTHROPIC_SKILLS_INDEX).unwrap();
+        let source = parse_extra_skill_index(&value).unwrap();
+
+        assert_eq!(source.name, "anthropic");
+        assert_eq!(source.repository, ANTHROPIC_SKILLS_URL);
+        assert_eq!(source.revision.len(), 40);
+        assert!(source.skills.iter().any(|skill| skill.id == "mcp-builder"));
+        for id in ["docx", "pdf", "pptx", "xlsx"] {
+            assert!(!source.skills.iter().any(|skill| skill.id == id));
+            assert!(source.excluded.iter().any(|skill| skill.id == id));
+        }
+    }
+
+    #[test]
+    fn source_index_rejects_unsafe_ids_paths_and_hashes() {
+        let base = json!({
+            "name": "test",
+            "repository": "https://github.com/example/skills",
+            "revision": "0123456789abcdef0123456789abcdef01234567",
+            "skills": [{ "id": "safe-skill", "path": "skills/safe-skill/SKILL.md" }]
+        });
+        assert!(parse_extra_skill_index(&base).is_ok());
+
+        for (id, path) in [
+            ("../escape", "skills/../escape/SKILL.md"),
+            ("safe-skill", "../SKILL.md"),
+            ("safe-skill", "skills/other/SKILL.md"),
+            ("UPPER", "skills/UPPER/SKILL.md"),
+        ] {
+            let mut unsafe_index = base.clone();
+            unsafe_index["skills"][0]["id"] = json!(id);
+            unsafe_index["skills"][0]["path"] = json!(path);
+            assert!(
+                parse_extra_skill_index(&unsafe_index).is_err(),
+                "{id}: {path}"
+            );
+        }
+
+        let mut bad_hash = base;
+        bad_hash["skills"][0]["sha256"] = json!("not-a-sha");
+        assert!(parse_extra_skill_index(&bad_hash).is_err());
+    }
+
+    #[test]
+    fn parses_github_directory_entries_without_accepting_unsafe_names() {
+        let source = parse_github_skills_directory(
+            &json!([
+                { "name": "review", "type": "dir" },
+                { "name": "README.md", "type": "file" }
+            ]),
+            "https://github.com/example/skills",
+        )
+        .unwrap();
+        assert_eq!(source.name, "skills");
+        assert_eq!(source.skills.len(), 1);
+        assert_eq!(source.skills[0].path, "skills/review/SKILL.md");
+
+        assert!(parse_github_skills_directory(
+            &json!([{ "name": "../escape", "type": "dir" }]),
+            "https://github.com/example/skills",
+        )
+        .is_err());
     }
 
     #[test]

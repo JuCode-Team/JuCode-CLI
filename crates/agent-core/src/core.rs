@@ -712,11 +712,9 @@ impl AgentCore {
                 Err(error) => format!("Project skills: failed to read ({error})"),
             }
         };
-        match self.fetch_marketplace() {
+        let marketplace = match self.fetch_marketplace() {
             Ok(marketplace) if marketplace.skills.is_empty() => {
-                vec![AgentEvent::Info(format!(
-                    "{installed}\n\n{project}\n\nSkills marketplace is empty"
-                ))]
+                "Source: JuCode marketplace\nNo skills available".to_string()
             }
             Ok(marketplace) => {
                 let defaults = marketplace
@@ -733,15 +731,49 @@ impl AgentCore {
                     };
                     lines.push(format!("{}{} — {}", skill.id, marker, skill.description));
                 }
-                vec![AgentEvent::Info(format!(
-                    "{installed}\n\n{project}\n\nAvailable marketplace skills:\n{}\n\nInstall with /skills install <id>; update with /skills update <id>; sync defaults with /skills sync.",
-                    lines.join("\n")
-                ))]
+                format!("Source: JuCode marketplace\n{}", lines.join("\n"))
             }
-            Err(error) => vec![AgentEvent::Info(format!(
-                "{installed}\n\n{project}\n\nMarketplace unavailable: {error}"
-            ))],
-        }
+            Err(error) => format!("Source: JuCode marketplace (unavailable: {error})"),
+        };
+        let extra = match self.fetch_extra_skill_source() {
+            Ok(Some(source)) => {
+                let mut lines = source
+                    .skills
+                    .iter()
+                    .map(|skill| skill.id.clone())
+                    .collect::<Vec<_>>();
+                if !source.excluded.is_empty() {
+                    lines.push(format!(
+                        "Not offered: {}",
+                        source
+                            .excluded
+                            .iter()
+                            .map(|skill| format!("{} ({})", skill.id, skill.reason))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                Some(format!(
+                    "Source: {} ({})\n{}",
+                    source.name,
+                    source.repository,
+                    if lines.is_empty() {
+                        "No skills available".to_string()
+                    } else {
+                        lines.join("\n")
+                    }
+                ))
+            }
+            Ok(None) => None,
+            Err(error) => Some(format!("Extra skills source unavailable: {error}")),
+        };
+        let mut sections = vec![installed, project, marketplace];
+        sections.extend(extra);
+        sections.push(
+            "Install with /skills install <id>; update with /skills update <id>; sync JuCode defaults with /skills sync."
+                .to_string(),
+        );
+        vec![AgentEvent::Info(sections.join("\n\n"))]
     }
 
     fn install_marketplace_skill_events(&mut self, id: &str, verb: &str) -> Vec<AgentEvent> {
@@ -750,26 +782,63 @@ impl AgentCore {
                 "installed skill not found: {id}"
             ))];
         }
-        match self.fetch_marketplace() {
-            Ok(marketplace) => {
-                let Some(skill) = marketplace.skills.iter().find(|skill| skill.id == id) else {
-                    return vec![AgentEvent::Error(format!(
-                        "marketplace skill not found: {id}"
-                    ))];
-                };
-                match skills::install_marketplace_skill(self.config.profile_dir(), skill) {
+        let marketplace = self.fetch_marketplace();
+        if let Ok(marketplace) = &marketplace {
+            if let Some(skill) = marketplace.skills.iter().find(|skill| skill.id == id) {
+                return match skills::install_marketplace_skill(self.config.profile_dir(), skill) {
                     Ok(()) => vec![
-                        AgentEvent::Status(format!("{verb} skill {}", skill.id)),
+                        AgentEvent::Status(format!(
+                            "{verb} skill {} from JuCode marketplace",
+                            skill.id
+                        )),
                         self.command_list_event(),
                     ],
                     Err(error) => vec![AgentEvent::Error(format!(
                         "failed to install skill {}: {error}",
                         skill.id
                     ))],
+                };
+            }
+        }
+        match self.fetch_extra_skill_source() {
+            Ok(Some(source)) => {
+                if let Some(skill) = source.skills.iter().find(|skill| skill.id == id) {
+                    return match skills::install_extra_skill(
+                        self.config.profile_dir(),
+                        &source,
+                        skill,
+                    ) {
+                        Ok(()) => vec![
+                            AgentEvent::Status(format!(
+                                "{verb} skill {} from {}",
+                                skill.id, source.name
+                            )),
+                            self.command_list_event(),
+                        ],
+                        Err(error) => vec![AgentEvent::Error(format!(
+                            "failed to install skill {} from {}: {error}",
+                            skill.id, source.name
+                        ))],
+                    };
+                }
+                if let Some(excluded) = source.excluded.iter().find(|skill| skill.id == id) {
+                    return vec![AgentEvent::Error(format!(
+                        "skill {} is not offered by {}: {}",
+                        excluded.id, source.name, excluded.reason
+                    ))];
                 }
             }
+            Ok(None) => {}
+            Err(error) => {
+                return vec![AgentEvent::Error(format!(
+                    "failed to load extra skills source: {error}"
+                ))];
+            }
+        }
+        match marketplace {
+            Ok(_) => vec![AgentEvent::Error(format!("skill not found in configured sources: {id}"))],
             Err(error) => vec![AgentEvent::Error(format!(
-                "failed to fetch skills marketplace: {error}"
+                "skill not found in configured extra source and JuCode marketplace is unavailable: {error}"
             ))],
         }
     }
@@ -834,6 +903,15 @@ impl AgentCore {
 
     fn fetch_marketplace(&self) -> Result<skills::Marketplace, String> {
         skills::fetch_marketplace(&self.config.jucode_api_url, self.auth.jucode_access_token())
+    }
+
+    fn fetch_extra_skill_source(&self) -> Result<Option<skills::ExtraSkillSource>, String> {
+        skills::fetch_extra_skill_source(
+            self.config
+                .extra_skills_source
+                .as_deref()
+                .unwrap_or_default(),
+        )
     }
 
     /// Returns the bearer token for the active provider: the JuCode OAuth

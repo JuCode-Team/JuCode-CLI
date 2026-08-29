@@ -195,6 +195,9 @@ pub struct Config {
     /// (`enable_browser_open` in config.json, default true). It is only ever
     /// exposed when running under JuCode Desktop (JUCODE_DESKTOP set).
     pub enable_browser_open: bool,
+    /// Optional additional GitHub skill repository. "anthropic" selects the
+    /// pinned built-in index for https://github.com/anthropics/skills.
+    pub extra_skills_source: Option<String>,
     pub extensions: Vec<ExtensionConfig>,
     pub mcp_servers: Vec<McpServerConfig>,
     path: PathBuf,
@@ -333,6 +336,7 @@ impl Config {
                 approval_mode: ApprovalMode::default(),
                 edit_tools: default_edit_tools(),
                 enable_browser_open: true,
+                extra_skills_source: None,
                 extensions: Vec::new(),
                 mcp_servers: Vec::new(),
                 path,
@@ -415,6 +419,7 @@ impl Config {
             approval_mode: read_approval_mode(&value)?,
             edit_tools: read_edit_tools(&value)?,
             enable_browser_open: read_bool(&value, "enable_browser_open", true),
+            extra_skills_source: read_optional_string(&value, "extra_skills_source"),
             extensions: read_extensions(&value),
             mcp_servers: read_mcp_servers(&value),
             path,
@@ -449,6 +454,7 @@ impl Config {
             "approval_mode": self.approval_mode.as_str(),
             "edit_tools": self.edit_tools,
             "enable_browser_open": self.enable_browser_open,
+            "extra_skills_source": self.extra_skills_source,
             "extensions": self.extensions.iter().map(extension_config_value).collect::<Vec<_>>(),
             "mcp_servers": self.mcp_servers.iter().map(mcp_server_config_value).collect::<Vec<_>>()
         });
@@ -603,6 +609,15 @@ fn read_string(value: &Value, key: &str, default: &str) -> String {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(default)
         .to_string()
+}
+
+fn read_optional_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn read_usize(value: &Value, key: &str, default: usize) -> usize {
@@ -1309,6 +1324,7 @@ mod tests {
             approval_mode: ApprovalMode::default(),
             edit_tools: default_edit_tools(),
             enable_browser_open: true,
+            extra_skills_source: None,
             extensions: Vec::new(),
             mcp_servers: Vec::new(),
             path: PathBuf::from("config.json"),
@@ -1534,6 +1550,26 @@ mod tests {
         let error = read_edit_tools(&json!({ "edit_tools": "write" })).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("array"));
+    }
+
+    #[test]
+    fn extra_skills_source_is_optional_and_trimmed() {
+        assert_eq!(
+            read_optional_string(&json!({}), "extra_skills_source"),
+            None
+        );
+        assert_eq!(
+            read_optional_string(
+                &json!({ "extra_skills_source": " anthropic " }),
+                "extra_skills_source"
+            )
+            .as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            read_optional_string(&json!({ "extra_skills_source": "" }), "extra_skills_source"),
+            None
+        );
     }
 
     #[test]

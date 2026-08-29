@@ -1,0 +1,40 @@
+{
+  "name": "anthropic",
+  "repository": "https://github.com/anthropics/skills",
+  "revision": "3b3fad96af16a10759d930941b4520ba0c40edae",
+  "skills": [
+    { "id": "academy-guide", "path": "skills/academy-guide/SKILL.md" },
+    { "id": "algorithmic-art", "path": "skills/algorithmic-art/SKILL.md" },
+    { "id": "brand-guidelines", "path": "skills/brand-guidelines/SKILL.md" },
+    { "id": "canvas-design", "path": "skills/canvas-design/SKILL.md" },
+    { "id": "claude-api", "path": "skills/claude-api/SKILL.md" },
+    { "id": "discernment-nudge", "path": "skills/discernment-nudge/SKILL.md" },
+    { "id": "doc-coauthoring", "path": "skills/doc-coauthoring/SKILL.md" },
+    { "id": "frontend-design", "path": "skills/frontend-design/SKILL.md" },
+    { "id": "internal-comms", "path": "skills/internal-comms/SKILL.md" },
+    { "id": "mcp-builder", "path": "skills/mcp-builder/SKILL.md" },
+    { "id": "skill-creator", "path": "skills/skill-creator/SKILL.md" },
+    { "id": "slack-gif-creator", "path": "skills/slack-gif-creator/SKILL.md" },
+    { "id": "theme-factory", "path": "skills/theme-factory/SKILL.md" },
+    { "id": "web-artifacts-builder", "path": "skills/web-artifacts-builder/SKILL.md" },
+    { "id": "webapp-testing", "path": "skills/webapp-testing/SKILL.md" }
+  ],
+  "excluded": [
+    {
+      "id": "docx",
+      "reason": "source-available document skill; not redistributed by JuCode"
+    },
+    {
+      "id": "pdf",
+      "reason": "source-available document skill; not redistributed by JuCode"
+    },
+    {
+      "id": "pptx",
+      "reason": "source-available document skill; not redistributed by JuCode"
+    },
+    {
+      "id": "xlsx",
+      "reason": "source-available document skill; not redistributed by JuCode"
+    }
+  ]
+}
