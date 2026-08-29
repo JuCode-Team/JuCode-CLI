@@ -506,6 +506,7 @@ dependencies = [
  "base64",
  "flate2",
  "getrandom",
+ "jucode-vendor",
  "semver",
  "serde_json",
  "sha2",
@@ -532,6 +533,13 @@ dependencies = [
  "ratatui",
  "serde_json",
  "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "jucode-vendor"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
