@@ -243,8 +243,24 @@ pub struct McpServerConfig {
     /// http: endpoint URL plus extra request headers (e.g. Authorization).
     pub url: String,
     pub headers: BTreeMap<String, String>,
+    /// Optional OAuth refresh metadata. Tokens live in auth.json, never config.json.
+    pub oauth: Option<McpOAuthConfig>,
     pub enabled: bool,
     pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpOAuthConfig {
+    pub client_id: String,
+    pub token_url: String,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpOAuthTokens {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub access_expires_at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -533,6 +549,16 @@ impl AuthStore {
                 "refresh_expires_at": t.refresh_expires_at,
             });
         }
+        // MCP transports refresh their own credentials while the agent is
+        // running. Preserve that independently-managed block when account
+        // login or provider-key changes rewrite auth.json.
+        if let Ok(content) = fs::read_to_string(&self.path) {
+            if let Ok(current) = serde_json::from_str::<Value>(&content) {
+                if let Some(tokens) = current.get("mcp_servers") {
+                    value["mcp_servers"] = tokens.clone();
+                }
+            }
+        }
         fs::write(
             &self.path,
             format!("{}\n", serde_json::to_string_pretty(&value)?),
@@ -796,6 +822,7 @@ pub fn parse_mcp_server_value(entry: &Value) -> Result<McpServerConfig, String> 
         McpTransportKind::parse(entry.get("transport").and_then(Value::as_str).unwrap_or(""))?;
     let command = read_string(entry, "command", "");
     let url = read_string(entry, "url", "");
+    let oauth = parse_mcp_oauth(entry.get("oauth"))?;
     match transport {
         McpTransportKind::Stdio if command.is_empty() => {
             return Err(format!(
@@ -804,6 +831,9 @@ pub fn parse_mcp_server_value(entry: &Value) -> Result<McpServerConfig, String> 
         }
         McpTransportKind::Http if url.is_empty() => {
             return Err(format!("MCP server {name}: http transport requires url"));
+        }
+        McpTransportKind::Stdio if oauth.is_some() => {
+            return Err(format!("MCP server {name}: oauth requires http transport"));
         }
         _ => {}
     }
@@ -815,10 +845,46 @@ pub fn parse_mcp_server_value(entry: &Value) -> Result<McpServerConfig, String> 
         env: read_string_map(entry, "env"),
         url,
         headers: read_string_map(entry, "headers"),
+        oauth,
         enabled: read_bool(entry, "enabled", true),
         timeout_seconds: read_u64(entry, "timeout_seconds", DEFAULT_MCP_TIMEOUT_SECONDS)
             .clamp(1, 3600),
     })
+}
+
+fn parse_mcp_oauth(value: Option<&Value>) -> Result<Option<McpOAuthConfig>, String> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| "MCP oauth must be an object".to_string())?;
+    let client_id = object
+        .get("client_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let token_url = object
+        .get("token_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let scope = object
+        .get("scope")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    if client_id.is_empty() != token_url.is_empty() {
+        return Err("MCP oauth client_id and token_url must be set together".to_string());
+    }
+    Ok(Some(McpOAuthConfig {
+        client_id,
+        token_url,
+        scope,
+    }))
 }
 
 fn is_valid_mcp_name(name: &str) -> bool {
@@ -855,7 +921,7 @@ fn read_string_map(value: &Value, key: &str) -> BTreeMap<String, String> {
 }
 
 fn mcp_server_config_value(server: &McpServerConfig) -> Value {
-    json!({
+    let mut value = json!({
         "name": server.name,
         "transport": server.transport.as_str(),
         "command": server.command,
@@ -865,7 +931,15 @@ fn mcp_server_config_value(server: &McpServerConfig) -> Value {
         "headers": server.headers,
         "enabled": server.enabled,
         "timeout_seconds": server.timeout_seconds,
-    })
+    });
+    if let Some(oauth) = &server.oauth {
+        value["oauth"] = json!({
+            "client_id": oauth.client_id,
+            "token_url": oauth.token_url,
+            "scope": oauth.scope,
+        });
+    }
+    value
 }
 
 fn model_config_value(model: &ModelConfig) -> Value {
@@ -1017,6 +1091,37 @@ fn config_path() -> io::Result<PathBuf> {
 
 fn auth_path() -> io::Result<PathBuf> {
     Ok(jucode_dir()?.join("auth.json"))
+}
+
+pub(crate) fn mcp_auth_path() -> io::Result<PathBuf> {
+    auth_path()
+}
+
+pub(crate) fn load_mcp_oauth_tokens(server: &str) -> io::Result<Option<McpOAuthTokens>> {
+    let path = auth_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(path)?;
+    let value = serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({}));
+    let Some(tokens) = value
+        .get("mcp_servers")
+        .and_then(Value::as_object)
+        .and_then(|servers| servers.get(server))
+    else {
+        return Ok(None);
+    };
+    let Some(access_token) = read_nonempty_str(tokens, "access_token") else {
+        return Ok(None);
+    };
+    Ok(Some(McpOAuthTokens {
+        access_token,
+        refresh_token: read_nonempty_str(tokens, "refresh_token").unwrap_or_default(),
+        access_expires_at: tokens
+            .get("access_expires_at")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    }))
 }
 
 fn system_prompt_path() -> io::Result<PathBuf> {
@@ -1297,12 +1402,18 @@ mod tests {
             "transport": "http",
             "url": "https://example.com/mcp",
             "headers": { "Authorization": "Bearer x" },
+            "oauth": {
+                "client_id": "client",
+                "token_url": "https://example.com/token",
+                "scope": "mcp"
+            },
             "enabled": false
         }))
         .unwrap();
         assert_eq!(http.transport, McpTransportKind::Http);
         assert!(!http.enabled);
         assert_eq!(http.timeout_seconds, DEFAULT_MCP_TIMEOUT_SECONDS);
+        assert_eq!(http.oauth.unwrap().client_id, "client");
 
         // Invalid name, missing command/url, unknown transport.
         assert!(parse_mcp_server_value(&json!({ "name": "bad name", "command": "x" })).is_err());
@@ -1312,6 +1423,13 @@ mod tests {
         assert!(
             parse_mcp_server_value(&json!({ "name": "a", "transport": "ws", "url": "u" })).is_err()
         );
+        assert!(parse_mcp_server_value(&json!({
+            "name": "a",
+            "transport": "http",
+            "url": "https://example.com",
+            "oauth": { "client_id": "only-one-field" }
+        }))
+        .is_err());
     }
 
     #[test]
@@ -1324,6 +1442,11 @@ mod tests {
             env: BTreeMap::from([("A".to_string(), "1".to_string())]),
             url: "https://example.com/mcp".to_string(),
             headers: BTreeMap::from([("Authorization".to_string(), "Bearer t".to_string())]),
+            oauth: Some(McpOAuthConfig {
+                client_id: "client".to_string(),
+                token_url: "https://example.com/token".to_string(),
+                scope: "mcp:read".to_string(),
+            }),
             enabled: false,
             timeout_seconds: 30,
         };
@@ -1337,6 +1460,7 @@ mod tests {
         assert_eq!(parsed.env, original.env);
         assert_eq!(parsed.url, original.url);
         assert_eq!(parsed.headers, original.headers);
+        assert_eq!(parsed.oauth, original.oauth);
         assert_eq!(parsed.enabled, original.enabled);
         assert_eq!(parsed.timeout_seconds, original.timeout_seconds);
     }

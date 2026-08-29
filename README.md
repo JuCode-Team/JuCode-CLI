@@ -14,7 +14,7 @@ The project is intentionally small: the agent harness is designed to give the mo
 - **Scoped editing tools**: exact replacement, hashline edits, full-file writes, and patch application.
 - **Large-output controls**: bash output truncation, ripgrep soft warnings, and `read` offset/limit support.
 - **Conversation compaction** based on tokenizer-counted context, not rough character estimates.
-- **Branchable sessions, resume, checkout, goals, skills, and lightweight subagents**.
+- **Branchable sessions, resume, checkout, goals, lifecycle-managed skills, full MCP, and lightweight subagents**.
 - **TUI diff display without exposing `diff` as an agent tool**.
 
 ## Installation
@@ -99,11 +99,19 @@ Useful commands:
 /goal <objective>             start or update a persistent goal
 /skills list                  list marketplace skills
 /skills install <id>          install a skill
+/skills update <id>           update an installed skill
+/skills enable|disable <id>   toggle an installed skill
+/skills uninstall <id>        remove an installed skill
 /skills sync                  sync default skills
 /pin <skill>                  keep a skill in current session context
+/mcp                          show MCP server status
 /compact                      compact older conversation context
 /quit                         exit
 ```
+
+Installed and project-local skill behavior is documented in [docs/skills.md](docs/skills.md).
+MCP stdio/HTTP setup, prompt commands, resource tools, roots, and HTTP authentication are
+documented in [docs/mcp.md](docs/mcp.md).
 
 ### Headless mode
 

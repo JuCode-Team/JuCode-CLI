@@ -2,11 +2,13 @@
 //! streamable HTTP (POST per message, JSON or SSE responses). No async — one
 //! reader thread per stdio server, blocking reads for HTTP streams.
 
+use crate::config::{McpOAuthConfig, McpOAuthTokens};
 use serde_json::{json, Map, Value};
 use std::{
     collections::{BTreeMap, HashMap},
+    fs,
     io::{BufRead, BufReader, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -18,20 +20,33 @@ use std::{
 
 const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
 const CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+static AUTH_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// One MCP server connection. Implementations must correlate concurrent
-/// requests by id and surface `notifications/tools/list_changed`.
+/// requests by id and surface list-change notifications.
 pub trait McpTransport: Send + Sync {
     fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String>;
     fn notify(&self, method: &str, params: Value) -> Result<(), String>;
     /// True once since the last call if the server signaled a tool-list change.
     fn take_tools_list_changed(&self) -> bool;
+    fn take_prompts_list_changed(&self) -> bool;
+    fn take_resources_list_changed(&self) -> bool;
     /// Record the negotiated protocol version (sent as a header by HTTP).
     fn set_protocol_version(&self, _version: &str) {}
 }
 
 type PendingMap = Arc<Mutex<HashMap<u64, mpsc::Sender<Result<Value, String>>>>>;
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
+struct ReaderContext {
+    server: String,
+    writer: SharedWriter,
+    pending: PendingMap,
+    tools_list_changed: Arc<AtomicBool>,
+    prompts_list_changed: Arc<AtomicBool>,
+    resources_list_changed: Arc<AtomicBool>,
+    root_uri: String,
+}
 
 /// JSON-RPC 2.0 peer over any byte stream pair: monotonic request ids, a
 /// reader thread routing responses to waiting callers, minimal handling of
@@ -42,6 +57,8 @@ pub struct JsonRpcPeer {
     pending: PendingMap,
     next_id: AtomicU64,
     tools_list_changed: Arc<AtomicBool>,
+    prompts_list_changed: Arc<AtomicBool>,
+    resources_list_changed: Arc<AtomicBool>,
 }
 
 impl JsonRpcPeer {
@@ -49,22 +66,32 @@ impl JsonRpcPeer {
         server: &str,
         reader: impl Read + Send + 'static,
         writer: impl Write + Send + 'static,
+        root: &Path,
     ) -> Self {
         let writer: SharedWriter = Arc::new(Mutex::new(Box::new(writer)));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let tools_list_changed = Arc::new(AtomicBool::new(false));
+        let prompts_list_changed = Arc::new(AtomicBool::new(false));
+        let resources_list_changed = Arc::new(AtomicBool::new(false));
         spawn_reader(
-            server.to_string(),
             reader,
-            Arc::clone(&writer),
-            Arc::clone(&pending),
-            Arc::clone(&tools_list_changed),
+            ReaderContext {
+                server: server.to_string(),
+                writer: Arc::clone(&writer),
+                pending: Arc::clone(&pending),
+                tools_list_changed: Arc::clone(&tools_list_changed),
+                prompts_list_changed: Arc::clone(&prompts_list_changed),
+                resources_list_changed: Arc::clone(&resources_list_changed),
+                root_uri: root_uri(root),
+            },
         );
         Self {
             writer,
             pending,
             next_id: AtomicU64::new(1),
             tools_list_changed,
+            prompts_list_changed,
+            resources_list_changed,
         }
     }
 
@@ -100,6 +127,14 @@ impl JsonRpcPeer {
         self.tools_list_changed.swap(false, Ordering::SeqCst)
     }
 
+    pub fn take_prompts_list_changed(&self) -> bool {
+        self.prompts_list_changed.swap(false, Ordering::SeqCst)
+    }
+
+    pub fn take_resources_list_changed(&self) -> bool {
+        self.resources_list_changed.swap(false, Ordering::SeqCst)
+    }
+
     fn forget(&self, id: u64) {
         if let Ok(mut pending) = self.pending.lock() {
             pending.remove(&id);
@@ -126,13 +161,7 @@ fn write_json_line(writer: &Mutex<Box<dyn Write + Send>>, message: &Value) -> Re
     writer.flush().map_err(|error| error.to_string())
 }
 
-fn spawn_reader(
-    server: String,
-    reader: impl Read + Send + 'static,
-    writer: SharedWriter,
-    pending: PendingMap,
-    tools_list_changed: Arc<AtomicBool>,
-) {
+fn spawn_reader(reader: impl Read + Send + 'static, context: ReaderContext) {
     thread::spawn(move || {
         let mut lines = BufReader::new(reader).lines();
         while let Some(Ok(line)) = lines.next() {
@@ -143,36 +172,39 @@ fn spawn_reader(
                 crate::log_warn!(
                     "mcp",
                     "discarding non-JSON line from server",
-                    server = server.clone()
+                    server = context.server.clone()
                 );
                 continue;
             };
-            dispatch_incoming(&server, message, &writer, &pending, &tools_list_changed);
+            dispatch_incoming(message, &context);
         }
         // EOF: unblock every waiting request by dropping its sender.
-        if let Ok(mut pending) = pending.lock() {
+        if let Ok(mut pending) = context.pending.lock() {
             pending.clear();
         }
-        crate::log_debug!("mcp", "reader thread finished", server = server);
+        crate::log_debug!("mcp", "reader thread finished", server = context.server);
     });
 }
 
-fn dispatch_incoming(
-    server: &str,
-    message: Value,
-    writer: &Mutex<Box<dyn Write + Send>>,
-    pending: &Mutex<HashMap<u64, mpsc::Sender<Result<Value, String>>>>,
-    tools_list_changed: &AtomicBool,
-) {
+fn dispatch_incoming(message: Value, context: &ReaderContext) {
     let Some(method) = message.get("method").and_then(Value::as_str) else {
-        route_response(server, &message, pending);
+        route_response(&context.server, &message, &context.pending);
         return;
     };
     match message.get("id").filter(|id| !id.is_null()) {
         Some(id) => {
-            let _ = write_json_line(writer, &server_request_reply(server, method, id));
+            let _ = write_json_line(
+                &context.writer,
+                &server_request_reply(&context.server, method, id, &context.root_uri),
+            );
         }
-        None => handle_notification(server, method, tools_list_changed),
+        None => handle_notification(
+            &context.server,
+            method,
+            &context.tools_list_changed,
+            &context.prompts_list_changed,
+            &context.resources_list_changed,
+        ),
     }
 }
 
@@ -194,11 +226,24 @@ fn route_response(
     }
 }
 
-/// Reply for a server-initiated request: `ping` gets an empty result, anything
-/// else a method-not-found error (sampling, roots, elicitation unsupported).
-pub(crate) fn server_request_reply(server: &str, method: &str, id: &Value) -> Value {
-    if method == "ping" {
-        return json!({ "jsonrpc": "2.0", "id": id, "result": {} });
+/// Reply for supported server-initiated requests. JuCode exposes its working
+/// directory as the single MCP root; sampling and elicitation remain out.
+pub(crate) fn server_request_reply(
+    server: &str,
+    method: &str,
+    id: &Value,
+    root_uri: &str,
+) -> Value {
+    match method {
+        "ping" => return json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+        "roots/list" => {
+            return json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "roots": [{ "uri": root_uri, "name": "workspace" }] }
+            })
+        }
+        _ => {}
     }
     crate::log_warn!(
         "mcp",
@@ -213,16 +258,25 @@ pub(crate) fn server_request_reply(server: &str, method: &str, id: &Value) -> Va
     })
 }
 
-pub(crate) fn handle_notification(server: &str, method: &str, tools_list_changed: &AtomicBool) {
-    if method == "notifications/tools/list_changed" {
-        tools_list_changed.store(true, Ordering::SeqCst);
-    } else {
-        crate::log_debug!(
+pub(crate) fn handle_notification(
+    server: &str,
+    method: &str,
+    tools_list_changed: &AtomicBool,
+    prompts_list_changed: &AtomicBool,
+    resources_list_changed: &AtomicBool,
+) {
+    match method {
+        "notifications/tools/list_changed" => tools_list_changed.store(true, Ordering::SeqCst),
+        "notifications/prompts/list_changed" => prompts_list_changed.store(true, Ordering::SeqCst),
+        "notifications/resources/list_changed" => {
+            resources_list_changed.store(true, Ordering::SeqCst)
+        }
+        _ => crate::log_debug!(
             "mcp",
             "ignoring server notification",
             server = server,
             method = method
-        );
+        ),
     }
 }
 
@@ -277,7 +331,7 @@ impl StdioTransport {
             drain_stderr(server.to_string(), stderr);
         }
         Ok(Self {
-            peer: JsonRpcPeer::new(server, stdout, stdin),
+            peer: JsonRpcPeer::new(server, stdout, stdin, cwd),
             child: Mutex::new(child),
             server: server.to_string(),
         })
@@ -304,6 +358,14 @@ impl McpTransport for StdioTransport {
 
     fn take_tools_list_changed(&self) -> bool {
         self.peer.take_tools_list_changed()
+    }
+
+    fn take_prompts_list_changed(&self) -> bool {
+        self.peer.take_prompts_list_changed()
+    }
+
+    fn take_resources_list_changed(&self) -> bool {
+        self.peer.take_resources_list_changed()
     }
 }
 
@@ -342,10 +404,31 @@ pub struct HttpTransport {
     protocol_version: Mutex<Option<String>>,
     next_id: AtomicU64,
     tools_list_changed: AtomicBool,
+    prompts_list_changed: AtomicBool,
+    resources_list_changed: AtomicBool,
+    oauth: Option<HttpOAuth>,
+    auth_path: Option<PathBuf>,
+    root_uri: String,
+}
+
+struct HttpOAuth {
+    metadata: McpOAuthConfig,
+    tokens: Mutex<McpOAuthTokens>,
 }
 
 impl HttpTransport {
-    pub fn new(server: &str, url: &str, headers: &BTreeMap<String, String>) -> Self {
+    pub fn new(
+        server: &str,
+        url: &str,
+        headers: &BTreeMap<String, String>,
+        oauth: Option<(McpOAuthConfig, McpOAuthTokens, PathBuf)>,
+        root: &Path,
+    ) -> Self {
+        let auth_path = oauth.as_ref().map(|(_, _, path)| path.clone());
+        let oauth = oauth.map(|(metadata, tokens, _)| HttpOAuth {
+            metadata,
+            tokens: Mutex::new(tokens),
+        });
         Self {
             server: server.to_string(),
             url: url.to_string(),
@@ -357,10 +440,32 @@ impl HttpTransport {
             protocol_version: Mutex::new(None),
             next_id: AtomicU64::new(1),
             tools_list_changed: AtomicBool::new(false),
+            prompts_list_changed: AtomicBool::new(false),
+            resources_list_changed: AtomicBool::new(false),
+            oauth,
+            auth_path,
+            root_uri: root_uri(root),
         }
     }
 
     fn post(&self, body: &Value, timeout: Duration) -> Result<ureq::Response, String> {
+        self.ensure_fresh_oauth()?;
+        match self.post_once(body, timeout) {
+            Ok(response) => Ok(response),
+            Err((Some(401), first_error)) if self.oauth.is_some() => {
+                self.refresh_oauth()
+                    .map_err(|error| format!("{first_error}; OAuth refresh failed: {error}"))?;
+                self.post_once(body, timeout).map_err(|(_, error)| error)
+            }
+            Err((_, error)) => Err(error),
+        }
+    }
+
+    fn post_once(
+        &self,
+        body: &Value,
+        timeout: Duration,
+    ) -> Result<ureq::Response, (Option<u16>, String)> {
         let mut request = self
             .agent
             .post(&self.url)
@@ -369,6 +474,9 @@ impl HttpTransport {
             .set("accept", "application/json, text/event-stream");
         for (name, value) in &self.headers {
             request = request.set(name, value);
+        }
+        if let Some(token) = self.oauth_access_token() {
+            request = request.set("authorization", &format!("Bearer {token}"));
         }
         if let Some(session_id) = self.session_id.lock().ok().and_then(|id| id.clone()) {
             request = request.set("mcp-session-id", &session_id);
@@ -381,9 +489,9 @@ impl HttpTransport {
             Err(ureq::Error::Status(code, response)) => {
                 let body = response.into_string().unwrap_or_default();
                 let snippet: String = body.chars().take(200).collect();
-                return Err(format!("HTTP {code}: {snippet}"));
+                return Err((Some(code), format!("HTTP {code}: {snippet}")));
             }
-            Err(error) => return Err(format!("HTTP request failed: {error}")),
+            Err(error) => return Err((None, format!("HTTP request failed: {error}"))),
         };
         if let Some(session_id) = response.header("mcp-session-id") {
             if let Ok(mut slot) = self.session_id.lock() {
@@ -391,6 +499,103 @@ impl HttpTransport {
             }
         }
         Ok(response)
+    }
+
+    fn oauth_access_token(&self) -> Option<String> {
+        self.oauth
+            .as_ref()?
+            .tokens
+            .lock()
+            .ok()
+            .map(|tokens| tokens.access_token.clone())
+    }
+
+    fn ensure_fresh_oauth(&self) -> Result<(), String> {
+        let Some(oauth) = &self.oauth else {
+            return Ok(());
+        };
+        let expires_at = oauth
+            .tokens
+            .lock()
+            .map_err(|_| "OAuth token lock poisoned".to_string())?
+            .access_expires_at;
+        if expires_at != 0 && expires_at <= unix_now().saturating_add(60) {
+            self.refresh_oauth()?;
+        }
+        Ok(())
+    }
+
+    fn refresh_oauth(&self) -> Result<(), String> {
+        let oauth = self
+            .oauth
+            .as_ref()
+            .ok_or_else(|| "OAuth is not configured".to_string())?;
+        if oauth.metadata.client_id.is_empty() || oauth.metadata.token_url.is_empty() {
+            return Err("token expired and no client_id/token_url is configured".to_string());
+        }
+        let current = oauth
+            .tokens
+            .lock()
+            .map_err(|_| "OAuth token lock poisoned".to_string())?
+            .clone();
+        if current.refresh_token.is_empty() {
+            return Err("token expired and auth.json has no refresh_token".to_string());
+        }
+        let mut form = vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", current.refresh_token.as_str()),
+            ("client_id", oauth.metadata.client_id.as_str()),
+        ];
+        if !oauth.metadata.scope.is_empty() {
+            form.push(("scope", oauth.metadata.scope.as_str()));
+        }
+        let response = ureq::post(&oauth.metadata.token_url)
+            .set("accept", "application/json")
+            .send_form(&form);
+        let value = match response {
+            Ok(response) => response
+                .into_json::<Value>()
+                .map_err(|error| format!("invalid token response: {error}"))?,
+            Err(ureq::Error::Status(code, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                return Err(format!("token endpoint returned HTTP {code}: {body}"));
+            }
+            Err(error) => return Err(format!("token request failed: {error}")),
+        };
+        let access_token = value
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|token| !token.trim().is_empty())
+            .ok_or_else(|| "token response missing access_token".to_string())?
+            .to_string();
+        let refresh_token = value
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .filter(|token| !token.trim().is_empty())
+            .unwrap_or(&current.refresh_token)
+            .to_string();
+        let access_expires_at = value
+            .get("expires_in")
+            .and_then(Value::as_u64)
+            .map(|seconds| unix_now().saturating_add(seconds))
+            .unwrap_or(0);
+        let updated = McpOAuthTokens {
+            access_token,
+            refresh_token,
+            access_expires_at,
+        };
+        persist_oauth_tokens(
+            self.auth_path
+                .as_deref()
+                .ok_or_else(|| "OAuth auth path is unavailable".to_string())?,
+            &self.server,
+            &updated,
+        )?;
+        *oauth
+            .tokens
+            .lock()
+            .map_err(|_| "OAuth token lock poisoned".to_string())? = updated;
+        Ok(())
     }
 
     /// Best-effort reply to a server request received on an SSE stream.
@@ -415,8 +620,19 @@ impl HttpTransport {
             return;
         };
         match message.get("id").filter(|id| !id.is_null()) {
-            Some(id) => self.post_reply(&server_request_reply(&self.server, method, id)),
-            None => handle_notification(&self.server, method, &self.tools_list_changed),
+            Some(id) => self.post_reply(&server_request_reply(
+                &self.server,
+                method,
+                id,
+                &self.root_uri,
+            )),
+            None => handle_notification(
+                &self.server,
+                method,
+                &self.tools_list_changed,
+                &self.prompts_list_changed,
+                &self.resources_list_changed,
+            ),
         }
     }
 }
@@ -464,9 +680,106 @@ impl McpTransport for HttpTransport {
         self.tools_list_changed.swap(false, Ordering::SeqCst)
     }
 
+    fn take_prompts_list_changed(&self) -> bool {
+        self.prompts_list_changed.swap(false, Ordering::SeqCst)
+    }
+
+    fn take_resources_list_changed(&self) -> bool {
+        self.resources_list_changed.swap(false, Ordering::SeqCst)
+    }
+
     fn set_protocol_version(&self, version: &str) {
         if let Ok(mut slot) = self.protocol_version.lock() {
             *slot = Some(version.to_string());
+        }
+    }
+}
+
+fn root_uri(root: &Path) -> String {
+    let absolute = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut encoded = String::new();
+    for byte in absolute.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                encoded.push(char::from(byte))
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    if encoded.starts_with('/') {
+        format!("file://{encoded}")
+    } else {
+        format!("file:///{encoded}")
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn persist_oauth_tokens(path: &Path, server: &str, tokens: &McpOAuthTokens) -> Result<(), String> {
+    let _guard = AUTH_WRITE_LOCK
+        .lock()
+        .map_err(|_| "OAuth auth-file lock poisoned".to_string())?;
+    let mut value = fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if !value
+        .get("mcp_servers")
+        .is_some_and(|servers| servers.is_object())
+    {
+        value["mcp_servers"] = json!({});
+    }
+    value["mcp_servers"][server] = json!({
+        "access_token": tokens.access_token,
+        "refresh_token": tokens.refresh_token,
+        "access_expires_at": tokens.access_expires_at,
+    });
+    let parent = path
+        .parent()
+        .ok_or_else(|| "auth.json has no parent directory".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temp = path.with_extension("json.oauth-tmp");
+    fs::write(
+        &temp,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
+        ),
+    )
+    .map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    match fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(error) if path.exists() => {
+            let backup = path.with_extension("json.oauth-backup");
+            let _ = fs::remove_file(&backup);
+            fs::rename(path, &backup).map_err(|move_error| move_error.to_string())?;
+            if let Err(move_error) = fs::rename(&temp, path) {
+                let _ = fs::rename(&backup, path);
+                let _ = fs::remove_file(&temp);
+                return Err(format!("{error}; replacement failed: {move_error}"));
+            }
+            let _ = fs::remove_file(backup);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            Err(error.to_string())
         }
     }
 }
@@ -562,6 +875,7 @@ mod tests {
                 pos: 0,
             },
             ChannelWriter { tx: to_server_tx },
+            Path::new("/workspace"),
         );
         let server_reader = BufReader::new(ChannelReader {
             rx: to_server_rx,
@@ -642,6 +956,20 @@ mod tests {
         let reply = read_message(&mut server_reader);
         assert_eq!(reply["id"], "srv-1");
         assert_eq!(reply["result"], json!({}));
+    }
+
+    #[test]
+    fn roots_list_reports_the_workspace_root() {
+        let (_peer, mut server_reader, mut server_writer) = peer_pair();
+        writeln!(
+            server_writer,
+            r#"{{"jsonrpc":"2.0","id":"roots-1","method":"roots/list"}}"#
+        )
+        .unwrap();
+        let reply = read_message(&mut server_reader);
+        assert_eq!(reply["id"], "roots-1");
+        assert_eq!(reply["result"]["roots"][0]["uri"], "file:///workspace");
+        assert_eq!(reply["result"]["roots"][0]["name"], "workspace");
     }
 
     #[test]
@@ -796,15 +1124,23 @@ mod tests {
             let response =
                 json!({ "jsonrpc": "2.0", "id": request["id"], "result": { "mode": "sse" } });
             let body = format!(
-                "data: {}\n\ndata: {}\n\n",
+                "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\n",
                 json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" }),
+                json!({ "jsonrpc": "2.0", "method": "notifications/prompts/list_changed" }),
+                json!({ "jsonrpc": "2.0", "method": "notifications/resources/list_changed" }),
                 response
             );
             respond(&mut stream, "text/event-stream", "", &body);
         });
 
         let headers = BTreeMap::from([("Authorization".to_string(), "Bearer secret".to_string())]);
-        let transport = HttpTransport::new("srv", &format!("http://{addr}/mcp"), &headers);
+        let transport = HttpTransport::new(
+            "srv",
+            &format!("http://{addr}/mcp"),
+            &headers,
+            None,
+            Path::new("/workspace"),
+        );
         let first = transport
             .request("initialize", json!({}), Duration::from_secs(5))
             .unwrap();
@@ -814,7 +1150,126 @@ mod tests {
             .unwrap();
         assert_eq!(second["mode"], "sse");
         assert!(transport.take_tools_list_changed());
+        assert!(transport.take_prompts_list_changed());
+        assert!(transport.take_resources_list_changed());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn http_oauth_refreshes_expired_tokens_and_persists_rotation() {
+        use std::net::{TcpListener, TcpStream};
+
+        fn read_request(
+            listener: &TcpListener,
+        ) -> (TcpStream, String, HashMap<String, String>, String) {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut headers = HashMap::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
+                }
+            }
+            let length = headers
+                .get("content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut body = vec![0_u8; length];
+            reader.read_exact(&mut body).unwrap();
+            (
+                stream,
+                request_line,
+                headers,
+                String::from_utf8(body).unwrap(),
+            )
+        }
+
+        fn respond_json(stream: &mut TcpStream, body: &str) {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "jucode-mcp-oauth-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let auth_path = root.join("auth.json");
+        fs::write(&auth_path, r#"{"providers":{"other":"keep"}}"#).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, line, _headers, body) = read_request(&listener);
+            assert!(line.contains("/token"));
+            assert!(body.contains("grant_type=refresh_token"));
+            assert!(body.contains("refresh_token=old-refresh"));
+            respond_json(
+                &mut stream,
+                r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#,
+            );
+
+            let (mut stream, line, headers, body) = read_request(&listener);
+            assert!(line.contains("/mcp"));
+            assert_eq!(
+                headers.get("authorization").map(String::as_str),
+                Some("Bearer new-access")
+            );
+            let request: Value = serde_json::from_str(&body).unwrap();
+            let response =
+                json!({ "jsonrpc": "2.0", "id": request["id"], "result": { "ok": true } });
+            respond_json(&mut stream, &response.to_string());
+        });
+        let oauth = McpOAuthConfig {
+            client_id: "client-1".to_string(),
+            token_url: format!("http://{addr}/token"),
+            scope: "mcp".to_string(),
+        };
+        let tokens = McpOAuthTokens {
+            access_token: "old-access".to_string(),
+            refresh_token: "old-refresh".to_string(),
+            access_expires_at: 1,
+        };
+        let transport = HttpTransport::new(
+            "secure",
+            &format!("http://{addr}/mcp"),
+            &BTreeMap::new(),
+            Some((oauth, tokens, auth_path.clone())),
+            Path::new("/workspace"),
+        );
+
+        let response = transport
+            .request("initialize", json!({}), Duration::from_secs(5))
+            .unwrap();
+
+        assert_eq!(response["ok"], true);
+        server.join().unwrap();
+        let persisted: Value =
+            serde_json::from_str(&fs::read_to_string(&auth_path).unwrap()).unwrap();
+        assert_eq!(persisted["providers"]["other"], "keep");
+        assert_eq!(
+            persisted["mcp_servers"]["secure"]["access_token"],
+            "new-access"
+        );
+        assert_eq!(
+            persisted["mcp_servers"]["secure"]["refresh_token"],
+            "new-refresh"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

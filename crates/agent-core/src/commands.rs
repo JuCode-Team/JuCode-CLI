@@ -118,7 +118,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/skills",
         aliases: &[],
-        args: "[list|install <id>|sync]",
+        args: "[list|install|update|uninstall|enable|disable|sync] [id]",
         description: "Manage skills",
         advanced: false,
     },
@@ -264,5 +264,11 @@ mod tests {
     fn mcp_command_is_registered_and_in_help() {
         assert!(is_known("/mcp"));
         assert!(help_line().contains("/mcp [tools|reload|enable|disable] [server]"));
+    }
+
+    #[test]
+    fn skill_lifecycle_commands_are_described() {
+        assert!(help_line()
+            .contains("/skills [list|install|update|uninstall|enable|disable|sync] [id]"));
     }
 }

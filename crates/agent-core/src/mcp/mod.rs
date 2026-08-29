@@ -23,6 +23,15 @@ use std::{
 };
 
 pub const MCP_TOOL_PREFIX: &str = "mcp__";
+const MCP_LIST_RESOURCES_TOOL: &str = "list_resources";
+const MCP_READ_RESOURCE_TOOL: &str = "read_resource";
+
+#[derive(Debug, Clone)]
+pub struct McpPromptCommand {
+    pub command: String,
+    pub args: String,
+    pub description: String,
+}
 
 #[derive(Clone, Default)]
 pub struct McpManager {
@@ -205,8 +214,22 @@ impl McpManager {
         let mut definitions = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for (server, client) in self.connected_clients() {
-            client.maybe_refresh_tools();
+            client.refresh_changed();
             for tool in client.tools_snapshot() {
+                if client.supports_resources()
+                    && matches!(
+                        tool.name.as_str(),
+                        MCP_LIST_RESOURCES_TOOL | MCP_READ_RESOURCE_TOOL
+                    )
+                {
+                    crate::log_warn!(
+                        "mcp",
+                        "server tool name conflicts with reserved resource tool",
+                        server = server.clone(),
+                        tool = tool.name
+                    );
+                    continue;
+                }
                 let name = mcp_tool_name(&server, &tool.name);
                 if !seen.insert(name.clone()) {
                     crate::log_warn!(
@@ -223,6 +246,32 @@ impl McpManager {
                     "description": tool.description,
                     "parameters": tool.input_schema,
                 }));
+            }
+            if client.supports_resources() {
+                let resource_definitions = [
+                    json!({
+                        "type": "function",
+                        "name": mcp_tool_name(&server, MCP_LIST_RESOURCES_TOOL),
+                        "description": format!("List text resources exposed by the {server} MCP server"),
+                        "parameters": { "type": "object", "properties": {}, "additionalProperties": false },
+                    }),
+                    json!({
+                        "type": "function",
+                        "name": mcp_tool_name(&server, MCP_READ_RESOURCE_TOOL),
+                        "description": format!("Read one listed text resource from the {server} MCP server"),
+                        "parameters": {
+                            "type": "object",
+                            "properties": { "uri": { "type": "string" } },
+                            "required": ["uri"],
+                            "additionalProperties": false
+                        },
+                    }),
+                ];
+                for definition in resource_definitions {
+                    if seen.insert(definition["name"].as_str().unwrap_or_default().to_string()) {
+                        definitions.push(definition);
+                    }
+                }
             }
         }
         definitions
@@ -244,14 +293,104 @@ impl McpManager {
             Ok(args) => args,
             Err(error) => return Some(error_output(error)),
         };
-        client.maybe_refresh_tools();
+        client.refresh_changed();
+        if tool == MCP_LIST_RESOURCES_TOOL && client.supports_resources() {
+            return Some((client.list_resources_output(), false));
+        }
+        if tool == MCP_READ_RESOURCE_TOOL && client.supports_resources() {
+            let Some(uri) = args.get("uri").and_then(Value::as_str) else {
+                return Some(error_output(
+                    "read_resource requires string uri".to_string(),
+                ));
+            };
+            return Some(match client.read_resource(uri) {
+                Ok(output) => (output, false),
+                Err(error) => error_output(error),
+            });
+        }
         Some(client.call_tool(&tool, args))
+    }
+
+    pub fn prompt_commands(&self) -> Vec<McpPromptCommand> {
+        let mut commands = Vec::new();
+        for (server, client) in self.connected_clients() {
+            client.refresh_changed();
+            for prompt in client.prompts_snapshot() {
+                let required = prompt
+                    .arguments
+                    .iter()
+                    .filter(|argument| argument.required)
+                    .map(|argument| argument.name.as_str())
+                    .collect::<Vec<_>>();
+                let args = if prompt.arguments.is_empty() {
+                    String::new()
+                } else if required.is_empty() {
+                    "[JSON arguments]".to_string()
+                } else {
+                    format!("<JSON: {}>", required.join(", "))
+                };
+                commands.push(McpPromptCommand {
+                    command: format!("/{}", mcp_tool_name(&server, &prompt.name)),
+                    args,
+                    description: prompt.description,
+                });
+            }
+        }
+        commands.sort_by(|left, right| left.command.cmp(&right.command));
+        commands
+    }
+
+    pub fn run_prompt(&self, command: &str, arguments: &str) -> Option<Result<String, String>> {
+        let name = command.strip_prefix('/')?;
+        if !name.starts_with(MCP_TOOL_PREFIX) {
+            return None;
+        }
+        let (server, prompt) = self.resolve_tool_name(name)?;
+        let client = match self.client_for(&server) {
+            Ok(client) => client,
+            Err(error) => return Some(Err(error)),
+        };
+        client.refresh_changed();
+        if !client
+            .prompts_snapshot()
+            .iter()
+            .any(|info| info.name == prompt)
+        {
+            return None;
+        }
+        let arguments = match parse_arguments(arguments) {
+            Ok(arguments) => arguments,
+            Err(error) => return Some(Err(error)),
+        };
+        Some(client.get_prompt(&prompt, arguments))
+    }
+
+    /// Consume list-change notifications outside model calls. The return value
+    /// tells the core to re-emit dynamic prompt slash commands.
+    pub fn refresh_changed(&self) -> bool {
+        let mut prompts_changed = false;
+        for (_, client) in self.connected_clients() {
+            prompts_changed |= client.refresh_changed();
+        }
+        if prompts_changed {
+            self.lock().dirty = true;
+        }
+        prompts_changed
     }
 
     /// The cached `annotations.readOnlyHint` for a full MCP tool name.
     pub fn tool_read_only_hint(&self, name: &str) -> Option<bool> {
         let (server, tool) = self.resolve_tool_name(name)?;
-        self.client_for(&server).ok()?.read_only_hint(&tool)
+        let client = self.client_for(&server).ok()?;
+        if client.supports_resources()
+            && matches!(
+                tool.as_str(),
+                MCP_LIST_RESOURCES_TOOL | MCP_READ_RESOURCE_TOOL
+            )
+        {
+            return Some(true);
+        }
+        client.read_only_hint(&tool)
     }
 
     /// Split a full name back into (server, tool) against known server names.
@@ -405,11 +544,41 @@ fn connect_server(config: &McpServerConfig, cwd: &Path) -> Result<(Arc<McpClient
             &config.name,
             &config.url,
             &config.headers,
+            match &config.oauth {
+                Some(metadata) => {
+                    let tokens = crate::config::load_mcp_oauth_tokens(&config.name)
+                        .map_err(|error| format!("failed to read MCP OAuth tokens: {error}"))?
+                        .ok_or_else(|| {
+                            format!(
+                                "MCP server {} uses OAuth but auth.json has no mcp_servers.{} token",
+                                config.name, config.name
+                            )
+                        })?;
+                    Some((
+                        metadata.clone(),
+                        tokens,
+                        crate::config::mcp_auth_path()
+                            .map_err(|error| format!("failed to locate auth.json: {error}"))?,
+                    ))
+                }
+                None => None,
+            },
+            cwd,
         )),
     };
-    let client = McpClient::new(&config.name, transport, timeout);
+    let client = McpClient::new(&config.name, transport, timeout, cwd);
     client.initialize()?;
-    let tool_count = client.refresh_tools()?;
+    let tool_count = if client.supports_tools() {
+        client.refresh_tools()?
+    } else {
+        0
+    };
+    if client.supports_prompts() {
+        client.refresh_prompts()?;
+    }
+    if client.supports_resources() {
+        client.refresh_resources()?;
+    }
     Ok((Arc::new(client), tool_count))
 }
 
@@ -425,6 +594,35 @@ pub(crate) mod test_support {
         manager
     }
 
+    pub(crate) fn manager_with_prompts_and_resources(
+        server: &str,
+        prompts: Value,
+        resources: Value,
+        prompt_result: Value,
+        resource_result: Value,
+    ) -> McpManager {
+        let manager = McpManager::default();
+        let state = client::test_support::FakeState::new(vec![json!({ "tools": [] })], json!({}));
+        state.initialize_result.lock().unwrap()["capabilities"] =
+            json!({ "tools": {}, "prompts": {}, "resources": {} });
+        *state.prompt_pages.lock().unwrap() = vec![json!({ "prompts": prompts })];
+        *state.resource_pages.lock().unwrap() = vec![json!({ "resources": resources })];
+        *state.prompt_result.lock().unwrap() = prompt_result;
+        *state.resource_result.lock().unwrap() = resource_result;
+        let client = McpClient::new(
+            server,
+            Box::new(client::test_support::FakeTransport(state)),
+            Duration::from_secs(5),
+            Path::new("/workspace"),
+        );
+        client.initialize().unwrap();
+        client.refresh_tools().unwrap();
+        client.refresh_prompts().unwrap();
+        client.refresh_resources().unwrap();
+        manager.insert_connected_for_tests(test_config(server), Arc::new(client));
+        manager
+    }
+
     pub(crate) fn test_config(name: &str) -> McpServerConfig {
         McpServerConfig {
             name: name.to_string(),
@@ -434,6 +632,7 @@ pub(crate) mod test_support {
             env: BTreeMap::new(),
             url: String::new(),
             headers: BTreeMap::new(),
+            oauth: None,
             enabled: true,
             timeout_seconds: 5,
         }
@@ -442,7 +641,9 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{manager_with_tools, test_config};
+    use super::test_support::{
+        manager_with_prompts_and_resources, manager_with_tools, test_config,
+    };
     use super::*;
 
     fn echo_tools() -> Value {
@@ -535,6 +736,71 @@ mod tests {
     }
 
     #[test]
+    fn prompts_are_exposed_as_dynamic_slash_commands() {
+        let manager = manager_with_prompts_and_resources(
+            "docs",
+            json!([{
+                "name": "summarize",
+                "description": "Summarize docs",
+                "arguments": [{ "name": "style", "required": true }]
+            }]),
+            json!([]),
+            json!({
+                "messages": [{ "role": "user", "content": { "type": "text", "text": "Summarize now" } }]
+            }),
+            json!({ "contents": [] }),
+        );
+        let commands = manager.prompt_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command, "/mcp__docs__summarize");
+        assert!(commands[0].args.contains("style"));
+        let rendered = manager
+            .run_prompt("/mcp__docs__summarize", r#"{"style":"brief"}"#)
+            .unwrap()
+            .unwrap();
+        assert!(rendered.contains("Summarize now"));
+    }
+
+    #[test]
+    fn resources_add_model_tools_and_route_bounded_reads() {
+        let manager = manager_with_prompts_and_resources(
+            "docs",
+            json!([]),
+            json!([{
+                "uri": "file:///workspace/guide.md",
+                "name": "guide",
+                "mimeType": "text/markdown"
+            }]),
+            json!({ "messages": [] }),
+            json!({
+                "contents": [{
+                    "uri": "file:///workspace/guide.md",
+                    "mimeType": "text/markdown",
+                    "text": "Guide body"
+                }]
+            }),
+        );
+        let names = manager
+            .definitions()
+            .into_iter()
+            .filter_map(|definition| definition["name"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"mcp__docs__list_resources".to_string()));
+        assert!(names.contains(&"mcp__docs__read_resource".to_string()));
+        let (listed, list_error) = manager.run_tool("mcp__docs__list_resources", "{}").unwrap();
+        assert!(!list_error);
+        assert!(listed.contains("guide.md"));
+        let (read, read_error) = manager
+            .run_tool(
+                "mcp__docs__read_resource",
+                r#"{"uri":"file:///workspace/guide.md"}"#,
+            )
+            .unwrap();
+        assert!(!read_error);
+        assert!(read.contains("Guide body"));
+    }
+
+    #[test]
     fn views_expose_state_and_tools() {
         let manager = manager_with_tools("files", echo_tools(), json!({}));
         let views = manager.views();
@@ -578,9 +844,8 @@ mod tests {
         assert!(output.contains("disabled"), "{output}");
     }
 
-    /// Full protocol walk (initialize → initialized → tools/list → tools/call)
-    /// against a real subprocess speaking canned newline JSON-RPC. Request ids
-    /// are monotonic from 1, so the script matches on method names.
+    /// Full protocol walk against a real subprocess speaking canned newline
+    /// JSON-RPC, including tools, prompts, and resources.
     #[cfg(unix)]
     #[test]
     fn connect_server_speaks_full_protocol_over_stdio() {
@@ -599,9 +864,13 @@ mod tests {
             r##"#!/bin/sh
 while read -r line; do
   case "$line" in
-    *'"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"canned","version":"1.0"}}}' ;;
+    *'"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{},"prompts":{},"resources":{}},"serverInfo":{"name":"canned","version":"1.0"}}}' ;;
     *'"tools/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"greet","description":"Say hi","inputSchema":{"type":"object"}}]}}' ;;
-    *'"tools/call"'*) printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"hi there"}]}}' ;;
+    *'"prompts/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"prompts":[{"name":"review","description":"Review code"}]}}' ;;
+    *'"resources/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resources":[{"uri":"doc://guide","name":"guide","mimeType":"text/plain"}]}}' ;;
+    *'"tools/call"'*) printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"hi there"}]}}' ;;
+    *'"prompts/get"'*) printf '%s\n' '{"jsonrpc":"2.0","id":6,"result":{"messages":[{"role":"user","content":{"type":"text","text":"Review this"}}]}}' ;;
+    *'"resources/read"'*) printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"contents":[{"uri":"doc://guide","text":"Guide text"}]}}' ;;
   esac
 done
 "##,
@@ -622,6 +891,17 @@ done
         let (output, is_error) = manager.run_tool("mcp__canned__greet", "{}").unwrap();
         assert!(!is_error);
         assert_eq!(output, "hi there");
+        assert_eq!(manager.prompt_commands()[0].command, "/mcp__canned__review");
+        assert!(manager
+            .run_prompt("/mcp__canned__review", "{}")
+            .unwrap()
+            .unwrap()
+            .contains("Review this"));
+        let (resource, is_error) = manager
+            .run_tool("mcp__canned__read_resource", r#"{"uri":"doc://guide"}"#)
+            .unwrap();
+        assert!(!is_error);
+        assert!(resource.contains("Guide text"));
         let _ = fs::remove_dir_all(dir);
     }
 }

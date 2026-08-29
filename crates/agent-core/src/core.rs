@@ -302,6 +302,17 @@ impl AgentCore {
                 description: entry.skill.description,
             }));
         }
+        commands.extend(
+            self.mcp
+                .prompt_commands()
+                .into_iter()
+                .map(|entry| CommandView {
+                    command: entry.command,
+                    marker: Some("MCP".to_string()),
+                    args: entry.args,
+                    description: entry.description,
+                }),
+        );
         AgentEvent::CommandList(commands)
     }
 
@@ -454,6 +465,9 @@ impl AgentCore {
     pub fn handle_command(&mut self, input: &str) -> (bool, Vec<AgentEvent>) {
         let (command, args) = split_command_line(input);
         let mut parts = args.split_whitespace();
+        if let Some(events) = self.mcp_prompt_command_events(command, args.trim()) {
+            return (false, events);
+        }
         if let Some(events) = self.skill_command_events(command, args.trim()) {
             return (false, events);
         }
@@ -576,20 +590,61 @@ impl AgentCore {
         match parts.next().unwrap_or("list") {
             "list" => self.list_marketplace_skills_events(),
             "install" => match parts.next() {
-                Some(id) => self.install_marketplace_skill_events(id),
+                Some(id) => self.install_marketplace_skill_events(id, "installed"),
                 None => vec![AgentEvent::Error("usage: /skills install <id>".to_string())],
+            },
+            "update" => match parts.next() {
+                Some(id) => self.install_marketplace_skill_events(id, "updated"),
+                None => vec![AgentEvent::Error("usage: /skills update <id>".to_string())],
+            },
+            "uninstall" => match parts.next() {
+                Some(id) => self.uninstall_skill_events(id),
+                None => vec![AgentEvent::Error(
+                    "usage: /skills uninstall <id>".to_string(),
+                )],
+            },
+            action @ ("enable" | "disable") => match parts.next() {
+                Some(id) => self.set_skill_enabled_events(id, action == "enable"),
+                None => vec![AgentEvent::Error(format!("usage: /skills {action} <id>"))],
             },
             "sync" => self.sync_default_skills_events(),
             other => vec![AgentEvent::Error(format!(
-                "unknown /skills action: {other}; use list, install, or sync"
+                "unknown /skills action: {other}; use list, install, update, uninstall, enable, disable, or sync"
             ))],
         }
     }
 
     fn list_marketplace_skills_events(&self) -> Vec<AgentEvent> {
+        let installed = match skills::installed_skill_ids(self.config.profile_dir()) {
+            Ok(skills) if skills.is_empty() => "Installed skills: none".to_string(),
+            Ok(skills) => format!("Installed skills:\n{}", skills.join("\n")),
+            Err(error) => format!("Installed skills: failed to read ({error})"),
+        };
+        let project_root = self.cwd.join(".jucode").join("skills");
+        let project = if !self.project_trusted && project_root.exists() {
+            "Project skills: hidden until project is trusted".to_string()
+        } else {
+            match discover_skills(self.config.profile_dir(), &self.cwd, self.project_trusted) {
+                Ok(found) => {
+                    let names = found
+                        .into_iter()
+                        .filter(|skill| skill.path.starts_with(&project_root))
+                        .map(|skill| skill.name)
+                        .collect::<Vec<_>>();
+                    if names.is_empty() {
+                        "Project skills: none".to_string()
+                    } else {
+                        format!("Project skills:\n{}", names.join("\n"))
+                    }
+                }
+                Err(error) => format!("Project skills: failed to read ({error})"),
+            }
+        };
         match self.fetch_marketplace() {
             Ok(marketplace) if marketplace.skills.is_empty() => {
-                vec![AgentEvent::Info("skills marketplace is empty".to_string())]
+                vec![AgentEvent::Info(format!(
+                    "{installed}\n\n{project}\n\nSkills marketplace is empty"
+                ))]
             }
             Ok(marketplace) => {
                 let defaults = marketplace
@@ -607,17 +662,22 @@ impl AgentCore {
                     lines.push(format!("{}{} — {}", skill.id, marker, skill.description));
                 }
                 vec![AgentEvent::Info(format!(
-                    "Available marketplace skills:\n{}\n\nInstall with /skills install <id>; sync defaults with /skills sync.",
+                    "{installed}\n\n{project}\n\nAvailable marketplace skills:\n{}\n\nInstall with /skills install <id>; update with /skills update <id>; sync defaults with /skills sync.",
                     lines.join("\n")
                 ))]
             }
-            Err(error) => vec![AgentEvent::Error(format!(
-                "failed to fetch skills marketplace: {error}"
+            Err(error) => vec![AgentEvent::Info(format!(
+                "{installed}\n\n{project}\n\nMarketplace unavailable: {error}"
             ))],
         }
     }
 
-    fn install_marketplace_skill_events(&mut self, id: &str) -> Vec<AgentEvent> {
+    fn install_marketplace_skill_events(&mut self, id: &str, verb: &str) -> Vec<AgentEvent> {
+        if verb == "updated" && !skills::skill_installed(self.config.profile_dir(), id) {
+            return vec![AgentEvent::Error(format!(
+                "installed skill not found: {id}"
+            ))];
+        }
         match self.fetch_marketplace() {
             Ok(marketplace) => {
                 let Some(skill) = marketplace.skills.iter().find(|skill| skill.id == id) else {
@@ -627,7 +687,7 @@ impl AgentCore {
                 };
                 match skills::install_marketplace_skill(self.config.profile_dir(), skill) {
                     Ok(()) => vec![
-                        AgentEvent::Status(format!("installed skill {}", skill.id)),
+                        AgentEvent::Status(format!("{verb} skill {}", skill.id)),
                         self.command_list_event(),
                     ],
                     Err(error) => vec![AgentEvent::Error(format!(
@@ -638,6 +698,42 @@ impl AgentCore {
             }
             Err(error) => vec![AgentEvent::Error(format!(
                 "failed to fetch skills marketplace: {error}"
+            ))],
+        }
+    }
+
+    fn uninstall_skill_events(&mut self, id: &str) -> Vec<AgentEvent> {
+        match skills::uninstall_skill(self.config.profile_dir(), id) {
+            Ok(true) => vec![
+                AgentEvent::Status(format!("uninstalled skill {id}")),
+                self.command_list_event(),
+            ],
+            Ok(false) => vec![AgentEvent::Error(format!(
+                "installed skill not found: {id}"
+            ))],
+            Err(error) => vec![AgentEvent::Error(format!(
+                "failed to uninstall skill {id}: {error}"
+            ))],
+        }
+    }
+
+    fn set_skill_enabled_events(&mut self, id: &str, enabled: bool) -> Vec<AgentEvent> {
+        if !skills::skill_installed(self.config.profile_dir(), id) {
+            return vec![AgentEvent::Error(format!(
+                "installed skill not found: {id}"
+            ))];
+        }
+        match skills::set_skill_enabled(self.config.profile_dir(), id, enabled) {
+            Ok(()) => vec![
+                AgentEvent::Status(format!(
+                    "{} skill {id}",
+                    if enabled { "enabled" } else { "disabled" }
+                )),
+                self.command_list_event(),
+            ],
+            Err(error) => vec![AgentEvent::Error(format!(
+                "failed to {} skill {id}: {error}",
+                if enabled { "enable" } else { "disable" }
             ))],
         }
     }
@@ -880,6 +976,32 @@ impl AgentCore {
         Some(events)
     }
 
+    fn mcp_prompt_command_events(
+        &mut self,
+        command: &str,
+        arguments: &str,
+    ) -> Option<Vec<AgentEvent>> {
+        let message = match self.mcp.run_prompt(command, arguments)? {
+            Ok(message) => message,
+            Err(error) => return Some(vec![AgentEvent::Error(error)]),
+        };
+        if self.running {
+            self.queued.push_back((message, Vec::new()));
+            return Some(vec![
+                AgentEvent::PendingMessages(self.pending_texts()),
+                AgentEvent::Status(format!("queued: {}", self.queued.len())),
+            ]);
+        }
+        let display = if arguments.is_empty() {
+            command.to_string()
+        } else {
+            format!("{command} {arguments}")
+        };
+        let mut events = vec![AgentEvent::UserMessage(display)];
+        events.extend(self.start_hooked_turn(message, Vec::new()));
+        Some(events)
+    }
+
     pub fn poll_events(&mut self) -> Vec<AgentEvent> {
         let mut events = Vec::new();
         let mut disconnected = false;
@@ -1057,11 +1179,13 @@ impl AgentCore {
         }
         events.extend(self.poll_goal_tool_requests());
         events.extend(self.poll_approval_requests());
+        self.mcp.refresh_changed();
         for message in self.mcp.drain_messages() {
             events.push(AgentEvent::Info(message));
         }
         if self.mcp.take_dirty() {
             events.push(self.mcp_servers_event());
+            events.push(self.command_list_event());
         }
         if self.should_generate_resume_summary() {
             self.start_resume_summary();
