@@ -183,6 +183,7 @@ pub struct Config {
     pub read_timeout_seconds: u64,
     pub compaction_threshold_percent: u64,
     pub include_project_instructions: bool,
+    pub encrypt_secrets: bool,
     pub approval_mode: ApprovalMode,
     /// Edit tools offered to the model (`edit_tools` in config.json).
     /// Canonical names: hashline_edit, str_replace (alias edit), write,
@@ -291,6 +292,7 @@ impl ModelConfig {
 pub struct AuthStore {
     keys: BTreeMap<String, String>,
     jucode: Option<JucodeTokens>,
+    encryption_key: Option<crate::secrets::SecretKey>,
     path: PathBuf,
 }
 
@@ -327,6 +329,7 @@ impl Config {
                 read_timeout_seconds: DEFAULT_READ_TIMEOUT_SECONDS,
                 compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
                 include_project_instructions: true,
+                encrypt_secrets: false,
                 approval_mode: ApprovalMode::default(),
                 edit_tools: default_edit_tools(),
                 enable_browser_open: true,
@@ -408,6 +411,7 @@ impl Config {
             )
             .clamp(10, 95),
             include_project_instructions: read_bool(&value, "include_project_instructions", true),
+            encrypt_secrets: read_bool(&value, "encrypt_secrets", false),
             approval_mode: read_approval_mode(&value)?,
             edit_tools: read_edit_tools(&value)?,
             enable_browser_open: read_bool(&value, "enable_browser_open", true),
@@ -441,6 +445,7 @@ impl Config {
             "read_timeout_seconds": self.read_timeout_seconds,
             "compaction_threshold_percent": self.compaction_threshold_percent,
             "include_project_instructions": self.include_project_instructions,
+            "encrypt_secrets": self.encrypt_secrets,
             "approval_mode": self.approval_mode.as_str(),
             "edit_tools": self.edit_tools,
             "enable_browser_open": self.enable_browser_open,
@@ -483,12 +488,17 @@ impl Config {
 }
 
 impl AuthStore {
-    pub fn load_or_create() -> io::Result<Self> {
+    pub fn load_or_create(encrypt_secrets: bool) -> io::Result<Self> {
         let path = auth_path()?;
         if !path.exists() {
             let auth = Self {
                 keys: BTreeMap::new(),
                 jucode: None,
+                encryption_key: if encrypt_secrets {
+                    crate::secrets::find_key()?
+                } else {
+                    None
+                },
                 path,
             };
             auth.save()?;
@@ -496,7 +506,13 @@ impl AuthStore {
         }
 
         let content = fs::read_to_string(&path)?;
-        let value = serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({}));
+        let mut value = serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({}));
+        let envelope_key = crate::secrets::reveal_auth(&mut value)?;
+        let encryption_key = match envelope_key {
+            Some(key) => Some(key),
+            None if encrypt_secrets => crate::secrets::find_key()?,
+            None => None,
+        };
         let mut keys = value
             .get("providers")
             .and_then(Value::as_object)
@@ -508,9 +524,12 @@ impl AuthStore {
         keys.remove("jucode");
         let jucode = value.get("jucode").and_then(read_jucode_tokens);
 
-        let auth = Self { keys, jucode, path };
-        auth.save()?;
-        Ok(auth)
+        Ok(Self {
+            keys,
+            jucode,
+            encryption_key,
+            path,
+        })
     }
 
     pub fn key_for(&self, provider: &str) -> Option<&str> {
@@ -558,6 +577,9 @@ impl AuthStore {
                     value["mcp_servers"] = tokens.clone();
                 }
             }
+        }
+        if let Some(key) = &self.encryption_key {
+            crate::secrets::protect_auth(&mut value, key)?;
         }
         fs::write(
             &self.path,
@@ -1283,6 +1305,7 @@ mod tests {
             read_timeout_seconds: DEFAULT_READ_TIMEOUT_SECONDS,
             compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
             include_project_instructions: true,
+            encrypt_secrets: false,
             approval_mode: ApprovalMode::default(),
             edit_tools: default_edit_tools(),
             enable_browser_open: true,
