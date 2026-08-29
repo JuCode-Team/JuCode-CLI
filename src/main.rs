@@ -890,10 +890,7 @@ mod tests {
             &mut pending,
         );
         queue_headless_denial(&AgentEvent::Connecting, &mut pending);
-        assert_eq!(
-            pending,
-            vec![("call_1".to_string(), "bash".to_string())]
-        );
+        assert_eq!(pending, vec![("call_1".to_string(), "bash".to_string())]);
     }
 
     #[test]
