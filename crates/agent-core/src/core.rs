@@ -14,8 +14,8 @@ use crate::{
         skill_message, skill_pin_message, PromptContext,
     },
     session::{
-        compaction_summary_item, ContextStatistics, EntryKind, SessionStore, SessionSummary,
-        ThreadGoal, ThreadGoalStatus,
+        compaction_summary_item, ContextStatistics, EntryKind, SessionLock, SessionStore,
+        SessionSummary, ThreadGoal, ThreadGoalStatus,
     },
     skills,
     subagents::SubagentManager,
@@ -107,9 +107,15 @@ pub struct AgentCore {
     config: Config,
     auth: AuthStore,
     session: SessionStore,
+    /// Held for the lifetime of the active session so a second process cannot
+    /// resume it and interleave journal appends. Released on session switch.
+    session_lock: Option<SessionLock>,
     profile_dir: PathBuf,
     cwd: PathBuf,
     queued: VecDeque<(String, Vec<String>)>,
+    /// Image paths staged with `/image <path>`; attached to (and drained by)
+    /// the next submitted user message.
+    pending_images: Vec<String>,
     running: bool,
     receiver: Option<Receiver<WorkerEvent>>,
     /// Dedicated channel for the idle resume-summary worker; kept separate from
@@ -163,13 +169,18 @@ impl AgentCore {
         // usable immediately and their tools appear once connected.
         let mcp = McpManager::default();
         mcp.start(&config.mcp_servers, &cwd);
+        let session = SessionStore::new();
+        // A fresh session id is unique, so this only fails on IO problems.
+        let session_lock = SessionLock::acquire(&profile_dir()?, &cwd, session.session_id()).ok();
         Ok(Self {
             config,
             auth: AuthStore::load_or_create()?,
-            session: SessionStore::new(),
+            session,
+            session_lock,
             profile_dir: profile_dir()?,
             cwd,
             queued: VecDeque::new(),
+            pending_images: Vec::new(),
             running: false,
             receiver: None,
             resume_summary_receiver: None,
@@ -313,6 +324,28 @@ impl AgentCore {
                     description: entry.description,
                 }),
         );
+        if let Ok(custom) = crate::custom_commands::discover_custom_commands(
+            self.config.profile_dir(),
+            &self.cwd,
+            self.project_trusted,
+        ) {
+            // Built-ins, skills, and MCP prompts win on name collisions; only add the rest.
+            let taken = commands
+                .iter()
+                .map(|existing| existing.command.clone())
+                .collect::<HashSet<_>>();
+            commands.extend(
+                custom
+                    .into_iter()
+                    .filter(|entry| !taken.contains(&entry.command))
+                    .map(|entry| CommandView {
+                        command: entry.command,
+                        marker: Some(if entry.project_scoped { "PROJ" } else { "CMD" }.to_string()),
+                        args: "[args]".to_string(),
+                        description: entry.description,
+                    }),
+            );
+        }
         AgentEvent::CommandList(commands)
     }
 
@@ -374,7 +407,11 @@ impl AgentCore {
         message: String,
         images: Vec<String>,
     ) -> Vec<AgentEvent> {
-        let (images, mut events) = self.validate_image_attachments(images);
+        // Images staged with /image ride along with the next message from any
+        // front-end (TUI, serve, acp), merged before explicit attachments.
+        let mut merged = std::mem::take(&mut self.pending_images);
+        merged.extend(images);
+        let (images, mut events) = self.validate_image_attachments(merged);
         if self.running {
             self.queued.push_back((message, images));
             events.push(AgentEvent::PendingMessages(self.pending_texts()));
@@ -472,6 +509,9 @@ impl AgentCore {
             return (false, events);
         }
         if !crate::commands::is_known(command) {
+            if let Some(events) = self.custom_command_events(command, args.trim()) {
+                return (false, events);
+            }
             return (
                 false,
                 vec![AgentEvent::Error(format!("unknown command: {command}"))],
@@ -575,6 +615,7 @@ impl AgentCore {
             "/doctor" => self.doctor_events(),
             "/skills" => self.skills_events(args.trim()),
             "/pin" => self.pin_skill_events(args.trim()),
+            "/image" => self.image_command_events(args.trim()),
             "/compact" => self.compact_command_events(),
             // Reached only if a command is registered in `commands::COMMANDS` but
             // has no dispatch arm here — a wiring bug, surfaced explicitly.
@@ -583,6 +624,34 @@ impl AgentCore {
             ))],
         };
         (false, events)
+    }
+
+    /// `/image <path>`: stage an image so it is attached to the next submitted
+    /// user message. Without an argument, lists what is currently staged.
+    fn image_command_events(&mut self, arg: &str) -> Vec<AgentEvent> {
+        let path = arg.trim().trim_matches('"').trim_matches('\'');
+        if path.is_empty() {
+            return if self.pending_images.is_empty() {
+                vec![AgentEvent::Info(
+                    "usage: /image <path> — attach an image to your next message".to_string(),
+                )]
+            } else {
+                vec![AgentEvent::Info(format!(
+                    "staged images (sent with your next message):\n{}",
+                    self.pending_images.join("\n")
+                ))]
+            };
+        }
+        match crate::tools::image_attachment_error(std::path::Path::new(path)) {
+            Some(error) => vec![AgentEvent::Error(format!("cannot attach {error}"))],
+            None => {
+                self.pending_images.push(path.to_string());
+                vec![AgentEvent::Info(format!(
+                    "attached {path}; it will be sent with your next message ({} staged)",
+                    self.pending_images.len()
+                ))]
+            }
+        }
     }
 
     fn skills_events(&mut self, arg: &str) -> Vec<AgentEvent> {
@@ -996,6 +1065,44 @@ impl AgentCore {
             command.to_string()
         } else {
             format!("{command} {arguments}")
+        };
+        let mut events = vec![AgentEvent::UserMessage(display)];
+        events.extend(self.start_hooked_turn(message, Vec::new()));
+        Some(events)
+    }
+
+    /// Dispatch a user-defined command from `~/.jucode/commands` or a trusted
+    /// project's `.jucode/commands`: the Markdown body becomes the user prompt.
+    fn custom_command_events(&mut self, command: &str, request: &str) -> Option<Vec<AgentEvent>> {
+        let commands = crate::custom_commands::discover_custom_commands(
+            self.config.profile_dir(),
+            &self.cwd,
+            self.project_trusted,
+        )
+        .ok()?;
+        let custom = commands
+            .into_iter()
+            .find(|entry| entry.command == command)?;
+        let message = match crate::custom_commands::command_message(&custom, request) {
+            Ok(message) => message,
+            Err(error) => {
+                return Some(vec![AgentEvent::Error(format!(
+                    "failed to read command file {}: {error}",
+                    custom.path.display()
+                ))])
+            }
+        };
+        if self.running {
+            self.queued.push_back((message, Vec::new()));
+            return Some(vec![
+                AgentEvent::PendingMessages(self.pending_texts()),
+                AgentEvent::Status(format!("queued: {}", self.queued.len())),
+            ]);
+        }
+        let display = if request.is_empty() {
+            command.to_string()
+        } else {
+            format!("{command} {request}")
         };
         let mut events = vec![AgentEvent::UserMessage(display)];
         events.extend(self.start_hooked_turn(message, Vec::new()));
@@ -2072,6 +2179,10 @@ impl AgentCore {
         self.resume_summary_receiver = None;
         self.resume_summary_running = false;
         self.session = SessionStore::new();
+        // Release the old session's lock and hold the new one.
+        self.session_lock = None;
+        self.session_lock =
+            SessionLock::acquire(&self.profile_dir, &self.cwd, self.session.session_id()).ok();
         let session_id = self.session.session_id().to_string();
         let save_event = self.save_session_event();
         vec![
@@ -2298,6 +2409,21 @@ impl AgentCore {
                 "cannot resume a session while a response is running".to_string(),
             )];
         }
+        if session_id == self.session.session_id() {
+            return vec![AgentEvent::Status(format!(
+                "already on session {session_id}"
+            ))];
+        }
+        // Take the target session's lock before loading so two processes can
+        // never resume (and append to) the same journal concurrently.
+        let lock = match SessionLock::acquire(&self.profile_dir, &self.cwd, session_id) {
+            Ok(lock) => lock,
+            Err(error) => {
+                return vec![AgentEvent::Error(format!(
+                    "cannot resume {session_id}: {error}"
+                ))]
+            }
+        };
         match SessionStore::load_for_cwd(&self.profile_dir, &self.cwd, session_id) {
             Ok(session) => {
                 self.queued.clear();
@@ -2310,6 +2436,8 @@ impl AgentCore {
                 self.turn_started_at = None;
                 self.turn_goal_tokens = 0;
                 self.session = session;
+                // Release the previous session's lock only after the switch.
+                self.session_lock = Some(lock);
                 vec![
                     AgentEvent::Transcript(self.session.transcript_items()),
                     AgentEvent::PendingMessages(Vec::new()),

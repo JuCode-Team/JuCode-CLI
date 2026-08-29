@@ -1,3 +1,5 @@
+mod acp;
+
 use jucode_agent_core::{AgentCore, AgentEvent, ApprovalMode};
 use jucode_tui::{TuiApp, TuiRuntime};
 use serde_json::{json, Value};
@@ -14,6 +16,7 @@ struct Runtime(AgentCore);
 #[derive(Default)]
 struct HeadlessStats {
     status: String,
+    approval_mode: String,
     input_tokens: u64,
     cached_input_tokens: u64,
     output_tokens: u64,
@@ -22,6 +25,7 @@ struct HeadlessStats {
     context_tokenizer: Option<String>,
     cost: f64,
     tool_calls: u64,
+    denied_approvals: u64,
     subagent_events: u64,
     assistant_chars: usize,
     last_error: Option<String>,
@@ -66,6 +70,12 @@ fn main() -> io::Result<()> {
         println!("jucode {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if args.iter().any(|a| a == "--help" || a == "-h")
+        || args.first().map(String::as_str) == Some("help")
+    {
+        print!("{}", help_text());
+        return Ok(());
+    }
     let approval_mode = match take_approval_mode_flag(&mut args) {
         Ok(mode) => mode,
         Err(error) => {
@@ -80,6 +90,10 @@ fn main() -> io::Result<()> {
     }
     if args.first().map(String::as_str) == Some("serve") {
         let code = run_serve(approval_mode)?;
+        std::process::exit(code);
+    }
+    if args.first().map(String::as_str) == Some("acp") {
+        let code = acp::run_acp(approval_mode)?;
         std::process::exit(code);
     }
     if args.first().map(String::as_str) == Some("providers") {
@@ -110,6 +124,39 @@ fn main() -> io::Result<()> {
     }
     core.start_update_check();
     TuiApp::new(Runtime(core)).run()
+}
+
+fn help_text() -> String {
+    format!(
+        "jucode {} — a lightweight terminal coding agent
+
+USAGE:
+    jucode [OPTIONS]                     start the interactive TUI
+    jucode --headless [PROMPT]           run one prompt non-interactively
+                                         (reads stdin when PROMPT is omitted;
+                                         emits JSONL events + final_result;
+                                         defaults to read-only, approvals are
+                                         auto-denied — pass --approval-mode
+                                         full-auto for unattended writes)
+    jucode serve                         newline-JSON protocol for GUI/IDE
+                                         front-ends (jucode's native schema)
+    jucode acp                           Agent Client Protocol (ACP v1)
+                                         JSON-RPC adapter over stdio, for
+                                         ACP-capable editors like Zed
+    jucode providers                     print built-in providers as JSON
+    jucode version                       print the version
+
+OPTIONS:
+    --approval-mode <read-only|auto-edit|full-auto>
+                                         tool approval mode for this run
+    -h, --help                           show this help
+    -V, --version                        print the version
+
+The TUI also supports: ! <cmd> (run a local shell command), @file mentions,
+/image <path> (attach an image), and custom commands from ~/.jucode/commands.
+",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// Extracts `--approval-mode <mode>` (or `--approval-mode=<mode>`) from `args`.
@@ -152,21 +199,23 @@ fn run_headless(args: Vec<String>, approval_mode: Option<ApprovalMode>) -> io::R
     }
     let mut core = AgentCore::new()?;
     let mut stdout = io::stdout();
-    for event in core.set_approval_mode(headless_approval_mode(approval_mode)) {
+    let mode = headless_approval_mode(approval_mode);
+    for event in core.set_approval_mode(mode) {
         write_event(&mut stdout, event)?;
     }
     let mut done = false;
-    let mut stats = HeadlessStats::default();
+    let mut stats = HeadlessStats {
+        approval_mode: mode.as_str().to_string(),
+        ..Default::default()
+    };
     let started = Instant::now();
-    let mut pending_denials = Vec::new();
+    let mut pending_denials: Vec<(String, String)> = Vec::new();
     for event in core.submit_user_message(prompt) {
         if matches!(event, AgentEvent::Error(_)) {
             done = true;
         }
-        if let AgentEvent::ApprovalRequest { call_id, name, .. } = &event {
-            pending_denials.push((call_id.clone(), name.clone()));
-        }
         record_headless_event(&event, &mut stats);
+        queue_headless_denial(&event, &mut pending_denials);
         write_event(&mut stdout, event)?;
     }
     auto_deny_approvals(&mut core, &mut stdout, &mut stats, &mut pending_denials)?;
@@ -178,10 +227,8 @@ fn run_headless(args: Vec<String>, approval_mode: Option<ApprovalMode>) -> io::R
             {
                 done = true;
             }
-            if let AgentEvent::ApprovalRequest { call_id, name, .. } = &event {
-                pending_denials.push((call_id.clone(), name.clone()));
-            }
             record_headless_event(&event, &mut stats);
+            queue_headless_denial(&event, &mut pending_denials);
             write_event(&mut stdout, event)?;
         }
         auto_deny_approvals(&mut core, &mut stdout, &mut stats, &mut pending_denials)?;
@@ -209,6 +256,7 @@ fn auto_deny_approvals(
     pending: &mut Vec<(String, String)>,
 ) -> io::Result<()> {
     for (call_id, name) in pending.drain(..) {
+        stats.denied_approvals += 1;
         let info = AgentEvent::Info(format!(
             "auto-denying {name} ({call_id}): approvals cannot be answered in --headless mode; rerun with --approval-mode auto-edit or full-auto to allow this class of tools"
         ));
@@ -220,6 +268,13 @@ fn auto_deny_approvals(
         }
     }
     Ok(())
+}
+
+/// Queues an approval request for auto-denial so headless can never hang on one.
+fn queue_headless_denial(event: &AgentEvent, pending_denials: &mut Vec<(String, String)>) {
+    if let AgentEvent::ApprovalRequest { call_id, name, .. } = event {
+        pending_denials.push((call_id.clone(), name.clone()));
+    }
 }
 
 /// Persistent bidirectional protocol mode for GUI/IDE front-ends.
@@ -524,6 +579,8 @@ fn final_result_json(stats: &HeadlessStats, elapsed_ms: u64) -> Value {
     json!({
         "type": "final_result",
         "status": stats.status,
+        "approval_mode": stats.approval_mode,
+        "denied_approvals": stats.denied_approvals,
         "input_tokens": stats.input_tokens,
         "cached_input_tokens": stats.cached_input_tokens,
         "output_tokens": stats.output_tokens,
@@ -783,6 +840,7 @@ mod tests {
     fn final_result_contains_status_and_usage() {
         let mut stats = HeadlessStats {
             status: "ready".to_string(),
+            approval_mode: "read-only".to_string(),
             ..Default::default()
         };
         stats.input_tokens = 12;
@@ -790,11 +848,14 @@ mod tests {
         stats.reasoning_tokens = 4;
         stats.context_tokens = 99;
         stats.tool_calls = 3;
+        stats.denied_approvals = 1;
         stats.subagent_events = 2;
 
         let value = final_result_json(&stats, 123);
         assert_eq!(value["type"], "final_result");
         assert_eq!(value["status"], "ready");
+        assert_eq!(value["approval_mode"], "read-only");
+        assert_eq!(value["denied_approvals"], 1);
         assert_eq!(value["input_tokens"], 12);
         assert_eq!(value["cached_input_tokens"], 0);
         assert_eq!(value["context_tokens"], 99);
@@ -812,6 +873,26 @@ mod tests {
         assert_eq!(
             headless_approval_mode(Some(ApprovalMode::FullAuto)),
             ApprovalMode::FullAuto
+        );
+    }
+
+    #[test]
+    fn approval_requests_are_queued_for_headless_denial() {
+        let mut pending = Vec::new();
+        queue_headless_denial(
+            &AgentEvent::ApprovalRequest {
+                call_id: "call_1".to_string(),
+                name: "bash".to_string(),
+                summary: "rm -rf".to_string(),
+                subagent_id: None,
+                hunks: None,
+            },
+            &mut pending,
+        );
+        queue_headless_denial(&AgentEvent::Connecting, &mut pending);
+        assert_eq!(
+            pending,
+            vec![("call_1".to_string(), "bash".to_string())]
         );
     }
 

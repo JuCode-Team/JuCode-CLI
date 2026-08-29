@@ -802,14 +802,22 @@ impl SessionStore {
     // Saving must not bump `updated_at`: every content mutation already does,
     // and bumping here would re-arm the idle resume-summary generator after
     // each summary save, looping it forever.
+    //
+    // Crash safety: the journal append is followed by fsync so acknowledged
+    // records survive power loss; a torn tail from a previous crash is sealed
+    // with a newline before appending so the next record starts clean; the
+    // summary sidecar is written via temp-file + rename so it is always either
+    // the old or the new version, never a partial file.
     pub fn save_for_cwd(&mut self, profile_dir: &Path, cwd: &Path) -> io::Result<()> {
         let dir = sessions_dir(profile_dir, cwd);
         fs::create_dir_all(&dir)?;
         let journal_path = dir.join(format!("{}.jsonl", self.session_id));
         let mut journal = fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&journal_path)?;
+        seal_torn_tail(&mut journal)?;
         if self.needs_snapshot || self.persisted_entries > self.entries.len() {
             write_json_line(
                 &mut journal,
@@ -827,13 +835,14 @@ impl SessionStore {
             &mut journal,
             &json!({ "type": "state", "state": self.state_json() }),
         )?;
+        journal.sync_all()?;
         self.persisted_entries = self.entries.len();
         self.needs_snapshot = false;
 
         let summary_path = dir.join(format!("{}.json", self.session_id));
-        fs::write(
-            summary_path,
-            format!("{}\n", serde_json::to_string_pretty(&self.summary_json())?),
+        write_atomically(
+            &summary_path,
+            format!("{}\n", serde_json::to_string_pretty(&self.summary_json())?).as_bytes(),
         )
     }
 
@@ -1077,11 +1086,19 @@ impl SessionStore {
         Ok(store)
     }
 
+    /// Replays a session journal. A crash can leave the final line truncated
+    /// (an interrupted append); unparseable lines are skipped so recovery keeps
+    /// every complete record and loses at most that torn tail.
     fn load_from_journal(path: &Path) -> io::Result<Self> {
         let content = fs::read_to_string(path)?;
         let mut store = SessionStore::new();
         for line in content.lines().filter(|line| !line.trim().is_empty()) {
             let Ok(record) = serde_json::from_str::<Value>(line) else {
+                crate::log_warn!(
+                    "session",
+                    "skipping unparseable journal line (torn tail recovery)",
+                    journal = path.display().to_string()
+                );
                 continue;
             };
             match record.get("type").and_then(Value::as_str) {
@@ -1219,6 +1236,112 @@ impl SessionStore {
 fn write_json_line(file: &mut fs::File, value: &Value) -> io::Result<()> {
     serde_json::to_writer(&mut *file, value)?;
     file.write_all(b"\n")
+}
+
+/// If a previous process crashed mid-append the journal can end in a partial
+/// record without a trailing newline. Appending straight after it would fuse
+/// the partial record with the next one, corrupting both; writing a newline
+/// first confines the damage to the already-lost partial line.
+fn seal_torn_tail(journal: &mut fs::File) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let len = journal.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    journal.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    journal.read_exact(&mut last)?;
+    if last[0] != b'\n' {
+        journal.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+/// Write `contents` to `path` via a temp file + fsync + rename, so readers
+/// (and post-crash recovery) only ever see the old or the new full contents.
+fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+    {
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+    }
+    fs::rename(&temp, path)
+}
+
+/// A cooperative single-writer lock over one session's journal, preventing two
+/// processes from resuming (and appending to) the same session concurrently.
+/// The lock file records the owning pid; a lock whose pid is no longer alive
+/// is reclaimed automatically. Dropped locks delete the file.
+#[derive(Debug)]
+pub struct SessionLock {
+    path: PathBuf,
+}
+
+impl SessionLock {
+    pub fn acquire(profile_dir: &Path, cwd: &Path, session_id: &str) -> Result<Self, String> {
+        let dir = sessions_dir(profile_dir, cwd);
+        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let path = dir.join(format!("{session_id}.lock"));
+        for attempt in 0..2 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    let _ = writeln!(file, "{}", json!({ "pid": std::process::id() }));
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let holder_pid = fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|content| serde_json::from_str::<Value>(content.trim()).ok())
+                        .and_then(|value| value.get("pid").and_then(Value::as_u64));
+                    match holder_pid {
+                        Some(pid) if attempt == 0 && !process_is_alive(pid) => {
+                            // Stale lock from a crashed process: reclaim it.
+                            let _ = fs::remove_file(&path);
+                            continue;
+                        }
+                        _ => {
+                            return Err(format!(
+                                "session {session_id} is already open{}; close it first or delete {} if stale",
+                                holder_pid
+                                    .map(|pid| format!(" by pid {pid}"))
+                                    .unwrap_or_default(),
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err(format!(
+            "session {session_id} is already open; delete {} if stale",
+            path.display()
+        ))
+    }
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Best-effort liveness probe for a lock-holder pid. On Linux this consults
+/// /proc; where /proc is unavailable the holder is assumed alive (the user is
+/// told which file to delete if the lock is actually stale).
+fn process_is_alive(pid: u64) -> bool {
+    let proc_root = Path::new("/proc");
+    if proc_root.exists() {
+        return proc_root.join(pid.to_string()).exists();
+    }
+    true
 }
 
 /// Drop tool-call items that would be invalid input: a `function_call_output`
@@ -1738,6 +1861,119 @@ pub fn extract_response_text(item: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_profile(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "jucode-session-test-{tag}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn truncated_journal_last_line_recovers_complete_records() {
+        let root = temp_profile("truncated");
+        let profile = root.join("profile");
+        let cwd = root.join("cwd");
+        let mut session = SessionStore::new();
+        session.append(EntryKind::User {
+            content: "first".to_string(),
+        });
+        session.append(EntryKind::User {
+            content: "second".to_string(),
+        });
+        session.save_for_cwd(&profile, &cwd).unwrap();
+        let session_id = session.session_id().to_string();
+
+        // Simulate a crash mid-append: a torn record without trailing newline.
+        let journal = sessions_dir(&profile, &cwd).join(format!("{session_id}.jsonl"));
+        let mut content = fs::read(&journal).unwrap();
+        content.extend_from_slice(br#"{"type":"entry","entry":{"id":99,"ki"#);
+        fs::write(&journal, content).unwrap();
+
+        let recovered = SessionStore::load_for_cwd(&profile, &cwd, &session_id).unwrap();
+        assert_eq!(recovered.entries.len(), 2);
+        assert_eq!(recovered.session_id(), session_id);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn torn_tail_is_sealed_so_the_next_append_stays_parseable() {
+        let root = temp_profile("seal");
+        let profile = root.join("profile");
+        let cwd = root.join("cwd");
+        let mut session = SessionStore::new();
+        session.append(EntryKind::User {
+            content: "kept".to_string(),
+        });
+        session.save_for_cwd(&profile, &cwd).unwrap();
+        let session_id = session.session_id().to_string();
+
+        // Crash mid-append: cut the final record in half (no trailing newline).
+        let journal = sessions_dir(&profile, &cwd).join(format!("{session_id}.jsonl"));
+        let content = fs::read(&journal).unwrap();
+        fs::write(&journal, &content[..content.len() - 10]).unwrap();
+
+        // The next save must not fuse its first record with the torn tail.
+        session.append(EntryKind::User {
+            content: "after-crash".to_string(),
+        });
+        session.save_for_cwd(&profile, &cwd).unwrap();
+
+        let recovered = SessionStore::load_for_cwd(&profile, &cwd, &session_id).unwrap();
+        let contents = recovered
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::User { content } => Some(content.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(contents.contains(&"kept".to_string()));
+        assert!(contents.contains(&"after-crash".to_string()));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_lock_blocks_second_holder_until_released() {
+        let root = temp_profile("lock");
+        let profile = root.join("profile");
+        let cwd = root.join("cwd");
+
+        let lock = SessionLock::acquire(&profile, &cwd, "s1").unwrap();
+        let error = SessionLock::acquire(&profile, &cwd, "s1").unwrap_err();
+        assert!(error.contains("already open"), "{error}");
+        assert!(error.contains(&std::process::id().to_string()), "{error}");
+
+        drop(lock);
+        let reacquired = SessionLock::acquire(&profile, &cwd, "s1");
+        assert!(reacquired.is_ok());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_lock_reclaims_stale_lock_from_dead_pid() {
+        if !Path::new("/proc").exists() {
+            return; // liveness probe requires /proc; skip elsewhere
+        }
+        let root = temp_profile("stale");
+        let profile = root.join("profile");
+        let cwd = root.join("cwd");
+        let dir = sessions_dir(&profile, &cwd);
+        fs::create_dir_all(&dir).unwrap();
+        // Pid values this large cannot exist (pid_max caps far lower).
+        fs::write(dir.join("s2.lock"), "{\"pid\":4294900000}\n").unwrap();
+
+        let lock = SessionLock::acquire(&profile, &cwd, "s2");
+        assert!(lock.is_ok());
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn appending_after_switch_creates_branch_without_rewriting_history() {

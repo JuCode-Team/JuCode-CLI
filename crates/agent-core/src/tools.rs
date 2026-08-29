@@ -3278,6 +3278,89 @@ fn deepest_canonical_ancestor(path: &Path) -> (PathBuf, PathBuf) {
     (path.to_path_buf(), PathBuf::new())
 }
 
+/// Checks whether a mutating tool call targets a path outside `root` (used to
+/// confine subagent writes to their isolated workspace). Returns a description
+/// of the violation, or None when the call is allowed. Read-only tools and
+/// tools without static path arguments (bash) always pass; bash isolation
+/// relies on the workspace being the child's cwd plus approval gating.
+pub(crate) fn write_target_escapes_root(
+    name: &str,
+    arguments: &str,
+    cwd: &Path,
+    root: &Path,
+) -> Option<String> {
+    let args = serde_json::from_str::<Value>(arguments).ok()?;
+    match name {
+        "write" | "str_replace" | "edit" | "hashline_edit" => {
+            let path = args.get("path").and_then(Value::as_str)?;
+            let resolved = normalize_lexically(&resolve_path(cwd, path));
+            if resolved.starts_with(normalize_lexically(root)) {
+                None
+            } else {
+                Some(format!("{name} targets {} outside the workspace", path))
+            }
+        }
+        "apply_patch" => {
+            let patch = args.get("patch").and_then(Value::as_str)?;
+            patch_escapes_workdir(patch)
+                .map(|path| format!("apply_patch touches {path} outside the workspace"))
+        }
+        _ => None,
+    }
+}
+
+/// Lexically resolves `.` and `..` components without touching the filesystem
+/// (targets may not exist yet). `..` at the root is kept, which can only make
+/// containment checks stricter.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push("..");
+                }
+            }
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
+/// A patch applied with `git apply` in the workspace cwd can only escape via
+/// absolute paths or `..` traversal in its file headers; flag either.
+fn patch_escapes_workdir(patch: &str) -> Option<String> {
+    for line in patch.lines() {
+        let path = if let Some(rest) = line.strip_prefix("+++ ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("rename to ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("rename from ") {
+            rest
+        } else {
+            continue;
+        };
+        let path = path
+            .trim()
+            .trim_start_matches("a/")
+            .trim_start_matches("b/");
+        if path == "/dev/null" {
+            continue;
+        }
+        if Path::new(path).is_absolute()
+            || Path::new(path)
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
 fn expand_tilde(path: &str) -> PathBuf {
     if path != "~" && !path.starts_with("~/") {
         return PathBuf::from(path);
@@ -3296,6 +3379,87 @@ fn expand_tilde(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_root_guard_blocks_targets_outside_workspace() {
+        let root = Path::new("/work/.jucode/agents/worker-1");
+
+        // Relative writes inside the workspace pass.
+        assert!(write_target_escapes_root(
+            "write",
+            &json!({ "path": "src/new.rs", "content": "x" }).to_string(),
+            root,
+            root
+        )
+        .is_none());
+
+        // Absolute writes into the parent tree are blocked.
+        let violation = write_target_escapes_root(
+            "write",
+            &json!({ "path": "/work/src/main.rs", "content": "x" }).to_string(),
+            root,
+            root,
+        );
+        assert!(violation.unwrap().contains("outside the workspace"));
+
+        // `..` traversal out of the workspace is blocked lexically.
+        let violation = write_target_escapes_root(
+            "str_replace",
+            &json!({ "path": "../../../src/main.rs", "edits": [] }).to_string(),
+            root,
+            root,
+        );
+        assert!(violation.unwrap().contains("outside the workspace"));
+
+        // Read-only tools are never gated.
+        assert!(write_target_escapes_root(
+            "read",
+            &json!({ "path": "/work/src/main.rs" }).to_string(),
+            root,
+            root
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn write_root_guard_blocks_escaping_patches() {
+        let root = Path::new("/work/.jucode/agents/worker-1");
+        let safe = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        assert!(write_target_escapes_root(
+            "apply_patch",
+            &json!({ "patch": safe }).to_string(),
+            root,
+            root
+        )
+        .is_none());
+
+        let absolute = "--- /work/src/lib.rs\n+++ /work/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        assert!(write_target_escapes_root(
+            "apply_patch",
+            &json!({ "patch": absolute }).to_string(),
+            root,
+            root
+        )
+        .is_some());
+
+        let traversal = "--- a/../escape.rs\n+++ b/../escape.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        assert!(write_target_escapes_root(
+            "apply_patch",
+            &json!({ "patch": traversal }).to_string(),
+            root,
+            root
+        )
+        .is_some());
+
+        let new_file = "--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1 @@\n+a\n";
+        assert!(write_target_escapes_root(
+            "apply_patch",
+            &json!({ "patch": new_file }).to_string(),
+            root,
+            root
+        )
+        .is_none());
+    }
 
     #[test]
     fn browser_open_definition_matches_tool_name_and_schema() {

@@ -327,6 +327,7 @@ fn model_and_tokens_render_below_input_without_ready_status() {
                 provider: "openai",
                 model: "gpt-5",
                 reasoning_effort: "medium",
+                git: None,
                 context_tokens: 12_345,
                 context_window: 400_000,
                 cost: 0.0,
@@ -415,6 +416,7 @@ fn colored_status_line_does_not_wrap_at_visible_width() {
                 provider: "jucode",
                 model: "claude-opus-4.7",
                 reasoning_effort: "high",
+                git: None,
                 context_tokens: 1633,
                 context_window: 400_000,
                 cost: 0.0,
@@ -992,6 +994,7 @@ fn projection_only_indents_text_not_ui_elements() {
                 provider: "jucode",
                 model: "gpt-5",
                 reasoning_effort: "medium",
+                git: None,
                 context_tokens: 10,
                 context_window: 100,
                 cost: 0.0,
@@ -1351,6 +1354,172 @@ fn shift_tab_effort_cycle_wraps() {
     assert_eq!(next_reasoning_effort(&efforts, "low"), "medium");
     assert_eq!(next_reasoning_effort(&efforts, "medium"), "none");
     assert_eq!(next_reasoning_effort(&efforts, "unknown"), "none");
+}
+
+#[test]
+fn bang_input_runs_locally_and_never_reaches_the_model() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.input.push_text("!echo tui-local-shell");
+    app.handle_key_at(KeyCode::Enter, KeyModifiers::empty(), Instant::now());
+
+    assert!(app.runtime.submitted.is_empty(), "must not go to the model");
+    assert!(app.runtime.commands.is_empty());
+    assert!(app.input.text().is_empty());
+    assert!(app
+        .state
+        .chat
+        .iter()
+        .any(|line| matches!(line, ChatLine::User(text) if text == "!echo tui-local-shell")));
+    assert!(app.state.chat.iter().any(|line| matches!(
+        line,
+        ChatLine::Tool { name, running: true, .. } if name == "! echo tui-local-shell"
+    )));
+
+    let mut finished = false;
+    for _ in 0..300 {
+        for result in app.local_shell.poll() {
+            app.state.finish_local_shell(result);
+        }
+        if app.state.chat.iter().any(|line| {
+            matches!(
+                line,
+                ChatLine::Tool { output, running: false, .. } if output.contains("tui-local-shell")
+            )
+        }) {
+            finished = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(finished, "local shell output never landed in history");
+}
+
+#[test]
+fn lone_bang_submits_as_a_regular_message() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.input.push_text("!");
+    app.handle_key_at(KeyCode::Enter, KeyModifiers::empty(), Instant::now());
+    assert_eq!(app.runtime.submitted, vec!["!".to_string()]);
+}
+
+#[test]
+fn at_mention_tab_completes_top_ranked_file() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.state.file_index = Some(vec![
+        "docs/main-notes.md".to_string(),
+        "src/main.rs".to_string(),
+    ]);
+    app.input.push_text("look at @main");
+
+    app.handle_key_at(KeyCode::Tab, KeyModifiers::empty(), Instant::now());
+
+    assert_eq!(app.input.text(), "look at @src/main.rs ");
+    assert!(app.runtime.submitted.is_empty());
+}
+
+#[test]
+fn at_mention_enter_completes_instead_of_submitting() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.state.file_index = Some(vec!["src/main.rs".to_string()]);
+    app.input.push_text("@ma");
+
+    app.handle_key_at(KeyCode::Enter, KeyModifiers::empty(), Instant::now());
+    assert_eq!(app.input.text(), "@src/main.rs ");
+    assert!(app.runtime.submitted.is_empty());
+
+    // Second Enter submits the completed message.
+    app.input.push_text("please review");
+    app.handle_key_at(KeyCode::Enter, KeyModifiers::empty(), Instant::now());
+    assert_eq!(
+        app.runtime.submitted,
+        vec!["@src/main.rs please review".to_string()]
+    );
+}
+
+#[test]
+fn at_mention_arrow_keys_cycle_candidates() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.state.file_index = Some(vec![
+        "src/main.rs".to_string(),
+        "src/maintenance.rs".to_string(),
+    ]);
+    app.input.push_text("@main");
+
+    app.handle_key_at(KeyCode::Down, KeyModifiers::empty(), Instant::now());
+    app.handle_key_at(KeyCode::Tab, KeyModifiers::empty(), Instant::now());
+
+    assert_eq!(app.input.text(), "@src/maintenance.rs ");
+}
+
+#[test]
+fn exact_mention_path_submits_on_enter() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.state.file_index = Some(vec!["src/main.rs".to_string()]);
+    app.input.push_text("@src/main.rs");
+
+    app.handle_key_at(KeyCode::Enter, KeyModifiers::empty(), Instant::now());
+
+    assert_eq!(app.runtime.submitted, vec!["@src/main.rs".to_string()]);
+}
+
+#[test]
+fn pasted_image_path_is_attached_not_inserted() {
+    let dir = std::env::temp_dir().join(format!(
+        "jucode-tui-image-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("shot.png");
+    std::fs::write(&path, b"fake png bytes").unwrap();
+
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.handle_paste(&path.display().to_string());
+    assert_eq!(
+        app.runtime.commands,
+        vec![format!("/image {}", path.display())]
+    );
+    assert!(app.input.text().is_empty());
+
+    // Quoted drag-and-drop form also resolves.
+    app.handle_paste(&format!("\"{}\"", path.display()));
+    assert_eq!(app.runtime.commands.len(), 2);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn pasted_non_image_text_stays_in_input() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.handle_paste("notes.txt and some text");
+    assert_eq!(app.input.text(), "notes.txt and some text");
+    assert!(app.runtime.commands.is_empty());
+}
+
+#[test]
+fn bottom_status_shows_git_branch_with_dirty_marker() {
+    let dirty = crate::git_bar::GitStatus {
+        branch: "main".to_string(),
+        dirty: true,
+    };
+    let document = UiBuilder::new()
+        .bottom_status(
+            BottomStatus {
+                provider: "p",
+                model: "m",
+                reasoning_effort: "low",
+                git: Some(&dirty),
+                context_tokens: 1,
+                context_window: 100,
+                cost: 0.0,
+            },
+            64,
+        )
+        .finish();
+    let line = strip_ansi(&document.controls.last().unwrap().text);
+    assert!(line.starts_with("p / m (low) main*"), "{line}");
 }
 
 trait TestUiBuilderExt {

@@ -1,4 +1,6 @@
 use super::*;
+use crate::git_bar::GitStatus;
+use crate::local_shell::LocalShellResult;
 
 pub(super) struct TuiState {
     pub(super) chat: Vec<ChatLine>,
@@ -25,6 +27,11 @@ pub(super) struct TuiState {
     pub(super) queued_approvals: Vec<(String, String, String)>,
     pub(super) pending_messages: Vec<String>,
     pub(super) reset_screen: bool,
+    /// Latest git branch/dirty reading for the bottom bar (None outside a repo).
+    pub(super) git_status: Option<GitStatus>,
+    /// Lazily-built project file list backing the `@` mention picker.
+    pub(super) file_index: Option<Vec<String>>,
+    cwd: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -59,6 +66,9 @@ impl Default for TuiState {
             queued_approvals: Vec::new(),
             pending_messages: Vec::new(),
             reset_screen: false,
+            git_status: None,
+            file_index: None,
+            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         }
     }
 }
@@ -74,7 +84,7 @@ impl TuiState {
         // collide with it.
         let content_width = padded_content_width(width).saturating_sub(1).max(1);
         let control_width = width.max(1);
-        let command_matches = self.command_matches(input);
+        let completion_rows = self.completion_rows(input);
         let input_display = input.render(!self.activity.is_active());
         let rendered_history_lines = self.rendered_history_lines(content_width);
         UiBuilder::new()
@@ -83,12 +93,13 @@ impl TuiState {
             .picker(self.picker_view.as_ref())
             .pending_messages(&self.pending_messages)
             .progress(&self.activity, self.thinking_tokens, now, control_width)
-            .input(&input_display, &command_matches, self.completion_index)
+            .input(&input_display, &completion_rows, self.completion_index)
             .bottom_status(
                 BottomStatus {
                     provider: &self.provider,
                     model: &self.model,
                     reasoning_effort: &self.reasoning_effort,
+                    git: self.git_status.as_ref(),
                     context_tokens: self.current_context_tokens,
                     context_window: self.context_window,
                     cost: self.current_cost,
@@ -144,7 +155,7 @@ impl TuiState {
     }
 
     pub(super) fn clamp_completion_index(&mut self, input: &InputBuffer) {
-        let count = self.command_matches(input).len();
+        let count = self.completion_rows(input).len();
         if count == 0 {
             self.completion_index = 0;
         } else if self.completion_index >= count {
@@ -159,6 +170,63 @@ impl TuiState {
             input.push_text(&command.command);
             input.push_char(' ');
             self.completion_index = 0;
+        }
+    }
+
+    /// Rows for the completion list under the input: slash-command matches
+    /// when typing a command, `@` file mentions otherwise.
+    pub(super) fn completion_rows(&mut self, input: &InputBuffer) -> Vec<CommandCandidate> {
+        let commands = self.command_matches(input);
+        if !commands.is_empty() {
+            return commands;
+        }
+        self.mention_matches(input)
+            .into_iter()
+            .map(|path| CommandCandidate {
+                command: format!("@{path}"),
+                marker: None,
+            })
+            .collect()
+    }
+
+    /// Fuzzy file matches for an `@token` ending at the cursor. Builds the
+    /// project file index on first use.
+    pub(super) fn mention_matches(&mut self, input: &InputBuffer) -> Vec<String> {
+        let tail = input.tail_chars_before_cursor();
+        let Some((_, query)) = crate::mention::mention_token(&tail) else {
+            return Vec::new();
+        };
+        let files = self
+            .file_index
+            .get_or_insert_with(|| crate::mention::list_project_files(&self.cwd));
+        crate::mention::fuzzy_filter(files, &query, crate::mention::MAX_MENTION_MATCHES)
+    }
+
+    pub(super) fn begin_local_shell(&mut self, call_id: &str, command: &str) {
+        self.chat.push(ChatLine::User(format!("!{command}")));
+        self.upsert_tool(
+            call_id.to_string(),
+            format!("! {command}"),
+            String::new(),
+            true,
+        );
+    }
+
+    pub(super) fn finish_local_shell(&mut self, result: LocalShellResult) {
+        if let Some(ChatLine::Tool {
+            output, running, ..
+        }) = self.chat.iter_mut().find(|line| {
+            matches!(
+                line,
+                ChatLine::Tool {
+                    call_id: Some(existing),
+                    ..
+                } if existing == &result.call_id
+            )
+        }) {
+            *output = result.output;
+            *running = false;
+            self.mark_history_dirty();
         }
     }
 }

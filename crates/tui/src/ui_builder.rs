@@ -378,8 +378,11 @@ impl UiBuilder {
             (status.context_tokens as f64 / status.context_window as f64 * 100.0).min(100.0)
         };
         let plain_left = format!(
-            "{} / {} ({})",
-            status.provider, status.model, status.reasoning_effort
+            "{} / {} ({}){}",
+            status.provider,
+            status.model,
+            status.reasoning_effort,
+            crate::git_bar::format_git_segment(status.git)
         );
         let cost = if status.cost > 0.0 {
             format!(" | ${:.4}", status.cost)

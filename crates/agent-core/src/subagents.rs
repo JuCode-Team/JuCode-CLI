@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, VecDeque},
+    path::{Path, PathBuf},
+    process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex,
@@ -10,6 +12,127 @@ use std::{
 
 pub(crate) const MAX_LIVE_SUBAGENTS: usize = 4;
 pub(crate) const MAX_SUBAGENT_DEPTH: u64 = 2;
+const MAX_HARVEST_FILES: usize = 200;
+
+/// An isolated working directory for one subagent. Subagent file writes are
+/// confined here so a child can never freely overwrite the parent's cwd files;
+/// the parent harvests results explicitly (reads files, or applies a diff).
+#[derive(Debug, Clone)]
+pub(crate) struct SubagentWorkspace {
+    pub root: PathBuf,
+    /// True when the workspace is a detached git worktree of the parent repo
+    /// (full file view, isolated writes); false for a fresh empty directory.
+    pub from_git: bool,
+}
+
+/// Prepares the isolated workspace for a subagent under
+/// `<parent_cwd>/.jucode/agents/<task>-<millis>`. Inside a git repository this
+/// is a detached `git worktree` (the child sees the committed tree and its
+/// writes stay in the worktree); outside a repository it is a fresh directory
+/// (the child reads the parent tree via absolute paths but writes only here).
+pub(crate) fn prepare_workspace(
+    parent_cwd: &Path,
+    task_name: &str,
+) -> Result<SubagentWorkspace, String> {
+    let root = parent_cwd
+        .join(".jucode")
+        .join("agents")
+        .join(format!("{task_name}-{}", now_ms()));
+    if root.exists() {
+        return Err(format!(
+            "subagent workspace already exists: {}",
+            root.display()
+        ));
+    }
+    if let Some(parent) = root.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+    if in_git_repository(parent_cwd) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(parent_cwd)
+            .args(["worktree", "add", "--detach"])
+            .arg(&root)
+            .output()
+            .map_err(|error| format!("failed to run git worktree add: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git worktree add failed for subagent workspace {}: {}",
+                root.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(SubagentWorkspace {
+            root,
+            from_git: true,
+        })
+    } else {
+        std::fs::create_dir_all(&root)
+            .map_err(|error| format!("failed to create {}: {error}", root.display()))?;
+        Ok(SubagentWorkspace {
+            root,
+            from_git: false,
+        })
+    }
+}
+
+fn in_git_repository(cwd: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Files the subagent changed inside its workspace, for the parent to harvest.
+/// Worktrees ask git (modified + untracked, gitignore-aware); plain directories
+/// list every file (the child started from an empty dir). Capped to keep the
+/// tool result bounded.
+pub(crate) fn changed_files(workspace: &SubagentWorkspace) -> Vec<String> {
+    if workspace.from_git {
+        let Ok(output) = Command::new("git")
+            .arg("-C")
+            .arg(&workspace.root)
+            .args(["status", "--porcelain", "--no-renames"])
+            .output()
+        else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.get(3..).map(str::to_string))
+            .take(MAX_HARVEST_FILES)
+            .collect()
+    } else {
+        let mut files = Vec::new();
+        collect_files(&workspace.root, &workspace.root, &mut files);
+        files.truncate(MAX_HARVEST_FILES);
+        files
+    }
+}
+
+fn collect_files(root: &Path, dir: &Path, files: &mut Vec<String>) {
+    if files.len() >= MAX_HARVEST_FILES {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(root, &path, files);
+        } else if let Ok(relative) = path.strip_prefix(root) {
+            files.push(relative.display().to_string());
+        }
+        if files.len() >= MAX_HARVEST_FILES {
+            return;
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SubagentStatus {
@@ -58,7 +181,7 @@ pub(crate) struct SubagentSlot {
     pub interrupt_flag: Arc<AtomicBool>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct SubagentRunResult {
     pub summary: String,
     pub partial_output: String,
@@ -69,6 +192,11 @@ pub(crate) struct SubagentRunResult {
     pub output_tokens: u64,
     pub elapsed_ms: u64,
     pub model: String,
+    /// Isolated workspace the agent wrote into (empty when spawn failed before
+    /// workspace creation). The parent harvests changes from here.
+    pub workdir: String,
+    /// Workspace-relative paths the agent created or modified.
+    pub files_changed: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +241,8 @@ struct SubagentRecord {
     error: Option<String>,
     started_at_ms: u64,
     completed_at_ms: Option<u64>,
+    /// Isolated workspace path once prepared; None until then.
+    workdir: Option<String>,
 }
 
 impl SubagentManager {
@@ -154,6 +284,7 @@ impl SubagentManager {
                 error: None,
                 started_at_ms: now_ms(),
                 completed_at_ms: None,
+                workdir: None,
             },
         );
         state.push_event(&path, "pending", "reserved");
@@ -162,6 +293,13 @@ impl SubagentManager {
             path,
             interrupt_flag,
         })
+    }
+
+    pub(crate) fn set_workdir(&self, path: &str, workdir: &str) {
+        let mut state = self.inner.state.lock().unwrap();
+        if let Some(agent) = state.agents.get_mut(path) {
+            agent.workdir = Some(workdir.to_string());
+        }
     }
 
     pub(crate) fn mark_running(&self, path: &str) {
@@ -480,6 +618,7 @@ fn agent_json(agent: &SubagentRecord) -> Value {
         "message": agent.message,
         "started_at_ms": agent.started_at_ms,
         "completed_at_ms": agent.completed_at_ms,
+        "workdir": agent.workdir,
         "result": agent.result.as_ref().map(result_json),
     })
 }
@@ -511,6 +650,8 @@ fn result_json(result: &SubagentRunResult) -> Value {
         "output_tokens": result.output_tokens,
         "elapsed_ms": result.elapsed_ms,
         "model": result.model,
+        "workdir": result.workdir,
+        "files_changed": result.files_changed,
     })
 }
 
@@ -597,13 +738,11 @@ mod tests {
             SubagentRunResult {
                 summary: "done".to_string(),
                 partial_output: "done".to_string(),
-                tool_calls: 0,
-                tools_used: Vec::new(),
                 input_tokens: 1,
-                cached_input_tokens: 0,
                 output_tokens: 2,
                 elapsed_ms: 3,
                 model: "gpt-test".to_string(),
+                ..Default::default()
             },
         );
         let result = manager
@@ -620,13 +759,11 @@ mod tests {
         SubagentRunResult {
             summary: "done".to_string(),
             partial_output: "done".to_string(),
-            tool_calls: 0,
-            tools_used: Vec::new(),
             input_tokens: input,
-            cached_input_tokens: 0,
             output_tokens: output,
             elapsed_ms: 1,
             model: "gpt-test".to_string(),
+            ..Default::default()
         }
     }
 
@@ -680,5 +817,75 @@ mod tests {
             .wait_agents("/root", vec!["missing".to_string()], 1)
             .unwrap_err();
         assert!(error.contains("agent not found: /root/missing"));
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("jucode-subagent-ws-{tag}-{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["-c", "user.email=test@example.com", "-c", "user.name=test"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            status.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+
+    #[test]
+    fn workspace_in_git_repo_is_worktree_and_child_writes_stay_out_of_parent() {
+        let repo = temp_dir("git");
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("tracked.txt"), "committed content").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "init"]);
+
+        let workspace = prepare_workspace(&repo, "worker").unwrap();
+        assert!(workspace.from_git);
+        assert!(workspace
+            .root
+            .starts_with(repo.join(".jucode").join("agents")));
+        // The child sees the committed tree...
+        assert!(workspace.root.join("tracked.txt").exists());
+
+        // ...and its writes do not appear in the parent cwd.
+        std::fs::write(workspace.root.join("child_output.txt"), "from child").unwrap();
+        std::fs::write(workspace.root.join("tracked.txt"), "child edit").unwrap();
+        assert!(!repo.join("child_output.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked.txt")).unwrap(),
+            "committed content"
+        );
+
+        let mut changed = changed_files(&workspace);
+        changed.sort();
+        assert_eq!(changed, vec!["child_output.txt", "tracked.txt"]);
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn workspace_outside_git_repo_is_fresh_restricted_directory() {
+        let parent = temp_dir("plain");
+        std::fs::write(parent.join("parent.txt"), "parent data").unwrap();
+
+        let workspace = prepare_workspace(&parent, "worker").unwrap();
+        assert!(!workspace.from_git);
+        // Restricted cwd: the child starts from an empty directory.
+        assert!(!workspace.root.join("parent.txt").exists());
+
+        std::fs::write(workspace.root.join("report.md"), "findings").unwrap();
+        assert!(!parent.join("report.md").exists());
+        assert_eq!(changed_files(&workspace), vec!["report.md".to_string()]);
+
+        let _ = std::fs::remove_dir_all(parent);
     }
 }

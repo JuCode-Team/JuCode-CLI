@@ -6,7 +6,8 @@ use crate::{
     mcp::McpManager,
     session::extract_response_text,
     subagents::{
-        SubagentManager, SubagentRunResult, SubagentSpawn, MAX_LIVE_SUBAGENTS, MAX_SUBAGENT_DEPTH,
+        prepare_workspace, SubagentManager, SubagentRunResult, SubagentSpawn, MAX_LIVE_SUBAGENTS,
+        MAX_SUBAGENT_DEPTH,
     },
     tools,
 };
@@ -71,6 +72,9 @@ pub struct OpenAiClient {
     subagent_manager: Option<SubagentManager>,
     agent_path: String,
     agent_depth: u64,
+    /// When set (subagents), mutating file tools may only target paths under
+    /// this root; the main agent has no such restriction.
+    write_root: Option<PathBuf>,
     hooks: Hooks,
 }
 
@@ -317,6 +321,7 @@ impl OpenAiClient {
             subagent_manager: config.subagent_manager,
             agent_path: "/root".to_string(),
             agent_depth: 0,
+            write_root: None,
             hooks: config.hooks,
         })
     }
@@ -1159,6 +1164,21 @@ impl OpenAiClient {
         if let Some(error) = self.disabled_tool_error(&request.name) {
             return json_tool_result(json!({ "error": error }), true);
         }
+        if let Some(root) = &self.write_root {
+            if let Some(violation) =
+                tools::write_target_escapes_root(&request.name, &request.arguments, cwd, root)
+            {
+                return json_tool_result(
+                    json!({
+                        "error": format!(
+                            "write isolation: {violation}. This agent's file writes are confined to its workspace {}. Write there and report results; the parent harvests changes from the workspace.",
+                            root.display()
+                        )
+                    }),
+                    true,
+                );
+            }
+        }
         let result = if let Some(result) = self.run_goal_tool(&request.name, &request.arguments) {
             result
         } else if let Some(result) = self.run_subagent_tool(
@@ -1288,16 +1308,33 @@ impl OpenAiClient {
         })?;
         let child_input =
             build_subagent_input(input, pending_call_ids, &fork_turns, &slot.path, message)?;
+        // Isolated workspace: file writes go to a per-agent worktree (or fresh
+        // dir), never straight into the parent's cwd. Prepared after the slot
+        // reservation so a failure is recorded on the agent, not swallowed.
+        let workspace = match prepare_workspace(cwd, task_name) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                let message = format!("failed to prepare isolated workspace: {error}");
+                manager.finish_err(&slot.path, message.clone(), SubagentRunResult::default());
+                return Err(message);
+            }
+        };
+        let workdir_display = workspace.root.display().to_string();
+        manager.set_workdir(&slot.path, &workdir_display);
         let started = Instant::now();
         let child_manager = manager.clone();
         let child_path = slot.path.clone();
-        let child_cwd = PathBuf::from(cwd);
+        let child_cwd = workspace.root.clone();
         let child = OpenAiClient {
             api_key: self.api_key.clone(),
             model: model.clone(),
             reasoning_effort,
             model_reasoning_efforts: self.model_reasoning_efforts.clone(),
-            system_prompt: subagent_system_prompt(&self.system_prompt, &child_path),
+            system_prompt: subagent_system_prompt(
+                &self.system_prompt,
+                &child_path,
+                &workspace.root,
+            ),
             prompt_cache_key: self.prompt_cache_key.clone(),
             turn_state: Arc::clone(&self.turn_state),
             extensions: self.extensions.clone(),
@@ -1323,6 +1360,7 @@ impl OpenAiClient {
             subagent_manager: Some(manager.clone()),
             agent_path: child_path.clone(),
             agent_depth: child_depth,
+            write_root: Some(workspace.root.clone()),
             hooks: self.hooks.clone(),
         };
 
@@ -1357,6 +1395,10 @@ impl OpenAiClient {
                 output_tokens: stats.output_tokens,
                 elapsed_ms,
                 model,
+                workdir: workspace.root.display().to_string(),
+                // Harvest: the parent sees exactly which workspace files the
+                // agent created or modified without scanning itself.
+                files_changed: crate::subagents::changed_files(&workspace),
             };
             match result {
                 Ok(()) => child_manager.finish_ok(&child_path, run_result),
@@ -1368,6 +1410,7 @@ impl OpenAiClient {
             "task_name": task_name,
             "path": slot.path,
             "status": "running",
+            "workdir": workdir_display,
         }))
     }
 
@@ -1570,7 +1613,7 @@ fn subagent_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "name": "spawn_agent",
-            "description": format!("Start a lightweight background subagent for an independent bounded task. The agent shares the current cwd and tools, inherits the system prompt and skills, and returns immediately. Keep at most {MAX_LIVE_SUBAGENTS} live agents; nesting is capped at depth {MAX_SUBAGENT_DEPTH}."),
+            "description": format!("Start a lightweight background subagent for an independent bounded task. The agent runs in an isolated per-agent workspace under .jucode/agents/ (a detached git worktree inside a repository, otherwise a fresh directory): its file writes stay there and never modify your cwd directly. The spawn result and wait/list results include the workdir and files_changed for harvesting. The agent inherits tools, system prompt, and skills and returns immediately. Keep at most {MAX_LIVE_SUBAGENTS} live agents; nesting is capped at depth {MAX_SUBAGENT_DEPTH}."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1876,9 +1919,10 @@ fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
     Ok(value)
 }
 
-fn subagent_system_prompt(parent_system: &str, path: &str) -> String {
+fn subagent_system_prompt(parent_system: &str, path: &str, workspace_root: &Path) -> String {
     format!(
-        "{parent_system}\n\n<subagent_context>\nYou are JuCode subagent {path}. Work only on the task delegated by the parent. Keep work bounded: inspect only what is needed, avoid broad refactors, and stop when you have enough evidence. Return a concise self-contained answer with Summary, Evidence, Files/commands checked, and Risks or unknowns. Do not ask follow-up questions unless the task is impossible without missing information.\n</subagent_context>"
+        "{parent_system}\n\n<subagent_context>\nYou are JuCode subagent {path}. Work only on the task delegated by the parent. Keep work bounded: inspect only what is needed, avoid broad refactors, and stop when you have enough evidence. Your working directory is an isolated workspace at {root}; all file writes must stay inside it (writes outside are rejected) and the parent harvests your changes from there. Return a concise self-contained answer with Summary, Evidence, Files/commands checked, and Risks or unknowns. Do not ask follow-up questions unless the task is impossible without missing information.\n</subagent_context>",
+        root = workspace_root.display()
     )
 }
 

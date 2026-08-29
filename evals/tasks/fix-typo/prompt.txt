@@ -1,0 +1,1 @@
+greeting.py prints a misspelled greeting. Fix the typo so running it prints exactly "hello world". Do not change anything else.
