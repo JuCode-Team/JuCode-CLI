@@ -137,10 +137,26 @@ fn is_shell_tool(name: &str) -> bool {
 }
 
 fn is_edit_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "write" | "edit" | "str_replace" | "hashline_edit" | "apply_patch"
-    )
+    canonical_edit_tool_name(name).is_some()
+}
+
+/// Canonical name for an edit tool, accepting the `edit` alias for
+/// `str_replace`. Returns None for anything that is not an edit tool.
+pub fn canonical_edit_tool_name(name: &str) -> Option<&'static str> {
+    match name {
+        "hashline_edit" => Some("hashline_edit"),
+        "str_replace" | "edit" => Some("str_replace"),
+        "write" => Some("write"),
+        "apply_patch" => Some("apply_patch"),
+        _ => None,
+    }
+}
+
+/// Edit tools exposed to the model when config.json has no `edit_tools`
+/// field. Only hashline_edit is on by default; users opt in to the others
+/// with e.g. `"edit_tools": ["hashline_edit", "str_replace", "write"]`.
+pub fn default_edit_tools() -> Vec<String> {
+    vec!["hashline_edit".to_string()]
 }
 
 fn is_network_tool(name: &str) -> bool {
@@ -168,6 +184,16 @@ pub struct Config {
     pub compaction_threshold_percent: u64,
     pub include_project_instructions: bool,
     pub approval_mode: ApprovalMode,
+    /// Edit tools offered to the model (`edit_tools` in config.json).
+    /// Canonical names: hashline_edit, str_replace (alias edit), write,
+    /// apply_patch. Defaults to hashline_edit only; an explicit empty array
+    /// disables all edit tools. Tools not listed here are neither sent to the
+    /// model nor executed if called anyway.
+    pub edit_tools: Vec<String>,
+    /// Whether the desktop-only browser_open tool may be offered at all
+    /// (`enable_browser_open` in config.json, default true). It is only ever
+    /// exposed when running under JuCode Desktop (JUCODE_DESKTOP set).
+    pub enable_browser_open: bool,
     pub extensions: Vec<ExtensionConfig>,
     pub mcp_servers: Vec<McpServerConfig>,
     path: PathBuf,
@@ -286,6 +312,8 @@ impl Config {
                 compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
                 include_project_instructions: true,
                 approval_mode: ApprovalMode::default(),
+                edit_tools: default_edit_tools(),
+                enable_browser_open: true,
                 extensions: Vec::new(),
                 mcp_servers: Vec::new(),
                 path,
@@ -365,6 +393,8 @@ impl Config {
             .clamp(10, 95),
             include_project_instructions: read_bool(&value, "include_project_instructions", true),
             approval_mode: read_approval_mode(&value)?,
+            edit_tools: read_edit_tools(&value)?,
+            enable_browser_open: read_bool(&value, "enable_browser_open", true),
             extensions: read_extensions(&value),
             mcp_servers: read_mcp_servers(&value),
             path,
@@ -396,6 +426,8 @@ impl Config {
             "compaction_threshold_percent": self.compaction_threshold_percent,
             "include_project_instructions": self.include_project_instructions,
             "approval_mode": self.approval_mode.as_str(),
+            "edit_tools": self.edit_tools,
+            "enable_browser_open": self.enable_browser_open,
             "extensions": self.extensions.iter().map(extension_config_value).collect::<Vec<_>>(),
             "mcp_servers": self.mcp_servers.iter().map(mcp_server_config_value).collect::<Vec<_>>()
         });
@@ -554,6 +586,38 @@ fn read_approval_mode(value: &Value) -> io::Result<ApprovalMode> {
             )
         }),
     }
+}
+
+/// Optional `edit_tools` in config.json. Absent defaults to hashline_edit
+/// only; an explicit empty array disables all edit tools. Unknown names are a
+/// hard load error rather than a silent fallback. The `edit` alias is stored
+/// canonically as `str_replace` and duplicates collapse.
+fn read_edit_tools(value: &Value) -> io::Result<Vec<String>> {
+    let Some(raw) = value.get("edit_tools") else {
+        return Ok(default_edit_tools());
+    };
+    let Some(items) = raw.as_array() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid edit_tools in config.json: expected an array of tool names",
+        ));
+    };
+    let mut tools = Vec::new();
+    for item in items {
+        let name = item.as_str().map(str::trim).unwrap_or_default();
+        let Some(canonical) = canonical_edit_tool_name(name) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid edit_tools entry '{name}' in config.json: use hashline_edit, str_replace (alias edit), write, or apply_patch"
+                ),
+            ));
+        };
+        if !tools.iter().any(|tool| tool == canonical) {
+            tools.push(canonical.to_string());
+        }
+    }
+    Ok(tools)
 }
 
 fn read_bool(value: &Value, key: &str, default: bool) -> bool {
@@ -1175,6 +1239,8 @@ mod tests {
             compaction_threshold_percent: DEFAULT_COMPACTION_THRESHOLD_PERCENT,
             include_project_instructions: true,
             approval_mode: ApprovalMode::default(),
+            edit_tools: default_edit_tools(),
+            enable_browser_open: true,
             extensions: Vec::new(),
             mcp_servers: Vec::new(),
             path: PathBuf::from("config.json"),
@@ -1346,6 +1412,55 @@ mod tests {
         let parsed = read_mcp_servers(&value);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].command, "run");
+    }
+
+    #[test]
+    fn edit_tools_default_to_hashline_only() {
+        assert_eq!(read_edit_tools(&json!({})).unwrap(), vec!["hashline_edit"]);
+        assert_eq!(default_edit_tools(), vec!["hashline_edit"]);
+    }
+
+    #[test]
+    fn edit_tools_accept_known_names_and_canonicalize_the_edit_alias() {
+        let tools = read_edit_tools(&json!({
+            "edit_tools": ["hashline_edit", "edit", "write", "str_replace", "apply_patch"]
+        }))
+        .unwrap();
+        assert_eq!(
+            tools,
+            vec!["hashline_edit", "str_replace", "write", "apply_patch"]
+        );
+
+        // An explicit empty array disables all edit tools.
+        assert_eq!(
+            read_edit_tools(&json!({ "edit_tools": [] })).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn edit_tools_reject_unknown_names_and_non_arrays() {
+        let error = read_edit_tools(&json!({ "edit_tools": ["bash"] })).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("bash"));
+
+        let error = read_edit_tools(&json!({ "edit_tools": "write" })).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("array"));
+    }
+
+    #[test]
+    fn canonical_edit_tool_name_covers_aliases_and_rejects_others() {
+        assert_eq!(canonical_edit_tool_name("edit"), Some("str_replace"));
+        assert_eq!(canonical_edit_tool_name("str_replace"), Some("str_replace"));
+        assert_eq!(
+            canonical_edit_tool_name("hashline_edit"),
+            Some("hashline_edit")
+        );
+        assert_eq!(canonical_edit_tool_name("write"), Some("write"));
+        assert_eq!(canonical_edit_tool_name("apply_patch"), Some("apply_patch"));
+        assert_eq!(canonical_edit_tool_name("read"), None);
+        assert_eq!(canonical_edit_tool_name("bash"), None);
     }
 
     #[test]

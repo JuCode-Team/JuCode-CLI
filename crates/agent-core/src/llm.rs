@@ -76,6 +76,13 @@ pub struct OpenAiClient {
     /// at client construction (turn start / subagent spawn) and never changed
     /// mid-run; loosening a running turn happens core-side instead.
     approval_mode: ApprovalMode,
+    /// Canonical edit-tool names offered to the model (config `edit_tools`).
+    /// Edit tools not in this list are removed from the tool definitions and
+    /// rejected with a clear error if the model calls them anyway.
+    enabled_edit_tools: Vec<String>,
+    /// Whether browser_open may be offered/executed at all (config
+    /// `enable_browser_open`); it additionally requires JUCODE_DESKTOP.
+    browser_open_enabled: bool,
     subagent_manager: Option<SubagentManager>,
     agent_path: String,
     agent_depth: u64,
@@ -103,6 +110,10 @@ pub struct OpenAiClientConfig<'a> {
     pub goal_tool_tx: Option<Sender<GoalToolRequest>>,
     pub approval_tx: Option<Sender<ApprovalRequest>>,
     pub approval_mode: ApprovalMode,
+    /// Canonical edit-tool names to expose (see `Config::edit_tools`).
+    pub edit_tools: Vec<String>,
+    /// Config-level switch for the desktop-only browser_open tool.
+    pub enable_browser_open: bool,
     pub subagent_manager: Option<SubagentManager>,
     pub hooks: Hooks,
 }
@@ -297,6 +308,8 @@ impl OpenAiClient {
             goal_tool_tx: config.goal_tool_tx,
             approval_tx: config.approval_tx,
             approval_mode: config.approval_mode,
+            enabled_edit_tools: config.edit_tools,
+            browser_open_enabled: config.enable_browser_open,
             subagent_manager: config.subagent_manager,
             agent_path: "/root".to_string(),
             agent_depth: 0,
@@ -931,8 +944,16 @@ impl OpenAiClient {
     }
 
     fn tool_definitions(&self) -> Vec<Value> {
-        let mut definitions = tools::definitions();
-        if std::env::var("JUCODE_DESKTOP").is_ok() {
+        let mut definitions = tools::definitions()
+            .into_iter()
+            .filter(|definition| {
+                definition
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_none_or(|name| self.disabled_tool_error(name).is_none())
+            })
+            .collect::<Vec<_>>();
+        if self.browser_open_enabled && std::env::var("JUCODE_DESKTOP").is_ok() {
             definitions.push(tools::browser_open_definition());
         }
         if self.allow_subagents && self.subagent_manager.is_some() {
@@ -1000,6 +1021,9 @@ impl OpenAiClient {
         pending_call_ids: &HashSet<String>,
         emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> tools::ToolExecutionResult {
+        if let Some(error) = self.disabled_tool_error(&request.name) {
+            return json_tool_result(json!({ "error": error }), true);
+        }
         let result = if let Some(result) = self.run_goal_tool(&request.name, &request.arguments) {
             result
         } else if let Some(result) = self.run_subagent_tool(
@@ -1159,6 +1183,8 @@ impl OpenAiClient {
             // auto-approved core-side if the live mode is looser).
             approval_tx: self.approval_tx.clone(),
             approval_mode: self.approval_mode,
+            enabled_edit_tools: self.enabled_edit_tools.clone(),
+            browser_open_enabled: self.browser_open_enabled,
             subagent_manager: Some(manager.clone()),
             agent_path: child_path.clone(),
             agent_depth: child_depth,
@@ -1332,6 +1358,31 @@ impl OpenAiClient {
             output: response.output,
             is_error: response.is_error,
         })
+    }
+
+    /// Config-level tool gating, checked both when building the tool
+    /// definitions sent to the model and when executing a call. Returns the
+    /// rejection reason when `name` is an edit tool that is not enabled (or
+    /// browser_open while disabled); None means the tool may run.
+    fn disabled_tool_error(&self, name: &str) -> Option<String> {
+        if let Some(canonical) = crate::config::canonical_edit_tool_name(name) {
+            if !self.enabled_edit_tools.iter().any(|tool| tool == canonical) {
+                let enabled = if self.enabled_edit_tools.is_empty() {
+                    "none".to_string()
+                } else {
+                    self.enabled_edit_tools.join(", ")
+                };
+                return Some(format!(
+                    "edit tool '{name}' is disabled by config (enabled edit tools: {enabled}). Add it to the edit_tools array in config.json to enable it."
+                ));
+            }
+        }
+        if name == "browser_open" && !self.browser_open_enabled {
+            return Some(
+                "browser_open is disabled by config (enable_browser_open is false)".to_string(),
+            );
+        }
+        None
     }
 
     /// Tools whose side effects warrant a user decision before they run under
@@ -3677,6 +3728,8 @@ mod tests {
             goal_tool_tx: None,
             approval_tx: None,
             approval_mode: ApprovalMode::default(),
+            edit_tools: crate::config::default_edit_tools(),
+            enable_browser_open: true,
             subagent_manager: None,
             hooks: Hooks::default(),
         })
@@ -3691,6 +3744,103 @@ mod tests {
         client.approval_mode = mode;
         client.approval_tx = approval_tx;
         client
+    }
+
+    fn definition_names(client: &OpenAiClient) -> Vec<String> {
+        client
+            .tool_definitions()
+            .iter()
+            .filter_map(|definition| definition.get("name").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn default_tool_definitions_expose_only_hashline_among_edit_tools() {
+        let client = test_client();
+        let names = definition_names(&client);
+        assert!(names.contains(&"hashline_edit".to_string()));
+        for disabled in ["str_replace", "write", "apply_patch"] {
+            assert!(!names.contains(&disabled.to_string()), "{disabled}");
+        }
+        // Non-edit tools are not gated by edit_tools.
+        for kept in ["read", "bash", "ls", "ripgrep", "outline", "checkpoint"] {
+            assert!(names.contains(&kept.to_string()), "{kept}");
+        }
+    }
+
+    #[test]
+    fn enabling_extra_edit_tools_exposes_and_executes_them() {
+        let mut client = test_client();
+        client.enabled_edit_tools = vec![
+            "hashline_edit".to_string(),
+            "str_replace".to_string(),
+            "write".to_string(),
+        ];
+        let names = definition_names(&client);
+        for enabled in ["hashline_edit", "str_replace", "write"] {
+            assert!(names.contains(&enabled.to_string()), "{enabled}");
+        }
+        assert!(!names.contains(&"apply_patch".to_string()));
+
+        // An enabled edit tool actually runs.
+        let dir =
+            std::env::temp_dir().join(format!("jucode-llm-edit-tools-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let request = ToolCallRequest {
+            call_id: "call_write".to_string(),
+            name: "write".to_string(),
+            arguments: json!({ "path": "enabled.txt", "content": "hi" }).to_string(),
+        };
+        let result = client.run_tool_call(&request, &dir, &[], &HashSet::new(), &mut |_| Ok(()));
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("enabled.txt")).unwrap(),
+            "hi"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disabled_edit_tool_calls_are_rejected_with_a_clear_error() {
+        let client = test_client();
+        for name in ["write", "str_replace", "apply_patch", "edit"] {
+            let request = ToolCallRequest {
+                call_id: format!("call_{name}"),
+                name: name.to_string(),
+                arguments: json!({ "path": "x.txt", "content": "hi" }).to_string(),
+            };
+            let result =
+                client.run_tool_call(&request, Path::new("."), &[], &HashSet::new(), &mut |_| {
+                    Ok(())
+                });
+            assert!(result.is_error, "{name}");
+            assert!(result.output.contains("disabled by config"), "{name}");
+            assert!(result.output.contains("hashline_edit"), "{name}");
+        }
+        assert!(client.disabled_tool_error("hashline_edit").is_none());
+        assert!(client.disabled_tool_error("read").is_none());
+        assert!(client.disabled_tool_error("bash").is_none());
+    }
+
+    #[test]
+    fn browser_open_can_be_disabled_by_config() {
+        let mut client = test_client();
+        assert!(client.disabled_tool_error("browser_open").is_none());
+        client.browser_open_enabled = false;
+        let error = client.disabled_tool_error("browser_open").unwrap();
+        assert!(error.contains("enable_browser_open"));
+        let request = ToolCallRequest {
+            call_id: "call_browser".to_string(),
+            name: "browser_open".to_string(),
+            arguments: json!({ "url": "https://example.com" }).to_string(),
+        };
+        let result =
+            client.run_tool_call(&request, Path::new("."), &[], &HashSet::new(), &mut |_| {
+                Ok(())
+            });
+        assert!(result.is_error);
+        assert!(!definition_names(&client).contains(&"browser_open".to_string()));
     }
 
     #[test]
