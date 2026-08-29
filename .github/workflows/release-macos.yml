@@ -24,6 +24,8 @@ jobs:
         target:
           - runner: macos-14
             rust_target: aarch64-apple-darwin
+          - runner: macos-14
+            rust_target: x86_64-apple-darwin
 
     steps:
       - uses: actions/checkout@v4
@@ -115,24 +117,45 @@ jobs:
         run: npm run release:sync-version
 
       - name: Stage npm binaries
-        run: npm run release:stage-binaries -- --source-root artifacts-normalized --target aarch64-apple-darwin
+        run: npm run release:stage-binaries -- --source-root artifacts-normalized --target aarch64-apple-darwin --target x86_64-apple-darwin
 
       - name: Pack npm packages
-        run: npm run release:pack -- --target aarch64-apple-darwin
+        run: npm run release:pack -- --target aarch64-apple-darwin --target x86_64-apple-darwin
 
       - name: Name macOS binaries uniquely for the release
         shell: bash
         run: |
           cp artifacts-normalized/aarch64-apple-darwin/jucode jucode-aarch64-apple-darwin
+          cp artifacts-normalized/x86_64-apple-darwin/jucode jucode-x86_64-apple-darwin
 
       - name: Upload macOS assets to GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.release_meta.outputs.tag }}
           files: |
-            jucode-aarch64-apple-darwin
+            jucode-*-apple-darwin
             dist/npm/*darwin*.tgz
 
       - name: Publish macOS npm packages
         if: ${{ env.NODE_AUTH_TOKEN != '' }}
-        run: npm publish ./npm/cli-darwin-arm64 --access public
+        shell: bash
+        run: |
+          version="${{ steps.release_meta.outputs.version }}"
+          npm view "@jucode/cli-darwin-arm64@${version}" version >/dev/null 2>&1 || npm publish ./npm/cli-darwin-arm64 --access public
+          npm view "@jucode/cli-darwin-x64@${version}" version >/dev/null 2>&1 || npm publish ./npm/cli-darwin-x64 --access public
+
+      - name: Publish root npm package after all platforms
+        if: ${{ env.NODE_AUTH_TOKEN != '' }}
+        shell: bash
+        run: |
+          version="${{ steps.release_meta.outputs.version }}"
+          for _ in {1..30}; do
+            if npm view "@jucode/cli-linux-x64@${version}" version >/dev/null 2>&1 && \
+               npm view "@jucode/cli-win32-x64@${version}" version >/dev/null 2>&1; then
+              npm view "@jucode/cli@${version}" version >/dev/null 2>&1 || npm publish ./npm/cli --access public
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Linux/Windows npm packages for ${version} were not published"
+          exit 1

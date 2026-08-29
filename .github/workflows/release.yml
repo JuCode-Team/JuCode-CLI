@@ -131,7 +131,8 @@ jobs:
 
       - name: Publish npm packages
         if: ${{ env.NODE_AUTH_TOKEN != '' }}
+        shell: bash
         run: |
-          npm publish ./npm/cli-linux-x64 --access public
-          npm publish ./npm/cli-win32-x64 --access public
-          npm publish ./npm/cli --access public
+          version="${{ steps.release_meta.outputs.version }}"
+          npm view "@jucode/cli-linux-x64@${version}" version >/dev/null 2>&1 || npm publish ./npm/cli-linux-x64 --access public
+          npm view "@jucode/cli-win32-x64@${version}" version >/dev/null 2>&1 || npm publish ./npm/cli-win32-x64 --access public
