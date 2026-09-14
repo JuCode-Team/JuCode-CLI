@@ -117,7 +117,7 @@ fn main() -> io::Result<()> {
         println!("{}", json!(list));
         std::process::exit(0);
     }
-    let mut core = AgentCore::new()?;
+    let mut core = AgentCore::new()?.with_version(env!("CARGO_PKG_VERSION"));
     if let Some(mode) = approval_mode {
         // Startup events (emitted by the TUI) will reflect the switched mode.
         let _ = core.set_approval_mode(mode);
@@ -197,7 +197,7 @@ fn run_headless(args: Vec<String>, approval_mode: Option<ApprovalMode>) -> io::R
     if prompt.trim().is_empty() {
         io::stdin().read_to_string(&mut prompt)?;
     }
-    let mut core = AgentCore::new()?;
+    let mut core = AgentCore::new()?.with_version(env!("CARGO_PKG_VERSION"));
     let mut stdout = io::stdout();
     let mode = headless_approval_mode(approval_mode);
     for event in core.set_approval_mode(mode) {
@@ -283,7 +283,7 @@ fn queue_headless_denial(event: &AgentEvent, pending_denials: &mut Vec<(String, 
 /// `AgentEvent` stream as newline-delimited JSON on stdout (same schema as
 /// `--headless`). Runs until stdin closes or a `shutdown`/`/quit` command.
 fn run_serve(approval_mode: Option<ApprovalMode>) -> io::Result<i32> {
-    let mut core = AgentCore::new()?;
+    let mut core = AgentCore::new()?.with_version(env!("CARGO_PKG_VERSION"));
     if let Some(mode) = approval_mode {
         // Set before startup_events so the startup approval_mode event reflects it.
         let _ = core.set_approval_mode(mode);

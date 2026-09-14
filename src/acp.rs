@@ -48,7 +48,7 @@ struct AcpState {
 }
 
 pub fn run_acp(approval_mode: Option<ApprovalMode>) -> io::Result<i32> {
-    let mut core = AgentCore::new()?;
+    let mut core = AgentCore::new()?.with_version(env!("CARGO_PKG_VERSION"));
     if let Some(mode) = approval_mode {
         let _ = core.set_approval_mode(mode);
     }

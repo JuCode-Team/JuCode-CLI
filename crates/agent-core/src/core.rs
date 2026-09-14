@@ -149,6 +149,10 @@ pub struct AgentCore {
     hooks: Hooks,
     plan: Vec<PlanItem>,
     mcp: McpManager,
+    /// Version reported in the startup event and used by the update check.
+    /// Binaries override it with their own via `with_version`; the default is
+    /// the agent-core crate version, which may differ.
+    version: &'static str,
 }
 
 impl AgentCore {
@@ -209,14 +213,22 @@ impl AgentCore {
             approved_tools: HashSet::new(),
             approval_mode,
             mcp,
+            version: env!("CARGO_PKG_VERSION"),
         })
+    }
+
+    /// Sets the version reported by `startup_events` and the update check.
+    /// Front-end binaries should pass their own package version.
+    pub fn with_version(mut self, version: &'static str) -> Self {
+        self.version = version;
+        self
     }
 
     pub fn startup_events(&self) -> Vec<AgentEvent> {
         let model_config = self.config.current_model_config();
         let mut events = vec![
             AgentEvent::Startup {
-                version: env!("CARGO_PKG_VERSION").to_string(),
+                version: self.version.to_string(),
                 session_id: self.session.session_id().to_string(),
                 profile_dir: self.config.profile_dir().display().to_string(),
                 config_path: self.config.path().display().to_string(),
@@ -247,7 +259,7 @@ impl AgentCore {
 
     pub fn start_update_check(&mut self) {
         if self.update_receiver.is_none() {
-            self.update_receiver = Some(update::spawn_update_check(env!("CARGO_PKG_VERSION")));
+            self.update_receiver = Some(update::spawn_update_check(self.version));
         }
     }
 
