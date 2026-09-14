@@ -30,3 +30,5 @@ ACP 当前无法无损承载 Desktop 已依赖的完整语义，包括：
 ## 实施边界
 
 `jucode acp` 应复用同一套 agent core，但保持独立协议适配层。新增能力可按需要映射到两条协议；不应为了追求单一协议而削弱 Desktop 功能，或把 JuCode 私有扩展强塞进 ACP。
+
+`serve` 的完整命令/事件格式见 [serve-protocol.md](serve-protocol.md)。

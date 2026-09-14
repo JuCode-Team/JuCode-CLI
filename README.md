@@ -156,7 +156,7 @@ This mode is useful for evaluation harnesses and reproducible agent experiments.
 
 ### ACP mode (`jucode acp`)
 
-`jucode acp` speaks the [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio) so ACP-capable editors such as Zed can drive JuCode as an external agent. It maps prompts, streaming message/thought chunks, tool-call progress, plan updates, cancellation, and permission requests; features ACP cannot express (session loading, hunk-subset approvals, the conversation tree) are explicitly rejected rather than half-implemented. `jucode serve` (the native newline-JSON protocol) is unchanged and remains the richer interface.
+`jucode acp` speaks the [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio) so ACP-capable editors such as Zed can drive JuCode as an external agent. It maps prompts, streaming message/thought chunks, tool-call progress, plan updates, cancellation, and permission requests; features ACP cannot express (session loading, hunk-subset approvals, the conversation tree) are explicitly rejected rather than half-implemented. `jucode serve` (the native newline-JSON protocol) is unchanged and remains the richer interface; its command/event schema is documented in [docs/serve-protocol.md](docs/serve-protocol.md).
 
 ## Agent tools
 
