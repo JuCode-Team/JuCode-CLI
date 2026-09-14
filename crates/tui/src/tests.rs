@@ -49,6 +49,7 @@ fn ansi_visible_width(text: &str) -> usize {
 struct TestRuntime {
     submitted: Vec<String>,
     commands: Vec<String>,
+    interrupts: usize,
 }
 
 impl TuiRuntime for TestRuntime {
@@ -65,8 +66,9 @@ impl TuiRuntime for TestRuntime {
         vec![AgentEvent::UserMessage(message)]
     }
 
-    fn steer(&mut self) -> Vec<AgentEvent> {
-        Vec::new()
+    fn interrupt(&mut self) -> Vec<AgentEvent> {
+        self.interrupts += 1;
+        vec![AgentEvent::Status("interrupted".to_string())]
     }
 
     fn handle_command(&mut self, input: &str) -> (bool, Vec<AgentEvent>) {
@@ -225,6 +227,25 @@ fn single_typed_char_flushes_after_burst_window() {
     app.flush_paste_burst_if_due(now + PASTE_BURST_CHAR_INTERVAL + Duration::from_millis(1));
 
     assert_eq!(app.input.text(), "a");
+}
+
+#[test]
+fn esc_interrupts_active_turn_and_clears_draft_when_idle() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    let now = Instant::now();
+
+    app.input.push_char('x');
+    app.apply_events(vec![AgentEvent::Connecting]);
+
+    app.handle_key_at(KeyCode::Esc, KeyModifiers::empty(), now);
+    assert_eq!(app.runtime.interrupts, 1);
+    // The draft survives an interrupt; the turn is over.
+    assert_eq!(app.input.text(), "x");
+    assert!(!app.state.activity.is_active());
+
+    app.handle_key_at(KeyCode::Esc, KeyModifiers::empty(), now);
+    assert_eq!(app.runtime.interrupts, 1);
+    assert_eq!(app.input.text(), "");
 }
 
 #[test]

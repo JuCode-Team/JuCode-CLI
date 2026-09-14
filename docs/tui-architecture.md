@@ -134,7 +134,7 @@ Key behaviors include:
 - multi-line input with `Shift+Enter` or `Ctrl+Enter`
 - slash-command completion via `Tab`, `Up`, `Down`
 - word navigation with `Ctrl`/`Alt` + arrows
-- `Esc` clears input, or sends `steer()` when messages are pending during active work
+- `Esc` clears input when idle, or sends `interrupt()` while a turn is running (queued pending messages still start the next turn)
 - `BackTab` cycles reasoning effort for the current model
 
 ### 2. Picker mode

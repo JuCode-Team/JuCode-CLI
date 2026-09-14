@@ -42,7 +42,7 @@
 TUI 的输入语义（`crates/tui/src/lib.rs`）可作为 GUI 交互的参照：
 
 - Enter：文本以 `/` 开头 → `handle_command`；否则 → `submit_user_message`（`lib.rs:625`）
-- Esc：运行中且有 pending 消息 → `steer`；否则清空输入（`lib.rs:582`）
+- Esc：运行中 → `interrupt`（排队的 pending 消息仍按队列语义自动接下一回合）；空闲 → 清空输入
 - Ctrl-C / Ctrl-Q：退出
 - 主循环每 ~30ms 调用一次 `poll_events()` 与 `model_status_event()`（`lib.rs:386`）
 

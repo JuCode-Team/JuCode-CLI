@@ -346,7 +346,7 @@ pub trait TuiRuntime {
     fn startup_events(&self) -> Vec<AgentEvent>;
     fn model_status_event(&self) -> AgentEvent;
     fn submit_user_message(&mut self, message: String) -> Vec<AgentEvent>;
-    fn steer(&mut self) -> Vec<AgentEvent>;
+    fn interrupt(&mut self) -> Vec<AgentEvent>;
     fn handle_command(&mut self, input: &str) -> (bool, Vec<AgentEvent>);
     fn poll_events(&mut self) -> Vec<AgentEvent>;
 }
@@ -670,8 +670,11 @@ impl<R: TuiRuntime> TuiApp<R> {
             }
             KeyCode::Esc => {
                 self.flush_paste_burst_before_non_plain_input();
-                if self.state.activity.is_active() && !self.state.pending_messages.is_empty() {
-                    let events = self.runtime.steer();
+                // While a turn runs, Esc interrupts it; queued pending messages
+                // still start on the next turn (engine queue semantics). When
+                // idle, Esc clears the draft instead.
+                if self.state.activity.is_active() {
+                    let events = self.runtime.interrupt();
                     self.apply_events(events);
                     return false;
                 }

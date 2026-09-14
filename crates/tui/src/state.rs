@@ -525,7 +525,7 @@ impl TuiState {
 
     pub(super) fn apply_status(&mut self, status: String) -> bool {
         let mut changed = self.status != status;
-        if status == "ready" || status.starts_with("queued:") {
+        if status == "ready" || status == "interrupted" || status.starts_with("queued:") {
             // The reasoning message (collapsed) stays in the transcript, but the
             // above-input status indicator is reset once the reply is done.
             self.collapse_live_thinking();
@@ -534,7 +534,7 @@ impl TuiState {
             self.thinking_tokens = 0;
             self.reasoning_index = None;
         }
-        if status == "ready" {
+        if status == "ready" || status == "interrupted" {
             let was_active = self.activity.is_active();
             self.activity.finish();
             changed |= was_active;

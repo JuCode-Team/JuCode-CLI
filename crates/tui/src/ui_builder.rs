@@ -303,7 +303,7 @@ impl UiBuilder {
         }
         self.control_line(
             UiKind::Status,
-            "pending: esc steer, next turn sends automatically".to_string(),
+            "pending: esc interrupts current turn, sends next".to_string(),
         );
         for (index, message) in pending_messages.iter().enumerate() {
             self.control_line(

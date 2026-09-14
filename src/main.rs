@@ -46,8 +46,8 @@ impl TuiRuntime for Runtime {
         self.0.submit_user_message(message)
     }
 
-    fn steer(&mut self) -> Vec<AgentEvent> {
-        self.0.steer()
+    fn interrupt(&mut self) -> Vec<AgentEvent> {
+        self.0.interrupt()
     }
 
     fn handle_command(&mut self, input: &str) -> (bool, Vec<AgentEvent>) {
