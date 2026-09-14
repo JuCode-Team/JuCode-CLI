@@ -18,7 +18,7 @@ mod subagents;
 mod tokens;
 mod tools;
 mod trust;
-mod update;
+pub mod update;
 mod web_fetch;
 
 pub use config::{builtin_providers, models_for_provider, ApprovalMode, ModelConfig};

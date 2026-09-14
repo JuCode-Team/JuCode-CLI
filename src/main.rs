@@ -96,6 +96,9 @@ fn main() -> io::Result<()> {
         let code = acp::run_acp(approval_mode)?;
         std::process::exit(code);
     }
+    if args.first().map(String::as_str) == Some("update") {
+        std::process::exit(run_update());
+    }
     if args.first().map(String::as_str) == Some("providers") {
         let list = jucode_agent_core::builtin_providers()
             .into_iter()
@@ -144,6 +147,7 @@ USAGE:
                                          JSON-RPC adapter over stdio, for
                                          ACP-capable editors like Zed
     jucode providers                     print built-in providers as JSON
+    jucode update                        update an npm-installed jucode
     jucode version                       print the version
 
 OPTIONS:
@@ -274,6 +278,37 @@ fn auto_deny_approvals(
 fn queue_headless_denial(event: &AgentEvent, pending_denials: &mut Vec<(String, String)>) {
     if let AgentEvent::ApprovalRequest { call_id, name, .. } = event {
         pending_denials.push((call_id.clone(), name.clone()));
+    }
+}
+
+/// `jucode update`: npm installs self-update through npm; other channels get
+/// the release URL instead of a partial fix.
+fn run_update() -> i32 {
+    use jucode_agent_core::update;
+    if update::install_channel() != update::InstallChannel::Npm {
+        eprintln!("{}", update::non_npm_update_hint());
+        return 1;
+    }
+    match update::latest_cli_version() {
+        Ok(latest) if !update::is_newer_version(env!("CARGO_PKG_VERSION"), &latest) => {
+            println!(
+                "already up to date ({}; latest {latest})",
+                env!("CARGO_PKG_VERSION")
+            );
+            return 0;
+        }
+        Ok(latest) => println!("updating to {latest}..."),
+        Err(error) => eprintln!("version check failed ({error}); trying npm anyway"),
+    }
+    match update::run_npm_update() {
+        Ok(message) => {
+            println!("{message}");
+            0
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
     }
 }
 

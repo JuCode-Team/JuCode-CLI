@@ -37,6 +37,20 @@ jucode
 
 JuCode is written in Rust and uses the workspace binary name `jucode`.
 
+### Updating
+
+JuCode checks for new versions at startup and prints a notice when one is
+available. npm installs self-update with:
+
+```bash
+jucode update
+```
+
+which runs `npm i -g @jucode/cli@latest` (on Windows the update runs right
+after the process exits, since the running executable is locked). Installs
+from GitHub Releases or source print the release URL instead — replace the
+binary manually.
+
 ## Configuration
 
 On first run, JuCode creates its configuration under the user profile directory. By default it targets the JuCode gateway (an OpenAI-compatible Responses API):
