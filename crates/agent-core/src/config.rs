@@ -195,10 +195,6 @@ pub struct Config {
     /// disables all edit tools. Tools not listed here are neither sent to the
     /// model nor executed if called anyway.
     pub edit_tools: Vec<String>,
-    /// Whether the desktop-only browser_open tool may be offered at all
-    /// (`enable_browser_open` in config.json, default true). It is only ever
-    /// exposed when running under JuCode Desktop (JUCODE_DESKTOP set).
-    pub enable_browser_open: bool,
     /// Optional additional GitHub skill repository. "anthropic" selects the
     /// pinned built-in index for https://github.com/anthropics/skills.
     pub extra_skills_source: Option<String>,
@@ -340,7 +336,6 @@ impl Config {
                 encrypt_secrets: false,
                 approval_mode: ApprovalMode::default(),
                 edit_tools: default_edit_tools(),
-                enable_browser_open: true,
                 extra_skills_source: None,
                 extensions: Vec::new(),
                 mcp_servers: Vec::new(),
@@ -423,7 +418,6 @@ impl Config {
             encrypt_secrets: read_bool(&value, "encrypt_secrets", false),
             approval_mode: read_approval_mode(&value)?,
             edit_tools: read_edit_tools(&value)?,
-            enable_browser_open: read_bool(&value, "enable_browser_open", true),
             extra_skills_source: read_optional_string(&value, "extra_skills_source"),
             extensions: read_extensions(&value),
             mcp_servers: read_mcp_servers(&value),
@@ -458,7 +452,6 @@ impl Config {
             "encrypt_secrets": self.encrypt_secrets,
             "approval_mode": self.approval_mode.as_str(),
             "edit_tools": self.edit_tools,
-            "enable_browser_open": self.enable_browser_open,
             "extra_skills_source": self.extra_skills_source,
             "extensions": self.extensions.iter().map(extension_config_value).collect::<Vec<_>>(),
             "mcp_servers": self.mcp_servers.iter().map(mcp_server_config_value).collect::<Vec<_>>()
@@ -1503,7 +1496,6 @@ mod tests {
             encrypt_secrets: false,
             approval_mode: ApprovalMode::default(),
             edit_tools: default_edit_tools(),
-            enable_browser_open: true,
             extra_skills_source: None,
             extensions: Vec::new(),
             mcp_servers: Vec::new(),

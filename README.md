@@ -84,7 +84,7 @@ The default edit tool is `hashline_edit`; the other edit tools are off unless yo
 "edit_tools": ["hashline_edit", "str_replace", "write", "apply_patch"]
 ```
 
-Valid names are `hashline_edit`, `str_replace` (alias `edit`), `write`, and `apply_patch`. Omitting the field enables only `hashline_edit`; an empty array disables all edit tools. Disabled edit tools are not sent to the model and return a clear error if called anyway. Non-edit tools (`read`, `bash`, `ls`, `ripgrep`, `outline`, `checkpoint`, and so on) are not affected by this field. The desktop-only `browser_open` tool can be switched off with `"enable_browser_open": false`.
+Valid names are `hashline_edit`, `str_replace` (alias `edit`), `write`, and `apply_patch`. Omitting the field enables only `hashline_edit`; an empty array disables all edit tools. Disabled edit tools are not sent to the model and return a clear error if called anyway. Non-edit tools (`read`, `bash`, `ls`, `ripgrep`, `outline`, `checkpoint`, and so on) are not affected by this field.
 
 File tools (read/write/edit/ls/outline/checkpoint/apply_patch) only operate on paths inside the working directory: absolute paths, `..`, and symlinks that resolve outside the workspace are rejected with a clear error. This is a path policy, not an OS sandbox — shell commands are not restricted by it.
 

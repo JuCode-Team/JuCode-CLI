@@ -374,7 +374,7 @@ mod tests {
             &PromptContext {
                 date: "2026-05-27".to_string(),
                 cwd: PathBuf::from("/repo"),
-                tools: crate::tools::prompt_tool_names(&edit_tools, false, true),
+                tools: crate::tools::prompt_tool_names(&edit_tools, true),
                 edit_tools,
                 project_instructions: Vec::new(),
                 skills: Vec::new(),
@@ -417,7 +417,7 @@ mod tests {
             &PromptContext {
                 date: "2026-05-27".to_string(),
                 cwd: PathBuf::from("/repo"),
-                tools: crate::tools::prompt_tool_names(&edit_tools, true, false),
+                tools: crate::tools::prompt_tool_names(&edit_tools, false),
                 edit_tools,
                 project_instructions: Vec::new(),
                 skills: Vec::new(),
@@ -426,7 +426,6 @@ mod tests {
         assert!(prompt.contains("Available tools: read, hashline_edit, write, apply_patch"));
         assert!(prompt.contains("use hashline_edit, write, apply_patch for file edits"));
         assert!(prompt.contains("write can create new files without a prior read"));
-        assert!(prompt.contains("browser_open"));
         assert!(!prompt.contains("spawn_agent"));
     }
 

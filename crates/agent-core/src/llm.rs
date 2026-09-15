@@ -66,9 +66,6 @@ pub struct OpenAiClient {
     /// Edit tools not in this list are removed from the tool definitions and
     /// rejected with a clear error if the model calls them anyway.
     enabled_edit_tools: Vec<String>,
-    /// Whether browser_open may be offered/executed at all (config
-    /// `enable_browser_open`); it additionally requires JUCODE_DESKTOP.
-    browser_open_enabled: bool,
     subagent_manager: Option<SubagentManager>,
     agent_path: String,
     agent_depth: u64,
@@ -104,8 +101,6 @@ pub struct OpenAiClientConfig<'a> {
     pub approval_mode: ApprovalMode,
     /// Canonical edit-tool names to expose (see `Config::edit_tools`).
     pub edit_tools: Vec<String>,
-    /// Config-level switch for the desktop-only browser_open tool.
-    pub enable_browser_open: bool,
     pub subagent_manager: Option<SubagentManager>,
     pub hooks: Hooks,
 }
@@ -322,7 +317,6 @@ impl OpenAiClient {
             approval_tx: config.approval_tx,
             approval_mode: config.approval_mode,
             enabled_edit_tools: config.edit_tools,
-            browser_open_enabled: config.enable_browser_open,
             subagent_manager: config.subagent_manager,
             agent_path: "/root".to_string(),
             agent_depth: 0,
@@ -1098,9 +1092,6 @@ impl OpenAiClient {
                     .is_none_or(|name| self.disabled_tool_error(name).is_none())
             })
             .collect::<Vec<_>>();
-        if self.browser_open_enabled && std::env::var("JUCODE_DESKTOP").is_ok() {
-            definitions.push(tools::browser_open_definition());
-        }
         if self.allow_subagents && self.subagent_manager.is_some() {
             definitions.extend(subagent_definitions());
         }
@@ -1361,7 +1352,6 @@ impl OpenAiClient {
             approval_tx: self.approval_tx.clone(),
             approval_mode: self.approval_mode,
             enabled_edit_tools: self.enabled_edit_tools.clone(),
-            browser_open_enabled: self.browser_open_enabled,
             subagent_manager: Some(manager.clone()),
             agent_path: child_path.clone(),
             agent_depth: child_depth,
@@ -1545,8 +1535,8 @@ impl OpenAiClient {
 
     /// Config-level tool gating, checked both when building the tool
     /// definitions sent to the model and when executing a call. Returns the
-    /// rejection reason when `name` is an edit tool that is not enabled (or
-    /// browser_open while disabled); None means the tool may run.
+    /// rejection reason when `name` is an edit tool that is not enabled;
+    /// None means the tool may run.
     fn disabled_tool_error(&self, name: &str) -> Option<String> {
         if let Some(canonical) = crate::config::canonical_edit_tool_name(name) {
             if !self.enabled_edit_tools.iter().any(|tool| tool == canonical) {
@@ -1559,11 +1549,6 @@ impl OpenAiClient {
                     "edit tool '{name}' is disabled by config (enabled edit tools: {enabled}). Add it to the edit_tools array in config.json to enable it."
                 ));
             }
-        }
-        if name == "browser_open" && !self.browser_open_enabled {
-            return Some(
-                "browser_open is disabled by config (enable_browser_open is false)".to_string(),
-            );
         }
         None
     }
@@ -2696,7 +2681,6 @@ mod tests {
             approval_tx: None,
             approval_mode: ApprovalMode::default(),
             edit_tools: crate::config::default_edit_tools(),
-            enable_browser_open: true,
             subagent_manager: None,
             hooks: Hooks::default(),
         })
@@ -2788,26 +2772,6 @@ mod tests {
         assert!(client.disabled_tool_error("hashline_edit").is_none());
         assert!(client.disabled_tool_error("read").is_none());
         assert!(client.disabled_tool_error("bash").is_none());
-    }
-
-    #[test]
-    fn browser_open_can_be_disabled_by_config() {
-        let mut client = test_client();
-        assert!(client.disabled_tool_error("browser_open").is_none());
-        client.browser_open_enabled = false;
-        let error = client.disabled_tool_error("browser_open").unwrap();
-        assert!(error.contains("enable_browser_open"));
-        let request = ToolCallRequest {
-            call_id: "call_browser".to_string(),
-            name: "browser_open".to_string(),
-            arguments: json!({ "url": "https://example.com" }).to_string(),
-        };
-        let result =
-            client.run_tool_call(&request, Path::new("."), &[], &HashSet::new(), &mut |_| {
-                Ok(())
-            });
-        assert!(result.is_error);
-        assert!(!definition_names(&client).contains(&"browser_open".to_string()));
     }
 
     #[test]

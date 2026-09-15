@@ -128,7 +128,6 @@ fn tool_action_label(name: &str) -> Cow<'_, str> {
         "write_stdin" => "Sent".into(),
         "outline" => "Outlined".into(),
         "checkpoint" => "Checkpointed".into(),
-        "browser_open" => "Opened".into(),
         "web_fetch" => "Fetched".into(),
         // Unknown tools (including MCP) keep their real name; `mcp__a__b` shows
         // as `a/b` instead of a useless "Tool".
