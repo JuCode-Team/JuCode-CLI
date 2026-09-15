@@ -333,9 +333,12 @@ impl AgentCore {
     fn command_list_event(&self) -> AgentEvent {
         let mut commands = crate::commands::COMMANDS
             .iter()
+            // Advanced commands still dispatch when typed; they just stay out
+            // of the completion menu and `/help` so the common set reads clean.
+            .filter(|spec| !spec.advanced)
             .map(|spec| CommandView {
                 command: spec.name.to_string(),
-                marker: spec.advanced.then(|| "ADV".to_string()),
+                marker: None,
                 args: spec.args.to_string(),
                 description: spec.description.to_string(),
             })

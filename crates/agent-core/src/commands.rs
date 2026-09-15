@@ -11,8 +11,8 @@ pub struct CommandSpec {
     pub aliases: &'static [&'static str],
     pub args: &'static str,
     pub description: &'static str,
-    /// Hidden from the curated `/help` line and flagged `ADV` in the command list;
-    /// still discoverable in autocomplete and fully runnable.
+    /// Hidden from the curated `/help` line and the `/` completion menu;
+    /// still fully runnable when typed.
     pub advanced: bool,
 }
 
