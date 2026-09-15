@@ -6,8 +6,9 @@ pub(crate) const MD_BOLD_ON: &str = "\x1b[1m";
 pub(crate) const MD_BOLD_OFF: &str = "\x1b[22m";
 pub(crate) const MD_ITALIC_ON: &str = "\x1b[3m";
 pub(crate) const MD_ITALIC_OFF: &str = "\x1b[23m";
-pub(crate) const MD_CODE_ON: &str = "\x1b[38;5;117m"; // light blue inline-code text
-const MD_CODE_OFF: &str = "\x1b[39m"; // restore default foreground
+// Inline code reads as a chip: light-blue text on a subtle dark panel.
+pub(crate) const MD_CODE_ON: &str = "\x1b[38;5;117;48;2;42;46;58m";
+pub(crate) const MD_CODE_OFF: &str = "\x1b[39;49m"; // restore default foreground + background
 pub(crate) const MD_DIM_ON: &str = "\x1b[90m";
 pub(crate) const MD_DIM_OFF: &str = "\x1b[39m";
 
@@ -99,6 +100,7 @@ fn render_inline(text: &str, base: &str) -> String {
         if let Some(end) = after.find('`') {
             out.push_str(MD_CODE_ON);
             out.push_str(&after[..end]);
+            out.push_str(MD_CODE_OFF);
             out.push_str(base);
             rest = &after[end + 1..];
         } else {

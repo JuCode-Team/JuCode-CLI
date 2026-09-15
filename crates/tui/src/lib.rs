@@ -58,6 +58,8 @@ const BOX_BORDER: &str = "\x1b[90m";
 const STARTUP_TEXT: &str = "\x1b[38;2;180;176;187m";
 const STARTUP_DIM: &str = "\x1b[38;2;125;121;134m";
 const STARTUP_ACCENT: &str = "\x1b[38;2;190;160;255m";
+/// Brand accent for turn markers (tool bullets); same hue as the startup card.
+pub(crate) const ACCENT: &str = STARTUP_ACCENT;
 const STARTUP_STRONG: &str = "\x1b[38;2;232;228;238m";
 const ANSI_ESCAPE: char = '\x1b';
 
@@ -92,7 +94,6 @@ pub(crate) enum UiKind {
     Brand,
     User,
     Assistant,
-    Separator,
     ToolHeader,
     Tool,
     System,
@@ -1499,11 +1500,12 @@ const THINKING_COLLAPSED_LINES: usize = 3;
 
 pub(crate) fn color_code(kind: UiKind) -> &'static str {
     match kind {
-        UiKind::Brand => "\x1b[34m",
-        UiKind::User => "\x1b[36m",
-        UiKind::Assistant => "\x1b[37m",
-        UiKind::Separator => "\x1b[38;2;105;108;120m",
-        UiKind::ToolHeader => "\x1b[37m",
+        // Brand/active rows share the startup accent hue.
+        UiKind::Brand => STARTUP_ACCENT,
+        UiKind::User => "\x1b[97m",
+        // Bright white (97) — plain 37 renders as mid-gray on most themes.
+        UiKind::Assistant => "\x1b[97m",
+        UiKind::ToolHeader => "\x1b[97m",
         UiKind::Tool | UiKind::System | UiKind::Status => "\x1b[90m",
         UiKind::BottomStatus => "\x1b[97;48;2;30;33;43m",
         UiKind::Error => "\x1b[31m",

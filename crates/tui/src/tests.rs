@@ -1,7 +1,7 @@
 use super::*;
 use crate::markdown::{
-    render_markdown, MD_BOLD_OFF, MD_BOLD_ON, MD_CODE_ON, MD_DIM_OFF, MD_DIM_ON, MD_ITALIC_OFF,
-    MD_ITALIC_ON,
+    render_markdown, MD_BOLD_OFF, MD_BOLD_ON, MD_CODE_OFF, MD_CODE_ON, MD_DIM_OFF, MD_DIM_ON,
+    MD_ITALIC_OFF, MD_ITALIC_ON,
 };
 use crate::tool_preview::tool_output_preview;
 use jucode_agent_core::{ModelOptionView, SessionListItemView, TreeNodeView};
@@ -634,10 +634,10 @@ fn markdown_bold_and_italic_render_inline() {
 #[test]
 fn markdown_inline_code_recolors_and_restores_base() {
     let base = color_code(UiKind::Assistant);
-    // Inline code uses a foreground color (not a background), restored to base.
+    // Inline code is a chip (fg + subtle bg); off clears both, then base fg.
     assert_eq!(
         render_markdown("run `a*b*c` now", usize::MAX, base),
-        vec![format!("run {MD_CODE_ON}a*b*c{base} now")]
+        vec![format!("run {MD_CODE_ON}a*b*c{MD_CODE_OFF}{base} now")]
     );
 }
 
@@ -850,7 +850,7 @@ fn tool_output_preview_prefers_diff_field() {
     let preview = tool_output_preview("str_replace", &output, false);
     let visible_preview = strip_ansi(&preview);
 
-    assert!(preview.contains("* Edited a (+1 -1)"));
+    assert!(preview.contains("a (+1 -1)"));
     assert!(visible_preview.contains("1 -  old"));
     assert!(visible_preview.contains("1 +  new"));
     assert!(!preview.contains("diff --git a/a b/a"));
@@ -900,7 +900,7 @@ fn tool_output_preview_keeps_additions_after_large_removals() {
 
     let preview = tool_output_preview("edit", &output, false);
 
-    assert!(preview.contains("* Edited README.md (+2 -30)"));
+    assert!(preview.contains("README.md (+2 -30)"));
     assert!(preview.contains("     1 -  old line 0"));
     assert!(preview.contains("    30 -  old line 29"));
     assert!(preview.contains("     1 +  new important line"));
@@ -953,7 +953,7 @@ fn tool_output_preview_projects_bash_latest_logs() {
 }
 
 #[test]
-fn chat_history_inserts_separator_between_turns() {
+fn chat_history_separates_turns_with_blank_lines() {
     let document = UiBuilder::new()
         .chat(&[
             ChatLine::User("first".to_string()),
@@ -961,10 +961,16 @@ fn chat_history_inserts_separator_between_turns() {
         ])
         .finish();
 
-    assert!(document
+    let kinds: Vec<UiKind> = document.history.iter().map(|line| line.kind).collect();
+    let blank = document
         .history
         .iter()
-        .any(|line| line.kind == UiKind::Separator && line.text.starts_with('─')));
+        .position(|line| line.text.is_empty())
+        .expect("a blank line separates the two turns");
+    assert_eq!(kinds[..blank], [UiKind::User]);
+    assert_eq!(kinds[blank + 1..], [UiKind::Assistant]);
+    // No leading blank before the first block.
+    assert!(!document.history[0].text.is_empty());
 }
 
 #[test]
@@ -1032,9 +1038,10 @@ fn projection_only_indents_text_not_ui_elements() {
         .collect::<Vec<_>>();
 
     assert!(plain.iter().any(|line| line.starts_with("  answer")));
-    assert!(plain.iter().any(|line| line.starts_with('─')));
-    assert!(plain.iter().any(|line| line.starts_with("Edit")));
-    assert!(plain.iter().any(|line| line.starts_with("     1 -")));
+    assert!(plain.iter().any(|line| line.is_empty()));
+    assert!(plain.iter().any(|line| line.starts_with("● Edit")));
+    assert!(plain.iter().any(|line| line.contains("⎿")));
+    assert!(plain.iter().any(|line| line.contains("1 -")));
     assert!(plain.iter().any(|line| line.starts_with("› hello")));
     let bottom_status = plain
         .iter()

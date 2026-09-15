@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::{
-    truncate_with_ellipsis, visible_width, UiKind, INVERSE_OFF, INVERSE_ON,
+    truncate_with_ellipsis, visible_width, UiKind, ACCENT, INVERSE_OFF, INVERSE_ON,
     TOOL_OUTPUT_PREVIEW_BYTES, TOOL_OUTPUT_PREVIEW_LINES,
 };
 
@@ -48,15 +48,10 @@ fn with_rejected_hunks_line(preview: String, output: &str) -> String {
     format!("{preview}\n{DIM}{rejected} hunk(s) rejected by user (not applied){RESET_STYLE}")
 }
 
-pub(crate) fn compact_tool_preview(name: &str, output: &str, running: bool) -> String {
-    let preview = tool_output_preview(name, output, running);
-    preview.lines().next().unwrap_or_default().to_string()
-}
-
 pub(crate) fn format_tool_header(name: &str, running: bool, preview: &str, width: usize) -> String {
     let action = tool_action_label(name);
     let suffix = if running { " running" } else { "" };
-    let prefix = format!("{STRONG}{action}{STRONG_OFF}{DIM}{suffix}");
+    let prefix = format!("{ACCENT}●{STRONG_OFF} {STRONG}{action}{STRONG_OFF}{DIM}{suffix}");
     let compact = preview.lines().next().unwrap_or_default().to_string();
     if compact.is_empty() {
         return format!("{prefix}{RESET_STYLE}");
@@ -206,7 +201,7 @@ fn edit_diff_view(diff: &str) -> String {
         return render_full_diff(diff);
     };
     let mut lines = vec![format!(
-        "* Edited {} (+{} -{})",
+        "{} (+{} -{})",
         parsed.path, parsed.additions, parsed.removals
     )];
     for line in parsed.lines {
@@ -621,7 +616,7 @@ pub(crate) fn diff_line_kind(line: &str) -> UiKind {
     if let Some(kind) = edit_view_line_kind(line) {
         return kind;
     }
-    if line.starts_with("* Edited") || line.starts_with("+++") || line.starts_with("---") {
+    if line.starts_with("+++") || line.starts_with("---") {
         UiKind::DiffHeader
     } else if line.starts_with('+') {
         UiKind::DiffAdd

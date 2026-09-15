@@ -4,9 +4,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::markdown::render_markdown;
 use crate::picker::{PickerMode, PickerState, TreePromptAction};
-use crate::tool_preview::{
-    compact_tool_preview, diff_line_kind, format_tool_header, tool_output_preview,
-};
+use crate::tool_preview::{diff_line_kind, format_tool_header, tool_output_preview};
 use crate::{
     color_code, compact_home_path, format_context_window, pad_to_width, spinner_char,
     truncate_to_width, ActivityState, BottomStatus, ChatLine, CommandCandidate, UiDocument, UiKind,
@@ -14,7 +12,10 @@ use crate::{
     THINKING_COLLAPSED_LINES, VISIBLE_CURSOR,
 };
 
-const TOOL_PREVIEW_INDENT: &str = "";
+/// Detail lines under a tool header hang off a `⎿` gutter on the first row,
+/// aligning the rest under it — the block reads as one unit.
+const TOOL_GUTTER_FIRST: &str = "  ⎿  ";
+const TOOL_GUTTER_REST: &str = "     ";
 const INPUT_PROMPT: &str = "›";
 /// Picker rows rendered at once; longer lists window around the selection.
 pub(crate) const PICKER_MAX_ROWS: usize = 15;
@@ -130,10 +131,8 @@ impl UiBuilder {
     }
 
     pub(crate) fn chat_with_width(mut self, chat: &[ChatLine], width: usize) -> Self {
-        for (index, item) in chat.iter().enumerate() {
-            if index > 0 {
-                self.push_separator(width);
-            }
+        for item in chat {
+            self.separate_block();
             match item {
                 ChatLine::Startup {
                     version,
@@ -150,14 +149,14 @@ impl UiBuilder {
                     model,
                     *context_window,
                 ),
-                ChatLine::User(text) => self.push_history(UiKind::User, text),
+                ChatLine::User(text) => self.push_user_message(text),
                 ChatLine::Assistant(text) => {
                     for line in render_markdown(text, width, color_code(UiKind::Assistant)) {
                         self.history_line(UiKind::Assistant, line);
                     }
                 }
                 ChatLine::Reasoning { text, collapsed } => {
-                    self.history_line(UiKind::Status, "* thinking".to_string());
+                    self.history_line(UiKind::Status, "✻ thinking".to_string());
                     let rendered = render_markdown(text, width, color_code(UiKind::Status));
                     let shown = if *collapsed {
                         THINKING_COLLAPSED_LINES.min(rendered.len())
@@ -455,6 +454,33 @@ impl UiBuilder {
         self.history
     }
 
+    /// One blank line between top-level blocks (turns, tool calls, notices)
+    /// gives the transcript its rhythm; leading blank is skipped.
+    fn separate_block(&mut self) {
+        if self
+            .history
+            .last()
+            .is_some_and(|line| !line.text.trim().is_empty())
+        {
+            self.history_line(UiKind::Status, String::new());
+        }
+    }
+
+    /// User turns echo with a dim `›` marker — same glyph as the composer
+    /// prompt — so their own messages read as quoted input, not output.
+    fn push_user_message(&mut self, text: &str) {
+        let dim = color_code(UiKind::Status);
+        let base = color_code(UiKind::User);
+        if text.is_empty() {
+            self.history_line(UiKind::User, format!("{dim}›"));
+            return;
+        }
+        for (index, line) in text.lines().enumerate() {
+            let marker = if index == 0 { "› " } else { "  " };
+            self.history_line(UiKind::User, format!("{dim}{marker}{base}{line}"));
+        }
+    }
+
     fn push_history(&mut self, kind: UiKind, text: &str) {
         if text.is_empty() {
             self.history_line(kind, String::new());
@@ -514,19 +540,19 @@ impl UiBuilder {
         self.history_line(UiKind::Brand, rounded_box_border('╰', '╯', content_width));
     }
 
-    fn push_separator(&mut self, width: usize) {
-        let width = if width == usize::MAX { 80 } else { width }.max(1);
-        self.history_line(UiKind::Separator, "─".repeat(width));
-    }
-
-    fn push_tool_preview(&mut self, text: &str, prefix: &str) {
+    fn push_tool_preview(&mut self, text: &str) {
         if text.is_empty() {
-            self.history_line(UiKind::Tool, prefix.to_string());
+            self.history_line(UiKind::Tool, TOOL_GUTTER_FIRST.to_string());
             return;
         }
 
-        for line in text.lines() {
-            self.history_line(diff_line_kind(line), format!("{prefix}{line}"));
+        for (index, line) in text.lines().enumerate() {
+            let gutter = if index == 0 {
+                TOOL_GUTTER_FIRST
+            } else {
+                TOOL_GUTTER_REST
+            };
+            self.history_line(diff_line_kind(line), format!("{gutter}{line}"));
         }
     }
 
@@ -535,11 +561,12 @@ impl UiBuilder {
         let header = format_tool_header(name, running, &preview, width);
         self.history_line(UiKind::ToolHeader, header);
 
-        if preview == compact_tool_preview(name, output, running) {
-            return;
+        // The header already shows the first preview line; the gutter block
+        // holds only what follows it.
+        let detail = preview.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
+        if !detail.trim().is_empty() {
+            self.push_tool_preview(detail);
         }
-
-        self.push_tool_preview(&preview, TOOL_PREVIEW_INDENT);
     }
 
     pub(crate) fn history_line(&mut self, kind: UiKind, text: String) {
