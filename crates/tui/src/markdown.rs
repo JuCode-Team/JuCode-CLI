@@ -1,16 +1,14 @@
-use unicode_width::UnicodeWidthChar;
-
-use crate::{split_ansi_sequence, visible_width};
-
-pub(crate) const MD_BOLD_ON: &str = "\x1b[1m";
-pub(crate) const MD_BOLD_OFF: &str = "\x1b[22m";
-pub(crate) const MD_ITALIC_ON: &str = "\x1b[3m";
-pub(crate) const MD_ITALIC_OFF: &str = "\x1b[23m";
-// Inline code reads as a chip: light-blue text on a subtle dark panel.
-pub(crate) const MD_CODE_ON: &str = "\x1b[38;5;117;48;2;42;46;58m";
-pub(crate) const MD_CODE_OFF: &str = "\x1b[39;49m"; // restore default foreground + background
-pub(crate) const MD_DIM_ON: &str = "\x1b[90m";
-pub(crate) const MD_DIM_OFF: &str = "\x1b[39m";
+use ratatui::{
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+};
+pub(crate) const MD_BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
+pub(crate) const MD_ITALIC: Style = Style::new().add_modifier(Modifier::ITALIC);
+/// Inline code reads as a chip: light-blue text on a subtle dark panel.
+pub(crate) const MD_CODE: Style = Style::new()
+    .fg(Color::Indexed(117))
+    .bg(Color::Rgb(42, 46, 58));
+pub(crate) const MD_DIM: Style = Style::new().fg(Color::DarkGray);
 
 #[derive(Clone, Copy)]
 enum MdAlign {
@@ -19,11 +17,10 @@ enum MdAlign {
     Center,
 }
 
-/// Render markdown into terminal lines: headings/bold/italic/inline-code become
-/// ANSI styling, and pipe tables become aligned box-drawn tables. `base` is the
-/// line's foreground color (so inline-code can restore it); the full color is still
-/// applied later by `render_ansi_line`.
-pub(crate) fn render_markdown(text: &str, width: usize, base: &str) -> Vec<String> {
+/// Render markdown into styled lines: headings/bold/italic/inline-code become
+/// span styles, and pipe tables become aligned box-drawn tables. The line's
+/// fallback color comes from its `UiKind` at paint time.
+pub(crate) fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
     let lines: Vec<&str> = text.split('\n').collect();
     let mut out = Vec::new();
     let mut index = 0;
@@ -57,88 +54,103 @@ pub(crate) fn render_markdown(text: &str, width: usize, base: &str) -> Vec<Strin
                 rows.push(parse_table_row(lines[end]));
                 end += 1;
             }
-            out.extend(render_table(&rows, &aligns, width, base));
+            out.extend(render_table(&rows, &aligns, width));
             index = end;
             continue;
         }
-        out.push(render_markdown_line(line, base));
+        out.push(render_markdown_line(line));
         index += 1;
     }
     out
 }
 
 /// Render code-block lines verbatim with a dim left gutter; no inline markdown.
-fn render_code_block(code: &[&str]) -> Vec<String> {
+fn render_code_block(code: &[&str]) -> Vec<Line<'static>> {
     code.iter()
-        .map(|line| format!("{MD_DIM_ON}│ {line}{MD_DIM_OFF}"))
+        .map(|line| Line::from(Span::styled(format!("│ {line}"), MD_DIM)))
         .collect()
 }
 
-fn render_markdown_line(line: &str, base: &str) -> String {
+fn render_markdown_line(line: &str) -> Line<'static> {
     let trimmed = line.trim_start();
     let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
     if (1..=6).contains(&hashes) {
         let after = &trimmed[hashes..];
         if after.is_empty() || after.starts_with(' ') {
-            return format!(
-                "{MD_BOLD_ON}{}{MD_BOLD_OFF}",
-                render_inline(after.trim_start(), base)
+            return Line::from(
+                render_inline(after.trim_start())
+                    .into_iter()
+                    .map(|span| Span::styled(span.content, span.style.add_modifier(Modifier::BOLD)))
+                    .collect::<Vec<_>>(),
             );
         }
     }
-    render_inline(line, base)
+    Line::from(render_inline(line))
 }
 
-fn render_inline(text: &str, base: &str) -> String {
-    // Code spans first so emphasis markers inside them stay literal. Inline code is
-    // recolored, then restored to the line's base color.
-    let mut out = String::new();
+fn render_inline(text: &str) -> Vec<Span<'static>> {
+    // Code spans first so emphasis markers inside them stay literal.
+    let mut spans = Vec::new();
     let mut rest = text;
     while let Some(start) = rest.find('`') {
-        out.push_str(&render_emphasis(&rest[..start]));
+        push_emphasis(&mut spans, &rest[..start]);
         let after = &rest[start + 1..];
         if let Some(end) = after.find('`') {
-            out.push_str(MD_CODE_ON);
-            out.push_str(&after[..end]);
-            out.push_str(MD_CODE_OFF);
-            out.push_str(base);
+            spans.push(Span::styled(after[..end].to_string(), MD_CODE));
             rest = &after[end + 1..];
         } else {
-            out.push('`');
+            spans.push(Span::raw("`".to_string()));
             rest = after;
         }
     }
-    out.push_str(&render_emphasis(rest));
-    out
+    push_emphasis(&mut spans, rest);
+    spans
 }
 
-fn render_emphasis(text: &str) -> String {
-    let text = replace_pair(text, "**", MD_BOLD_ON, MD_BOLD_OFF);
-    let text = replace_pair(&text, "__", MD_BOLD_ON, MD_BOLD_OFF);
-    replace_pair(&text, "*", MD_ITALIC_ON, MD_ITALIC_OFF)
+/// Apply `**`/`__`/`*` pair emphasis; markers inside styled spans keep their
+/// style and gain the emphasis modifier, unbalanced markers stay literal.
+fn push_emphasis(spans: &mut Vec<Span<'static>>, text: &str) {
+    let mut segments = vec![(text.to_string(), Style::default())];
+    for (delim, style) in [("**", MD_BOLD), ("__", MD_BOLD), ("*", MD_ITALIC)] {
+        let mut next = Vec::new();
+        for (segment, segment_style) in segments {
+            for (part, matched) in split_pair(&segment, delim) {
+                let style = if matched {
+                    segment_style.patch(style)
+                } else {
+                    segment_style
+                };
+                next.push((part, style));
+            }
+        }
+        segments = next;
+    }
+    spans.extend(
+        segments
+            .into_iter()
+            .filter(|(text, _)| !text.is_empty())
+            .map(|(text, style)| Span::styled(text, style)),
+    );
 }
 
-/// Replace balanced `delim`-wrapped spans with `on`/`off`; unbalanced markers stay
-/// literal.
-fn replace_pair(text: &str, delim: &str, on: &str, off: &str) -> String {
-    let mut out = String::new();
+/// Split `text` on balanced `delim` pairs: `(chunk, inside_delimiters)` parts.
+fn split_pair(text: &str, delim: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
     let mut rest = text;
     loop {
         let Some(start) = rest.find(delim) else {
-            out.push_str(rest);
+            out.push((rest.to_string(), false));
             return out;
         };
-        out.push_str(&rest[..start]);
+        out.push((rest[..start].to_string(), false));
         let after = &rest[start + delim.len()..];
         match after.find(delim) {
             Some(end) if end > 0 => {
-                out.push_str(on);
-                out.push_str(&after[..end]);
-                out.push_str(off);
+                out.push((after[..end].to_string(), true));
                 rest = &after[end + delim.len()..];
             }
             _ => {
-                out.push_str(delim);
+                out.push((delim.to_string(), false));
                 rest = after;
             }
         }
@@ -179,7 +191,7 @@ fn parse_table_aligns(line: &str, columns: usize) -> Vec<MdAlign> {
         .collect()
 }
 
-fn render_table(rows: &[Vec<String>], aligns: &[MdAlign], width: usize, base: &str) -> Vec<String> {
+fn render_table(rows: &[Vec<String>], aligns: &[MdAlign], width: usize) -> Vec<Line<'static>> {
     let columns = rows
         .iter()
         .map(|row| row.len())
@@ -191,18 +203,24 @@ fn render_table(rows: &[Vec<String>], aligns: &[MdAlign], width: usize, base: &s
     }
 
     // Style each cell (header bold) and measure its visible width.
-    let styled: Vec<Vec<(String, usize)>> = rows
+    let styled: Vec<Vec<(Line<'static>, usize)>> = rows
         .iter()
         .enumerate()
         .map(|(row_index, row)| {
             (0..columns)
                 .map(|col| {
                     let raw = row.get(col).map(String::as_str).unwrap_or("");
-                    let mut cell = render_inline(raw, base);
+                    let mut cell = render_inline(raw);
                     if row_index == 0 {
-                        cell = format!("{MD_BOLD_ON}{cell}{MD_BOLD_OFF}");
+                        cell = cell
+                            .into_iter()
+                            .map(|span| {
+                                Span::styled(span.content, span.style.add_modifier(Modifier::BOLD))
+                            })
+                            .collect();
                     }
-                    let visible = visible_width(&cell);
+                    let cell = Line::from(cell);
+                    let visible = cell.width();
                     (cell, visible)
                 })
                 .collect()
@@ -235,12 +253,12 @@ fn render_table(rows: &[Vec<String>], aligns: &[MdAlign], width: usize, base: &s
 
     let mut out = vec![table_border('┌', '┬', '┐', &col_widths)];
     for (row_index, row) in styled.iter().enumerate() {
-        let mut line = String::from("│");
+        let mut spans = vec![Span::raw("│".to_string())];
         for (col, (cell, visible)) in row.iter().enumerate() {
             let target = col_widths[col];
             let (content, content_width) = if *visible > target {
-                let truncated = truncate_visible(cell, target);
-                let measured = visible_width(&truncated);
+                let truncated = truncate_line(cell, target);
+                let measured = truncated.width();
                 (truncated, measured)
             } else {
                 (cell.clone(), *visible)
@@ -251,13 +269,11 @@ fn render_table(rows: &[Vec<String>], aligns: &[MdAlign], width: usize, base: &s
                 MdAlign::Right => (pad, 0),
                 MdAlign::Center => (pad / 2, pad - pad / 2),
             };
-            line.push(' ');
-            line.push_str(&" ".repeat(left));
-            line.push_str(&content);
-            line.push_str(&" ".repeat(right));
-            line.push_str(" │");
+            spans.push(Span::raw(format!(" {}", " ".repeat(left))));
+            spans.extend(content.spans);
+            spans.push(Span::raw(format!("{} │", " ".repeat(right))));
         }
-        out.push(line);
+        out.push(Line::from(spans));
         if row_index == 0 {
             out.push(table_border('├', '┼', '┤', &col_widths));
         }
@@ -266,7 +282,7 @@ fn render_table(rows: &[Vec<String>], aligns: &[MdAlign], width: usize, base: &s
     out
 }
 
-fn table_border(left: char, middle: char, right: char, col_widths: &[usize]) -> String {
+fn table_border(left: char, middle: char, right: char, col_widths: &[usize]) -> Line<'static> {
     let mut out = String::new();
     out.push(left);
     for (index, width) in col_widths.iter().enumerate() {
@@ -276,39 +292,11 @@ fn table_border(left: char, middle: char, right: char, col_widths: &[usize]) -> 
         out.push_str(&"─".repeat(width + 2));
     }
     out.push(right);
-    out
+    Line::from(out)
 }
 
-/// Truncate an already-styled string to `max` visible columns, keeping ANSI
-/// sequences, appending an ellipsis, and closing any open styles.
-fn truncate_visible(styled: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    let budget = max.saturating_sub(1);
-    let mut out = String::new();
-    let mut visible = 0;
-    let mut rest = styled;
-    while !rest.is_empty() {
-        if let Some((sequence, next)) = split_ansi_sequence(rest) {
-            out.push_str(sequence);
-            rest = next;
-            continue;
-        }
-        let Some(ch) = rest.chars().next() else {
-            break;
-        };
-        let ch_width = ch.width().unwrap_or(0);
-        if visible + ch_width > budget {
-            break;
-        }
-        out.push(ch);
-        visible += ch_width;
-        rest = &rest[ch.len_utf8()..];
-    }
-    out.push('…');
-    out.push_str(MD_BOLD_OFF);
-    out.push_str(MD_ITALIC_OFF);
-    out.push_str(MD_CODE_OFF);
-    out
+/// Truncate a styled line to `max` visible columns, keeping span styles and
+/// appending an ellipsis.
+fn truncate_line(line: &Line<'static>, max: usize) -> Line<'static> {
+    crate::truncate_line_spans(line, max)
 }

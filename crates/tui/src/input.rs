@@ -1,8 +1,14 @@
 use std::time::{Duration, Instant};
 
+use ratatui::{
+    style::Style,
+    text::{Line, Span},
+};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use crate::{
-    CURSOR_MARKER, PASTE_BURST_CHAR_INTERVAL, PASTE_BURST_IDLE_TIMEOUT,
-    PASTE_ENTER_SUPPRESS_WINDOW, PASTE_PLACEHOLDER_CHARS, SELECT_END, SELECT_START,
+    UiKind, UiLine, INPUT_SELECTION, PASTE_BURST_CHAR_INTERVAL, PASTE_BURST_IDLE_TIMEOUT,
+    PASTE_ENTER_SUPPRESS_WINDOW, PASTE_PLACEHOLDER_CHARS,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -45,51 +51,55 @@ impl InputBuffer {
         display
     }
 
-    /// Display string for the UI. The logical cursor marker is embedded at the cursor
-    /// position so the renderer can place the terminal's hardware cursor there; any active
-    /// selection is reverse-video highlighted. Selection styling is closed and reopened
-    /// around newlines so every logical line stays balanced.
-    pub(crate) fn render(&self, show_cursor: bool) -> String {
+    /// Styled display lines for the composer, split at newlines. The line holding the
+    /// caret carries `cursor` (a display column), so the renderer can place the
+    /// terminal's hardware cursor; selected cells get `INPUT_SELECTION` spans.
+    pub(crate) fn render(&self, show_cursor: bool) -> Vec<UiLine> {
         let selection = if show_cursor { self.selection() } else { None };
-        let mut out = String::new();
-        let mut in_selection = false;
+        let mut lines = Vec::new();
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut text = String::new();
+        let mut selected = false;
+        let mut cursor_col = None;
+        let mut width = 0usize;
+
         for index in 0..=self.cells.len() {
-            if let Some((_, end)) = selection {
-                if in_selection && index == end {
-                    out.push_str(SELECT_END);
-                    in_selection = false;
-                }
+            let now_selected = selection.is_some_and(|(start, end)| index >= start && index < end);
+            if now_selected != selected {
+                flush_input_span(&mut spans, &mut text, selected);
+                selected = now_selected;
             }
             if show_cursor && index == self.cursor {
-                out.push_str(CURSOR_MARKER);
-            }
-            if let Some((start, end)) = selection {
-                if index == start && start != end {
-                    out.push_str(SELECT_START);
-                    in_selection = true;
-                }
+                cursor_col = Some(width);
             }
             let Some(cell) = self.cells.get(index) else {
-                continue;
+                break;
             };
             match cell {
                 Cell::Char('\n') => {
-                    if in_selection {
-                        out.push_str(SELECT_END);
-                    }
-                    out.push('\n');
-                    if in_selection {
-                        out.push_str(SELECT_START);
-                    }
+                    flush_input_span(&mut spans, &mut text, selected);
+                    let mut line =
+                        UiLine::new(UiKind::Input, Line::from(std::mem::take(&mut spans)));
+                    line.cursor = cursor_col.take();
+                    lines.push(line);
+                    width = 0;
                 }
-                Cell::Char(ch) => out.push(*ch),
+                Cell::Char(ch) => {
+                    text.push(*ch);
+                    width += ch.width().unwrap_or(0);
+                }
                 Cell::LargePaste(paste) => {
-                    let char_count = paste.chars().count();
-                    out.push_str(&format!("[Pasted: {char_count} chars]"));
+                    let placeholder = format!("[Pasted: {} chars]", paste.chars().count());
+                    width += UnicodeWidthStr::width(placeholder.as_str());
+                    text.push_str(&placeholder);
                 }
             }
         }
-        out
+        flush_input_span(&mut spans, &mut text, selected);
+        let mut line = UiLine::new(UiKind::Input, Line::from(spans));
+        line.cursor = cursor_col;
+        lines.push(line);
+        lines
     }
 
     /// The contiguous run of plainly-typed chars immediately before the cursor
@@ -317,6 +327,18 @@ impl InputBuffer {
     }
 }
 
+fn flush_input_span(spans: &mut Vec<Span<'static>>, text: &mut String, selected: bool) {
+    if text.is_empty() {
+        return;
+    }
+    let style = if selected {
+        INPUT_SELECTION
+    } else {
+        Style::default()
+    };
+    spans.push(Span::styled(std::mem::take(text), style));
+}
+
 fn normalize_pasted_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
@@ -470,6 +492,7 @@ impl PasteBurst {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Modifier;
 
     fn typed(text: &str) -> InputBuffer {
         let mut input = InputBuffer::default();
@@ -576,13 +599,17 @@ mod tests {
     fn caret_marker_sits_before_char_under_cursor() {
         let mut input = typed("abc");
         input.move_left(false); // cursor at index 2, before 'c'
-        assert_eq!(input.render(true), format!("ab{CURSOR_MARKER}c"));
+        let lines = input.render(true);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].cursor, Some(2));
+        assert_eq!(lines[0].plain(), "abc");
     }
 
     #[test]
     fn caret_marker_at_end_has_no_trailing_glyph() {
         let input = typed("ab"); // cursor at end
-        assert_eq!(input.render(true), format!("ab{CURSOR_MARKER}"));
+        let lines = input.render(true);
+        assert_eq!(lines[0].cursor, Some(2));
     }
 
     #[test]
@@ -591,13 +618,19 @@ mod tests {
         input.move_document_start(false);
         input.move_right(true);
         input.move_right(true); // select "ab", cursor at end of selection
-        let rendered = input.render(true);
-        // Selection is highlighted; no separate block caret while selecting.
-        assert_eq!(
-            rendered,
-            format!("{SELECT_START}ab{SELECT_END}{CURSOR_MARKER}c")
-        );
-        assert_eq!(input.render(false), "abc");
+        let lines = input.render(true);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].cursor, Some(2));
+        let spans = &lines[0].line.spans;
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content.as_ref(), "ab");
+        assert!(spans[0].style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(spans[1].content.as_ref(), "c");
+
+        let hidden = input.render(false);
+        assert_eq!(hidden[0].plain(), "abc");
+        assert_eq!(hidden[0].cursor, None);
+        assert_eq!(hidden[0].line.spans.len(), 1);
     }
 
     #[test]
@@ -628,6 +661,21 @@ mod tests {
     #[test]
     fn caret_marker_on_empty_input_is_just_the_marker() {
         let input = typed("");
-        assert_eq!(input.render(true), CURSOR_MARKER.to_string());
+        let lines = input.render(true);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].cursor, Some(0));
+        assert_eq!(lines[0].plain(), "");
+    }
+
+    #[test]
+    fn render_splits_multiline_input_and_tracks_caret_line() {
+        let mut input = typed("ab\ncd");
+        input.move_home(false); // start of "cd"
+        let lines = input.render(true);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].plain(), "ab");
+        assert_eq!(lines[0].cursor, None);
+        assert_eq!(lines[1].plain(), "cd");
+        assert_eq!(lines[1].cursor, Some(0));
     }
 }

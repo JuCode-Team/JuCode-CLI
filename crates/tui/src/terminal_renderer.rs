@@ -2,22 +2,22 @@ use std::io::{self, Stdout};
 
 use ratatui::{
     backend::CrosstermBackend,
-    buffer::{Buffer, Cell as RtCell},
+    buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{
         Block, BorderType, Borders, Scrollbar, ScrollbarOrientation, ScrollbarState,
         StatefulWidget, Widget,
     },
     Terminal,
 };
-use unicode_width::UnicodeWidthChar;
 
 #[cfg(test)]
 use crate::ProjectedDocument;
 use crate::{
-    extract_cursor, padded_content_width, render_ansi_line, split_ansi_sequence, visible_width,
-    wrap_lines, CursorTarget, UiDocument, UiKind, UiLine, CONTENT_LEFT_PADDING, CURSOR_MARKER,
+    extract_cursor, kind_style, padded_content_width, wrap_lines, CursorTarget, UiDocument, UiKind,
+    UiLine, CONTENT_LEFT_PADDING,
 };
 
 /// Column reserved on the right of the transcript for the scrollbar.
@@ -174,17 +174,14 @@ fn draw(
     }
     let width = area.width as usize;
 
-    // Transcript lines keep their click target (chat item index) alongside the
-    // projected ANSI text so painted rows map back to toggleable items.
-    let transcript: Vec<(String, Option<usize>)> = document
+    // Transcript lines keep their click target (chat item index) on the UiLine
+    // so painted rows map back to toggleable items.
+    let transcript: Vec<UiLine> = document
         .rendered_history_lines
         .clone()
         .unwrap_or_else(|| wrap_lines(&document.history, padded_content_width(width)))
         .into_iter()
-        .map(|line| {
-            let click = line.click;
-            (render_projected_line(line, true), click)
-        })
+        .map(|line| project_line(line, true))
         .collect();
     let regions = ControlRegions::split(&document.controls, width);
 
@@ -251,7 +248,7 @@ fn input_cursor_position(box_rect: Rect, cursor: Option<CursorTarget>) -> Option
 fn draw_transcript(
     buf: &mut Buffer,
     rect: Rect,
-    lines: &[(String, Option<usize>)],
+    lines: &[UiLine],
     scroll: &mut usize,
     clickables: &mut ClickTargets,
 ) {
@@ -269,16 +266,16 @@ fn draw_transcript(
         rect.width.saturating_sub(SCROLLBAR_WIDTH),
         rect.height,
     );
-    for (row, (text, click)) in lines[start..end].iter().enumerate() {
-        if let Some(index) = click {
-            clickables.push((text_rect.y + row as u16, *index));
+    for (row, line) in lines[start..end].iter().enumerate() {
+        if let Some(index) = line.click {
+            clickables.push((text_rect.y + row as u16, index));
         }
-        paint_ansi_line(
+        paint_line(
             buf,
             text_rect.x,
             text_rect.y + row as u16,
             text_rect.width as usize,
-            text,
+            line,
         );
     }
 
@@ -322,7 +319,7 @@ fn paint_selection(buf: &mut Buffer, area: Rect, selection: TextSelection) {
     }
 }
 
-fn draw_input_box(buf: &mut Buffer, rect: Rect, lines: &[String]) {
+fn draw_input_box(buf: &mut Buffer, rect: Rect, lines: &[UiLine]) {
     if rect.height < 2 || rect.width < 2 {
         paint_lines(buf, rect, lines);
         return;
@@ -338,7 +335,7 @@ fn draw_input_box(buf: &mut Buffer, rect: Rect, lines: &[String]) {
 
 /// Paints the last `rect.height` lines of `lines` from the top of `rect`. Regions are
 /// height-clamped to fit, so this shows everything unless the region overflowed.
-fn paint_region_tail(buf: &mut Buffer, rect: Rect, lines: &[String]) {
+fn paint_region_tail(buf: &mut Buffer, rect: Rect, lines: &[UiLine]) {
     if rect.height == 0 {
         return;
     }
@@ -346,9 +343,29 @@ fn paint_region_tail(buf: &mut Buffer, rect: Rect, lines: &[String]) {
     paint_lines(buf, rect, &lines[start..]);
 }
 
-fn paint_lines(buf: &mut Buffer, rect: Rect, lines: &[String]) {
+fn paint_lines(buf: &mut Buffer, rect: Rect, lines: &[UiLine]) {
     for (row, line) in lines.iter().enumerate().take(rect.height as usize) {
-        paint_ansi_line(buf, rect.x, rect.y + row as u16, rect.width as usize, line);
+        paint_line(buf, rect.x, rect.y + row as u16, rect.width as usize, line);
+    }
+}
+
+/// Paints one styled line: kind style is the base each span overrides, the row's
+/// remaining cells are reset to the kind background — clearing stale glyphs and
+/// extending diff/status backgrounds to the region edge in one pass.
+fn paint_line(buf: &mut Buffer, x0: u16, y: u16, width: usize, line: &UiLine) {
+    let base = kind_style(line.kind);
+    let mut styled = line.line.clone();
+    for span in &mut styled.spans {
+        span.style = base.patch(span.style);
+    }
+    let painted = styled.width().min(width);
+    buf.set_line(x0, y, &styled, width as u16);
+    let row_bg = base.bg.unwrap_or(Color::Reset);
+    for column in painted..width {
+        if let Some(cell) = buf.cell_mut((x0 + column as u16, y)) {
+            cell.reset();
+            cell.bg = row_bg;
+        }
     }
 }
 
@@ -357,10 +374,10 @@ fn paint_lines(buf: &mut Buffer, rect: Rect, lines: &[String]) {
 /// kinds), then the input box (a trailing run of `Input` lines), and everything above is
 /// the live region (assistant stream, picker, pending, progress).
 struct ControlRegions {
-    live: Vec<String>,
-    input: Vec<String>,
-    candidates: Vec<String>,
-    status: Vec<String>,
+    live: Vec<UiLine>,
+    input: Vec<UiLine>,
+    candidates: Vec<UiLine>,
+    status: Vec<UiLine>,
     /// Caret position (row, column) within the input box content, for the hardware cursor.
     cursor: Option<CursorTarget>,
 }
@@ -381,17 +398,13 @@ impl ControlRegions {
         let mut input = pop_trailing(&mut lines, |line| line.kind == UiKind::Input);
         input.reverse();
         // The input builder wraps the prompt in empty spacer lines; the box border
-        // replaces them, so drop them before projecting.
-        input.retain(|line| !line.text.is_empty());
+        // replaces them, so drop them before projecting. A caret-only line (empty
+        // continuation row) must stay — it carries the cursor position.
+        input.retain(|line| !line.plain().is_empty() || line.cursor.is_some());
 
-        // Pull the caret position out of the input lines so the renderer can place the
-        // hardware cursor; this also strips the marker so it never reaches the buffer.
-        let mut input = wrap_lines(&input, width);
-        let cursor = extract_cursor(&mut input);
-        let input = input
-            .into_iter()
-            .map(|line| render_projected_line(render_control_line(&line, width), false))
-            .collect();
+        // The caret rides on the wrapped input line as a field, not a text marker.
+        let input = wrap_lines(&input, width);
+        let cursor = extract_cursor(&input);
 
         Self {
             live: project_control_region(&lines, width),
@@ -411,23 +424,8 @@ fn pop_trailing(lines: &mut Vec<UiLine>, keep: impl Fn(&UiLine) -> bool) -> Vec<
     taken
 }
 
-fn project_control_region(lines: &[UiLine], width: usize) -> Vec<String> {
+fn project_control_region(lines: &[UiLine], width: usize) -> Vec<UiLine> {
     wrap_lines(lines, width)
-        .into_iter()
-        .map(|line| {
-            let mut text = render_projected_line(render_control_line(&line, width), false);
-            // Strip the logical cursor marker; the caret is drawn as a reverse-video block
-            // in the text itself, so the hardware cursor stays hidden.
-            strip_cursor_marker(&mut text);
-            text
-        })
-        .collect()
-}
-
-fn strip_cursor_marker(text: &mut String) {
-    while let Some(index) = text.find(CURSOR_MARKER) {
-        text.replace_range(index..index + CURSOR_MARKER.len(), "");
-    }
 }
 
 /// Selects which `view_height` lines of a `total`-line frame are visible.
@@ -476,10 +474,10 @@ impl ProjectedDocument {
             .unwrap_or_else(|| wrap_lines(&document.history, history_width));
         let transcript_lines: Vec<String> = transcript_lines
             .into_iter()
-            .map(|line| render_projected_line(line, true))
+            .map(|line| project_line(line, true).plain())
             .collect();
-        let mut controls = wrap_lines(&document.controls, control_width);
-        let cursor = extract_cursor(&mut controls);
+        let controls = wrap_lines(&document.controls, control_width);
+        let cursor = extract_cursor(&controls);
         let mut active_lines = Vec::new();
         if !transcript_lines.is_empty() && !document.controls.is_empty() {
             active_lines.push(String::new());
@@ -492,7 +490,16 @@ impl ProjectedDocument {
         active_lines.extend(
             controls
                 .into_iter()
-                .map(|line| render_projected_line(render_control_line(&line, control_width), false))
+                .map(|line| {
+                    let mut text = line.plain();
+                    // Input rows are padded to the region width at paint time;
+                    // mirror that so the projection matches the screen.
+                    let visible = line.line.width();
+                    if line.kind == UiKind::Input && visible < control_width {
+                        text.push_str(&" ".repeat(control_width - visible));
+                    }
+                    text
+                })
                 .collect::<Vec<_>>(),
         );
 
@@ -520,23 +527,16 @@ impl ProjectedDocument {
     }
 }
 
-fn render_control_line(line: &UiLine, width: usize) -> UiLine {
-    let mut line = line.clone();
-    if line.kind == UiKind::Input {
-        let visible = visible_width(&line.text);
-        if visible < width {
-            line.text.push_str(&" ".repeat(width - visible));
-        }
+fn project_line(line: UiLine, history: bool) -> UiLine {
+    if line.line.spans.is_empty() || !should_pad_line(line.kind, history) {
+        return line;
     }
-    line
-}
-
-fn render_projected_line(line: UiLine, history: bool) -> String {
-    let rendered = render_ansi_line(&line);
-    if rendered.is_empty() || !should_pad_line(line.kind, history) {
-        rendered
-    } else {
-        format!("{}{}", " ".repeat(CONTENT_LEFT_PADDING), rendered)
+    let mut spans = Vec::with_capacity(line.line.spans.len() + 1);
+    spans.push(Span::raw(" ".repeat(CONTENT_LEFT_PADDING)));
+    spans.extend(line.line.spans);
+    UiLine {
+        line: Line::from(spans),
+        ..line
     }
 }
 
@@ -548,186 +548,6 @@ fn should_pad_line(kind: UiKind, history: bool) -> bool {
         kind,
         UiKind::User | UiKind::Assistant | UiKind::System | UiKind::Error | UiKind::Status
     )
-}
-
-#[cfg(test)]
-fn render_ansi_lines_to_buffer(lines: &[String], buffer: &mut Buffer) {
-    let area = buffer.area;
-    for (row, line) in lines.iter().enumerate().take(area.height as usize) {
-        paint_ansi_line(
-            buffer,
-            area.x,
-            area.y + row as u16,
-            area.width as usize,
-            line,
-        );
-    }
-}
-
-fn paint_ansi_line(buffer: &mut Buffer, x0: u16, y: u16, width: usize, line: &str) {
-    let mut rest = line;
-    let mut column = 0usize;
-    let mut style = AnsiCellStyle::default();
-    let mut row_background = Color::Reset;
-    while !rest.is_empty() && column < width {
-        if let Some((sequence, tail)) = split_ansi_sequence(rest) {
-            style.apply_sequence(sequence);
-            if style.bg != Color::Reset {
-                row_background = style.bg;
-            }
-            rest = tail;
-            continue;
-        }
-
-        let Some(ch) = rest.chars().next() else {
-            break;
-        };
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        rest = &rest[ch.len_utf8()..];
-        if ch_width == 0 {
-            continue;
-        }
-        if column + ch_width > width {
-            break;
-        }
-
-        let x = x0 + column as u16;
-        if let Some(cell) = buffer.cell_mut((x, y)) {
-            cell.set_char(ch);
-            apply_cell_style(cell, style);
-        }
-        for offset in 1..ch_width {
-            if let Some(cell) = buffer.cell_mut((x + offset as u16, y)) {
-                cell.set_symbol(" ");
-                apply_cell_style(cell, style);
-                cell.skip = true;
-            }
-        }
-        column += ch_width;
-    }
-
-    if row_background != Color::Reset {
-        for column in 0..width {
-            if let Some(cell) = buffer.cell_mut((x0 + column as u16, y)) {
-                if cell.bg == Color::Reset {
-                    cell.bg = row_background;
-                }
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AnsiCellStyle {
-    fg: Color,
-    bg: Color,
-    modifier: Modifier,
-}
-
-impl Default for AnsiCellStyle {
-    fn default() -> Self {
-        Self {
-            fg: Color::Reset,
-            bg: Color::Reset,
-            modifier: Modifier::empty(),
-        }
-    }
-}
-
-impl AnsiCellStyle {
-    fn apply_sequence(&mut self, sequence: &str) {
-        let Some(body) = sequence
-            .strip_prefix("\x1b[")
-            .and_then(|value| value.strip_suffix('m'))
-        else {
-            return;
-        };
-        let params = if body.is_empty() {
-            vec![0]
-        } else {
-            body.split(';')
-                .filter_map(|part| part.parse::<u16>().ok())
-                .collect::<Vec<_>>()
-        };
-        let mut index = 0;
-        while index < params.len() {
-            match params[index] {
-                0 => *self = Self::default(),
-                1 => self.modifier.insert(Modifier::BOLD),
-                3 => self.modifier.insert(Modifier::ITALIC),
-                7 => self.modifier.insert(Modifier::REVERSED),
-                22 => self.modifier.remove(Modifier::BOLD),
-                23 => self.modifier.remove(Modifier::ITALIC),
-                27 => self.modifier.remove(Modifier::REVERSED),
-                30..=37 => self.fg = ansi_color(params[index], false),
-                39 => self.fg = Color::Reset,
-                40..=47 => self.bg = ansi_color(params[index], true),
-                49 => self.bg = Color::Reset,
-                90..=97 => self.fg = ansi_color(params[index], false),
-                100..=107 => self.bg = ansi_color(params[index], true),
-                38 | 48 => {
-                    if let Some((color, consumed)) = parse_extended_color(&params[index..]) {
-                        if params[index] == 38 {
-                            self.fg = color;
-                        } else {
-                            self.bg = color;
-                        }
-                        index += consumed.saturating_sub(1);
-                    }
-                }
-                _ => {}
-            }
-            index += 1;
-        }
-    }
-}
-
-fn apply_cell_style(cell: &mut RtCell, style: AnsiCellStyle) {
-    cell.fg = style.fg;
-    cell.bg = style.bg;
-    cell.modifier = style.modifier;
-}
-
-fn ansi_color(code: u16, background: bool) -> Color {
-    let foreground_code = if background {
-        code.saturating_sub(10)
-    } else {
-        code
-    };
-    match foreground_code {
-        30 => Color::Black,
-        31 => Color::Red,
-        32 => Color::Green,
-        33 => Color::Yellow,
-        34 => Color::Blue,
-        35 => Color::Magenta,
-        36 => Color::Cyan,
-        37 => Color::Gray,
-        90 => Color::DarkGray,
-        91 => Color::LightRed,
-        92 => Color::LightGreen,
-        93 => Color::LightYellow,
-        94 => Color::LightBlue,
-        95 => Color::LightMagenta,
-        96 => Color::LightCyan,
-        97 => Color::White,
-        _ => Color::Reset,
-    }
-}
-
-fn parse_extended_color(params: &[u16]) -> Option<(Color, usize)> {
-    match params {
-        [_, 5, index, ..] => Some((Color::Indexed((*index).min(u8::MAX as u16) as u8), 3)),
-        [_, 2, red, green, blue, ..] => Some((
-            Color::Rgb(
-                (*red).min(u8::MAX as u16) as u8,
-                (*green).min(u8::MAX as u16) as u8,
-                (*blue).min(u8::MAX as u16) as u8,
-            ),
-            5,
-        )),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -754,17 +574,29 @@ mod tests {
     }
 
     #[test]
-    fn ansi_lines_render_into_ratatui_cells_with_style() {
+    fn styled_spans_paint_into_cells_with_kind_fallback() {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
-        render_ansi_lines_to_buffer(
-            &["\x1b[31;1mA\x1b[0m \x1b[48;2;1;2;3mB".to_string()],
-            &mut buffer,
+        let line = UiLine::new(
+            UiKind::Assistant,
+            Line::from(vec![
+                Span::styled(
+                    "A",
+                    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled("B", Style::new().bg(Color::Rgb(1, 2, 3))),
+            ]),
         );
+        paint_line(&mut buffer, 0, 0, 8, &line);
 
         let first = &buffer[(0, 0)];
         assert_eq!(first.symbol(), "A");
         assert_eq!(first.fg, Color::Red);
         assert!(first.modifier.contains(Modifier::BOLD));
+
+        // Unstyled spans take the kind color (Assistant = bright white).
+        let second = &buffer[(1, 0)];
+        assert_eq!(second.fg, Color::White);
 
         let third = &buffer[(2, 0)];
         assert_eq!(third.symbol(), "B");
@@ -772,12 +604,10 @@ mod tests {
     }
 
     #[test]
-    fn background_color_extends_to_end_of_line() {
+    fn kind_background_extends_to_end_of_line() {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
-        render_ansi_lines_to_buffer(
-            &["\x1b[38;2;170;220;170;48;2;28;70;38m+x\x1b[0m".to_string()],
-            &mut buffer,
-        );
+        let line = UiLine::new(UiKind::DiffAdd, "+x");
+        paint_line(&mut buffer, 0, 0, 8, &line);
 
         assert!(buffer
             .content
@@ -788,66 +618,31 @@ mod tests {
     #[test]
     fn control_regions_split_separates_input_box_candidates_and_status() {
         let controls = vec![
-            UiLine {
-                kind: UiKind::Status,
-                text: "  spinner".to_string(),
-                click: None,
-            },
-            UiLine {
-                kind: UiKind::Input,
-                text: String::new(),
-                click: None,
-            },
-            UiLine {
-                kind: UiKind::Input,
-                text: "› hi".to_string(),
-                click: None,
-            },
-            UiLine {
-                kind: UiKind::Input,
-                text: String::new(),
-                click: None,
-            },
-            UiLine {
-                kind: UiKind::Selected,
-                text: "  /help".to_string(),
-                click: None,
-            },
-            UiLine {
-                kind: UiKind::BottomStatus,
-                text: "model · tokens".to_string(),
-                click: None,
-            },
+            UiLine::new(UiKind::Status, "  spinner"),
+            UiLine::new(UiKind::Input, ""),
+            UiLine::new(UiKind::Input, "› hi"),
+            UiLine::new(UiKind::Input, ""),
+            UiLine::new(UiKind::Selected, "  /help"),
+            UiLine::new(UiKind::BottomStatus, "model · tokens"),
         ];
 
         let regions = ControlRegions::split(&controls, 40);
 
         assert_eq!(regions.live.len(), 1);
-        assert!(strip_ansi(&regions.live[0]).contains("spinner"));
+        assert!(regions.live[0].plain().contains("spinner"));
         // Wrapper blank lines stripped, leaving just the prompt line for the box.
         assert_eq!(regions.input.len(), 1);
-        assert!(strip_ansi(&regions.input[0]).contains("› hi"));
+        assert!(regions.input[0].plain().contains("› hi"));
         assert_eq!(regions.candidates.len(), 1);
-        assert!(strip_ansi(&regions.candidates[0]).contains("/help"));
+        assert!(regions.candidates[0].plain().contains("/help"));
         assert_eq!(regions.status.len(), 1);
-        assert!(strip_ansi(&regions.status[0]).contains("model"));
+        assert!(regions.status[0].plain().contains("model"));
     }
 
-    fn strip_ansi(text: &str) -> String {
-        let mut out = String::new();
-        let mut rest = text;
-        while !rest.is_empty() {
-            if let Some((_, tail)) = split_ansi_sequence(rest) {
-                rest = tail;
-                continue;
-            }
-            let ch = rest.chars().next().expect("non-empty");
-            if ch != '\u{1b}' {
-                out.push(ch);
-            }
-            rest = &rest[ch.len_utf8()..];
-        }
-        out
+    fn input_lines(text: &str) -> Vec<UiLine> {
+        let mut input = crate::input::InputBuffer::default();
+        input.push_text(text);
+        input.render(true)
     }
 
     fn sample_document() -> UiDocument {
@@ -856,7 +651,7 @@ mod tests {
             .collect();
         UiBuilder::new()
             .chat_with_width(&history, 18)
-            .input("hi", &[], 0)
+            .input(&input_lines("hi"), &[], 0)
             .bottom_status(
                 BottomStatus {
                     provider: "p",
@@ -971,7 +766,7 @@ mod tests {
                 collapsed: true,
                 duration_secs: Some(3),
             }])
-            .input("hi", &[], 0)
+            .input(&input_lines("hi"), &[], 0)
             .finish();
         let mut scroll = 0usize;
         let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();

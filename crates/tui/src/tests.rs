@@ -1,48 +1,36 @@
 use super::*;
-use crate::markdown::{
-    render_markdown, MD_BOLD_OFF, MD_BOLD_ON, MD_CODE_OFF, MD_CODE_ON, MD_DIM_OFF, MD_DIM_ON,
-    MD_ITALIC_OFF, MD_ITALIC_ON,
-};
+use crate::markdown::{render_markdown, MD_CODE, MD_DIM};
 use crate::tool_preview::{format_tool_header, tool_output_preview};
 use jucode_agent_core::{ModelOptionView, SessionListItemView, TreeNodeView};
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use ratatui::style::Modifier;
+use unicode_width::UnicodeWidthStr;
 
-fn strip_ansi(text: &str) -> String {
-    let mut output = String::new();
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\x1b' {
-            output.push(ch);
-            continue;
-        }
-        if chars.next() != Some('[') {
-            continue;
-        }
-        for ch in chars.by_ref() {
-            if ch.is_ascii_alphabetic() {
-                break;
-            }
-        }
-    }
-    output
+fn markdown_text(lines: &[Line<'static>]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect()
 }
 
-fn ansi_visible_width(text: &str) -> usize {
-    let mut width = 0;
-    let mut rest = text;
-    while !rest.is_empty() {
-        if let Some((_, next)) = split_ansi_sequence(rest) {
-            rest = next;
-            continue;
-        }
-        let Some(ch) = rest.chars().next() else {
-            break;
-        };
-        width += ch.width().unwrap_or(0);
-        rest = &rest[ch.len_utf8()..];
-    }
-    width
+fn preview_text(lines: &[UiLine]) -> String {
+    lines
+        .iter()
+        .map(UiLine::plain)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn has_modifier(line: &Line<'static>, modifier: Modifier) -> bool {
+    line.spans
+        .iter()
+        .any(|span| span.style.add_modifier.contains(modifier))
+}
+
+fn input_lines(text: &str) -> Vec<UiLine> {
+    let mut input = crate::input::InputBuffer::default();
+    input.push_text(text);
+    input.render(true)
 }
 
 #[derive(Default)]
@@ -250,29 +238,33 @@ fn esc_interrupts_active_turn_and_clears_draft_when_idle() {
 
 #[test]
 fn input_renders_multiple_lines() {
-    let document = UiBuilder::new().input("one\ntwo", &[], 0).finish();
+    let document = UiBuilder::new()
+        .input(&input_lines("one\ntwo"), &[], 0)
+        .finish();
 
     assert_eq!(document.controls[0].kind, UiKind::Input);
-    assert_eq!(document.controls[0].text, "");
+    assert_eq!(document.controls[0].plain(), "");
     assert_eq!(document.controls[1].kind, UiKind::Input);
-    assert_eq!(document.controls[1].text, "› one");
+    assert_eq!(document.controls[1].plain(), "› one");
     assert_eq!(document.controls[2].kind, UiKind::Input);
-    assert_eq!(document.controls[2].text, "  two");
+    assert_eq!(document.controls[2].plain(), "  two");
     assert_eq!(document.controls[3].kind, UiKind::Input);
-    assert_eq!(document.controls[3].text, "");
+    assert_eq!(document.controls[3].plain(), "");
 }
 
 #[test]
 fn single_line_input_renders_text_on_middle_row() {
-    let document = UiBuilder::new().input("hello", &[], 0).finish();
+    let document = UiBuilder::new()
+        .input(&input_lines("hello"), &[], 0)
+        .finish();
 
     assert_eq!(document.controls.len(), 3);
     assert_eq!(document.controls[0].kind, UiKind::Input);
-    assert_eq!(document.controls[0].text, "");
+    assert_eq!(document.controls[0].plain(), "");
     assert_eq!(document.controls[1].kind, UiKind::Input);
-    assert_eq!(document.controls[1].text, "› hello");
+    assert_eq!(document.controls[1].plain(), "› hello");
     assert_eq!(document.controls[2].kind, UiKind::Input);
-    assert_eq!(document.controls[2].text, "");
+    assert_eq!(document.controls[2].plain(), "");
 }
 
 #[test]
@@ -280,22 +272,14 @@ fn cursor_row_is_relative_to_whole_frame() {
     let frame = RenderedFrame::build(
         &UiDocument {
             history: vec![
-                UiLine {
-                    kind: UiKind::User,
-                    text: "hello".to_string(),
-                    click: None,
-                },
-                UiLine {
-                    kind: UiKind::Assistant,
-                    text: "world".to_string(),
-                    click: None,
-                },
+                UiLine::new(UiKind::User, "hello"),
+                UiLine::new(UiKind::Assistant, "world"),
             ],
             rendered_history_lines: None,
-            controls: vec![UiLine {
-                kind: UiKind::Input,
-                text: format!("› prompt{CURSOR_MARKER}"),
-                click: None,
+            controls: vec![{
+                let mut line = UiLine::new(UiKind::Input, "› prompt");
+                line.cursor = Some(8);
+                line
             }],
             reset_screen: false,
         },
@@ -311,7 +295,7 @@ fn cursor_row_is_relative_to_whole_frame() {
 fn command_completion_renders_below_input_with_selected_color() {
     let document = UiBuilder::new()
         .input(
-            &format!("/{CURSOR_MARKER}{VISIBLE_CURSOR}"),
+            &input_lines("/"),
             &[
                 CommandCandidate {
                     command: "/help".to_string(),
@@ -328,24 +312,22 @@ fn command_completion_renders_below_input_with_selected_color() {
 
     assert_eq!(document.controls.len(), 5);
     assert_eq!(document.controls[0].kind, UiKind::Input);
-    assert_eq!(document.controls[0].text, "");
+    assert_eq!(document.controls[0].plain(), "");
     assert_eq!(document.controls[1].kind, UiKind::Input);
-    assert_eq!(
-        document.controls[1].text,
-        format!("› /{CURSOR_MARKER}{VISIBLE_CURSOR}")
-    );
+    assert_eq!(document.controls[1].plain(), "› /");
+    assert_eq!(document.controls[1].cursor, Some(3));
     assert_eq!(document.controls[2].kind, UiKind::Input);
-    assert_eq!(document.controls[2].text, "");
+    assert_eq!(document.controls[2].plain(), "");
     assert_eq!(document.controls[3].kind, UiKind::Status);
-    assert_eq!(document.controls[3].text, "  /help");
+    assert_eq!(document.controls[3].plain(), "  /help");
     assert_eq!(document.controls[4].kind, UiKind::Selected);
-    assert_eq!(document.controls[4].text, "  /review SKILL");
+    assert_eq!(document.controls[4].plain(), "  /review SKILL");
 }
 
 #[test]
 fn model_and_tokens_render_below_input_without_ready_status() {
     let document = UiBuilder::new()
-        .input(&format!("hello{CURSOR_MARKER}{VISIBLE_CURSOR}"), &[], 0)
+        .input(&input_lines("hello"), &[], 0)
         .bottom_status(
             BottomStatus {
                 provider: "openai",
@@ -361,52 +343,41 @@ fn model_and_tokens_render_below_input_without_ready_status() {
         .finish();
 
     assert_eq!(document.controls.len(), 4);
-    assert_eq!(
-        document.controls[1].text,
-        format!("› hello{CURSOR_MARKER}{VISIBLE_CURSOR}")
-    );
-    let status = strip_ansi(&document.controls[3].text);
+    assert_eq!(document.controls[1].plain(), "› hello");
+    assert_eq!(document.controls[1].cursor, Some(7));
+    let status = document.controls[3].plain();
     assert!(status.starts_with("openai / gpt-5 (medium)"));
     assert!(status.ends_with("tokens 12345/400000 | context 3.1%"));
     assert!(!status.contains("ready"));
-    assert_eq!(
-        UnicodeWidthStr::width(strip_ansi(&document.controls[3].text).as_str()),
-        64
-    );
+    assert_eq!(document.controls[3].line.width(), 64);
 }
 
 #[test]
 fn input_line_pads_to_frame_width() {
-    let document = UiBuilder::new()
-        .input(&format!("hi{CURSOR_MARKER}{VISIBLE_CURSOR}"), &[], 0)
-        .finish();
+    let document = UiBuilder::new().input(&input_lines("hi"), &[], 0).finish();
 
     let frame = RenderedFrame::build(&document, 40);
     let input_line = frame
         .lines
         .iter()
-        .find(|line| strip_ansi(line).contains("› hi"))
+        .find(|line| line.contains("› hi"))
         .expect("input line should render");
 
-    assert!(input_line.contains("\x1b[38;2;224;226;232m"));
-    assert_eq!(UnicodeWidthStr::width(strip_ansi(input_line).as_str()), 40);
+    // Projected to the frame, the composer row fills the terminal width.
+    assert_eq!(UnicodeWidthStr::width(input_line.as_str()), 40);
 }
 
 #[test]
 fn native_cursor_tracks_middle_input_row() {
     let document = UiBuilder::new()
-        .input(&format!("hello{CURSOR_MARKER}{VISIBLE_CURSOR}"), &[], 0)
+        .input(&input_lines("hello"), &[], 0)
         .finish();
 
     let frame = RenderedFrame::build(&document, 40);
     let cursor = frame.cursor.expect("cursor marker should be found");
 
     assert_eq!(frame.lines.len(), 3);
-    assert!(strip_ansi(&frame.lines[cursor.row]).starts_with("› hello|"));
-    assert_eq!(
-        UnicodeWidthStr::width(strip_ansi(&frame.lines[cursor.row]).as_str()),
-        40
-    );
+    assert!(frame.lines[cursor.row].starts_with("› hello"));
     assert_eq!(cursor.row, 1);
     assert_eq!(cursor.column, 2 + "hello".len());
 }
@@ -420,7 +391,7 @@ fn progress_renders_above_input() {
     let progress_index = document
         .controls
         .iter()
-        .position(|line| line.text.contains("connecting"))
+        .position(|line| line.plain().contains("connecting"))
         .expect("progress line should render");
     let input_index = document
         .controls
@@ -434,7 +405,7 @@ fn progress_renders_above_input() {
 #[test]
 fn colored_status_line_does_not_wrap_at_visible_width() {
     let document = UiBuilder::new()
-        .input("", &[], 0)
+        .input(&input_lines(""), &[], 0)
         .bottom_status(
             BottomStatus {
                 provider: "jucode",
@@ -452,11 +423,8 @@ fn colored_status_line_does_not_wrap_at_visible_width() {
     let frame = RenderedFrame::build(&document, 64);
 
     assert_eq!(frame.lines.len(), 4);
-    assert!(strip_ansi(&frame.lines[3]).contains("tokens 1633/400000 | context 0.4%"));
-    assert_eq!(
-        UnicodeWidthStr::width(strip_ansi(&frame.lines[3]).as_str()),
-        64
-    );
+    assert!(frame.lines[3].contains("tokens 1633/400000 | context 0.4%"));
+    assert_eq!(UnicodeWidthStr::width(frame.lines[3].as_str()), 64);
 }
 
 #[test]
@@ -472,31 +440,31 @@ fn startup_renders_inside_box() {
         }])
         .finish();
 
-    assert!(document.history[0].text.starts_with("\x1b[90m╭"));
-    assert!(document.history[1].text.contains("\x1b[90m│"));
-    assert!(strip_ansi(&document.history[0].text).starts_with('╭'));
-    assert!(strip_ansi(&document.history[1].text).contains(" \\/"));
-    assert!(strip_ansi(&document.history[1].text)
+    assert_eq!(document.history[0].plain().chars().next(), Some('╭'));
+    // Box borders keep their dim color as a span style.
+    assert!(document.history[0]
+        .line
+        .spans
+        .iter()
+        .any(|span| span.style.fg == Some(Color::DarkGray)));
+    assert!(document.history[1].plain().contains(" \\/"));
+    assert!(document.history[1]
+        .plain()
         .contains("Welcome to JuCode v0.1.2 (claude-opus-4-7 · 1M context)"));
-    assert!(strip_ansi(&document.history[2].text).contains("<'l"));
-    assert!(!strip_ansi(&document.history[2].text).contains("cwd:"));
-    assert!(strip_ansi(&document.history[3].text).contains(" ll"));
-    assert!(strip_ansi(&document.history[3].text).contains("cwd:"));
+    assert!(document.history[2].plain().contains("<'l"));
+    assert!(!document.history[2].plain().contains("cwd:"));
+    assert!(document.history[3].plain().contains(" ll"));
+    assert!(document.history[3].plain().contains("cwd:"));
     assert!(!document
         .history
         .iter()
-        .any(|line| strip_ansi(&line.text).contains("directory:")));
-    assert!(strip_ansi(&document.history[5].text).contains(" || ||"));
-    assert!(strip_ansi(&document.history[5].text).contains("/help for commands"));
-    assert!(strip_ansi(&document.history[7].text).starts_with('╰'));
-    let border_width = ansi_visible_width(&document.history[0].text);
+        .any(|line| line.plain().contains("directory:")));
+    assert!(document.history[5].plain().contains(" || ||"));
+    assert!(document.history[5].plain().contains("/help for commands"));
+    assert_eq!(document.history[7].plain().chars().next(), Some('╰'));
+    let border_width = document.history[0].line.width();
     for line in document.history.iter().take(8) {
-        assert_eq!(
-            ansi_visible_width(&line.text),
-            border_width,
-            "{}",
-            strip_ansi(&line.text)
-        );
+        assert_eq!(line.line.width(), border_width, "{}", line.plain());
     }
 }
 
@@ -514,11 +482,7 @@ fn projected_startup_box_lines_stay_aligned() {
         .finish();
 
     let frame = RenderedFrame::build(&document, 80);
-    let plain = frame
-        .lines
-        .iter()
-        .map(|line| strip_ansi(line))
-        .collect::<Vec<_>>();
+    let plain = frame.lines.clone();
     let width = UnicodeWidthStr::width(plain[0].as_str());
 
     for line in plain.iter().take(8) {
@@ -650,72 +614,75 @@ fn reasoning_tokens_show_in_thinking_progress_not_transcript() {
     assert!(document
         .controls
         .iter()
-        .any(|line| line.text.contains("thinking") && line.text.contains("(88 tokens)")));
+        .any(|line| line.plain().contains("thinking") && line.plain().contains("(88 tokens)")));
     assert!(!document
         .history
         .iter()
-        .any(|line| line.text.contains("88 tokens")));
+        .any(|line| line.plain().contains("88 tokens")));
 }
 
 #[test]
 fn markdown_heading_renders_bold() {
-    let base = color_code(UiKind::Assistant);
-    assert_eq!(
-        render_markdown("## Section title", usize::MAX, base),
-        vec![format!("{MD_BOLD_ON}Section title{MD_BOLD_OFF}")]
-    );
+    let lines = render_markdown("## Section title", usize::MAX);
+    assert_eq!(markdown_text(&lines), vec!["Section title"]);
+    assert!(lines[0]
+        .spans
+        .iter()
+        .all(|span| span.style.add_modifier.contains(Modifier::BOLD)));
 }
 
 #[test]
 fn markdown_bold_and_italic_render_inline() {
-    let base = color_code(UiKind::Assistant);
-    assert_eq!(
-        render_markdown("a **bold** and *em* word", usize::MAX, base),
-        vec![format!(
-            "a {MD_BOLD_ON}bold{MD_BOLD_OFF} and {MD_ITALIC_ON}em{MD_ITALIC_OFF} word"
-        )]
-    );
+    let lines = render_markdown("a **bold** and *em* word", usize::MAX);
+    assert_eq!(markdown_text(&lines), vec!["a bold and em word"]);
+    let styled = |needle: &str| {
+        lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == needle)
+            .map(|span| span.style)
+    };
+    assert_eq!(styled("bold").unwrap().add_modifier, Modifier::BOLD);
+    assert_eq!(styled("em").unwrap().add_modifier, Modifier::ITALIC);
 }
 
 #[test]
 fn markdown_inline_code_recolors_and_restores_base() {
-    let base = color_code(UiKind::Assistant);
-    // Inline code is a chip (fg + subtle bg); off clears both, then base fg.
-    assert_eq!(
-        render_markdown("run `a*b*c` now", usize::MAX, base),
-        vec![format!("run {MD_CODE_ON}a*b*c{MD_CODE_OFF}{base} now")]
-    );
+    let lines = render_markdown("run `a*b*c` now", usize::MAX);
+    // Inline code is a chip (fg + subtle bg) as a single styled span.
+    assert_eq!(markdown_text(&lines), vec!["run a*b*c now"]);
+    let chip = lines[0]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "a*b*c")
+        .expect("code span");
+    assert_eq!(chip.style.bg, MD_CODE.bg);
+    assert_eq!(chip.style.fg, MD_CODE.fg);
 }
 
 #[test]
 fn markdown_fenced_code_block_renders_verbatim_with_gutter() {
     let md = "before\n```rust\nlet x = **2**;\nfoo();\n```\nafter";
-    let base = color_code(UiKind::Assistant);
+    let lines = render_markdown(md, usize::MAX);
     assert_eq!(
-        render_markdown(md, usize::MAX, base),
-        vec![
-            "before".to_string(),
-            format!("{MD_DIM_ON}│ let x = **2**;{MD_DIM_OFF}"),
-            format!("{MD_DIM_ON}│ foo();{MD_DIM_OFF}"),
-            "after".to_string(),
-        ]
+        markdown_text(&lines),
+        vec!["before", "│ let x = **2**;", "│ foo();", "after"]
     );
+    // Code lines are dim; emphasis markers inside them stay literal.
+    assert!(lines[1].spans.iter().all(|span| span.style.fg == MD_DIM.fg));
 }
 
 #[test]
 fn markdown_unbalanced_markers_stay_literal() {
-    let base = color_code(UiKind::Assistant);
-    assert_eq!(
-        render_markdown("2 * 3 = 6", usize::MAX, base),
-        vec!["2 * 3 = 6"]
-    );
+    let lines = render_markdown("2 * 3 = 6", usize::MAX);
+    assert_eq!(markdown_text(&lines), vec!["2 * 3 = 6"]);
 }
 
 #[test]
 fn markdown_table_renders_aligned_box() {
     let table = "| Name | Qty |\n|:-----|----:|\n| apple | 3 |\n| fig | 22 |";
-    let lines = render_markdown(table, usize::MAX, color_code(UiKind::Assistant));
-    let plain: Vec<String> = lines.iter().map(|line| strip_ansi(line)).collect();
+    let lines = render_markdown(table, usize::MAX);
+    let plain = markdown_text(&lines);
 
     assert_eq!(
         plain,
@@ -728,20 +695,21 @@ fn markdown_table_renders_aligned_box() {
             "└───────┴─────┘".to_string(),
         ]
     );
-    // Header cells are bold (styling preserved before strip).
-    assert!(lines[1].contains(&format!("{MD_BOLD_ON}Name{MD_BOLD_OFF}")));
+    // Header cells are bold.
+    let header = lines[1]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "Name")
+        .expect("header cell");
+    assert!(header.style.add_modifier.contains(Modifier::BOLD));
 }
 
 #[test]
 fn markdown_table_is_capped_to_width() {
     let table = "| A | B |\n|---|---|\n| xxxxxxxxxx | yyyyyyyyyy |";
-    let lines = render_markdown(table, 20, color_code(UiKind::Assistant));
+    let lines = render_markdown(table, 20);
     for line in &lines {
-        assert!(
-            visible_width(line) <= 20,
-            "line exceeds width: {}",
-            strip_ansi(line)
-        );
+        assert!(line.width() <= 20, "line exceeds width: {}", line);
     }
 }
 
@@ -753,7 +721,7 @@ fn assistant_message_is_rendered_as_markdown() {
     assert!(document
         .history
         .iter()
-        .any(|line| line.text.contains(MD_BOLD_ON) && line.text.contains("there")));
+        .any(|line| has_modifier(&line.line, Modifier::BOLD) && line.plain().contains("there")));
 }
 
 #[test]
@@ -779,7 +747,7 @@ fn thinking_tokens_reset_after_reply_completes() {
     assert!(!document
         .controls
         .iter()
-        .any(|line| line.text.contains("42 tokens")));
+        .any(|line| line.plain().contains("42 tokens")));
     assert!(reasoning_entry(&app).is_some());
 }
 
@@ -795,10 +763,10 @@ fn collapsed_reasoning_message_keeps_only_duration_header() {
     let visible: Vec<&UiLine> = document
         .history
         .iter()
-        .filter(|line| !line.text.trim().is_empty())
+        .filter(|line| !line.is_blank())
         .collect();
     assert_eq!(visible.len(), 1);
-    assert!(visible[0].text.contains("✻ thought for 2s"));
+    assert!(visible[0].plain().contains("✻ thought for 2s"));
     // The header is the click target that expands the block again.
     assert_eq!(visible[0].click, Some(0));
 }
@@ -812,11 +780,11 @@ fn expanded_reasoning_message_renders_body_lines() {
             duration_secs: Some(90),
         }])
         .finish();
-    let visible: Vec<&str> = document
+    let visible: Vec<String> = document
         .history
         .iter()
-        .filter(|line| !line.text.trim().is_empty())
-        .map(|line| line.text.trim())
+        .filter(|line| !line.is_blank())
+        .map(|line| line.plain().trim().to_string())
         .collect();
     assert_eq!(visible, vec!["✻ thought for 1m 30s", "l1", "l2"]);
 }
@@ -899,7 +867,7 @@ fn tool_output_preview_truncates_long_output() {
         .map(|index| format!("line {index}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let preview = tool_output_preview("custom", &output, false);
+    let preview = preview_text(&tool_output_preview("custom", &output, false));
 
     assert!(preview.contains("line 0"));
     assert!(!preview.contains("line 19"));
@@ -914,13 +882,12 @@ fn tool_output_preview_prefers_diff_field() {
     })
     .to_string();
 
-    let preview = tool_output_preview("str_replace", &output, false);
-    let visible_preview = strip_ansi(&preview);
+    let visible_preview = preview_text(&tool_output_preview("str_replace", &output, false));
 
-    assert!(preview.contains("a (+1 -1)"));
+    assert!(visible_preview.contains("a (+1 -1)"));
     assert!(visible_preview.contains("1 -  old"));
     assert!(visible_preview.contains("1 +  new"));
-    assert!(!preview.contains("diff --git a/a b/a"));
+    assert!(!visible_preview.contains("diff --git a/a b/a"));
     assert!(!visible_preview.contains("raw"));
 }
 
@@ -933,8 +900,7 @@ fn tool_output_preview_appends_rejected_hunk_count_after_partial_approval() {
     })
     .to_string();
 
-    let preview = tool_output_preview("str_replace", &output, false);
-    let visible_preview = strip_ansi(&preview);
+    let visible_preview = preview_text(&tool_output_preview("str_replace", &output, false));
 
     // The diff shows only the applied hunks, plus a rejected-count line.
     assert!(visible_preview.contains("1 +  new"));
@@ -947,7 +913,7 @@ fn tool_output_preview_appends_rejected_hunk_count_after_partial_approval() {
         "rejected_hunks": [],
     })
     .to_string();
-    assert!(!strip_ansi(&tool_output_preview("str_replace", &full, false)).contains("rejected"));
+    assert!(!preview_text(&tool_output_preview("str_replace", &full, false)).contains("rejected"));
 }
 
 #[test]
@@ -965,7 +931,7 @@ fn tool_output_preview_keeps_additions_after_large_removals() {
     })
     .to_string();
 
-    let preview = tool_output_preview("edit", &output, false);
+    let preview = preview_text(&tool_output_preview("edit", &output, false));
 
     assert!(preview.contains("README.md (+2 -30)"));
     assert!(preview.contains("     1 -  old line 0"));
@@ -992,8 +958,8 @@ fn tool_output_preview_projects_read_and_ls() {
     })
     .to_string();
 
-    let read_preview = tool_output_preview("read", &read, false);
-    let ls_preview = tool_output_preview("ls", &ls, false);
+    let read_preview = preview_text(&tool_output_preview("read", &read, false));
+    let ls_preview = preview_text(&tool_output_preview("ls", &ls, false));
 
     assert_eq!(read_preview, "read main.rs: 12 lines from line 5");
     assert!(!read_preview.contains("hidden"));
@@ -1007,13 +973,23 @@ fn tool_error_json_shows_message_not_raw_json() {
         r#"{"error":"shell session not found","session_id":0}"#,
         false,
     );
-    assert_eq!(preview, "error: shell session not found");
+    assert_eq!(preview_text(&preview), "error: shell session not found");
     // The header names the real tool instead of a generic "Tool".
-    let header = strip_ansi(&format_tool_header("write_stdin", false, &preview, 60));
-    assert!(header.contains("Sent"));
+    let header = format_tool_header("write_stdin", false, preview.first().map(|l| &l.line), 60);
+    assert!(header
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>()
+        .contains("Sent"));
     // MCP tools show server/tool rather than the mcp__ prefix form.
-    let header = strip_ansi(&format_tool_header("mcp__fs__read_file", false, "", 60));
-    assert!(header.contains("fs/read_file"));
+    let header = format_tool_header("mcp__fs__read_file", false, None, 60);
+    assert!(header
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>()
+        .contains("fs/read_file"));
 }
 
 #[test]
@@ -1027,7 +1003,7 @@ fn running_session_preview_shows_session_not_exit_code() {
     })
     .to_string();
 
-    let preview = strip_ansi(&tool_output_preview("write_stdin", &output, false));
+    let preview = preview_text(&tool_output_preview("write_stdin", &output, false));
     assert!(preview.contains("cargo test  session 3 running"));
     assert!(!preview.contains("exit"));
 }
@@ -1043,8 +1019,7 @@ fn tool_output_preview_projects_bash_latest_logs() {
     })
     .to_string();
 
-    let preview = tool_output_preview("bash", &output, false);
-    let plain_preview = strip_ansi(&preview);
+    let plain_preview = preview_text(&tool_output_preview("bash", &output, false));
 
     assert!(plain_preview.contains("cargo test  exit 0"));
     assert!(plain_preview.contains("stdout:"));
@@ -1064,12 +1039,12 @@ fn chat_history_separates_turns_with_blank_lines() {
     let blank = document
         .history
         .iter()
-        .position(|line| line.text.is_empty())
+        .position(|line| line.is_blank())
         .expect("a blank line separates the two turns");
     assert_eq!(kinds[..blank], [UiKind::User]);
     assert_eq!(kinds[blank + 1..], [UiKind::Assistant]);
     // No leading blank before the first block.
-    assert!(!document.history[0].text.is_empty());
+    assert!(!document.history[0].is_blank());
 }
 
 #[test]
@@ -1086,17 +1061,14 @@ fn tool_preview_colors_diff_lines() {
         }])
         .finish();
 
-    assert!(
-        document
-            .history
-            .iter()
-            .any(|line| line.kind == UiKind::DiffRemove
-                && strip_ansi(&line.text).contains("1 -  old"))
-    );
     assert!(document
         .history
         .iter()
-        .any(|line| line.kind == UiKind::DiffAdd && strip_ansi(&line.text).contains("1 +  new")));
+        .any(|line| line.kind == UiKind::DiffRemove && line.plain().contains("1 -  old")));
+    assert!(document
+        .history
+        .iter()
+        .any(|line| line.kind == UiKind::DiffAdd && line.plain().contains("1 +  new")));
 }
 
 #[test]
@@ -1114,7 +1086,7 @@ fn projection_only_indents_text_not_ui_elements() {
                 running: false,
             },
         ])
-        .input("hello", &[], 0)
+        .input(&input_lines("hello"), &[], 0)
         .bottom_status(
             BottomStatus {
                 provider: "jucode",
@@ -1130,11 +1102,7 @@ fn projection_only_indents_text_not_ui_elements() {
         .finish();
 
     let frame = RenderedFrame::build(&document, 40);
-    let plain = frame
-        .lines
-        .iter()
-        .map(|line| strip_ansi(line))
-        .collect::<Vec<_>>();
+    let plain = frame.lines.clone();
 
     assert!(plain.iter().any(|line| line.starts_with("  answer")));
     assert!(plain.iter().any(|line| line.is_empty()));
@@ -1178,12 +1146,14 @@ fn assistant_delta_streams_into_transcript() {
     let history = document
         .rendered_history_lines
         .expect("history lines should be projected");
-    assert!(history.iter().any(|line| line.text.contains("streaming")));
+    assert!(history
+        .iter()
+        .any(|line| line.plain().contains("streaming")));
     // Nothing leaks into the control region above the composer.
     assert!(!document
         .controls
         .iter()
-        .any(|line| line.text.contains("streaming")));
+        .any(|line| line.plain().contains("streaming")));
 }
 
 #[test]
@@ -1392,13 +1362,13 @@ fn checkout_tree_marks_rows_with_children_as_directories() {
     assert!(document
         .controls
         .iter()
-        .any(|line| line.text.contains("[-]") && line.text.contains("user: root")));
+        .any(|line| line.plain().contains("[-]") && line.plain().contains("user: root")));
     assert!(document
         .controls
         .iter()
         .any(|line| line.kind == UiKind::TreeDirectory
-            && line.text.contains("[+]")
-            && line.text.contains("user: child 2")));
+            && line.plain().contains("[+]")
+            && line.plain().contains("user: child 2")));
 }
 
 #[test]
@@ -1431,13 +1401,13 @@ fn checkout_tree_marks_head_and_active_path() {
     // The HEAD node is annotated as the current position.
     assert!(controls
         .iter()
-        .any(|line| line.text.contains("user: third") && line.text.contains("current")));
+        .any(|line| line.plain().contains("user: third") && line.plain().contains("current")));
     // Every node on the path to the HEAD is bulleted (root e1 included).
     assert!(controls
         .iter()
-        .any(|line| line.text.contains('\u{2022}') && line.text.contains("user: first")));
+        .any(|line| line.plain().contains('\u{2022}') && line.plain().contains("user: first")));
     // A position counter is shown; selection starts on the HEAD (row 3 of 3).
-    assert!(controls.iter().any(|line| line.text.contains("(3/3)")));
+    assert!(controls.iter().any(|line| line.plain().contains("(3/3)")));
 }
 
 #[test]
@@ -1508,7 +1478,7 @@ fn model_picker_renders_effort_hint() {
     let controls = document
         .controls
         .iter()
-        .map(|line| strip_ansi(&line.text))
+        .map(UiLine::plain)
         .collect::<Vec<_>>();
 
     assert!(controls.iter().any(|text| text.contains("thinking: none")));
@@ -1702,7 +1672,7 @@ fn bottom_status_shows_git_branch_with_dirty_marker() {
             64,
         )
         .finish();
-    let line = strip_ansi(&document.controls.last().unwrap().text);
+    let line = document.controls.last().unwrap().plain();
     assert!(line.starts_with("p / m (low) main*"), "{line}");
 }
 
@@ -1715,7 +1685,6 @@ impl TestUiBuilderExt for UiBuilder {
         for index in 0..history_lines {
             self.history_line(UiKind::Assistant, format!("line {index}"));
         }
-        self.input(&format!("{CURSOR_MARKER}{VISIBLE_CURSOR}"), &[], 0)
-            .finish()
+        self.input(&input_lines(""), &[], 0).finish()
     }
 }

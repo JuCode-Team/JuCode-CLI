@@ -2,9 +2,7 @@ use std::time::Instant;
 
 use crate::terminal_renderer::render_document_for_bench;
 use crate::ui_builder::UiBuilder;
-use crate::{
-    wrap_lines, BottomStatus, ChatLine, UiDocument, UiLine, CURSOR_MARKER, VISIBLE_CURSOR,
-};
+use crate::{wrap_lines, BottomStatus, ChatLine, UiDocument, UiLine};
 
 pub struct RenderFrameBench {
     history: Vec<ChatLine>,
@@ -54,14 +52,16 @@ fn render_history_lines(history: &[ChatLine], width: usize) -> Vec<UiLine> {
     wrap_lines(&history, width)
 }
 
+fn bench_input_lines(tick: usize) -> Vec<UiLine> {
+    let mut input = crate::input::InputBuffer::default();
+    input.push_text(&format!("benchmark input {tick}"));
+    input.render(true)
+}
+
 fn build_document(rendered_history_lines: Vec<UiLine>, width: usize, tick: usize) -> UiDocument {
     UiBuilder::new()
         .rendered_history_lines(rendered_history_lines)
-        .input(
-            &format!("benchmark input {tick}{CURSOR_MARKER}{VISIBLE_CURSOR}"),
-            &[],
-            0,
-        )
+        .input(&bench_input_lines(tick), &[], 0)
         .bottom_status(
             BottomStatus {
                 provider: "bench",

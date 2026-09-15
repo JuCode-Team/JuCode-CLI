@@ -1,24 +1,33 @@
 use std::borrow::Cow;
 use std::path::Path;
 
-use crate::{
-    truncate_with_ellipsis, visible_width, UiKind, ACCENT, INVERSE_OFF, INVERSE_ON,
-    TOOL_OUTPUT_PREVIEW_BYTES, TOOL_OUTPUT_PREVIEW_LINES,
+use ratatui::{
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
 };
 
-const STRONG: &str = "\x1b[1;97m";
-const STRONG_OFF: &str = "\x1b[22m";
-const DIM: &str = "\x1b[90m";
-const BASH_COMMAND: &str = "\x1b[38;2;220;224;232;48;2;44;48;58m";
-const RESET_STYLE: &str = "\x1b[0m";
+use crate::{
+    truncate_line_spans, UiKind, UiLine, ACCENT, INPUT_SELECTION, TOOL_OUTPUT_PREVIEW_BYTES,
+    TOOL_OUTPUT_PREVIEW_LINES,
+};
 
-pub(crate) fn tool_output_preview(name: &str, output: &str, running: bool) -> String {
+const STRONG: Style = Style::new().fg(Color::White).add_modifier(Modifier::BOLD);
+const DIM: Style = Style::new().fg(Color::DarkGray);
+const BASH_COMMAND: Style = Style::new()
+    .fg(Color::Rgb(220, 224, 232))
+    .bg(Color::Rgb(44, 48, 58));
+const ERROR: Style = Style::new().fg(Color::Red);
+
+pub(crate) fn tool_output_preview(name: &str, output: &str, running: bool) -> Vec<UiLine> {
     if is_shell_tool(name) && running {
         return limited_preview(output);
     }
     // Any tool can fail with {"error": "…"}; show the message, not raw JSON.
     if let Some(error) = json_error(output) {
-        return format!("error: {error}");
+        return vec![UiLine::new(
+            UiKind::Tool,
+            Line::from(Span::styled(format!("error: {error}"), ERROR)),
+        )];
     }
     if let Some(preview) = projected_tool_output(name, output) {
         return preview;
@@ -37,7 +46,7 @@ pub(crate) fn tool_output_preview(name: &str, output: &str, running: bool) -> St
 /// After a partial (hunk-subset) approval the tool's diff already contains
 /// only the applied hunks; append a count of the user-rejected ones so the
 /// preview does not read as the full requested change.
-fn with_rejected_hunks_line(preview: String, output: &str) -> String {
+fn with_rejected_hunks_line(mut preview: Vec<UiLine>, output: &str) -> Vec<UiLine> {
     let rejected = serde_json::from_str::<serde_json::Value>(output)
         .ok()
         .and_then(|value| {
@@ -50,41 +59,53 @@ fn with_rejected_hunks_line(preview: String, output: &str) -> String {
     if rejected == 0 {
         return preview;
     }
-    format!("{preview}\n{DIM}{rejected} hunk(s) rejected by user (not applied){RESET_STYLE}")
+    preview.push(UiLine::new(
+        UiKind::Tool,
+        Line::from(Span::styled(
+            format!("{rejected} hunk(s) rejected by user (not applied)"),
+            DIM,
+        )),
+    ));
+    preview
 }
 
-pub(crate) fn format_tool_header(name: &str, running: bool, preview: &str, width: usize) -> String {
+pub(crate) fn format_tool_header(
+    name: &str,
+    running: bool,
+    preview_first: Option<&Line<'static>>,
+    width: usize,
+) -> Line<'static> {
     let action = tool_action_label(name);
-    let suffix = if running { " running" } else { "" };
-    let prefix = format!("{ACCENT}●{STRONG_OFF} {STRONG}{action}{STRONG_OFF}{DIM}{suffix}");
-    let compact = preview.lines().next().unwrap_or_default().to_string();
-    if compact.is_empty() {
-        return format!("{prefix}{RESET_STYLE}");
+    let mut spans = vec![
+        Span::styled("●", ACCENT),
+        Span::raw(" "),
+        Span::styled(action.to_string(), STRONG),
+    ];
+    if running {
+        spans.push(Span::styled(" running", DIM));
     }
 
-    let separator = "  ";
-    let available = width
-        .saturating_sub(visible_width(&prefix))
-        .saturating_sub(visible_width(separator));
+    let Some(first) = preview_first.filter(|line| line.width() > 0) else {
+        return Line::from(spans);
+    };
+    let head_width: usize = spans
+        .iter()
+        .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    let available = width.saturating_sub(head_width).saturating_sub(2);
     if available == 0 {
-        return prefix;
+        return Line::from(spans);
     }
-
-    let compact_width = visible_width(&compact);
-    if visible_width(&prefix)
-        .saturating_add(visible_width(separator))
-        .saturating_add(compact_width)
-        <= width
-    {
-        return format!("{prefix}{separator}{compact}{RESET_STYLE}");
-    }
-
-    let truncated = truncate_with_ellipsis(&compact, available);
-    if truncated.is_empty() {
-        format!("{prefix}{RESET_STYLE}")
-    } else {
-        format!("{prefix}{separator}{truncated}{RESET_STYLE}")
-    }
+    spans.push(Span::raw("  "));
+    // The compact preview dimmer than the action; its own styled spans (e.g. the
+    // command chip) still win.
+    spans.extend(
+        truncate_line_spans(first, available)
+            .spans
+            .into_iter()
+            .map(|span| Span::styled(span.content, DIM.patch(span.style))),
+    );
+    Line::from(spans)
 }
 
 fn is_shell_tool(name: &str) -> bool {
@@ -120,7 +141,7 @@ fn tool_action_label(name: &str) -> Cow<'_, str> {
     }
 }
 
-fn projected_tool_output(name: &str, output: &str) -> Option<String> {
+fn projected_tool_output(name: &str, output: &str) -> Option<Vec<UiLine>> {
     let value = serde_json::from_str::<serde_json::Value>(output).ok()?;
     match name {
         "read" => {
@@ -138,23 +159,30 @@ fn projected_tool_output(name: &str, output: &str) -> Option<String> {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             let suffix = if truncated { " …" } else { "" };
-            Some(format!(
+            Some(vec![plain_preview_line(format!(
                 "read {}: {lines} lines from line {offset}{suffix}",
                 display_path_name(path)
-            ))
+            ))])
         }
         "ls" => {
             let path = value.get("path").and_then(serde_json::Value::as_str)?;
-            Some(format!("ls {}", path))
+            Some(vec![plain_preview_line(format!("ls {}", path))])
         }
         _ if is_shell_tool(name) || name == "write_stdin" => Some(project_bash_output(&value)),
         _ => None,
     }
 }
 
-fn project_bash_output(value: &serde_json::Value) -> String {
+fn plain_preview_line(text: String) -> UiLine {
+    UiLine::new(UiKind::Tool, Line::from(text))
+}
+
+fn project_bash_output(value: &serde_json::Value) -> Vec<UiLine> {
     if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
-        return format!("error: {error}");
+        return vec![UiLine::new(
+            UiKind::Tool,
+            Line::from(Span::styled(format!("error: {error}"), ERROR)),
+        )];
     }
     let command = value
         .get("command")
@@ -196,16 +224,24 @@ fn project_bash_output(value: &serde_json::Value) -> String {
         .get("stderr")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    let mut lines = vec![format!(
-        "{BASH_COMMAND}{command}{RESET_STYLE}{DIM}  {status}{RESET_STYLE}"
+    let mut lines = vec![UiLine::new(
+        UiKind::Tool,
+        Line::from(vec![
+            Span::styled(command.to_string(), BASH_COMMAND),
+            Span::styled(format!("  {status}"), DIM),
+        ]),
     )];
-    if !stdout.trim().is_empty() {
-        lines.push(format!("stdout:\n{}", tail_lines(stdout, 8)));
+    for (label, body) in [("stdout:", stdout), ("stderr:", stderr)] {
+        if !body.trim().is_empty() {
+            lines.push(plain_preview_line(label.to_string()));
+            lines.extend(
+                tail_lines(body, 8)
+                    .lines()
+                    .map(|line| plain_preview_line(line.to_string())),
+            );
+        }
     }
-    if !stderr.trim().is_empty() {
-        lines.push(format!("stderr:\n{}", tail_lines(stderr, 8)));
-    }
-    lines.join("\n")
+    lines
 }
 
 fn display_path_name(path: &str) -> String {
@@ -237,22 +273,20 @@ fn is_edit_tool(name: &str) -> bool {
     matches!(name, "edit" | "str_replace" | "hashline_edit" | "write")
 }
 
-fn render_full_diff(diff: &str) -> String {
-    render_intra_line_diff(&diff.lines().collect::<Vec<_>>()).join("\n")
+fn render_full_diff(diff: &str) -> Vec<UiLine> {
+    render_intra_line_diff(&diff.lines().collect::<Vec<_>>())
 }
 
-fn edit_diff_view(diff: &str) -> String {
+fn edit_diff_view(diff: &str) -> Vec<UiLine> {
     let Some(parsed) = parse_unified_diff(diff) else {
         return render_full_diff(diff);
     };
-    let mut lines = vec![format!(
+    let mut lines = vec![plain_preview_line(format!(
         "{} (+{} -{})",
         parsed.path, parsed.additions, parsed.removals
-    )];
-    for line in parsed.lines {
-        lines.push(line.render());
-    }
-    lines.join("\n")
+    ))];
+    lines.extend(parsed.lines.iter().map(EditDiffLine::render));
+    lines
 }
 
 struct ParsedEditDiff {
@@ -270,16 +304,19 @@ enum EditDiffLine {
 }
 
 impl EditDiffLine {
-    fn render(&self) -> String {
-        match self {
+    fn render(&self) -> UiLine {
+        let (kind, text) = match self {
             EditDiffLine::Context { line, text } => match line {
-                Some(line) => format!("{line:>6}    {text}"),
-                None => format!("{:>6}    {text}", ""),
+                Some(line) => (UiKind::Tool, format!("{line:>6}    {text}")),
+                None => (UiKind::Tool, format!("{:>6}    {text}", "")),
             },
-            EditDiffLine::Add { line, text } => format!("{line:>6} +  {text}"),
-            EditDiffLine::Remove { line, text } => format!("{line:>6} -  {text}"),
-            EditDiffLine::Gap => format!("{:>6}    …", ""),
-        }
+            EditDiffLine::Add { line, text } => (UiKind::DiffAdd, format!("{line:>6} +  {text}")),
+            EditDiffLine::Remove { line, text } => {
+                (UiKind::DiffRemove, format!("{line:>6} -  {text}"))
+            }
+            EditDiffLine::Gap => (UiKind::Tool, format!("{:>6}    …", "")),
+        };
+        UiLine::new(kind, Line::from(text))
     }
 }
 
@@ -384,8 +421,8 @@ fn parse_hunk_start(value: &str) -> Option<usize> {
         .ok()
 }
 
-fn diff_preview(diff: &str) -> String {
-    let mut preview = Vec::new();
+fn diff_preview(diff: &str) -> Vec<UiLine> {
+    let mut preview: Vec<UiLine> = Vec::new();
     let mut preview_bytes = 0usize;
     let mut file_label = None;
     let mut hunk_header = None;
@@ -421,22 +458,22 @@ fn diff_preview(diff: &str) -> String {
 
     let mut truncated = saw_next_hunk;
     if let Some(label) = file_label.as_deref() {
-        truncated |= !push_preview_line(&mut preview, &mut preview_bytes, label);
+        truncated |= !push_preview_text(&mut preview, &mut preview_bytes, label);
     }
-    truncated |= !push_preview_line(&mut preview, &mut preview_bytes, header);
+    truncated |= !push_preview_text(&mut preview, &mut preview_bytes, header);
 
     let line_budget = TOOL_OUTPUT_PREVIEW_LINES.saturating_sub(preview.len());
     let selected = balanced_diff_lines(&change_lines, line_budget);
     truncated |= selected.len() < change_lines.len();
     for line in render_intra_line_diff(&selected) {
-        truncated |= !push_preview_line(&mut preview, &mut preview_bytes, &line);
+        truncated |= !push_preview_line(&mut preview, &mut preview_bytes, line);
     }
 
     if truncated {
-        preview.push("…".to_string());
+        preview.push(plain_preview_line("…".to_string()));
     }
 
-    preview.join("\n")
+    preview
 }
 
 fn diff_file_label(line: &str) -> String {
@@ -510,13 +547,16 @@ fn balanced_diff_lines<'a>(lines: &[&'a str], limit: usize) -> Vec<&'a str> {
     selected
 }
 
-fn render_intra_line_diff(lines: &[&str]) -> Vec<String> {
+fn render_intra_line_diff(lines: &[&str]) -> Vec<UiLine> {
     let mut rendered = Vec::new();
     let mut index = 0usize;
 
     while index < lines.len() {
         if !is_diff_change_line(lines[index]) {
-            rendered.push(lines[index].to_string());
+            rendered.push(UiLine::new(
+                diff_line_kind(lines[index]),
+                Line::from(lines[index].to_string()),
+            ));
             index += 1;
             continue;
         }
@@ -543,15 +583,23 @@ fn render_intra_line_diff(lines: &[&str]) -> Vec<String> {
             rendered.push(old_line);
             rendered.push(new_line);
         } else {
-            rendered.extend(removed.iter().map(|line| (*line).to_string()));
-            rendered.extend(added.iter().map(|line| (*line).to_string()));
+            rendered.extend(
+                removed
+                    .iter()
+                    .map(|line| UiLine::new(UiKind::DiffRemove, Line::from((*line).to_string()))),
+            );
+            rendered.extend(
+                added
+                    .iter()
+                    .map(|line| UiLine::new(UiKind::DiffAdd, Line::from((*line).to_string()))),
+            );
         }
     }
 
     rendered
 }
 
-fn render_intra_line_pair(old_line: &str, new_line: &str) -> (String, String) {
+fn render_intra_line_pair(old_line: &str, new_line: &str) -> (UiLine, UiLine) {
     let old_content = old_line.strip_prefix('-').unwrap_or(old_line);
     let new_content = new_line.strip_prefix('+').unwrap_or(new_line);
     let old_chars = old_content.chars().collect::<Vec<_>>();
@@ -576,82 +624,82 @@ fn render_intra_line_pair(old_line: &str, new_line: &str) -> (String, String) {
     }
 
     (
-        format!(
-            "-{}",
-            highlight_changed_range(old_content, prefix, old_suffix)
+        UiLine::new(
+            UiKind::DiffRemove,
+            diff_change_line('-', old_content, prefix, old_suffix),
         ),
-        format!(
-            "+{}",
-            highlight_changed_range(new_content, prefix, new_suffix)
+        UiLine::new(
+            UiKind::DiffAdd,
+            diff_change_line('+', new_content, prefix, new_suffix),
         ),
     )
 }
 
-fn highlight_changed_range(text: &str, start: usize, end: usize) -> String {
+fn diff_change_line(prefix: char, text: &str, start: usize, end: usize) -> Line<'static> {
+    let mut spans = vec![Span::raw(prefix.to_string())];
     if start >= end {
-        return text.to_string();
+        spans.push(Span::raw(text.to_string()));
+        return Line::from(spans);
     }
-
-    let mut output = String::new();
-    for (index, ch) in text.chars().enumerate() {
-        if index == start {
-            output.push_str(INVERSE_ON);
-        }
-        output.push(ch);
-        if index + 1 == end {
-            output.push_str(INVERSE_OFF);
-        }
+    let before: String = text.chars().take(start).collect();
+    let changed: String = text.chars().skip(start).take(end - start).collect();
+    let after: String = text.chars().skip(end).collect();
+    if !before.is_empty() {
+        spans.push(Span::raw(before));
     }
-    output
+    spans.push(Span::styled(changed, INPUT_SELECTION));
+    if !after.is_empty() {
+        spans.push(Span::raw(after));
+    }
+    Line::from(spans)
 }
 
-fn push_preview_line(preview: &mut Vec<String>, preview_bytes: &mut usize, line: &str) -> bool {
+fn push_preview_line(preview: &mut Vec<UiLine>, preview_bytes: &mut usize, line: UiLine) -> bool {
     if preview.len() >= TOOL_OUTPUT_PREVIEW_LINES {
         return false;
     }
 
+    let line_len: usize = line.line.spans.iter().map(|span| span.content.len()).sum();
     let next_bytes = preview_bytes
-        .saturating_add(line.len())
+        .saturating_add(line_len)
         .saturating_add(usize::from(!preview.is_empty()));
     if next_bytes > TOOL_OUTPUT_PREVIEW_BYTES {
         return false;
     }
 
-    preview.push(line.to_string());
+    preview.push(line);
     *preview_bytes = next_bytes;
     true
 }
 
-fn limited_preview(output: &str) -> String {
-    let mut preview = String::new();
-    let mut lines = 0usize;
+fn push_preview_text(preview: &mut Vec<UiLine>, preview_bytes: &mut usize, line: &str) -> bool {
+    push_preview_line(
+        preview,
+        preview_bytes,
+        UiLine::new(diff_line_kind(line), Line::from(line.to_string())),
+    )
+}
+
+fn limited_preview(output: &str) -> Vec<UiLine> {
+    let mut preview = Vec::new();
+    let mut preview_bytes = 0usize;
     let mut truncated = false;
 
     for line in output.lines() {
-        if lines >= TOOL_OUTPUT_PREVIEW_LINES
-            || preview.len().saturating_add(line.len()) > TOOL_OUTPUT_PREVIEW_BYTES
-        {
+        if !push_preview_text(&mut preview, &mut preview_bytes, line) {
             truncated = true;
             break;
         }
-        if !preview.is_empty() {
-            preview.push('\n');
-        }
-        preview.push_str(line);
-        lines += 1;
     }
 
     if output.is_empty() {
-        preview.push_str("(empty output)");
-    } else if output.lines().count() > lines {
+        preview.push(plain_preview_line("(empty output)".to_string()));
+    } else if output.lines().count() > preview.len() {
         truncated = true;
     }
 
     if truncated {
-        if !preview.is_empty() {
-            preview.push('\n');
-        }
-        preview.push('…');
+        preview.push(plain_preview_line("…".to_string()));
     }
 
     preview

@@ -1,15 +1,18 @@
 use std::time::Instant;
 
+use ratatui::{
+    style::{Color, Style},
+    text::{Line, Span},
+};
 use unicode_width::UnicodeWidthStr;
 
 use crate::markdown::render_markdown;
 use crate::picker::{PickerMode, PickerState, TreePromptAction};
-use crate::tool_preview::{diff_line_kind, format_tool_header, tool_output_preview};
+use crate::tool_preview::{format_tool_header, tool_output_preview};
 use crate::{
-    color_code, compact_home_path, format_context_window, pad_to_width, spinner_char,
+    compact_home_path, format_context_window, pad_to_width, spinner_char, truncate_line_to_width,
     truncate_to_width, ActivityState, BottomStatus, ChatLine, CommandCandidate, UiDocument, UiKind,
-    UiLine, BOX_BORDER, RESET, STARTUP_ACCENT, STARTUP_DIM, STARTUP_STRONG, STARTUP_TEXT,
-    VISIBLE_CURSOR,
+    UiLine, BOX_BORDER, STARTUP_ACCENT, STARTUP_DIM, STARTUP_STRONG, STARTUP_TEXT, VISIBLE_CURSOR,
 };
 
 /// Detail lines under a tool header hang off a `⎿` gutter on the first row,
@@ -28,8 +31,11 @@ fn format_thinking_duration(secs: u64) -> String {
     }
 }
 
-fn rounded_box_border(left: char, right: char, width: usize) -> String {
-    format!("{BOX_BORDER}{left}{}{right}{RESET}", "─".repeat(width + 2))
+fn rounded_box_border(left: char, right: char, width: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("{left}{}{right}", "─".repeat(width + 2)),
+        BOX_BORDER,
+    ))
 }
 
 fn startup_box_line(
@@ -38,77 +44,90 @@ fn startup_box_line(
     mascot_width: usize,
     right_width: usize,
     width: usize,
-) -> String {
+) -> Line<'static> {
     let plain_width = mascot_width + 3 + right_width;
     let text_width = UnicodeWidthStr::width(text);
     let text_padding = " ".repeat(right_width.saturating_sub(text_width));
-    let colored = format!(
-        "{}{}{}   {}{}{}",
-        STARTUP_ACCENT,
-        pad_to_width(mascot, mascot_width),
-        STARTUP_TEXT,
-        color_startup_text(text),
-        text_padding,
-        RESET
-    );
-    format!(
-        "{BOX_BORDER}│{RESET} {colored}{} {BOX_BORDER}│{RESET}",
-        " ".repeat(width.saturating_sub(plain_width))
-    )
+    let fill = " ".repeat(width.saturating_sub(plain_width));
+    let mut spans = vec![
+        Span::styled("│", BOX_BORDER),
+        Span::raw(" "),
+        Span::styled(pad_to_width(mascot, mascot_width), STARTUP_ACCENT),
+        Span::raw("   "),
+    ];
+    spans.extend(startup_text_spans(text));
+    spans.push(Span::raw(format!("{text_padding}{fill} ")));
+    spans.push(Span::styled("│", BOX_BORDER));
+    Line::from(spans)
 }
 
-fn color_startup_text(text: &str) -> String {
+fn startup_text_spans(text: &str) -> Vec<Span<'static>> {
     if let Some(rest) = text.strip_prefix("Welcome to ") {
         if let Some(details) = rest.strip_prefix("JuCode") {
-            return format!(
-                "{STARTUP_STRONG}Welcome to {STARTUP_ACCENT}JuCode{STARTUP_DIM}{details}{STARTUP_TEXT}"
-            );
+            return vec![
+                Span::styled("Welcome to ", STARTUP_STRONG),
+                Span::styled("JuCode", STARTUP_ACCENT),
+                Span::styled(details.to_string(), STARTUP_DIM),
+            ];
         }
     }
     if let Some(path) = text.strip_prefix("cwd: ") {
-        return format!("{STARTUP_TEXT}cwd: {STARTUP_STRONG}{path}{STARTUP_TEXT}");
+        return vec![
+            Span::styled("cwd: ", STARTUP_TEXT),
+            Span::styled(path.to_string(), STARTUP_STRONG),
+        ];
     }
     if text == "/help for commands · /exit to quit" {
-        return format!(
-            "{STARTUP_STRONG}/help{STARTUP_TEXT} for commands · {STARTUP_STRONG}/exit{STARTUP_TEXT} to quit"
-        );
+        return vec![
+            Span::styled("/help", STARTUP_STRONG),
+            Span::styled(" for commands · ", STARTUP_TEXT),
+            Span::styled("/exit", STARTUP_STRONG),
+            Span::styled(" to quit", STARTUP_TEXT),
+        ];
     }
-    format!("{STARTUP_TEXT}{text}")
+    vec![Span::styled(text.to_string(), STARTUP_TEXT)]
 }
 
-fn format_status_line(left: &str, right: &str, width: usize) -> String {
+/// Left/right status layout; `left` spans keep their own styles (e.g. the
+/// colored reasoning effort) while `right` is plain text.
+fn format_status_line(left: Vec<Span<'static>>, right: &str, width: usize) -> Line<'static> {
     let width = width.max(1);
-    let left_width = UnicodeWidthStr::width(left);
+    let left_width: usize = left
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
     let right_width = UnicodeWidthStr::width(right);
 
     if left_width + 1 + right_width <= width {
-        return format!(
-            "{left}{}{right}",
-            " ".repeat(width - left_width - right_width)
-        );
+        let mut spans = left;
+        spans.push(Span::raw(" ".repeat(width - left_width - right_width)));
+        spans.push(Span::raw(right.to_string()));
+        return Line::from(spans);
     }
     if right_width >= width {
-        return truncate_to_width(right, width);
+        return Line::from(truncate_to_width(right, width));
     }
 
-    let left_width = width - right_width - 1;
-    format!("{} {right}", truncate_to_width(left, left_width))
+    let left_budget = width - right_width - 1;
+    let mut spans = truncate_line_to_width(&Line::from(left), left_budget).spans;
+    spans.push(Span::raw(format!(" {right}")));
+    Line::from(spans)
 }
 
-pub(crate) fn colored_reasoning_effort(effort: &str) -> String {
-    colored_reasoning_effort_with_base(effort, color_code(UiKind::Status))
-}
-
-fn colored_reasoning_effort_with_base(effort: &str, base_color: &str) -> String {
+fn reasoning_effort_style(effort: &str) -> Style {
     let color = match effort {
-        "none" | "minimal" => "\x1b[38;2;150;150;150m",
-        "low" => "\x1b[38;2;90;190;140m",
-        "medium" => "\x1b[38;2;230;200;90m",
-        "high" => "\x1b[38;2;245;150;70m",
-        "xhigh" => "\x1b[38;2;245;90;90m",
-        _ => base_color,
+        "none" | "minimal" => Color::Rgb(150, 150, 150),
+        "low" => Color::Rgb(90, 190, 140),
+        "medium" => Color::Rgb(230, 200, 90),
+        "high" => Color::Rgb(245, 150, 70),
+        "xhigh" => Color::Rgb(245, 90, 90),
+        _ => return Style::default(),
     };
-    format!("{color}{effort}{RESET}{base_color}")
+    Style::new().fg(color)
+}
+
+fn reasoning_effort_span(effort: &str) -> Span<'static> {
+    Span::styled(effort.to_string(), reasoning_effort_style(effort))
 }
 
 pub(crate) struct UiBuilder {
@@ -159,7 +178,7 @@ impl UiBuilder {
                 ),
                 ChatLine::User(text) => self.push_user_message(text),
                 ChatLine::Assistant(text) => {
-                    for line in render_markdown(text, width, color_code(UiKind::Assistant)) {
+                    for line in render_markdown(text, width) {
                         self.history_line(UiKind::Assistant, line);
                     }
                 }
@@ -179,8 +198,10 @@ impl UiBuilder {
                     };
                     self.history_clickable_line(UiKind::Status, header, item_index);
                     if !*collapsed {
-                        for line in render_markdown(text, width, color_code(UiKind::Status)) {
-                            self.history_line(UiKind::Status, format!("  {line}"));
+                        for line in render_markdown(text, width.saturating_sub(2)) {
+                            let mut spans = vec![Span::raw("  ")];
+                            spans.extend(line.spans);
+                            self.history_line(UiKind::Status, Line::from(spans));
                         }
                     }
                 }
@@ -225,10 +246,8 @@ impl UiBuilder {
                 TreePromptAction::ApiKey => "paste api key",
                 TreePromptAction::LoginPaste => "redirect url or code",
             };
-            // No CURSOR_MARKER here: the composer below already carries the
-            // real cursor target, and a second marker would leak as raw APC
-            // on terminals that don't swallow it. The `|` is the prompt's
-            // visible caret.
+            // The `|` is the prompt's visible caret; the hardware cursor stays
+            // in the composer below.
             self.control_line(
                 UiKind::Input,
                 format!("{INPUT_PROMPT} {label}: {}{VISIBLE_CURSOR}", prompt.input),
@@ -238,7 +257,7 @@ impl UiBuilder {
             let effort = &picker.efforts[picker.selected_effort];
             self.control_line(
                 UiKind::Status,
-                format!("thinking: {}", colored_reasoning_effort(effort)),
+                Line::from(vec![Span::raw("thinking: "), reasoning_effort_span(effort)]),
             );
         }
         if picker.rows.is_empty() {
@@ -350,21 +369,20 @@ impl UiBuilder {
 
     pub(crate) fn input(
         mut self,
-        input: &str,
+        input_lines: &[UiLine],
         command_matches: &[CommandCandidate],
         selected_index: usize,
     ) -> Self {
-        self.control_line(UiKind::Input, String::new());
-        let lines = input.split('\n').collect::<Vec<_>>();
-        for (index, line) in lines.iter().enumerate() {
-            let prefix = if index == 0 {
-                format!("{INPUT_PROMPT} ")
-            } else {
-                "  ".to_string()
-            };
-            self.control_line(UiKind::Input, format!("{prefix}{line}"));
+        self.control_line(UiKind::Input, Line::default());
+        for (index, source) in input_lines.iter().enumerate() {
+            let prefix = if index == 0 { "› " } else { "  " };
+            let mut spans = vec![Span::raw(prefix)];
+            spans.extend(source.line.spans.iter().cloned());
+            let mut line = UiLine::new(UiKind::Input, Line::from(spans));
+            line.cursor = source.cursor.map(|column| column + 2);
+            self.controls.push(line);
         }
-        self.control_line(UiKind::Input, String::new());
+        self.control_line(UiKind::Input, Line::default());
         if !command_matches.is_empty() {
             for (index, candidate) in command_matches.iter().enumerate() {
                 let kind = if index == selected_index {
@@ -396,11 +414,14 @@ impl UiBuilder {
         let indicator = spinner_char(progress.preset, activity.animation_tick, progress.step);
         let (red, green, blue) = progress.color;
         let label = truncate_to_width(&progress.label, width.saturating_sub(4));
-        let line = format!(
-            "  \x1b[38;2;{red};{green};{blue}m{indicator}{RESET}{} {label}",
-            color_code(UiKind::Status),
+        self.control_line(
+            UiKind::Status,
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(indicator, Style::new().fg(Color::Rgb(red, green, blue))),
+                Span::raw(format!(" {label}")),
+            ]),
         );
-        self.control_line(UiKind::Status, line);
         self
     }
 
@@ -410,13 +431,14 @@ impl UiBuilder {
         } else {
             (status.context_tokens as f64 / status.context_window as f64 * 100.0).min(100.0)
         };
-        let plain_left = format!(
-            "{} / {} ({}){}",
-            status.provider,
-            status.model,
-            status.reasoning_effort,
-            crate::git_bar::format_git_segment(status.git)
-        );
+        let left = vec![
+            Span::raw(format!("{} / {} (", status.provider, status.model)),
+            reasoning_effort_span(status.reasoning_effort),
+            Span::raw(format!(
+                "){}",
+                crate::git_bar::format_git_segment(status.git)
+            )),
+        ];
         let cost = if status.cost > 0.0 {
             format!(" | ${:.4}", status.cost)
         } else {
@@ -426,16 +448,7 @@ impl UiBuilder {
             "tokens {}/{} | context {percent:.1}%{cost}",
             status.context_tokens, status.context_window
         );
-        let line = format_status_line(&plain_left, &right, width).replace(
-            &format!("({})", status.reasoning_effort),
-            &format!(
-                "({})",
-                colored_reasoning_effort_with_base(
-                    status.reasoning_effort,
-                    color_code(UiKind::BottomStatus)
-                )
-            ),
-        );
+        let line = format_status_line(left, &right, width);
         self.control_line(UiKind::BottomStatus, line);
         self
     }
@@ -461,33 +474,36 @@ impl UiBuilder {
     /// One blank line between top-level blocks (turns, tool calls, notices)
     /// gives the transcript its rhythm; leading blank is skipped.
     fn separate_block(&mut self) {
-        if self
-            .history
-            .last()
-            .is_some_and(|line| !line.text.trim().is_empty())
-        {
-            self.history_line(UiKind::Status, String::new());
+        if self.history.last().is_some_and(|line| !line.is_blank()) {
+            self.history_line(UiKind::Status, Line::default());
         }
     }
 
     /// User turns echo with a dim `›` marker — same glyph as the composer
     /// prompt — so their own messages read as quoted input, not output.
     fn push_user_message(&mut self, text: &str) {
-        let dim = color_code(UiKind::Status);
-        let base = color_code(UiKind::User);
         if text.is_empty() {
-            self.history_line(UiKind::User, format!("{dim}›"));
+            self.history_line(
+                UiKind::User,
+                Line::from(Span::styled("›", Style::new().fg(Color::DarkGray))),
+            );
             return;
         }
         for (index, line) in text.lines().enumerate() {
             let marker = if index == 0 { "› " } else { "  " };
-            self.history_line(UiKind::User, format!("{dim}{marker}{base}{line}"));
+            self.history_line(
+                UiKind::User,
+                Line::from(vec![
+                    Span::styled(marker, Style::new().fg(Color::DarkGray)),
+                    Span::raw(line.to_string()),
+                ]),
+            );
         }
     }
 
     fn push_history(&mut self, kind: UiKind, text: &str) {
         if text.is_empty() {
-            self.history_line(kind, String::new());
+            self.history_line(kind, Line::default());
             return;
         }
 
@@ -544,58 +560,58 @@ impl UiBuilder {
         self.history_line(UiKind::Brand, rounded_box_border('╰', '╯', content_width));
     }
 
-    fn push_tool_preview(&mut self, text: &str) {
-        if text.is_empty() {
-            self.history_line(UiKind::Tool, TOOL_GUTTER_FIRST.to_string());
+    fn push_tool_preview(&mut self, lines: &[UiLine]) {
+        if lines.is_empty() {
+            self.history_line(UiKind::Tool, TOOL_GUTTER_FIRST);
             return;
         }
 
-        for (index, line) in text.lines().enumerate() {
+        for (index, line) in lines.iter().enumerate() {
             let gutter = if index == 0 {
                 TOOL_GUTTER_FIRST
             } else {
                 TOOL_GUTTER_REST
             };
-            self.history_line(diff_line_kind(line), format!("{gutter}{line}"));
+            let mut spans = vec![Span::raw(gutter)];
+            spans.extend(line.line.spans.iter().cloned());
+            self.history.push(UiLine {
+                kind: line.kind,
+                line: Line::from(spans),
+                click: None,
+                cursor: None,
+            });
         }
     }
 
     fn push_tool_block(&mut self, name: &str, output: &str, running: bool, width: usize) {
         let preview = tool_output_preview(name, output, running);
-        let header = format_tool_header(name, running, &preview, width);
+        let header =
+            format_tool_header(name, running, preview.first().map(|line| &line.line), width);
         self.history_line(UiKind::ToolHeader, header);
 
         // The header already shows the first preview line; the gutter block
         // holds only what follows it.
-        let detail = preview.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
-        if !detail.trim().is_empty() {
-            self.push_tool_preview(detail);
+        if preview.iter().skip(1).any(|line| !line.is_blank()) {
+            self.push_tool_preview(&preview[1..]);
         }
     }
 
-    pub(crate) fn history_line(&mut self, kind: UiKind, text: String) {
-        self.history.push(UiLine {
-            kind,
-            text,
-            click: None,
-        });
+    pub(crate) fn history_line(&mut self, kind: UiKind, line: impl Into<Line<'static>>) {
+        self.history.push(UiLine::new(kind, line));
     }
 
     /// A history line carrying a click target: clicking its painted row toggles
     /// the chat item at `index`.
-    fn history_clickable_line(&mut self, kind: UiKind, text: String, index: usize) {
-        self.history.push(UiLine {
-            kind,
-            text,
-            click: Some(index),
-        });
+    fn history_clickable_line(
+        &mut self,
+        kind: UiKind,
+        line: impl Into<Line<'static>>,
+        index: usize,
+    ) {
+        self.history.push(UiLine::clickable(kind, line, index));
     }
 
-    fn control_line(&mut self, kind: UiKind, text: String) {
-        self.controls.push(UiLine {
-            kind,
-            text,
-            click: None,
-        });
+    fn control_line(&mut self, kind: UiKind, line: impl Into<Line<'static>>) {
+        self.controls.push(UiLine::new(kind, line));
     }
 }

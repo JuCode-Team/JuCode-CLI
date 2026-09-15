@@ -27,6 +27,10 @@ use ratatui::crossterm::{
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use ratatui::{
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+};
 use state::TuiState;
 use std::{
     io::{self, Write},
@@ -48,24 +52,19 @@ const PASTE_ENTER_SUPPRESS_WINDOW: Duration = Duration::from_millis(120);
 const PASTE_BURST_IDLE_TIMEOUT: Duration = Duration::from_millis(8);
 #[cfg(windows)]
 const PASTE_BURST_IDLE_TIMEOUT: Duration = Duration::from_millis(60);
-const CURSOR_MARKER: &str = "\x1b_jucode:cursor\x07";
 const VISIBLE_CURSOR: &str = "|";
-const SELECT_START: &str = "\x1b[7m";
-const SELECT_END: &str = "\x1b[27m";
 const ENABLE_BRACKETED_PASTE: &str = "\x1b[?2004h";
 const DISABLE_BRACKETED_PASTE: &str = "\x1b[?2004l";
 pub(crate) const CONTENT_LEFT_PADDING: usize = 2;
-pub(crate) const RESET: &str = "\x1b[0m";
-const INVERSE_ON: &str = "\x1b[7m";
-const INVERSE_OFF: &str = "\x1b[27m";
-const BOX_BORDER: &str = "\x1b[90m";
-const STARTUP_TEXT: &str = "\x1b[38;2;180;176;187m";
-const STARTUP_DIM: &str = "\x1b[38;2;125;121;134m";
-const STARTUP_ACCENT: &str = "\x1b[38;2;190;160;255m";
+const STARTUP_TEXT: Style = Style::new().fg(Color::Rgb(180, 176, 187));
+const STARTUP_DIM: Style = Style::new().fg(Color::Rgb(125, 121, 134));
+const STARTUP_ACCENT: Style = Style::new().fg(Color::Rgb(190, 160, 255));
 /// Brand accent for turn markers (tool bullets); same hue as the startup card.
-pub(crate) const ACCENT: &str = STARTUP_ACCENT;
-const STARTUP_STRONG: &str = "\x1b[38;2;232;228;238m";
-const ANSI_ESCAPE: char = '\x1b';
+pub(crate) const ACCENT: Style = STARTUP_ACCENT;
+const STARTUP_STRONG: Style = Style::new().fg(Color::Rgb(232, 228, 238));
+/// The composer's own text selection (not the mouse drag overlay).
+pub(crate) const INPUT_SELECTION: Style = Style::new().add_modifier(Modifier::REVERSED);
+const BOX_BORDER: Style = Style::new().fg(Color::DarkGray);
 
 #[derive(Debug, Clone)]
 pub(crate) enum ChatLine {
@@ -114,13 +113,54 @@ pub(crate) enum UiKind {
     DiffHeader,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct UiLine {
     pub(crate) kind: UiKind,
-    pub(crate) text: String,
+    /// Styled content; `kind` supplies the fallback style for unstyled spans.
+    pub(crate) line: Line<'static>,
     /// When set, clicking this line toggles the chat item it points at
     /// (currently: thinking headers expand/collapse their reasoning block).
     pub(crate) click: Option<usize>,
+    /// Hardware-caret column on this line (composer only); follows the line
+    /// through wrapping so the renderer can place the terminal cursor.
+    pub(crate) cursor: Option<usize>,
+}
+
+impl UiLine {
+    pub(crate) fn new(kind: UiKind, line: impl Into<Line<'static>>) -> Self {
+        Self {
+            kind,
+            line: line.into(),
+            click: None,
+            cursor: None,
+        }
+    }
+
+    pub(crate) fn clickable(kind: UiKind, line: impl Into<Line<'static>>, index: usize) -> Self {
+        Self {
+            kind,
+            line: line.into(),
+            click: Some(index),
+            cursor: None,
+        }
+    }
+
+    /// Span contents concatenated — what a row shows, styles aside.
+    pub(crate) fn plain(&self) -> String {
+        self.line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// No visible text (empty or whitespace-only spans).
+    pub(crate) fn is_blank(&self) -> bool {
+        self.line
+            .spans
+            .iter()
+            .all(|span| span.content.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1353,107 +1393,94 @@ pub(crate) fn padded_content_width(width: usize) -> usize {
     width.saturating_sub(CONTENT_LEFT_PADDING).max(1)
 }
 
+/// Hard-wrap at the column limit — wide chars split at grapheme boundaries,
+/// so a CJK cell never tears. The click target stays on the first segment;
+/// the caret column lands on whichever segment contains it.
 fn wrap_line(line: &UiLine, width: usize, output: &mut Vec<UiLine>) {
-    // The click target lives on the first wrapped segment only.
-    let mut click = line.click;
-    if line.text.is_empty() {
+    if line.line.width() <= width {
         output.push(line.clone());
         return;
     }
 
-    let mut current = String::new();
-    let mut current_width = 0;
-    let mut rest = line.text.as_str();
-    let mut reverse_active = false;
+    let before = output.len();
+    let mut click = line.click;
+    let mut cursor = line.cursor;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut segment_width = 0usize;
+    let mut consumed = 0usize;
 
-    while !rest.is_empty() {
-        if let Some(next) = rest.strip_prefix(CURSOR_MARKER) {
-            current.push_str(CURSOR_MARKER);
-            rest = next;
-            continue;
+    for grapheme in line.line.styled_graphemes(Style::default()) {
+        let grapheme_width = grapheme.symbol.width();
+        if segment_width > 0 && segment_width + grapheme_width > width {
+            push_wrapped_segment(
+                output,
+                line.kind,
+                &mut spans,
+                segment_width,
+                &mut consumed,
+                &mut click,
+                &mut cursor,
+            );
+            segment_width = 0;
         }
-        if let Some((sequence, next)) = split_ansi_sequence(rest) {
-            if sequence == SELECT_START {
-                reverse_active = true;
-            } else if sequence == SELECT_END || sequence == RESET {
-                reverse_active = false;
+        match spans.last_mut() {
+            Some(span) if span.style == grapheme.style => {
+                span.content.to_mut().push_str(grapheme.symbol);
             }
-            current.push_str(sequence);
-            rest = next;
-            continue;
+            _ => spans.push(Span::styled(grapheme.symbol.to_string(), grapheme.style)),
         }
-
-        let Some(ch) = rest.chars().next() else {
-            break;
-        };
-        let ch_width = ch.width().unwrap_or(0);
-        if current_width > 0 && current_width + ch_width > width {
-            if reverse_active {
-                current.push_str(SELECT_END);
-            }
-            output.push(UiLine {
-                kind: line.kind,
-                text: current,
-                click: click.take(),
-            });
-            current = String::new();
-            if reverse_active {
-                current.push_str(SELECT_START);
-            }
-            current_width = 0;
-        }
-        current.push(ch);
-        current_width += ch_width;
-        rest = &rest[ch.len_utf8()..];
+        segment_width += grapheme_width;
     }
-
-    if !current.is_empty() {
-        output.push(UiLine {
-            kind: line.kind,
-            text: current,
-            click: click.take(),
-        });
+    if !spans.is_empty() {
+        push_wrapped_segment(
+            output,
+            line.kind,
+            &mut spans,
+            segment_width,
+            &mut consumed,
+            &mut click,
+            &mut cursor,
+        );
+    }
+    // A line of only zero-width graphemes still occupies a screen row.
+    if output.len() == before {
+        output.push(UiLine::new(line.kind, Line::default()));
     }
 }
 
-pub(crate) fn split_ansi_sequence(text: &str) -> Option<(&str, &str)> {
-    let rest = text.strip_prefix("\x1b[")?;
-    for (index, ch) in rest.char_indices() {
-        if ch.is_ascii_alphabetic() {
-            let end = 2 + index + ch.len_utf8();
-            return Some((&text[..end], &text[end..]));
+#[allow(clippy::too_many_arguments)]
+fn push_wrapped_segment(
+    output: &mut Vec<UiLine>,
+    kind: UiKind,
+    spans: &mut Vec<Span<'static>>,
+    segment_width: usize,
+    consumed: &mut usize,
+    click: &mut Option<usize>,
+    cursor: &mut Option<usize>,
+) {
+    let caret = cursor
+        .filter(|column| *column <= *consumed + segment_width)
+        .map(|column| column - *consumed);
+    if caret.is_some() {
+        *cursor = None;
+    }
+    *consumed += segment_width;
+    output.push(UiLine {
+        kind,
+        line: Line::from(std::mem::take(spans)),
+        click: click.take(),
+        cursor: caret,
+    });
+}
+
+/// The caret rides on the line carrying `cursor` — a field, not a text marker.
+pub(crate) fn extract_cursor(lines: &[UiLine]) -> Option<CursorTarget> {
+    for (row, line) in lines.iter().enumerate().rev() {
+        if let Some(column) = line.cursor {
+            return Some(CursorTarget { row, column });
         }
     }
     None
-}
-
-pub(crate) fn extract_cursor(lines: &mut [UiLine]) -> Option<CursorTarget> {
-    for (row, line) in lines.iter_mut().enumerate().rev() {
-        let Some(index) = line.text.find(CURSOR_MARKER) else {
-            continue;
-        };
-        let before = &line.text[..index];
-        let column = visible_width(before);
-        line.text
-            .replace_range(index..index + CURSOR_MARKER.len(), "");
-        return Some(CursorTarget { row, column });
-    }
-    None
-}
-
-pub(crate) fn render_ansi_line(line: &UiLine) -> String {
-    // Input lines carry reverse-video toggles (block caret/selection) and Assistant
-    // lines carry markdown styling (bold/italic/code). Wrap both in the kind color +
-    // RESET regardless, so surrounding text keeps its color and the inline toggles
-    // compose with it.
-    let always_color = matches!(
-        line.kind,
-        UiKind::Input | UiKind::Assistant | UiKind::Status | UiKind::BottomStatus
-    );
-    if !always_color && line.text.contains(ANSI_ESCAPE) {
-        return line.text.clone();
-    }
-    format!("{}{}{}", color_code(line.kind), line.text, RESET)
 }
 
 pub(crate) fn spinner_char(preset: SpinnerPreset, tick: usize, step: usize) -> &'static str {
@@ -1498,24 +1525,6 @@ fn interpolate_channel(from: u8, to: u8, amount: f32) -> u8 {
     (from as f32 + (to as f32 - from as f32) * amount).round() as u8
 }
 
-/// Display width of `text`, skipping ANSI escape sequences (CSI/SGR).
-fn visible_width(text: &str) -> usize {
-    let mut width = 0;
-    let mut rest = text;
-    while !rest.is_empty() {
-        if let Some((_, next)) = split_ansi_sequence(rest) {
-            rest = next;
-            continue;
-        }
-        let Some(ch) = rest.chars().next() else {
-            break;
-        };
-        width += ch.width().unwrap_or(0);
-        rest = &rest[ch.len_utf8()..];
-    }
-    width
-}
-
 fn truncate_to_width(text: &str, max_width: usize) -> String {
     let mut output = String::new();
     let mut width = 0;
@@ -1530,30 +1539,44 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
     output
 }
 
-fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
+/// Width-aware hard truncation of a styled line; span styles survive the cut.
+pub(crate) fn truncate_line_to_width(line: &Line<'static>, max: usize) -> Line<'static> {
+    if line.width() <= max {
+        return line.clone();
     }
-    if visible_width(text) <= max_width {
-        return text.to_string();
-    }
-    if max_width == 1 {
-        return "…".to_string();
-    }
-
-    let ellipsis_width = visible_width("…");
-    let mut output = String::new();
-    let mut width = 0;
-    for ch in text.chars() {
-        let ch_width = ch.width().unwrap_or(0);
-        if width + ch_width + ellipsis_width > max_width {
-            break;
+    let mut spans = Vec::new();
+    let mut visible = 0usize;
+    'outer: for span in &line.spans {
+        let mut current = String::new();
+        for ch in span.content.chars() {
+            let ch_width = ch.width().unwrap_or(0);
+            if visible + ch_width > max {
+                break;
+            }
+            current.push(ch);
+            visible += ch_width;
         }
-        output.push(ch);
-        width += ch_width;
+        if !current.is_empty() {
+            spans.push(Span::styled(current, span.style));
+        }
+        if visible >= max {
+            break 'outer;
+        }
     }
-    output.push('…');
-    output
+    Line::from(spans)
+}
+
+/// Same, but reserves a column for a trailing `…` when content was dropped.
+pub(crate) fn truncate_line_spans(line: &Line<'static>, max: usize) -> Line<'static> {
+    if max == 0 {
+        return Line::default();
+    }
+    if line.width() <= max {
+        return line.clone();
+    }
+    let mut truncated = truncate_line_to_width(line, max - 1);
+    truncated.spans.push(Span::raw("…"));
+    truncated
 }
 
 /// An indeterminate progress bar that fills and drains across `width` cells,
@@ -1570,23 +1593,28 @@ fn indeterminate_bar(tick: usize, width: usize) -> String {
         .collect()
 }
 
-pub(crate) fn color_code(kind: UiKind) -> &'static str {
+/// Fallback style for a line kind — spans keep their own style where set.
+/// crossterm maps `White`/`DarkGray` to `38;5;15`/`38;5;8`, the bright-white and
+/// gray slots this TUI used as raw `97`/`90`.
+pub(crate) fn kind_style(kind: UiKind) -> Style {
     match kind {
         // Brand/active rows share the startup accent hue.
         UiKind::Brand => STARTUP_ACCENT,
-        UiKind::User => "\x1b[97m",
-        // Bright white (97) — plain 37 renders as mid-gray on most themes.
-        UiKind::Assistant => "\x1b[97m",
-        UiKind::ToolHeader => "\x1b[97m",
-        UiKind::Tool | UiKind::System | UiKind::Status => "\x1b[90m",
-        UiKind::BottomStatus => "\x1b[97;48;2;30;33;43m",
-        UiKind::Error => "\x1b[31m",
-        UiKind::Selected => "\x1b[97m",
-        UiKind::Input => "\x1b[38;2;224;226;232m",
-        UiKind::TreeDirectory => "\x1b[33m",
-        UiKind::DiffAdd => "\x1b[38;2;170;220;170;48;2;28;70;38m",
-        UiKind::DiffRemove => "\x1b[38;2;230;150;145;48;2;85;38;32m",
-        UiKind::DiffHeader => "\x1b[36m",
+        UiKind::User | UiKind::Assistant | UiKind::ToolHeader | UiKind::Selected => {
+            Style::new().fg(Color::White)
+        }
+        UiKind::Tool | UiKind::System | UiKind::Status => Style::new().fg(Color::DarkGray),
+        UiKind::BottomStatus => Style::new().fg(Color::White).bg(Color::Rgb(30, 33, 43)),
+        UiKind::Error => Style::new().fg(Color::Red),
+        UiKind::Input => Style::new().fg(Color::Rgb(224, 226, 232)),
+        UiKind::TreeDirectory => Style::new().fg(Color::Yellow),
+        UiKind::DiffAdd => Style::new()
+            .fg(Color::Rgb(170, 220, 170))
+            .bg(Color::Rgb(28, 70, 38)),
+        UiKind::DiffRemove => Style::new()
+            .fg(Color::Rgb(230, 150, 145))
+            .bg(Color::Rgb(85, 38, 32)),
+        UiKind::DiffHeader => Style::new().fg(Color::Cyan),
     }
 }
 
