@@ -20,6 +20,9 @@ pub(super) struct TuiState {
     pub(super) context_window: u64,
     pub(super) max_output_tokens: u64,
     pub(super) reasoning_efforts: Vec<String>,
+    /// Current approval mode name, tracked from `AgentEvent::ApprovalMode` so
+    /// shift+tab can cycle it.
+    pub(super) approval_mode: String,
     pub(super) current_context_tokens: u64,
     pub(super) current_cost: f64,
     pub(super) activity: ActivityState,
@@ -62,6 +65,7 @@ impl Default for TuiState {
             context_window: 128_000,
             max_output_tokens: 128_000,
             reasoning_efforts: vec!["medium".to_string()],
+            approval_mode: "manual".to_string(),
             current_context_tokens: 0,
             current_cost: 0.0,
             activity: ActivityState::idle(),
@@ -465,6 +469,7 @@ impl TuiState {
                     true
                 }
                 AgentEvent::ApprovalMode { mode } => {
+                    self.approval_mode = mode.clone();
                     self.chat
                         .push(ChatLine::System(format!("approval mode: {mode}")));
                     self.mark_history_dirty();

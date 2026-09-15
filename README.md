@@ -72,7 +72,10 @@ You can switch model and reasoning effort inside the TUI:
 ```text
 /model gpt-5.5 medium
 /model gpt-5.4-mini low
+/effort high
 ```
+
+`ctrl+t` cycles the effort for the current model; inside the `/model` picker, `tab` cycles it for the highlighted model.
 
 The config also supports custom OpenAI-compatible base URLs, retry settings, model metadata, project-instruction discovery, and optional extensions.
 
@@ -90,7 +93,7 @@ File tools (read/write/edit/ls/outline/checkpoint/apply_patch) only operate on p
 
 ### Approval modes
 
-`approval_mode` in `config.json` (or `/approvals <mode>` in a session) picks one of four levels:
+`approval_mode` in `config.json` (or `/permissions <mode>` in a session; `shift+tab` cycles modes) picks one of four levels:
 
 | Mode | File edits | Shell commands |
 |---|---|---|
@@ -127,6 +130,8 @@ Useful commands:
 /help                         show command summary
 /login [web-url] [api-url]    login and sync marketplace defaults
 /model [model] [effort]       view or change model and reasoning effort
+/effort [effort]              cycle or set reasoning effort
+/permissions [mode]           view or change the approval mode
 /tree                         show branchable session tree
 /resume [session-id]          resume a previous session
 /context                      inspect context and token statistics

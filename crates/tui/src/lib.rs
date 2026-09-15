@@ -661,6 +661,11 @@ impl<R: TuiRuntime> TuiApp<R> {
             {
                 true
             }
+            KeyCode::Char('t') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.flush_paste_burst_before_non_plain_input();
+                self.cycle_reasoning_effort();
+                false
+            }
             KeyCode::Char(ch)
                 if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
@@ -777,7 +782,7 @@ impl<R: TuiRuntime> TuiApp<R> {
             }
             KeyCode::BackTab => {
                 self.flush_paste_burst_before_non_plain_input();
-                self.cycle_reasoning_effort();
+                self.cycle_approval_mode();
                 false
             }
             KeyCode::Esc => {
@@ -1039,7 +1044,7 @@ impl<R: TuiRuntime> TuiApp<R> {
                 }
                 false
             }
-            KeyCode::BackTab => {
+            KeyCode::Tab | KeyCode::BackTab => {
                 if let Some(picker) = self.state.picker_view.as_mut() {
                     picker.cycle_effort();
                 }
@@ -1153,6 +1158,17 @@ impl<R: TuiRuntime> TuiApp<R> {
         let (_, events) = self
             .runtime
             .handle_command(&format!("/model {} {next}", self.state.model));
+        self.apply_events(events);
+    }
+
+    fn cycle_approval_mode(&mut self) {
+        const ORDER: [&str; 4] = ["manual", "auto-edit", "auto", "full-access"];
+        let next = ORDER
+            .iter()
+            .position(|mode| *mode == self.state.approval_mode)
+            .map(|index| ORDER[(index + 1) % ORDER.len()])
+            .unwrap_or("manual");
+        let (_, events) = self.runtime.handle_command(&format!("/permissions {next}"));
         self.apply_events(events);
     }
 }

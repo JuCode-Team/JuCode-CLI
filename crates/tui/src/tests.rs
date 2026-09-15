@@ -61,6 +61,14 @@ impl TuiRuntime for TestRuntime {
 
     fn handle_command(&mut self, input: &str) -> (bool, Vec<AgentEvent>) {
         self.commands.push(input.to_string());
+        if let Some(mode) = input.strip_prefix("/permissions ") {
+            return (
+                false,
+                vec![AgentEvent::ApprovalMode {
+                    mode: mode.to_string(),
+                }],
+            );
+        }
         (false, Vec::new())
     }
 
@@ -1550,12 +1558,80 @@ fn login_paste_picker_submits_paste_command() {
 }
 
 #[test]
-fn shift_tab_effort_cycle_wraps() {
+fn effort_cycle_wraps() {
     let efforts = vec!["none".to_string(), "low".to_string(), "medium".to_string()];
     assert_eq!(next_reasoning_effort(&efforts, "none"), "low");
     assert_eq!(next_reasoning_effort(&efforts, "low"), "medium");
     assert_eq!(next_reasoning_effort(&efforts, "medium"), "none");
     assert_eq!(next_reasoning_effort(&efforts, "unknown"), "none");
+}
+
+#[test]
+fn backtab_cycles_approval_mode() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    let now = Instant::now();
+
+    for expected in [
+        "/permissions auto-edit",
+        "/permissions auto",
+        "/permissions full-access",
+        "/permissions manual",
+    ] {
+        app.handle_key_at(KeyCode::BackTab, KeyModifiers::SHIFT, now);
+        assert_eq!(
+            app.runtime.commands.last().map(String::as_str),
+            Some(expected)
+        );
+    }
+    assert_eq!(app.state.approval_mode, "manual");
+}
+
+#[test]
+fn ctrl_t_cycles_reasoning_effort() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.state.model = "gpt-5.5".to_string();
+    app.state.reasoning_efforts = vec!["low".to_string(), "medium".to_string(), "high".to_string()];
+    app.state.reasoning_effort = "low".to_string();
+
+    app.handle_key_at(KeyCode::Char('t'), KeyModifiers::CONTROL, Instant::now());
+
+    assert_eq!(
+        app.runtime.commands.last().map(String::as_str),
+        Some("/model gpt-5.5 medium")
+    );
+}
+
+#[test]
+fn model_picker_tab_cycles_effort() {
+    let models = vec![
+        ModelOptionView {
+            model: "gpt-5.5".to_string(),
+            active: true,
+            context_window: 200_000,
+            max_output_tokens: 32_000,
+            reasoning_efforts: vec!["low".to_string(), "medium".to_string()],
+        },
+        ModelOptionView {
+            model: "gpt-5.4-mini".to_string(),
+            active: false,
+            context_window: 200_000,
+            max_output_tokens: 32_000,
+            reasoning_efforts: vec!["none".to_string(), "low".to_string()],
+        },
+    ];
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.state.picker_view = Some(PickerState::model(models, "low".to_string()));
+    let now = Instant::now();
+
+    app.handle_key_at(KeyCode::Tab, KeyModifiers::empty(), now);
+    let picker = app.state.picker_view.as_ref().unwrap();
+    assert_eq!(picker.efforts[picker.selected_effort], "medium");
+
+    // Switching rows re-bases the effort list on the newly selected model:
+    // "medium" is unsupported there, so it falls back to the first entry.
+    app.handle_key_at(KeyCode::Down, KeyModifiers::empty(), now);
+    let picker = app.state.picker_view.as_ref().unwrap();
+    assert_eq!(picker.efforts[picker.selected_effort], "none");
 }
 
 #[test]

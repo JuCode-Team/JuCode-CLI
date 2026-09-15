@@ -1419,7 +1419,7 @@ impl OpenAiClient {
             provider_kind: self.provider_kind,
             goal_tool_tx: None,
             // The child shares the parent's approval channel and inherits the
-            // parent's mode as of spawn time; a later /approvals switch does
+            // parent's mode as of spawn time; a later /permissions switch does
             // not retarget live subagents (their requests can still be
             // auto-approved core-side if the live mode is looser).
             approval_tx: self.approval_tx.clone(),

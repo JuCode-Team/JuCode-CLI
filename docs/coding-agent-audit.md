@@ -64,7 +64,7 @@
 
 ### 8. TUI(crates/tui/)
 
-markdown 渲染(`markdown.rs`)、工具输出预览(`tool_preview.rs`)、picker(`picker.rs`)、丰富的 slash 命令(`/model`、`/approvals`、`/context`、`/goal`、`/doctor`、`/mcp`、`/stats` 等约 25 个)。**缺失**:`@` 文件提及补全(`crates/tui/src/input.rs` 无相关实现)、`!` 直通 shell、git 状态栏。
+markdown 渲染(`markdown.rs`)、工具输出预览(`tool_preview.rs`)、picker(`picker.rs`)、丰富的 slash 命令(`/model`、`/permissions`、`/context`、`/goal`、`/doctor`、`/mcp`、`/stats` 等约 25 个)。**缺失**:`@` 文件提及补全(`crates/tui/src/input.rs` 无相关实现)、`!` 直通 shell、git 状态栏。
 
 ### 9. Headless / serve(src/main.rs)
 

@@ -136,7 +136,7 @@ pub struct AgentCore {
     /// subagents (their requests arrive on the same channel). It can only
     /// loosen the approval mode, never tighten it.
     approved_tools: HashSet<String>,
-    /// Session approval mode; starts from config and is switched by /approvals
+    /// Session approval mode; starts from config and is switched by /permissions
     /// or the serve `set_approval_mode` op (session-only, not persisted).
     approval_mode: ApprovalMode,
     update_receiver: Option<Receiver<UpdateNotice>>,
@@ -644,7 +644,8 @@ impl AgentCore {
                 Ok((call_id, allow, always, hunks)) => self.approve(&call_id, allow, always, hunks),
                 Err(error) => vec![AgentEvent::Error(error)],
             },
-            "/approvals" => self.approvals_command_events(args.trim()),
+            "/permissions" => self.permissions_command_events(args.trim()),
+            "/effort" => self.effort_command_events(args.trim()),
             "/extensions" => self.extension_events(),
             "/mcp" => self.mcp_command_events(args.trim()),
             "/context" => self.context_events(),
@@ -2103,8 +2104,8 @@ impl AgentCore {
         ]
     }
 
-    /// `/approvals [mode]` — show the current mode, or switch it for this session.
-    fn approvals_command_events(&mut self, arg: &str) -> Vec<AgentEvent> {
+    /// `/permissions [mode]` — show the current mode, or switch it for this session.
+    fn permissions_command_events(&mut self, arg: &str) -> Vec<AgentEvent> {
         if arg.is_empty() {
             return vec![
                 AgentEvent::Info(format!(
@@ -2113,7 +2114,7 @@ impl AgentCore {
                      auto-edit   - file edits run freely; shell commands still ask\n\
                      auto        - a safety model auto-approves safe shell commands; the rest ask\n\
                      full-access - everything runs without asking\n\
-                     Switch with /approvals <mode>; a change applies to new turns and can\n\
+                     Switch with /permissions <mode>; a change applies to new turns and can\n\
                      only loosen (never tighten) gating of an in-flight turn.",
                     self.approval_mode.as_str()
                 )),
@@ -2123,9 +2124,32 @@ impl AgentCore {
         match ApprovalMode::parse(arg) {
             Ok(mode) => self.set_approval_mode(mode),
             Err(error) => vec![AgentEvent::Error(format!(
-                "usage: /approvals [manual|auto-edit|auto|full-access] ({error})"
+                "usage: /permissions [manual|auto-edit|auto|full-access] ({error})"
             ))],
         }
+    }
+
+    /// `/effort [level]` — with no argument cycle to the next effort the
+    /// current model supports; with one, set it explicitly.
+    fn effort_command_events(&mut self, arg: &str) -> Vec<AgentEvent> {
+        let model = self.config.model.clone();
+        let efforts = self.reasoning_efforts_for_model(&model);
+        if efforts.is_empty() {
+            return vec![AgentEvent::Error(format!(
+                "{model} does not support reasoning effort"
+            ))];
+        }
+        let next = if arg.is_empty() {
+            let index = efforts
+                .iter()
+                .position(|effort| effort == &self.config.reasoning_effort)
+                .map(|index| (index + 1) % efforts.len())
+                .unwrap_or(0);
+            efforts[index].clone()
+        } else {
+            arg.to_string()
+        };
+        self.set_model_config(model, next)
     }
 
     /// Forward the client's allow/deny decision to the parked tool call. With

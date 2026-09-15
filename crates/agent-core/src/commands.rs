@@ -60,6 +60,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         advanced: false,
     },
     CommandSpec {
+        name: "/effort",
+        aliases: &[],
+        args: "[effort]",
+        description: "Cycle or set the model reasoning effort",
+        advanced: false,
+    },
+    CommandSpec {
         name: "/tree",
         aliases: &[],
         args: "",
@@ -95,7 +102,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         advanced: true,
     },
     CommandSpec {
-        name: "/approvals",
+        name: "/permissions",
         aliases: &[],
         args: "[manual|auto-edit|auto|full-access]",
         description: "Show or switch the tool approval mode",
@@ -270,8 +277,9 @@ mod tests {
 
     #[test]
     fn approvals_command_is_registered_and_in_help() {
-        assert!(is_known("/approvals"));
-        assert!(help_line().contains("/approvals [manual|auto-edit|auto|full-access]"));
+        assert!(is_known("/permissions"));
+        assert!(is_known("/effort"));
+        assert!(help_line().contains("/permissions [manual|auto-edit|auto|full-access]"));
     }
 
     #[test]
