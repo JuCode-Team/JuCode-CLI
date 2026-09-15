@@ -463,9 +463,9 @@ impl Config {
             "extensions": self.extensions.iter().map(extension_config_value).collect::<Vec<_>>(),
             "mcp_servers": self.mcp_servers.iter().map(mcp_server_config_value).collect::<Vec<_>>()
         });
-        fs::write(
+        write_atomically(
             &self.path,
-            format!("{}\n", serde_json::to_string_pretty(&value)?),
+            &format!("{}\n", serde_json::to_string_pretty(&value)?),
         )
     }
 
@@ -634,11 +634,29 @@ impl AuthStore {
         if let Some(key) = &self.encryption_key {
             crate::secrets::protect_auth(&mut value, key)?;
         }
-        fs::write(
+        write_atomically(
             &self.path,
-            format!("{}\n", serde_json::to_string_pretty(&value)?),
+            &format!("{}\n", serde_json::to_string_pretty(&value)?),
         )
     }
+}
+
+/// Write `contents` to `path` atomically via a temp file in the same
+/// directory plus rename, so a crash or interrupt mid-write never leaves a
+/// truncated file behind. The temp name carries the pid so concurrent saves
+/// do not collide.
+fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("jucode");
+    let temp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    fs::write(&temp, contents)?;
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    Ok(())
 }
 
 pub fn profile_dir() -> io::Result<PathBuf> {
@@ -1349,6 +1367,8 @@ fn jucode_dir() -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn cost_for_prices_cached_input_separately() {
@@ -1763,5 +1783,61 @@ mod tests {
         let error = read_approval_mode(&json!({ "approval_mode": "bogus" })).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("approval_mode"));
+    }
+
+    #[test]
+    fn write_atomically_replaces_file_without_leaving_temp() {
+        let dir = std::env::temp_dir().join(format!(
+            "jucode-atomic-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        write_atomically(&path, "{\"a\":1}\n").unwrap();
+        write_atomically(&path, "{\"a\":2}\n").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"a\":2}\n");
+        let entries = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, ["config.json".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auth_save_preserves_mcp_servers_block() {
+        let dir = std::env::temp_dir().join(format!(
+            "jucode-auth-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        fs::write(
+            &path,
+            "{\"providers\":{},\"mcp_servers\":{\"fs\":{\"access_token\":\"tok\"}}}\n",
+        )
+        .unwrap();
+
+        let store = AuthStore {
+            keys: BTreeMap::from([("openai".to_string(), "sk-test".to_string())]),
+            jucode: None,
+            oauth: BTreeMap::new(),
+            encryption_key: None,
+            path: path.clone(),
+        };
+        store.save().unwrap();
+
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["providers"]["openai"], "sk-test");
+        assert_eq!(saved["mcp_servers"]["fs"]["access_token"], "tok");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
