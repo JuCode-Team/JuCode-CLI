@@ -134,6 +134,8 @@ pub fn discover_skills(
     }
     if project_trusted {
         read_skills_dir(&cwd.join(".jucode").join("skills"), &mut skills)?;
+        // `.agents/skills/` is the cross-tool convention for project skills.
+        read_skills_dir(&cwd.join(".agents").join("skills"), &mut skills)?;
     }
     skills.sort_by(|left, right| left.name.cmp(&right.name));
     skills.dedup_by(|left, right| left.name == right.name && left.path == right.path);
@@ -558,8 +560,10 @@ mod tests {
         let cwd = root.join("repo");
         let global = profile.join("skills/global");
         let project = cwd.join(".jucode/skills/project");
+        let agents = cwd.join(".agents/skills/agents-skill");
         fs::create_dir_all(&global).unwrap();
         fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&agents).unwrap();
         fs::write(
             global.join("SKILL.md"),
             "---\nname: global\ndescription: Global\n---\n",
@@ -568,6 +572,11 @@ mod tests {
         fs::write(
             project.join("SKILL.md"),
             "---\nname: project\ndescription: Project\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            agents.join("SKILL.md"),
+            "---\nname: agents\ndescription: Agents dir\n---\n",
         )
         .unwrap();
         crate::skills::set_skill_enabled(&profile, "global", false).unwrap();
@@ -580,7 +589,7 @@ mod tests {
                 .iter()
                 .map(|skill| skill.name.as_str())
                 .collect::<Vec<_>>(),
-            ["project"]
+            ["agents", "project"]
         );
         assert!(untrusted.is_empty());
         let _ = fs::remove_dir_all(root);

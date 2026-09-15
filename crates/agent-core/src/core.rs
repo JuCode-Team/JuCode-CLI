@@ -729,15 +729,22 @@ impl AgentCore {
             Ok(skills) => format!("Installed skills:\n{}", skills.join("\n")),
             Err(error) => format!("Installed skills: failed to read ({error})"),
         };
-        let project_root = self.cwd.join(".jucode").join("skills");
-        let project = if !self.project_trusted && project_root.exists() {
+        let project_roots = [
+            self.cwd.join(".jucode").join("skills"),
+            self.cwd.join(".agents").join("skills"),
+        ];
+        let project = if !self.project_trusted && project_roots.iter().any(|root| root.exists()) {
             "Project skills: hidden until project is trusted".to_string()
         } else {
             match discover_skills(self.config.profile_dir(), &self.cwd, self.project_trusted) {
                 Ok(found) => {
                     let names = found
                         .into_iter()
-                        .filter(|skill| skill.path.starts_with(&project_root))
+                        .filter(|skill| {
+                            project_roots
+                                .iter()
+                                .any(|root| skill.path.starts_with(root))
+                        })
                         .map(|skill| skill.name)
                         .collect::<Vec<_>>();
                     if names.is_empty() {

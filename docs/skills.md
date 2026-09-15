@@ -3,7 +3,7 @@
 JuCode loads skills from these sources:
 
 1. installed user skills under `~/.jucode/skills`;
-2. project skills under `<project>/.jucode/skills`, only after the project is trusted;
+2. project skills under `<project>/.jucode/skills` and `<project>/.agents/skills` (the cross-tool convention directory), only after the project is trusted;
 3. the JuCode marketplace returned by `/v1/skills/marketplace`;
 4. one optional extra GitHub source configured in `~/.jucode/config.json`.
 
