@@ -1604,7 +1604,7 @@ pub(crate) fn kind_style(kind: UiKind) -> Style {
             Style::new().fg(Color::White)
         }
         UiKind::Tool | UiKind::System | UiKind::Status => Style::new().fg(Color::DarkGray),
-        UiKind::BottomStatus => Style::new().fg(Color::White).bg(Color::Rgb(30, 33, 43)),
+        UiKind::BottomStatus => Style::new().fg(Color::White),
         UiKind::Error => Style::new().fg(Color::Red),
         UiKind::Input => Style::new().fg(Color::Rgb(224, 226, 232)),
         UiKind::TreeDirectory => Style::new().fg(Color::Yellow),

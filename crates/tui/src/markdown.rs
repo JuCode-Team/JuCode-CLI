@@ -4,10 +4,8 @@ use ratatui::{
 };
 pub(crate) const MD_BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 pub(crate) const MD_ITALIC: Style = Style::new().add_modifier(Modifier::ITALIC);
-/// Inline code reads as a chip: light-blue text on a subtle dark panel.
-pub(crate) const MD_CODE: Style = Style::new()
-    .fg(Color::Indexed(117))
-    .bg(Color::Rgb(42, 46, 58));
+/// Inline code reads as light-blue text on the shared background.
+pub(crate) const MD_CODE: Style = Style::new().fg(Color::Indexed(117));
 pub(crate) const MD_DIM: Style = Style::new().fg(Color::DarkGray);
 
 #[derive(Clone, Copy)]

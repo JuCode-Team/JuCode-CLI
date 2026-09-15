@@ -13,9 +13,7 @@ use crate::{
 
 const STRONG: Style = Style::new().fg(Color::White).add_modifier(Modifier::BOLD);
 const DIM: Style = Style::new().fg(Color::DarkGray);
-const BASH_COMMAND: Style = Style::new()
-    .fg(Color::Rgb(220, 224, 232))
-    .bg(Color::Rgb(44, 48, 58));
+const BASH_COMMAND: Style = Style::new().fg(Color::Rgb(220, 224, 232));
 const ERROR: Style = Style::new().fg(Color::Red);
 
 pub(crate) fn tool_output_preview(name: &str, output: &str, running: bool) -> Vec<UiLine> {
