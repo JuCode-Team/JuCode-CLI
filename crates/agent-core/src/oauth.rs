@@ -209,7 +209,7 @@ fn fetch_models(base_url: &str, access_token: &str) -> Result<Vec<OAuthModel>, S
     Ok(parse_models_response(&value))
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -287,7 +287,9 @@ fn read_u64_field(value: &Value, keys: &[&str]) -> Option<u64> {
         .find_map(Value::as_u64)
 }
 
-fn json_response(response: Result<ureq::Response, ureq::Error>) -> Result<Value, String> {
+pub(crate) fn json_response(
+    response: Result<ureq::Response, ureq::Error>,
+) -> Result<Value, String> {
     match response {
         Ok(response) => response
             .into_json::<Value>()
@@ -302,7 +304,7 @@ fn json_response(response: Result<ureq::Response, ureq::Error>) -> Result<Value,
     }
 }
 
-fn parse_callback_query(request_line: &str) -> Result<HashMap<String, String>, String> {
+pub(crate) fn parse_callback_query(request_line: &str) -> Result<HashMap<String, String>, String> {
     let path = request_line
         .split_whitespace()
         .nth(1)
@@ -320,7 +322,7 @@ fn parse_callback_query(request_line: &str) -> Result<HashMap<String, String>, S
         .collect())
 }
 
-fn write_callback_response(stream: &mut impl Write, ok: bool) -> Result<(), String> {
+pub(crate) fn write_callback_response(stream: &mut impl Write, ok: bool) -> Result<(), String> {
     let body = if ok {
         "JuCode CLI login complete. You can close this tab."
     } else {
@@ -335,17 +337,17 @@ fn write_callback_response(stream: &mut impl Write, ok: bool) -> Result<(), Stri
     .map_err(|error| error.to_string())
 }
 
-fn random_token(bytes: usize) -> Result<String, String> {
+pub(crate) fn random_token(bytes: usize) -> Result<String, String> {
     let mut data = vec![0_u8; bytes];
     getrandom::getrandom(&mut data).map_err(|error| error.to_string())?;
     Ok(URL_SAFE_NO_PAD.encode(data))
 }
 
-fn pkce_challenge(verifier: &str) -> String {
+pub(crate) fn pkce_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-fn open_browser(url: &str) -> Result<(), String> {
+pub(crate) fn open_browser(url: &str) -> Result<(), String> {
     let status = if cfg!(windows) {
         Command::new("rundll32")
             .arg("url.dll,FileProtocolHandler")
@@ -364,7 +366,7 @@ fn open_browser(url: &str) -> Result<(), String> {
     }
 }
 
-fn url_encode(value: &str) -> String {
+pub(crate) fn url_encode(value: &str) -> String {
     value
         .bytes()
         .flat_map(|byte| match byte {
@@ -376,7 +378,7 @@ fn url_encode(value: &str) -> String {
         .collect()
 }
 
-fn url_decode(value: &str) -> String {
+pub(crate) fn url_decode(value: &str) -> String {
     let mut output = Vec::new();
     let bytes = value.as_bytes();
     let mut index = 0;

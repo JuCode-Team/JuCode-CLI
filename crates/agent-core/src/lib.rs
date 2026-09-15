@@ -10,6 +10,7 @@ mod llm;
 pub mod logging;
 mod mcp;
 mod oauth;
+mod omp_auth;
 mod prompt;
 mod secrets;
 mod session;
@@ -24,7 +25,7 @@ mod web_fetch;
 pub use config::{builtin_providers, models_for_provider, ApprovalMode, ModelConfig};
 pub use core::AgentCore;
 pub use event::{
-    AgentEvent, CommandView, GoalView, McpServerView, McpToolView, ModelOptionView, PlanItem,
-    SessionListItemView, TranscriptItem, TreeNodeView,
+    AgentEvent, CommandView, GoalView, LoginProviderView, McpServerView, McpToolView,
+    ModelOptionView, PlanItem, SessionListItemView, TranscriptItem, TreeNodeView,
 };
 pub use hunks::HunkView;

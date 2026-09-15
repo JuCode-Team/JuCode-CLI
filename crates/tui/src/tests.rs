@@ -1369,6 +1369,20 @@ fn model_picker_renders_effort_hint() {
 }
 
 #[test]
+fn login_paste_picker_submits_paste_command() {
+    let mut picker = PickerState::login_paste();
+    assert!(picker.prompt.is_some());
+    for ch in "zcode://cb?code=abc&state=s".chars() {
+        picker.push_prompt_char(ch);
+    }
+    assert_eq!(
+        picker.take_prompt_command().as_deref(),
+        Some("/login-paste zcode://cb?code=abc&state=s")
+    );
+    assert_eq!(picker.take_prompt_command(), None);
+}
+
+#[test]
 fn shift_tab_effort_cycle_wraps() {
     let efforts = vec!["none".to_string(), "low".to_string(), "medium".to_string()];
     assert_eq!(next_reasoning_effort(&efforts, "none"), "low");

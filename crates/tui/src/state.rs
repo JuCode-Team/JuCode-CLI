@@ -472,6 +472,14 @@ impl TuiState {
                     self.picker_view = Some(PickerState::model(models, active_effort));
                     true
                 }
+                AgentEvent::LoginPicker(providers) => {
+                    self.picker_view = Some(PickerState::login(providers));
+                    true
+                }
+                AgentEvent::LoginPastePrompt { .. } => {
+                    self.picker_view = Some(PickerState::login_paste());
+                    true
+                }
                 AgentEvent::CommandList(commands) => {
                     self.commands = commands.into_iter().map(CommandCandidate::from).collect();
                     self.clamp_completion_index(input);

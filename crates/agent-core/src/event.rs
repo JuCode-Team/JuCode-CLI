@@ -25,6 +25,19 @@ pub struct ModelOptionView {
     pub reasoning_efforts: Vec<String>,
 }
 
+/// One row of the `/login` provider picker.
+#[derive(Debug, Clone)]
+pub struct LoginProviderView {
+    pub id: String,
+    pub label: String,
+    /// Flow kind and sign-in state, e.g. "oauth · signed in".
+    pub detail: String,
+    /// Currently configured provider.
+    pub active: bool,
+    /// The flow is a pasted API key, not a browser/device dance.
+    pub wants_key: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct CommandView {
     pub command: String,
@@ -155,6 +168,14 @@ pub enum AgentEvent {
     ModelView {
         models: Vec<ModelOptionView>,
         active_effort: String,
+    },
+    /// Interactive provider picker emitted by bare `/login`.
+    LoginPicker(Vec<LoginProviderView>),
+    /// A manual-callback login (zcode://, vscode://) is waiting for the user
+    /// to paste the redirect URL or code; clients should open a text input
+    /// and forward it to `/login-paste`.
+    LoginPastePrompt {
+        provider: String,
     },
     CommandList(Vec<CommandView>),
     Goal(Option<GoalView>),

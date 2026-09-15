@@ -1,6 +1,12 @@
 use crate::{
-    config::{profile_dir, ApprovalMode, AuthStore, Config, JucodeTokens, ModelConfig},
-    event::{AgentEvent, CommandView, GoalView, ModelOptionView, PlanItem, SessionListItemView},
+    config::{
+        models_for_provider, profile_dir, ApprovalMode, AuthStore, Config, JucodeTokens,
+        ModelConfig,
+    },
+    event::{
+        AgentEvent, CommandView, GoalView, LoginProviderView, ModelOptionView, PlanItem,
+        SessionListItemView,
+    },
     extensions::ExtensionRegistry,
     hooks::Hooks,
     llm::{
@@ -9,6 +15,7 @@ use crate::{
     },
     mcp::McpManager,
     oauth::{self, OAuthLoginResult, OAuthModel},
+    omp_auth::{self, OmpLoginOutcome},
     prompt::{
         build_system_prompt, discover_project_instructions, discover_skills, skill_commands,
         skill_message, skill_pin_message, PromptContext,
@@ -30,7 +37,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver},
+        mpsc::{self, Receiver, Sender},
         Arc,
     },
     thread,
@@ -134,6 +141,9 @@ pub struct AgentCore {
     approval_mode: ApprovalMode,
     update_receiver: Option<Receiver<UpdateNotice>>,
     login_receiver: Option<Receiver<Result<OAuthLoginResult, String>>>,
+    omp_login_receiver: Option<Receiver<OmpLoginEvent>>,
+    /// Feeds pasted redirect URLs/codes into a manual-callback login worker.
+    omp_login_code_tx: Option<Sender<String>>,
     total_input_tokens: u64,
     total_cached_input_tokens: u64,
     total_output_tokens: u64,
@@ -153,6 +163,16 @@ pub struct AgentCore {
     /// Binaries override it with their own via `with_version`; the default is
     /// the agent-core crate version, which may differ.
     version: &'static str,
+}
+
+/// Messages from an omp provider login worker: interim notices (browser URL,
+/// device code) then the final outcome keyed by provider id.
+enum OmpLoginEvent {
+    Notice(String),
+    Done {
+        provider: String,
+        result: Result<OmpLoginOutcome, String>,
+    },
 }
 
 impl AgentCore {
@@ -194,6 +214,8 @@ impl AgentCore {
             goal_tool_receiver: None,
             update_receiver: None,
             login_receiver: None,
+            omp_login_receiver: None,
+            omp_login_code_tx: None,
             total_input_tokens: 0,
             total_cached_input_tokens: 0,
             total_output_tokens: 0,
@@ -537,6 +559,7 @@ impl AgentCore {
             "/quit" | "/exit" => return (true, Vec::new()),
             "/help" | "/" => vec![AgentEvent::Info(crate::commands::help_line())],
             "/login" => self.login_events(args.trim()),
+            "/login-paste" => self.login_paste_events(args.trim()),
             "/usage" => self.usage_events(),
             "/new" => self.new_session_events(),
             "/config" => vec![AgentEvent::Info(format!(
@@ -547,7 +570,7 @@ impl AgentCore {
                 self.config.base_url,
                 self.config.jucode_web_url,
                 self.config.jucode_api_url,
-                mask_key(self.provider_api_key()),
+                mask_key(self.provider_api_key().as_deref()),
                 self.config.api_key_env,
                 self.config.retry_attempts
             ))],
@@ -927,20 +950,29 @@ impl AgentCore {
     }
 
     /// Returns the bearer token for the active provider: the JuCode OAuth
-    /// access token for the jucode provider, otherwise the raw provider key.
-    fn provider_api_key(&self) -> Option<&str> {
+    /// access token for the jucode provider, a stored omp OAuth access token
+    /// when logged in via the catalog, otherwise the raw provider key.
+    fn provider_api_key(&self) -> Option<String> {
         if self.config.provider == "jucode" {
-            self.auth.jucode_access_token()
-        } else {
-            self.auth.key_for(&self.config.provider)
+            return self.auth.jucode_access_token().map(str::to_string);
         }
+        let catalog = jucode_vendor::omp::catalog();
+        let store_id = catalog
+            .auth_provider(&self.config.provider)
+            .and_then(|p| p.store_as.as_deref())
+            .unwrap_or(&self.config.provider);
+        if let Some(credential) = self.auth.oauth_credential(store_id) {
+            return Some(omp_auth::bearer_token(credential));
+        }
+        self.auth.key_for(&self.config.provider).map(str::to_string)
     }
 
-    /// Refreshes the JuCode access token when it's near expiry so the
-    /// inference call carries a valid bearer. No-op for non-jucode providers.
+    /// Refreshes the active provider's bearer when it's near expiry so the
+    /// inference call carries a valid token. Handles the JuCode session and
+    /// omp OAuth credentials; BYOK providers return early.
     fn ensure_provider_credentials(&mut self) -> Result<(), String> {
         if self.config.provider != "jucode" {
-            return Ok(());
+            return self.ensure_omp_credentials();
         }
         // Reload auth.json from disk first. The Desktop shell shares
         // ~/.jucode/auth.json and may have rotated the (single-use) refresh
@@ -984,6 +1016,56 @@ impl AgentCore {
                 Err(format!(
                     "failed to refresh JuCode session: {error}. Run /login."
                 ))
+            }
+        }
+    }
+
+    /// Refresh path for omp OAuth credentials (see
+    /// [`Self::ensure_provider_credentials`]). No-op when the active provider
+    /// has no stored credential — BYOK keys don't expire here.
+    fn ensure_omp_credentials(&mut self) -> Result<(), String> {
+        let catalog = jucode_vendor::omp::catalog();
+        let provider = &self.config.provider;
+        let store_id = catalog
+            .auth_provider(provider)
+            .and_then(|p| p.store_as.as_deref())
+            .unwrap_or(provider)
+            .to_string();
+        // Pick up tokens written by another process first (same rationale as
+        // the jucode reload above).
+        self.auth = AuthStore::load_or_create(self.config.encrypt_secrets)
+            .map_err(|error| format!("failed to reload auth.json: {error}"))?;
+        let Some(credential) = self.auth.oauth_credential(&store_id) else {
+            return Ok(());
+        };
+        let now_ms = oauth::unix_now().saturating_mul(1000);
+        // Refresh slightly ahead of expiry; the credential's declared skew is
+        // already baked into expires_at_ms.
+        if credential.expires_at_ms > now_ms + 120_000 {
+            return Ok(());
+        }
+        if credential.refresh.is_empty() {
+            return Err(format!(
+                "{provider} session expired and cannot be refreshed. Run /login {provider}."
+            ));
+        }
+        match omp_auth::refresh(&store_id, credential, &self.profile_dir) {
+            Ok(refreshed) => {
+                crate::log_info!("oauth", "refreshed provider token");
+                self.auth.set_oauth_credential(&store_id, refreshed);
+                self.auth.save().map_err(|error| error.to_string())
+            }
+            Err(error) => {
+                crate::log_error!(
+                    "oauth",
+                    "provider token refresh failed",
+                    error = error.clone()
+                );
+                // The stored credential is dead (e.g. revoked refresh token);
+                // drop it so we don't retry the same failing refresh forever.
+                self.auth.clear_oauth(&store_id);
+                let _ = self.auth.save();
+                Err(format!("failed to refresh {provider}: {error}"))
             }
         }
     }
@@ -1376,6 +1458,36 @@ impl AgentCore {
                 Err(mpsc::TryRecvError::Disconnected) => {}
             }
         }
+        if let Some(rx) = self.omp_login_receiver.take() {
+            let mut finished = None;
+            let mut disconnected = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(OmpLoginEvent::Notice(text)) => events.push(AgentEvent::Info(text)),
+                    Ok(OmpLoginEvent::Done { provider, result }) => {
+                        finished = Some((provider, result));
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            if let Some((provider, result)) = finished {
+                self.omp_login_code_tx = None;
+                events.extend(self.apply_omp_login_result(provider, result));
+            } else if disconnected {
+                // The worker died without a Done (panic or channel drop) —
+                // never leave the login invisible.
+                self.omp_login_code_tx = None;
+                events.push(AgentEvent::Error(
+                    "provider login ended unexpectedly — try /login again".to_string(),
+                ));
+            } else {
+                self.omp_login_receiver = Some(rx);
+            }
+        }
         events.extend(self.poll_goal_tool_requests());
         events.extend(self.poll_approval_requests());
         self.mcp.refresh_changed();
@@ -1584,6 +1696,7 @@ impl AgentCore {
         self.pending_approvals.clear();
         let Ok(client) = OpenAiClient::from_config(OpenAiClientConfig {
             model: self.config.model.clone(),
+            provider: self.config.provider.clone(),
             protocol: self.config.protocol.clone(),
             reasoning_effort: self.effective_reasoning_effort(),
             model_reasoning_efforts: self
@@ -1602,7 +1715,7 @@ impl AgentCore {
             mcp: self.mcp.clone(),
             base_url: self.config.base_url.clone(),
             max_output_tokens: self.config.current_model_config().max_output_tokens,
-            api_key: self.provider_api_key(),
+            api_key: self.provider_api_key().as_deref(),
             api_key_env: &self.config.api_key_env,
             retry_attempts: self.config.retry_attempts,
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
@@ -1827,6 +1940,7 @@ impl AgentCore {
     fn compaction_client(&self) -> Result<OpenAiClient, String> {
         OpenAiClient::from_config(OpenAiClientConfig {
             model: self.config.compact_model.clone(),
+            provider: self.config.provider.clone(),
             protocol: self.config.protocol.clone(),
             reasoning_effort: self.config.compact_reasoning_effort.clone(),
             model_reasoning_efforts: Vec::new(),
@@ -1836,7 +1950,7 @@ impl AgentCore {
             mcp: McpManager::default(),
             base_url: self.config.base_url.clone(),
             max_output_tokens: self.config.compact_model_config().max_output_tokens,
-            api_key: self.provider_api_key(),
+            api_key: self.provider_api_key().as_deref(),
             api_key_env: &self.config.api_key_env,
             retry_attempts: self.config.retry_attempts,
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
@@ -1869,6 +1983,7 @@ impl AgentCore {
             .unwrap_or_else(|| self.config.compact_model_config().max_output_tokens);
         OpenAiClient::from_config(OpenAiClientConfig {
             model,
+            provider: self.config.provider.clone(),
             protocol: self.config.protocol.clone(),
             reasoning_effort: self.config.compact_reasoning_effort.clone(),
             model_reasoning_efforts: Vec::new(),
@@ -1878,7 +1993,7 @@ impl AgentCore {
             mcp: McpManager::default(),
             base_url: self.config.base_url.clone(),
             max_output_tokens,
-            api_key: self.provider_api_key(),
+            api_key: self.provider_api_key().as_deref(),
             api_key_env: &self.config.api_key_env,
             retry_attempts: self.config.retry_attempts,
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
@@ -2289,6 +2404,8 @@ impl AgentCore {
         .collect()
     }
 
+    /// `/login <provider>` — run the omp catalog's declared flow for one
+    /// upstream provider (browser OAuth, device code, or api-key guidance).
     fn login_events(&mut self, arg: &str) -> Vec<AgentEvent> {
         if self.running {
             return vec![AgentEvent::Error(
@@ -2296,18 +2413,35 @@ impl AgentCore {
             )];
         }
         let mut parts = arg.split_whitespace();
-        let web_url = parts
-            .next()
-            .map(str::to_string)
-            .unwrap_or_else(|| self.config.jucode_web_url.clone());
+        let first = parts.next().unwrap_or_default();
+        if first.is_empty() {
+            return vec![self.login_picker_event()];
+        }
+        if first == "list" {
+            return self.omp_login_list_events();
+        }
+        if !first.is_empty()
+            && first != "jucode"
+            && jucode_vendor::omp::catalog().auth_provider(first).is_some()
+        {
+            return match parts.next() {
+                Some(key) => self.omp_api_key_events(first, key),
+                None => self.omp_login_events(first),
+            };
+        }
+        let web_url = if first == "jucode" {
+            self.config.jucode_web_url.clone()
+        } else {
+            first.to_string()
+        };
         let api_url = parts.next().map(str::to_string).unwrap_or_else(|| {
-            if arg.is_empty() {
+            if first.is_empty() || first == "jucode" {
                 self.config.jucode_api_url.clone()
             } else {
                 web_url.clone()
             }
         });
-        if self.login_receiver.is_some() {
+        if self.login_receiver.is_some() || self.omp_login_receiver.is_some() {
             return vec![AgentEvent::Error(
                 "a login is already in progress".to_string(),
             )];
@@ -2322,6 +2456,284 @@ impl AgentCore {
         vec![AgentEvent::Info(
             "Opening your browser to sign in to JuCode. Complete the authorization there — waiting for it to finish (up to 5 min)…".to_string(),
         )]
+    }
+
+    /// Starts the declared login flow for an omp provider on a worker
+    /// thread; interim auth notices (device codes, browser URLs) arrive as
+    /// `OmpLoginEvent::Notice` on the receiver.
+    fn omp_login_events(&mut self, provider: &str) -> Vec<AgentEvent> {
+        if self.login_receiver.is_some() || self.omp_login_receiver.is_some() {
+            return vec![AgentEvent::Error(
+                "a login is already in progress".to_string(),
+            )];
+        }
+        let catalog = jucode_vendor::omp::catalog();
+        let name = catalog
+            .auth_provider(provider)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| provider.to_string());
+        let provider_id = provider.to_string();
+        let profile_dir = self.profile_dir.clone();
+        // Manual/native callbacks take the pasted-code path: the worker blocks
+        // on this channel until `/login-paste` feeds it a redirect URL or code.
+        let manual = matches!(
+            catalog
+                .auth_provider(&provider_id)
+                .and_then(|p| p.login.as_ref()),
+            Some(jucode_vendor::omp::LoginRule::OauthCode(rule))
+                if rule.callback.manual_only || rule.callback.native_scheme
+        );
+        let (code_tx, code_rx) = mpsc::channel();
+        self.omp_login_code_tx = manual.then_some(code_tx);
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let on_auth = |url: &str, instructions: Option<&str>| {
+                let text = match instructions {
+                    Some(instructions) => format!("{instructions}\n{url}"),
+                    None => url.to_string(),
+                };
+                let _ = tx.send(OmpLoginEvent::Notice(text));
+            };
+            let on_notice = |text: &str| {
+                let _ = tx.send(OmpLoginEvent::Notice(text.to_string()));
+            };
+            let result = omp_auth::login(
+                &provider_id,
+                &profile_dir,
+                &on_auth,
+                &on_notice,
+                manual.then_some(code_rx),
+            );
+            let _ = tx.send(OmpLoginEvent::Done {
+                provider: provider_id,
+                result,
+            });
+        });
+        self.omp_login_receiver = Some(rx);
+        let mut events = vec![AgentEvent::Info(format!("starting {name} login…"))];
+        if manual {
+            events.push(AgentEvent::LoginPastePrompt { provider: name });
+        }
+        events
+    }
+
+    /// `/login-paste <redirect-url-or-code>` — completes a manual-callback
+    /// provider login (e.g. zai-coding-plan's zcode:// redirect).
+    fn login_paste_events(&mut self, arg: &str) -> Vec<AgentEvent> {
+        let text = arg.trim();
+        if text.is_empty() {
+            return vec![AgentEvent::Error(
+                "usage: /login-paste <redirect-url-or-code>".to_string(),
+            )];
+        }
+        match &self.omp_login_code_tx {
+            Some(tx) if tx.send(text.to_string()).is_ok() => {
+                vec![AgentEvent::Info(
+                    "code received — finishing login…".to_string(),
+                )]
+            }
+            _ => vec![AgentEvent::Error(
+                "no login is waiting for a pasted code".to_string(),
+            )],
+        }
+    }
+
+    /// Rows for the interactive provider picker emitted by bare `/login`.
+    /// JuCode's own gateway stays first; the rest follow catalog order with
+    /// their flow kind and sign-in state.
+    fn login_picker_event(&self) -> AgentEvent {
+        let catalog = jucode_vendor::omp::catalog();
+        let mut rows = vec![LoginProviderView {
+            id: "jucode".to_string(),
+            label: "JuCode".to_string(),
+            detail: if self.auth.jucode_tokens().is_some() {
+                "oauth · signed in".to_string()
+            } else {
+                "oauth".to_string()
+            },
+            active: self.config.provider == "jucode",
+            wants_key: false,
+        }];
+        for provider in catalog.auth_providers() {
+            let Some(login) = &provider.login else {
+                continue;
+            };
+            if !catalog.provider_usable(&provider.id) {
+                continue;
+            }
+            let store_id = provider.store_as.as_deref().unwrap_or(&provider.id);
+            let signed_in = self.auth.oauth_credential(store_id).is_some()
+                || self.auth.key_for(&provider.id).is_some();
+            let (kind, wants_key) = match login {
+                jucode_vendor::omp::LoginRule::OauthCode(_) => ("oauth", false),
+                jucode_vendor::omp::LoginRule::DeviceCode(_) => ("device code", false),
+                jucode_vendor::omp::LoginRule::ApiKey(_) => ("api key", true),
+                jucode_vendor::omp::LoginRule::Custom { .. } => ("custom · unsupported", false),
+            };
+            let detail = if signed_in {
+                format!("{kind} · signed in")
+            } else {
+                kind.to_string()
+            };
+            rows.push(LoginProviderView {
+                id: provider.id.clone(),
+                label: provider.name.clone(),
+                detail,
+                active: self.config.provider == provider.id,
+                wants_key,
+            });
+        }
+        AgentEvent::LoginPicker(rows)
+    }
+
+    /// `/login list` — the catalog's login-capable providers grouped by flow.
+    fn omp_login_list_events(&self) -> Vec<AgentEvent> {
+        let catalog = jucode_vendor::omp::catalog();
+        let mut lines = vec![format!(
+            "provider logins (omp catalog {}) — /login <id>:",
+            catalog.omp_version
+        )];
+        for provider in catalog.auth_providers() {
+            let Some(login) = &provider.login else {
+                continue;
+            };
+            let kind = match login {
+                jucode_vendor::omp::LoginRule::OauthCode(_) => "oauth",
+                jucode_vendor::omp::LoginRule::DeviceCode(_) => "device code",
+                jucode_vendor::omp::LoginRule::ApiKey(_) => "api key",
+                jucode_vendor::omp::LoginRule::Custom { .. } => "unsupported",
+            };
+            if !catalog.provider_usable(&provider.id) {
+                continue;
+            }
+            lines.push(format!("  {} — {} ({kind})", provider.id, provider.name));
+        }
+        vec![AgentEvent::Info(lines.join("\n"))]
+    }
+
+    fn apply_omp_login_result(
+        &mut self,
+        provider_id: String,
+        result: Result<OmpLoginOutcome, String>,
+    ) -> Vec<AgentEvent> {
+        let catalog = jucode_vendor::omp::catalog();
+        let name = catalog
+            .auth_provider(&provider_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| provider_id.clone());
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => return vec![AgentEvent::Error(format!("{name} login failed: {error}"))],
+        };
+        let OmpLoginOutcome::Credentials(credential) = outcome else {
+            let OmpLoginOutcome::ApiKeyInstructions {
+                auth_url,
+                instructions,
+                prompt,
+            } = outcome
+            else {
+                unreachable!()
+            };
+            let mut lines = Vec::new();
+            if let Some(instructions) = instructions {
+                lines.push(instructions);
+            }
+            if let Some(url) = auth_url {
+                lines.push(format!("create a key: {url}"));
+            }
+            if let Some(prompt) = prompt {
+                lines.push(prompt);
+            }
+            lines.push(format!(
+                "then store it as \"{provider_id}\" under \"providers\" in ~/.jucode/auth.json"
+            ));
+            return vec![AgentEvent::Info(lines.join("\n"))];
+        };
+        let store_id = catalog
+            .auth_provider(&provider_id)
+            .and_then(|p| p.store_as.clone())
+            .unwrap_or_else(|| provider_id.clone());
+        self.auth.set_oauth_credential(&store_id, *credential);
+        self.adopt_provider(&provider_id);
+        match self.auth.save().and_then(|_| self.config.save()) {
+            Ok(()) => vec![
+                AgentEvent::Info(format!(
+                    "{name} connected; provider switched to {provider_id}"
+                )),
+                self.model_status_event(),
+            ],
+            Err(error) => vec![AgentEvent::Error(format!("failed to save login: {error}"))],
+        }
+    }
+
+    /// `/login <provider> <api-key>` — BYOK shortcut: stores the pasted key
+    /// under `providers.<id>` and switches the active provider, mirroring
+    /// what a successful OAuth login does.
+    fn omp_api_key_events(&mut self, provider: &str, key: &str) -> Vec<AgentEvent> {
+        let catalog = jucode_vendor::omp::catalog();
+        let Some(auth_provider) = catalog.auth_provider(provider) else {
+            return vec![AgentEvent::Error(format!(
+                "unknown provider \"{provider}\""
+            ))];
+        };
+        let mut key = key.trim();
+        if matches!(
+            &auth_provider.login,
+            Some(jucode_vendor::omp::LoginRule::ApiKey(rule))
+                if rule.normalize.as_deref() == Some("strip-bearer")
+        ) {
+            key = key
+                .strip_prefix("Bearer ")
+                .or_else(|| key.strip_prefix("bearer "))
+                .unwrap_or(key)
+                .trim();
+        }
+        if key.is_empty() {
+            return vec![AgentEvent::Error("empty api key".to_string())];
+        }
+        let name = auth_provider.name.clone();
+        self.auth.set_key(provider, key.to_string());
+        self.adopt_provider(provider);
+        match self.auth.save().and_then(|_| self.config.save()) {
+            Ok(()) => vec![
+                AgentEvent::Info(format!(
+                    "{name} api key saved; provider switched to {provider}"
+                )),
+                self.model_status_event(),
+            ],
+            Err(error) => vec![AgentEvent::Error(format!("failed to save login: {error}"))],
+        }
+    }
+
+    /// Point the session config at `provider_id` after a successful login:
+    /// catalog model table, a sensible default model, its base URL, and a
+    /// valid reasoning effort for that model.
+    fn adopt_provider(&mut self, provider_id: &str) {
+        let catalog = jucode_vendor::omp::catalog();
+        self.config.provider = provider_id.to_string();
+        self.config.models = models_for_provider(provider_id);
+        let models = catalog.models(provider_id);
+        let supported = catalog.supported_models(provider_id, models);
+        let pick = catalog
+            .default_model(provider_id)
+            .filter(|default| supported.iter().any(|m| m.id == *default))
+            .map(str::to_string)
+            .or_else(|| supported.first().map(|m| m.id.clone()));
+        if let Some(model) = pick {
+            self.config.model = model.clone();
+            if let Some(base_url) = catalog.base_url_for(provider_id, &model) {
+                self.config.base_url = base_url.to_string();
+            }
+            let efforts = self.reasoning_efforts_for_model(&model);
+            if !efforts
+                .iter()
+                .any(|effort| effort == &self.config.reasoning_effort)
+            {
+                self.config.reasoning_effort = self.default_reasoning_effort_for_model(&model);
+            }
+        } else if let Some(base_url) = catalog.default_base_url(provider_id) {
+            self.config.base_url = base_url.to_string();
+        }
     }
 
     fn apply_login_result(&mut self, result: OAuthLoginResult) -> Vec<AgentEvent> {

@@ -17,7 +17,7 @@ use git_bar::GitStatusTracker;
 use input::{paste_burst_render_delay, InputBuffer, PasteBurst, PasteCharDecision, PasteFlush};
 use jucode_agent_core::{AgentEvent, CommandView, TranscriptItem};
 use local_shell::{local_shell_command, LocalShellRunner};
-use picker::{PickerState, TreePromptAction};
+use picker::{PickerMode, PickerState, TreePromptAction};
 use ratatui::crossterm::{
     cursor::{Hide, Show},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -744,6 +744,17 @@ impl<R: TuiRuntime> TuiApp<R> {
 
     fn handle_paste(&mut self, text: &str) {
         self.paste_burst.clear_after_explicit_paste();
+        // While a picker prompt is open the paste targets it — landing in the
+        // composer instead leaves the prompt empty and Enter submits nothing.
+        if let Some(picker) = self
+            .state
+            .picker_view
+            .as_mut()
+            .filter(|picker| picker.prompt.is_some())
+        {
+            picker.push_prompt_str(text);
+            return;
+        }
         // A pasted (or drag-and-dropped) image file path is attached directly
         // instead of inserted as text; terminals deliver file drops as paths.
         if let Some(path) = pasted_image_path(text) {
@@ -762,7 +773,16 @@ impl<R: TuiRuntime> TuiApp<R> {
                 true
             }
             PasteFlush::Typed(ch) => {
-                self.input.push_char(ch);
+                if let Some(picker) = self
+                    .state
+                    .picker_view
+                    .as_mut()
+                    .filter(|picker| picker.prompt.is_some())
+                {
+                    picker.push_prompt_char(ch);
+                } else {
+                    self.input.push_char(ch);
+                }
                 self.clamp_completion_index();
                 true
             }
@@ -801,8 +821,14 @@ impl<R: TuiRuntime> TuiApp<R> {
                 true
             }
             KeyCode::Esc => {
-                if let Some(picker) = self.state.picker_view.as_mut() {
-                    picker.cancel_prompt();
+                match self.state.picker_view.as_mut() {
+                    // The paste prompt is the whole picker — esc closes it;
+                    // `/login-paste` still works afterwards.
+                    Some(picker) if picker.mode == PickerMode::LoginPaste => {
+                        self.state.picker_view = None;
+                    }
+                    Some(picker) => picker.cancel_prompt(),
+                    None => {}
                 }
                 false
             }
@@ -813,6 +839,9 @@ impl<R: TuiRuntime> TuiApp<R> {
                 false
             }
             KeyCode::Enter => {
+                let closes = self.state.picker_view.as_ref().is_some_and(|picker| {
+                    matches!(picker.mode, PickerMode::Login | PickerMode::LoginPaste)
+                });
                 let Some(command) = self
                     .state
                     .picker_view
@@ -821,6 +850,10 @@ impl<R: TuiRuntime> TuiApp<R> {
                 else {
                     return false;
                 };
+                // The key/paste prompt ends the flow — no picker to return to.
+                if closes {
+                    self.state.picker_view = None;
+                }
                 let (_, events) = self.runtime.handle_command(&command);
                 self.apply_events(events);
                 false
@@ -870,6 +903,18 @@ impl<R: TuiRuntime> TuiApp<R> {
                 }
                 false
             }
+            KeyCode::PageUp => {
+                if let Some(picker) = self.state.picker_view.as_mut() {
+                    picker.page_up();
+                }
+                false
+            }
+            KeyCode::PageDown => {
+                if let Some(picker) = self.state.picker_view.as_mut() {
+                    picker.page_down();
+                }
+                false
+            }
             KeyCode::Left => {
                 if let Some(picker) = self.state.picker_view.as_mut() {
                     picker.move_parent();
@@ -903,6 +948,17 @@ impl<R: TuiRuntime> TuiApp<R> {
                 false
             }
             KeyCode::Enter => {
+                if self
+                    .state
+                    .picker_view
+                    .as_ref()
+                    .is_some_and(PickerState::selected_wants_key)
+                {
+                    if let Some(picker) = self.state.picker_view.as_mut() {
+                        picker.begin_key_prompt();
+                    }
+                    return false;
+                }
                 let Some(command) = self
                     .state
                     .picker_view

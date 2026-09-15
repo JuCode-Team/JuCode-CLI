@@ -19,6 +19,7 @@ use serde_json::Value;
 
 pub mod anthropic;
 pub mod chat;
+pub mod omp;
 pub mod providers;
 pub mod responses;
 

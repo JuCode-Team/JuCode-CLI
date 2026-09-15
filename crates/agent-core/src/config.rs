@@ -295,6 +295,7 @@ impl ModelConfig {
 pub struct AuthStore {
     keys: BTreeMap<String, String>,
     jucode: Option<JucodeTokens>,
+    oauth: BTreeMap<String, crate::omp_auth::OmpCredential>,
     encryption_key: Option<crate::secrets::SecretKey>,
     path: PathBuf,
 }
@@ -375,8 +376,8 @@ impl Config {
         } else {
             &legacy_jucode_url
         };
-        let default_base_url =
-            default_base_url_for_provider(&provider).unwrap_or("https://api.openai.com/v1");
+        let default_base_url = default_base_url_for_provider(&provider)
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
         let config = Self {
             protocol: read_string(&value, "protocol", ""),
             model,
@@ -384,7 +385,7 @@ impl Config {
             compact_model,
             compact_reasoning_effort,
             models,
-            base_url: normalize_base_url(&read_string(&value, "base_url", default_base_url)),
+            base_url: normalize_base_url(&read_string(&value, "base_url", &default_base_url)),
             provider,
             jucode_web_url: normalize_base_url(&read_string(
                 &value,
@@ -500,6 +501,7 @@ impl AuthStore {
             let auth = Self {
                 keys: BTreeMap::new(),
                 jucode: None,
+                oauth: BTreeMap::new(),
                 encryption_key: if encrypt_secrets {
                     crate::secrets::find_key()?
                 } else {
@@ -529,10 +531,23 @@ impl AuthStore {
         // the user is forced through /login (which writes the token block).
         keys.remove("jucode");
         let jucode = value.get("jucode").and_then(read_jucode_tokens);
+        let oauth = value
+            .get("oauth")
+            .and_then(Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|(id, entry)| {
+                        read_omp_credential(entry).map(|cred| (id.clone(), cred))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         Ok(Self {
             keys,
             jucode,
+            oauth,
             encryption_key,
             path,
         })
@@ -540,6 +555,10 @@ impl AuthStore {
 
     pub fn key_for(&self, provider: &str) -> Option<&str> {
         self.keys.get(provider).map(String::as_str)
+    }
+
+    pub fn set_key(&mut self, provider: &str, key: String) {
+        self.keys.insert(provider.to_string(), key);
     }
 
     /// The current JuCode OAuth token bundle, if logged in.
@@ -560,6 +579,23 @@ impl AuthStore {
         self.jucode = None;
     }
 
+    /// Stored OAuth credential for an omp provider (`oauth.<id>` block).
+    pub fn oauth_credential(&self, provider: &str) -> Option<&crate::omp_auth::OmpCredential> {
+        self.oauth.get(provider)
+    }
+
+    pub fn set_oauth_credential(
+        &mut self,
+        provider: &str,
+        credential: crate::omp_auth::OmpCredential,
+    ) {
+        self.oauth.insert(provider.to_string(), credential);
+    }
+
+    pub fn clear_oauth(&mut self, provider: &str) {
+        self.oauth.remove(provider);
+    }
+
     pub fn save(&self) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -573,6 +609,13 @@ impl AuthStore {
                 "access_expires_at": t.access_expires_at,
                 "refresh_expires_at": t.refresh_expires_at,
             });
+        }
+        if !self.oauth.is_empty() {
+            value["oauth"] = json!(self
+                .oauth
+                .iter()
+                .map(|(id, cred)| (id.clone(), omp_credential_json(cred)))
+                .collect::<Map<String, Value>>());
         }
         // MCP transports refresh their own credentials while the agent is
         // running. Preserve that independently-managed block when account
@@ -1026,6 +1069,38 @@ pub(crate) fn is_thinking_disabled(efforts: &[String]) -> bool {
     efforts.is_empty() || efforts.iter().all(|effort| effort == "none")
 }
 
+/// Reasoning-effort tiers for a catalog model. Upstream's exact ladders live
+/// in KDL class rules we don't compile; this maps the model's dialect to the
+/// tiers JuCode's wire protocols understand.
+fn efforts_for_catalog_model(model: &jucode_vendor::omp::CatalogModel) -> Vec<String> {
+    if !model.reasoning {
+        return vec!["none".to_string()];
+    }
+    match model.api.as_str() {
+        "anthropic-messages" => ["none", "low", "medium", "high", "xhigh", "max"]
+            .iter()
+            .map(|e| e.to_string())
+            .collect(),
+        "openai-completions" | "openrouter" => vec!["none".to_string()],
+        _ => ["none", "low", "medium", "high", "xhigh"]
+            .iter()
+            .map(|e| e.to_string())
+            .collect(),
+    }
+}
+
+fn model_config_from_catalog(model: &jucode_vendor::omp::CatalogModel) -> ModelConfig {
+    ModelConfig {
+        name: model.id.clone(),
+        context_window: model.context_window,
+        max_output_tokens: model.max_tokens,
+        reasoning_efforts: efforts_for_catalog_model(model),
+        input_cost: model.input_cost,
+        cached_input_cost: model.cached_input_cost,
+        output_cost: model.output_cost,
+    }
+}
+
 fn model_config_from_template(model: &jucode_vendor::ModelTemplate) -> ModelConfig {
     ModelConfig {
         name: model.name.to_string(),
@@ -1043,30 +1118,69 @@ fn model_config_from_template(model: &jucode_vendor::ModelTemplate) -> ModelConf
 }
 
 /// Built-in providers as (id, default base_url, protocol) — for UIs to offer a
-/// picker. Templates (base URLs, protocols, models) live in the vendor crate.
+/// picker. The jucode gateway comes first; the rest follows the vendored omp
+/// catalog's login order, listing providers with at least one servable model
+/// or no declared table (manual/BYOK providers like ollama).
 pub fn builtin_providers() -> Vec<(String, String, String)> {
-    jucode_vendor::templates()
-        .iter()
-        .map(|p| {
-            (
-                p.id.to_string(),
-                p.base_url.to_string(),
-                p.protocol.as_str().to_string(),
-            )
-        })
-        .collect()
+    let catalog = jucode_vendor::omp::catalog();
+    let mut providers: Vec<(String, String, String)> = Vec::new();
+    if let Some(jucode) = jucode_vendor::providers::template("jucode") {
+        providers.push((
+            jucode.id.to_string(),
+            jucode.base_url.to_string(),
+            jucode.protocol.as_str().to_string(),
+        ));
+    }
+    for auth in catalog.auth_providers() {
+        let models = catalog.models(&auth.id);
+        let supported = catalog.supported_models(&auth.id, models);
+        let template = jucode_vendor::providers::template(&auth.id);
+        if supported.is_empty() && template.is_none() {
+            // Either every declared model speaks a dialect JuCode doesn't
+            // serve, or the catalog has no models for it (discovery-driven
+            // upstream) and no local template can fill in.
+            continue;
+        }
+        let base_url = catalog
+            .default_base_url(&auth.id)
+            .map(str::to_string)
+            .or_else(|| template.map(|p| p.base_url.to_string()))
+            .unwrap_or_default();
+        let protocol = supported
+            .first()
+            .and_then(|m| catalog.protocol_for(&auth.id, &m.id))
+            .map(|p| p.as_str().to_string())
+            .or_else(|| template.map(|p| p.protocol.as_str().to_string()))
+            .unwrap_or_default();
+        providers.push((auth.id.clone(), base_url, protocol));
+    }
+    providers
 }
 
-/// Default model table for a provider, falling back to the jucode set.
+/// Default model table for a provider. The omp catalog wins (it carries real
+/// costs and context sizes); providers without catalog entries keep the
+/// legacy template, and unknown ids fall back to the jucode set.
 pub fn models_for_provider(id: &str) -> Vec<ModelConfig> {
+    let catalog = jucode_vendor::omp::catalog();
+    let models = catalog.models(id);
+    let supported = catalog.supported_models(id, models);
+    if !supported.is_empty() {
+        return supported
+            .iter()
+            .map(|model| model_config_from_catalog(model))
+            .collect();
+    }
     jucode_vendor::providers::template(id)
         .or_else(|| jucode_vendor::providers::template("jucode"))
         .map(|p| p.models.iter().map(model_config_from_template).collect())
         .unwrap_or_default()
 }
 
-fn default_base_url_for_provider(id: &str) -> Option<&'static str> {
-    jucode_vendor::providers::template(id).map(|p| p.base_url)
+fn default_base_url_for_provider(id: &str) -> Option<String> {
+    jucode_vendor::omp::catalog()
+        .default_base_url(id)
+        .map(str::to_string)
+        .or_else(|| jucode_vendor::providers::template(id).map(|p| p.base_url.to_string()))
 }
 
 fn default_model_config(name: &str) -> ModelConfig {
@@ -1094,6 +1208,47 @@ fn read_provider_keys(providers: &Map<String, Value>) -> BTreeMap<String, String
         }
     }
     keys
+}
+
+fn read_omp_credential(value: &Value) -> Option<crate::omp_auth::OmpCredential> {
+    let str_opt = |key: &str| read_optional_string(value, key);
+    Some(crate::omp_auth::OmpCredential {
+        access: str_opt("access_token")?,
+        refresh: str_opt("refresh_token").unwrap_or_default(),
+        expires_at_ms: value
+            .get("expires_at_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        email: str_opt("email"),
+        account_id: str_opt("account_id"),
+        org_id: str_opt("org_id"),
+        org_name: str_opt("org_name"),
+        project_id: str_opt("project_id"),
+        api_endpoint: str_opt("api_endpoint"),
+        enterprise_url: str_opt("enterprise_url"),
+    })
+}
+
+fn omp_credential_json(cred: &crate::omp_auth::OmpCredential) -> Value {
+    let mut value = json!({
+        "access_token": cred.access,
+        "refresh_token": cred.refresh,
+        "expires_at_ms": cred.expires_at_ms,
+    });
+    for (key, field) in [
+        ("email", &cred.email),
+        ("account_id", &cred.account_id),
+        ("org_id", &cred.org_id),
+        ("org_name", &cred.org_name),
+        ("project_id", &cred.project_id),
+        ("api_endpoint", &cred.api_endpoint),
+        ("enterprise_url", &cred.enterprise_url),
+    ] {
+        if let Some(field) = field {
+            value[key] = json!(field);
+        }
+    }
+    value
 }
 
 fn read_jucode_tokens(value: &Value) -> Option<JucodeTokens> {
@@ -1215,13 +1370,14 @@ mod tests {
 
     #[test]
     fn builtin_providers_expose_vendor_templates_with_models() {
-        // `jucode providers` prints this list; it must include the chat-based
-        // templates alongside the original responses/anthropic ones.
+        // `jucode providers` prints this list: JuCode's own gateway first,
+        // then the vendored omp catalog's usable providers.
         let providers = builtin_providers();
         let ids: Vec<&str> = providers.iter().map(|(id, _, _)| id.as_str()).collect();
-        assert_eq!(
-            ids,
-            ["jucode", "openai", "deepseek", "ollama", "openrouter"]
+        assert_eq!(ids[0], "jucode");
+        assert!(
+            ids.len() > 5,
+            "catalog providers should far exceed the old 5 templates"
         );
         for (id, base_url, protocol) in &providers {
             assert!(!base_url.is_empty(), "{id}");

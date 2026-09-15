@@ -80,6 +80,9 @@ pub struct OpenAiClient {
 
 pub struct OpenAiClientConfig<'a> {
     pub model: String,
+    /// Provider id — used to route (provider, model) through the vendored
+    /// omp catalog's api-routes before falling back to `protocol`.
+    pub provider: String,
     pub protocol: String,
     pub reasoning_effort: String,
     /// Supported reasoning-effort tiers per model name (low→high). Pass an empty
@@ -293,7 +296,9 @@ impl OpenAiClient {
                 )
             })?,
         };
-        let provider_kind = Protocol::resolve(&config.protocol, &config.model);
+        let provider_kind = jucode_vendor::omp::catalog()
+            .protocol_for(&config.provider, &config.model)
+            .unwrap_or_else(|| Protocol::resolve(&config.protocol, &config.model));
         Ok(Self {
             api_key,
             model: config.model,
@@ -2672,6 +2677,7 @@ mod tests {
     fn test_client() -> OpenAiClient {
         OpenAiClient::from_config(OpenAiClientConfig {
             model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
             protocol: "responses".to_string(),
             reasoning_effort: "medium".to_string(),
             model_reasoning_efforts: Vec::new(),

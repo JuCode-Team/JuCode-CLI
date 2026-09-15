@@ -168,6 +168,17 @@ fn for_each_secret(auth: &mut Value, mut visit: impl FnMut(&mut String)) {
             }
         }
     }
+    if let Some(oauth) = auth.get_mut("oauth").and_then(Value::as_object_mut) {
+        for entry in oauth.values_mut() {
+            if let Some(object) = entry.as_object_mut() {
+                for field in ["access_token", "refresh_token"] {
+                    if let Some(Value::String(secret)) = object.get_mut(field) {
+                        visit(secret);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn read_key(path: &Path) -> io::Result<Option<SecretKey>> {

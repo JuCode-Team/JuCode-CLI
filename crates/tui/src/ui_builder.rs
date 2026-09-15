@@ -10,12 +10,14 @@ use crate::tool_preview::{
 use crate::{
     color_code, compact_home_path, format_context_window, pad_to_width, spinner_char,
     truncate_to_width, ActivityState, BottomStatus, ChatLine, CommandCandidate, UiDocument, UiKind,
-    UiLine, BOX_BORDER, CURSOR_MARKER, RESET, STARTUP_ACCENT, STARTUP_DIM, STARTUP_STRONG,
-    STARTUP_TEXT, THINKING_COLLAPSED_LINES, VISIBLE_CURSOR,
+    UiLine, BOX_BORDER, RESET, STARTUP_ACCENT, STARTUP_DIM, STARTUP_STRONG, STARTUP_TEXT,
+    THINKING_COLLAPSED_LINES, VISIBLE_CURSOR,
 };
 
 const TOOL_PREVIEW_INDENT: &str = "";
 const INPUT_PROMPT: &str = "›";
+/// Picker rows rendered at once; longer lists window around the selection.
+pub(crate) const PICKER_MAX_ROWS: usize = 15;
 
 fn rounded_box_border(left: char, right: char, width: usize) -> String {
     format!("{BOX_BORDER}{left}{}{right}{RESET}", "─".repeat(width + 2))
@@ -207,19 +209,26 @@ impl UiBuilder {
             PickerMode::Trust => {
                 "trust project? arrows move, enter select (loads project skills & hooks if trusted)"
             }
+            PickerMode::Login => "login: arrows move, pgup/pgdn page, enter select, esc close",
+            PickerMode::LoginPaste => {
+                "finish sign-in: paste the redirect URL or code, enter submit, esc close"
+            }
         };
         self.control_line(UiKind::Status, hint.to_string());
         if let Some(prompt) = picker.prompt.as_ref() {
             let label = match prompt.action {
                 TreePromptAction::Fork => "fork branch",
                 TreePromptAction::Delete => "delete branch",
+                TreePromptAction::ApiKey => "paste api key",
+                TreePromptAction::LoginPaste => "redirect url or code",
             };
+            // No CURSOR_MARKER here: the composer below already carries the
+            // real cursor target, and a second marker would leak as raw APC
+            // on terminals that don't swallow it. The `|` is the prompt's
+            // visible caret.
             self.control_line(
                 UiKind::Input,
-                format!(
-                    "{INPUT_PROMPT} {label}: {}{CURSOR_MARKER}{VISIBLE_CURSOR}",
-                    prompt.input
-                ),
+                format!("{INPUT_PROMPT} {label}: {}{VISIBLE_CURSOR}", prompt.input),
             );
         }
         if picker.mode == PickerMode::Model && !picker.efforts.is_empty() {
@@ -230,7 +239,9 @@ impl UiBuilder {
             );
         }
         if picker.rows.is_empty() {
-            self.control_line(UiKind::Status, "(empty)".to_string());
+            if picker.mode != PickerMode::LoginPaste {
+                self.control_line(UiKind::Status, "(empty)".to_string());
+            }
             return self;
         }
         let is_tree = picker.mode == PickerMode::Checkout;
@@ -239,7 +250,23 @@ impl UiBuilder {
         } else {
             std::collections::HashSet::new()
         };
-        for (index, row) in picker.rows.iter().enumerate() {
+        // Long lists (the login provider picker has ~60 rows) would flood the
+        // control area; render a window centered on the selection instead.
+        let total = picker.rows.len();
+        let (start, end) = if total <= PICKER_MAX_ROWS {
+            (0, total)
+        } else {
+            let start = picker
+                .selected
+                .saturating_sub(PICKER_MAX_ROWS / 2)
+                .min(total - PICKER_MAX_ROWS);
+            (start, start + PICKER_MAX_ROWS)
+        };
+        if start > 0 {
+            self.control_line(UiKind::Status, format!("    ↑ {start} more"));
+        }
+        for (index, row) in picker.rows[start..end].iter().enumerate() {
+            let index = index + start;
             let selected = index == picker.selected;
             let cursor = if selected { "\u{203a} " } else { "  " };
             let directory = if row.has_children {
@@ -287,10 +314,13 @@ impl UiBuilder {
             };
             self.control_line(kind, line);
         }
-        if is_tree {
+        if end < total {
+            self.control_line(UiKind::Status, format!("    ↓ {} more", total - end));
+        }
+        if is_tree || total > PICKER_MAX_ROWS {
             self.control_line(
                 UiKind::Status,
-                format!("({}/{})", picker.selected + 1, picker.rows.len()),
+                format!("({}/{})", picker.selected + 1, total),
             );
         }
         self.control_line(UiKind::System, String::new());

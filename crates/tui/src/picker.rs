@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use jucode_agent_core::{ModelOptionView, SessionListItemView, TreeNodeView};
+use jucode_agent_core::{LoginProviderView, ModelOptionView, SessionListItemView, TreeNodeView};
 
 use crate::format_token_count;
 
@@ -13,6 +13,8 @@ pub(crate) struct PickerState {
     pub(crate) efforts: Vec<String>,
     pub(crate) selected_effort: usize,
     pub(crate) prompt: Option<TreePrompt>,
+    /// Login-mode rows that need a pasted API key instead of a browser flow.
+    key_rows: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +44,9 @@ pub(crate) enum PickerMode {
     Model,
     Trust,
     Approval,
+    Login,
+    /// No rows: just the paste input for a manual-callback login.
+    LoginPaste,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +59,10 @@ pub(crate) struct TreePrompt {
 pub(crate) enum TreePromptAction {
     Fork,
     Delete,
+    /// Paste an API key for the selected login-mode provider row.
+    ApiKey,
+    /// Paste the redirect URL or code for a manual-callback login.
+    LoginPaste,
 }
 
 impl PickerState {
@@ -70,6 +79,7 @@ impl PickerState {
             efforts: Vec::new(),
             selected_effort: 0,
             prompt: None,
+            key_rows: HashSet::new(),
         }
     }
 
@@ -97,6 +107,7 @@ impl PickerState {
             efforts: Vec::new(),
             selected_effort: 0,
             prompt: None,
+            key_rows: HashSet::new(),
         }
     }
 
@@ -123,6 +134,7 @@ impl PickerState {
             efforts: Vec::new(),
             selected_effort: 0,
             prompt: None,
+            key_rows: HashSet::new(),
         }
     }
 
@@ -162,6 +174,58 @@ impl PickerState {
             efforts,
             selected_effort,
             prompt: None,
+            key_rows: HashSet::new(),
+        }
+    }
+
+    pub(crate) fn login(providers: Vec<LoginProviderView>) -> Self {
+        let selected = providers.iter().position(|row| row.active).unwrap_or(0);
+        let key_rows = providers
+            .iter()
+            .filter(|p| p.wants_key)
+            .map(|p| p.id.clone())
+            .collect();
+        let rows = providers
+            .into_iter()
+            .map(|p| PickerRow {
+                id: p.id,
+                parent_id: None,
+                depth: 0,
+                prefix: String::new(),
+                label: p.label,
+                active: p.active,
+                has_children: false,
+                detail: p.detail,
+                reasoning_efforts: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        Self {
+            rows,
+            selected,
+            mode: PickerMode::Login,
+            tree: None,
+            efforts: Vec::new(),
+            selected_effort: 0,
+            prompt: None,
+            key_rows,
+        }
+    }
+
+    /// Manual-callback login waiting on a pasted redirect URL or code: no
+    /// rows, the prompt is open on arrival.
+    pub(crate) fn login_paste() -> Self {
+        Self {
+            rows: Vec::new(),
+            selected: 0,
+            mode: PickerMode::LoginPaste,
+            tree: None,
+            efforts: Vec::new(),
+            selected_effort: 0,
+            prompt: Some(TreePrompt {
+                action: TreePromptAction::LoginPaste,
+                input: String::new(),
+            }),
+            key_rows: HashSet::new(),
         }
     }
 
@@ -194,6 +258,7 @@ impl PickerState {
             efforts: Vec::new(),
             selected_effort: 0,
             prompt: None,
+            key_rows: HashSet::new(),
         }
     }
 
@@ -226,6 +291,7 @@ impl PickerState {
             efforts: Vec::new(),
             selected_effort: 0,
             prompt: None,
+            key_rows: HashSet::new(),
         }
     }
 
@@ -245,7 +311,25 @@ impl PickerState {
                 Some(format!("/model {id} {effort}"))
             }
             PickerMode::Trust => Some(format!("/trust {id}")),
+            PickerMode::Login => Some(format!("/login {id}")),
+            PickerMode::LoginPaste => None,
         }
+    }
+
+    /// Login mode: the selected provider wants a pasted key, so Enter opens
+    /// the inline prompt instead of running `/login <id>` directly.
+    pub(crate) fn selected_wants_key(&self) -> bool {
+        self.mode == PickerMode::Login
+            && self
+                .selected_id()
+                .is_some_and(|id| self.key_rows.contains(&id))
+    }
+
+    pub(crate) fn begin_key_prompt(&mut self) {
+        self.prompt = Some(TreePrompt {
+            action: TreePromptAction::ApiKey,
+            input: String::new(),
+        });
     }
 
     /// Ids of the nodes on the path from the root to the current HEAD, used to
@@ -296,6 +380,16 @@ impl PickerState {
         }
     }
 
+    /// Bulk insert (bracketed paste); newlines can't be submitted anyway, so
+    /// they're dropped rather than splitting the value.
+    pub(crate) fn push_prompt_str(&mut self, text: &str) {
+        if let Some(prompt) = self.prompt.as_mut() {
+            prompt
+                .input
+                .extend(text.chars().filter(|ch| !matches!(ch, '\n' | '\r')));
+        }
+    }
+
     pub(crate) fn pop_prompt_char(&mut self) {
         if let Some(prompt) = self.prompt.as_mut() {
             prompt.input.pop();
@@ -303,14 +397,18 @@ impl PickerState {
     }
 
     pub(crate) fn take_prompt_command(&mut self) -> Option<String> {
-        let prompt = self.prompt.take()?;
-        let label = prompt.input.trim();
-        if label.is_empty() {
+        // Empty input keeps the prompt open — in LoginPaste mode the prompt
+        // is the whole picker, so consuming it would leave a dead panel.
+        if self.prompt.as_ref()?.input.trim().is_empty() {
             return None;
         }
+        let prompt = self.prompt.take()?;
+        let label = prompt.input.trim();
         match prompt.action {
             TreePromptAction::Fork => Some(format!("/fork {label}")),
             TreePromptAction::Delete => Some(format!("/delete {label}")),
+            TreePromptAction::ApiKey => self.selected_id().map(|id| format!("/login {id} {label}")),
+            TreePromptAction::LoginPaste => Some(format!("/login-paste {label}")),
         }
     }
 
@@ -323,6 +421,19 @@ impl PickerState {
         if self.selected + 1 < self.rows.len() {
             self.selected += 1;
         }
+        self.sync_selected_model_efforts();
+    }
+
+    pub(crate) fn page_up(&mut self) {
+        self.selected = self
+            .selected
+            .saturating_sub(crate::ui_builder::PICKER_MAX_ROWS);
+        self.sync_selected_model_efforts();
+    }
+
+    pub(crate) fn page_down(&mut self) {
+        self.selected = (self.selected + crate::ui_builder::PICKER_MAX_ROWS)
+            .min(self.rows.len().saturating_sub(1));
         self.sync_selected_model_efforts();
     }
 

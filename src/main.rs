@@ -592,6 +592,8 @@ fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
         AgentEvent::ApprovalMode { .. } => "approval_mode",
         AgentEvent::TrustPrompt { .. } => "trust_prompt",
         AgentEvent::ModelView { .. } => "model_view",
+        AgentEvent::LoginPicker(_) => "login_picker",
+        AgentEvent::LoginPastePrompt { .. } => "login_paste_prompt",
         AgentEvent::CommandList(_) => "command_list",
         AgentEvent::Goal(_) => "goal",
         AgentEvent::Plan(_) => "plan",
@@ -826,6 +828,20 @@ fn event_json(event: AgentEvent) -> Value {
                     "reasoning_efforts": model.reasoning_efforts
                 })
             }).collect::<Vec<_>>()
+        }),
+        AgentEvent::LoginPicker(providers) => json!({
+            "type": "login_picker",
+            "providers": providers.into_iter().map(|p| json!({
+                "id": p.id,
+                "label": p.label,
+                "detail": p.detail,
+                "active": p.active,
+                "wants_key": p.wants_key
+            })).collect::<Vec<_>>()
+        }),
+        AgentEvent::LoginPastePrompt { provider } => json!({
+            "type": "login_paste_prompt",
+            "provider": provider
         }),
         AgentEvent::CommandList(commands) => json!({
             "type": "command_list",

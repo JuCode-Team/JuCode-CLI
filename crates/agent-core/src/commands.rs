@@ -27,9 +27,16 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/login",
         aliases: &[],
-        args: "[web-url] [api-url]",
-        description: "Sign in to JuCode (OAuth)",
+        args: "[provider|list] [api-key] | [web-url] [api-url]",
+        description: "Sign in to JuCode or a catalog provider (OAuth)",
         advanced: false,
+    },
+    CommandSpec {
+        name: "/login-paste",
+        aliases: &[],
+        args: "<redirect-url-or-code>",
+        description: "Complete a manual provider login",
+        advanced: true,
     },
     CommandSpec {
         name: "/usage",
