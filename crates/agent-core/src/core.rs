@@ -1703,6 +1703,9 @@ impl AgentCore {
             goal_tool_tx: Some(goal_tool_tx),
             approval_tx: Some(approval_tx),
             approval_mode: self.approval_mode,
+            safety_model: Some(self.config.safety_model.clone())
+                .filter(|model| !model.trim().is_empty()),
+            safety_reasoning_effort: self.config.safety_reasoning_effort.clone(),
             edit_tools: self.config.edit_tools.clone(),
             subagent_manager: Some(self.subagent_manager.clone()),
             hooks: self.hooks.clone(),
@@ -1937,6 +1940,8 @@ impl AgentCore {
             goal_tool_tx: None,
             approval_tx: None,
             approval_mode: self.approval_mode,
+            safety_model: None,
+            safety_reasoning_effort: String::new(),
             // Summarization clients never expose or execute tools.
             edit_tools: Vec::new(),
             subagent_manager: None,
@@ -1979,6 +1984,8 @@ impl AgentCore {
             goal_tool_tx: None,
             approval_tx: None,
             approval_mode: self.approval_mode,
+            safety_model: None,
+            safety_reasoning_effort: String::new(),
             // Summarization clients never expose or execute tools.
             edit_tools: Vec::new(),
             subagent_manager: None,
@@ -2102,9 +2109,10 @@ impl AgentCore {
             return vec![
                 AgentEvent::Info(format!(
                     "approval mode: {}\n\
-                     read-only  - file edits and shell commands ask for approval (default)\n\
-                     auto-edit  - file edits run freely; shell commands still ask\n\
-                     full-auto  - everything runs without asking\n\
+                     manual      - file edits and shell commands ask for approval (default)\n\
+                     auto-edit   - file edits run freely; shell commands still ask\n\
+                     auto        - a safety model auto-approves safe shell commands; the rest ask\n\
+                     full-access - everything runs without asking\n\
                      Switch with /approvals <mode>; a change applies to new turns and can\n\
                      only loosen (never tighten) gating of an in-flight turn.",
                     self.approval_mode.as_str()
@@ -2115,7 +2123,7 @@ impl AgentCore {
         match ApprovalMode::parse(arg) {
             Ok(mode) => self.set_approval_mode(mode),
             Err(error) => vec![AgentEvent::Error(format!(
-                "usage: /approvals [read-only|auto-edit|full-auto] ({error})"
+                "usage: /approvals [manual|auto-edit|auto|full-access] ({error})"
             ))],
         }
     }

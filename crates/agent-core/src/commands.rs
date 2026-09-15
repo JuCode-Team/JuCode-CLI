@@ -97,7 +97,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/approvals",
         aliases: &[],
-        args: "[read-only|auto-edit|full-auto]",
+        args: "[manual|auto-edit|auto|full-access]",
         description: "Show or switch the tool approval mode",
         advanced: false,
     },
@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn approvals_command_is_registered_and_in_help() {
         assert!(is_known("/approvals"));
-        assert!(help_line().contains("/approvals [read-only|auto-edit|full-auto]"));
+        assert!(help_line().contains("/approvals [manual|auto-edit|auto|full-access]"));
     }
 
     #[test]

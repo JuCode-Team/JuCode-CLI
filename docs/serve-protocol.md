@@ -27,7 +27,7 @@ On spawn, before any command, the engine emits its startup batch:
 {"type":"startup","version":"0.2.0","session_id":"...","profile_dir":"...","config_path":"...","cwd":"...","model":"...","context_window":200000}
 {"type":"model_status","provider":"...","model":"...","reasoning_effort":"...","context_window":200000,"context_limit":160000,"max_output_tokens":32000,"reasoning_efforts":["low","medium","high"],"state":"ready"}
 {"type":"command_list","commands":[{"command":"/help","marker":null,"args":"","description":"..."}]}
-{"type":"approval_mode","mode":"read-only"}
+{"type":"approval_mode","mode":"manual"}
 {"type":"mcp_servers","servers":[...]}
 {"type":"trust_prompt","cwd":"...","repo_root":"..."}        // only when an untrusted project has local resources
 {"type":"info","message":"..."}                              // session_start hook output, if any
@@ -118,10 +118,10 @@ can retry with a corrected op.
 ### `set_approval_mode`
 
 ```json
-{"op":"set_approval_mode","mode":"read-only"}
+{"op":"set_approval_mode","mode":"manual"}
 ```
 
-`mode` is `read-only`, `auto-edit`, or `full-auto`. Emits
+`mode` is `manual`, `auto-edit`, `auto`, or `full-access`. Emits
 `status:"approval mode: ..."` and an `approval_mode` event. The change
 applies to new turns; an in-flight turn's gating can only loosen.
 

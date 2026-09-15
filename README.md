@@ -88,6 +88,26 @@ Valid names are `hashline_edit`, `str_replace` (alias `edit`), `write`, and `app
 
 File tools (read/write/edit/ls/outline/checkpoint/apply_patch) only operate on paths inside the working directory: absolute paths, `..`, and symlinks that resolve outside the workspace are rejected with a clear error. This is a path policy, not an OS sandbox — shell commands are not restricted by it.
 
+### Approval modes
+
+`approval_mode` in `config.json` (or `/approvals <mode>` in a session) picks one of four levels:
+
+| Mode | File edits | Shell commands |
+|---|---|---|
+| `manual` (default) | ask | ask |
+| `auto-edit` | run freely | ask |
+| `auto` | run freely | a safety model auto-approves safe commands; the rest still ask |
+| `full-access` | run freely | run freely, no prompts |
+
+Under `auto`, every shell command first goes through a one-shot safety classification in an isolated context — the classifier sees only the command, the working directory, and your request, never the conversation history. Commands it judges safe run immediately; anything unsafe, ambiguous, or a failed classification falls back to the interactive prompt. The classifier model is configured with `safety_model` (defaults to `compact_model`) and `safety_reasoning_effort` in `config.json`:
+
+```json
+"safety_model": "gpt-5.4-mini",
+"safety_reasoning_effort": "low"
+```
+
+`full-access` runs the model's shell commands and file writes with your user permissions and no prompts — `bash` is not confined to the workspace, so only use it for tasks and repositories you trust.
+
 ## Usage
 
 ### Interactive mode
@@ -140,10 +160,10 @@ Other TUI conveniences:
 
 Headless mode emits JSONL events and finishes with a `final_result` event containing status, usage, context, tool-call counts, and elapsed time.
 
-Headless runs default to the `read-only` approval mode: tool calls that would need interactive approval (edits, shell commands) are auto-denied with a clear message instead of hanging. Pass `--approval-mode` explicitly for tasks that change files or run commands:
+Headless runs default to the `manual` approval mode: tool calls that would need interactive approval (edits, shell commands) are auto-denied with a clear message instead of hanging. Pass `--approval-mode` explicitly for tasks that change files or run commands:
 
 ```bash
-jucode --headless --approval-mode full-auto "Fix the failing test and verify the focused suite"
+jucode --headless --approval-mode full-access "Fix the failing test and verify the focused suite"
 ```
 
 Read-only tasks work without a flag:
@@ -158,13 +178,13 @@ You can also pipe the task through stdin:
 cat task.md | jucode --headless
 ```
 
-Headless defaults to the safest approval mode (`read-only`), and any tool call that would need interactive approval is denied automatically instead of hanging the run. Opt in to unattended edits or shell commands explicitly:
+Headless defaults to the safest approval mode (`manual`), and any tool call that would need interactive approval is denied automatically instead of hanging the run. Opt in to unattended edits or shell commands explicitly:
 
 ```bash
-jucode --headless --approval-mode full-auto "Fix the failing test"
+jucode --headless --approval-mode full-access "Fix the failing test"
 ```
 
-`full-auto` runs the model's shell commands and file writes with your user
+`full-access` runs the model's shell commands and file writes with your user
 permissions and no prompts — `bash` is not confined to the workspace, so only
 use it for tasks and repositories you trust.
 

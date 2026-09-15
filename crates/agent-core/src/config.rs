@@ -2,6 +2,7 @@ use serde_json::{json, Map, Value};
 use std::{
     collections::BTreeMap,
     env, fs, io,
+    io::{IsTerminal, Write},
     path::{Path, PathBuf},
 };
 
@@ -63,34 +64,41 @@ pub const DEFAULT_MCP_TIMEOUT_SECONDS: u64 = 60;
 pub enum ApprovalMode {
     /// Every mutating tool (file edits and shell/stdin) requires approval.
     #[default]
-    ReadOnly,
+    Manual,
     /// File-editing tools run without approval; shell/stdin still ask.
     AutoEdit,
+    /// AutoEdit plus a safety classifier that auto-approves shell commands it
+    /// judges safe; unsafe, ambiguous, or unclassifiable commands still ask.
+    Auto,
     /// Everything runs without approval.
-    FullAuto,
+    FullAccess,
 }
 
 impl ApprovalMode {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::ReadOnly => "read-only",
+            Self::Manual => "manual",
             Self::AutoEdit => "auto-edit",
-            Self::FullAuto => "full-auto",
+            Self::Auto => "auto",
+            Self::FullAccess => "full-access",
         }
     }
 
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim() {
-            "read-only" => Ok(Self::ReadOnly),
+            "manual" => Ok(Self::Manual),
             "auto-edit" => Ok(Self::AutoEdit),
-            "full-auto" => Ok(Self::FullAuto),
+            "auto" => Ok(Self::Auto),
+            "full-access" => Ok(Self::FullAccess),
             other => Err(format!(
-                "unknown approval mode '{other}': use read-only, auto-edit, or full-auto"
+                "unknown approval mode '{other}': use manual, auto-edit, auto, or full-access"
             )),
         }
     }
 
     /// Whether a call to `tool_name` needs a user decision under this mode.
+    /// Under `auto`, shell tools still count as gated here — the safety
+    /// classifier runs first and may resolve the call before the user is asked.
     pub fn requires_approval(&self, tool_name: &str) -> bool {
         // MCP tools are untrusted by default. Without the readOnlyHint in
         // hand this gates conservatively; hint-aware callers use
@@ -99,27 +107,33 @@ impl ApprovalMode {
             return self.requires_approval_for_mcp(false);
         }
         if is_shell_tool(tool_name) {
-            return *self != Self::FullAuto;
+            return *self != Self::FullAccess;
         }
         if is_edit_tool(tool_name) {
-            return *self == Self::ReadOnly;
+            return *self == Self::Manual;
         }
         // Network egress can exfiltrate local context, so the strictest mode
         // still asks; both auto modes already accept broader side effects.
         if is_network_tool(tool_name) {
-            return *self == Self::ReadOnly;
+            return *self == Self::Manual;
         }
         false
     }
 
+    /// Whether a shell-tool call should go through the safety classifier
+    /// before falling back to a user decision. Only `auto` classifies.
+    pub fn classifies_shell(&self) -> bool {
+        *self == Self::Auto
+    }
+
     /// Approval policy for MCP tools, given the server's `readOnlyHint`
-    /// annotation: read-only asks for everything, auto-edit asks unless the
-    /// tool is marked read-only, full-auto never asks.
+    /// annotation: manual asks for everything, the auto modes ask unless the
+    /// tool is marked read-only, full-access never asks.
     pub fn requires_approval_for_mcp(&self, read_only_hint: bool) -> bool {
         match self {
-            Self::ReadOnly => true,
-            Self::AutoEdit => !read_only_hint,
-            Self::FullAuto => false,
+            Self::Manual => true,
+            Self::AutoEdit | Self::Auto => !read_only_hint,
+            Self::FullAccess => false,
         }
     }
 }
@@ -129,7 +143,7 @@ pub(crate) fn is_mcp_tool(name: &str) -> bool {
     name.starts_with("mcp__")
 }
 
-fn is_shell_tool(name: &str) -> bool {
+pub(crate) fn is_shell_tool(name: &str) -> bool {
     matches!(
         name,
         "bash" | "execute" | "exec_command" | "shell_command" | "write_stdin"
@@ -177,6 +191,10 @@ pub struct Config {
     pub reasoning_effort: String,
     pub compact_model: String,
     pub compact_reasoning_effort: String,
+    /// Model used by the `auto` approval mode's safety classifier. Absent or
+    /// empty in config.json falls back to `compact_model`.
+    pub safety_model: String,
+    pub safety_reasoning_effort: String,
     pub models: Vec<ModelConfig>,
     pub base_url: String,
     pub jucode_web_url: String,
@@ -323,6 +341,8 @@ impl Config {
                 reasoning_effort: "medium".to_string(),
                 compact_model: "gpt-5.5".to_string(),
                 compact_reasoning_effort: DEFAULT_COMPACT_REASONING_EFFORT.to_string(),
+                safety_model: "gpt-5.5".to_string(),
+                safety_reasoning_effort: DEFAULT_COMPACT_REASONING_EFFORT.to_string(),
                 models: models_for_provider("jucode"),
                 base_url: "https://api.jucode.cn/v1".to_string(),
                 jucode_web_url: "https://api.jucode.cn".to_string(),
@@ -346,7 +366,30 @@ impl Config {
         }
 
         let content = fs::read_to_string(&path)?;
-        let value = serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({}));
+        match Self::from_value(&content, path.clone()) {
+            Ok(config) => {
+                config.save()?;
+                Ok(config)
+            }
+            Err(error) => {
+                if offer_config_reset(&path, &error)? {
+                    Self::load_or_create()
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    /// Parse `content` as config.json. Malformed JSON and invalid field values
+    /// are hard errors; `load_or_create` offers to reset the file in that case.
+    fn from_value(content: &str, path: PathBuf) -> io::Result<Self> {
+        let value = serde_json::from_str::<Value>(content).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("config.json is not valid JSON: {error}"),
+            )
+        })?;
         let provider = read_string(&value, "provider", "openai");
         let model = read_string(&value, "model", "gpt-5");
         let mut models = read_model_configs(&value, &provider);
@@ -361,6 +404,14 @@ impl Config {
             "compact_reasoning_effort",
             DEFAULT_COMPACT_REASONING_EFFORT,
             &compact_model,
+            &models,
+        );
+        let safety_model = read_string(&value, "safety_model", &compact_model);
+        let safety_reasoning_effort = read_reasoning_effort(
+            &value,
+            "safety_reasoning_effort",
+            DEFAULT_COMPACT_REASONING_EFFORT,
+            &safety_model,
             &models,
         );
         let legacy_jucode_url = read_string(&value, "jucode_base_url", "");
@@ -383,6 +434,8 @@ impl Config {
             reasoning_effort,
             compact_model,
             compact_reasoning_effort,
+            safety_model,
+            safety_reasoning_effort,
             models,
             base_url: normalize_base_url(&read_string(&value, "base_url", &default_base_url)),
             provider,
@@ -423,7 +476,6 @@ impl Config {
             mcp_servers: read_mcp_servers(&value),
             path,
         };
-        config.save()?;
         Ok(config)
     }
 
@@ -439,6 +491,8 @@ impl Config {
             "reasoning_effort": self.reasoning_effort,
             "compact_model": self.compact_model,
             "compact_reasoning_effort": self.compact_reasoning_effort,
+            "safety_model": self.safety_model,
+            "safety_reasoning_effort": self.safety_reasoning_effort,
             "models": self.models.iter().map(model_config_value).collect::<Vec<_>>(),
             "base_url": normalize_base_url(&self.base_url),
             "jucode_web_url": normalize_base_url(&self.jucode_web_url),
@@ -652,6 +706,25 @@ fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// When config.json fails to parse (invalid values, malformed JSON), offer an
+/// interactive reset: the file is removed and `load_or_create` regenerates
+/// defaults. Only prompts on a TTY; non-interactive callers get the error.
+fn offer_config_reset(path: &Path, error: &io::Error) -> io::Result<bool> {
+    if !io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    eprintln!("{}: {error}", path.display());
+    eprint!("Reset config to defaults? [y/N] ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+        return Ok(false);
+    }
+    fs::remove_file(path)?;
+    Ok(true)
+}
+
 pub fn profile_dir() -> io::Result<PathBuf> {
     jucode_dir()
 }
@@ -690,7 +763,7 @@ fn read_u64(value: &Value, key: &str, default: u64) -> u64 {
     value.get(key).and_then(Value::as_u64).unwrap_or(default)
 }
 
-/// Optional `approval_mode` in config.json; absent/empty defaults to read-only,
+/// Optional `approval_mode` in config.json; absent/empty defaults to manual,
 /// an unknown value is a hard load error rather than a silent fallback.
 fn read_approval_mode(value: &Value) -> io::Result<ApprovalMode> {
     let raw = value
@@ -1464,6 +1537,8 @@ mod tests {
             reasoning_effort: "medium".to_string(),
             compact_model: "compact-model".to_string(),
             compact_reasoning_effort: "low".to_string(),
+            safety_model: "compact-model".to_string(),
+            safety_reasoning_effort: "low".to_string(),
             models: vec![
                 ModelConfig {
                     name: "chat-model".to_string(),
@@ -1508,25 +1583,23 @@ mod tests {
 
     #[test]
     fn approval_mode_parses_wire_names_and_rejects_unknown() {
-        assert_eq!(
-            ApprovalMode::parse("read-only").unwrap(),
-            ApprovalMode::ReadOnly
-        );
+        assert_eq!(ApprovalMode::parse("manual").unwrap(), ApprovalMode::Manual);
         assert_eq!(
             ApprovalMode::parse("auto-edit").unwrap(),
             ApprovalMode::AutoEdit
         );
+        assert_eq!(ApprovalMode::parse("auto").unwrap(), ApprovalMode::Auto);
         assert_eq!(
-            ApprovalMode::parse("full-auto").unwrap(),
-            ApprovalMode::FullAuto
+            ApprovalMode::parse("full-access").unwrap(),
+            ApprovalMode::FullAccess
         );
         assert_eq!(
-            ApprovalMode::parse(" full-auto ").unwrap().as_str(),
-            "full-auto"
+            ApprovalMode::parse(" full-access ").unwrap().as_str(),
+            "full-access"
         );
         let error = ApprovalMode::parse("yolo").unwrap_err();
         assert!(error.contains("yolo"));
-        assert!(error.contains("read-only, auto-edit, or full-auto"));
+        assert!(error.contains("manual, auto-edit, auto, or full-access"));
     }
 
     #[test]
@@ -1549,46 +1622,62 @@ mod tests {
         let free_tools = ["read", "ls", "ripgrep", "outline", "spawn_agent"];
 
         for tool in shell_tools {
-            assert!(ApprovalMode::ReadOnly.requires_approval(tool), "{tool}");
+            assert!(ApprovalMode::Manual.requires_approval(tool), "{tool}");
             assert!(ApprovalMode::AutoEdit.requires_approval(tool), "{tool}");
-            assert!(!ApprovalMode::FullAuto.requires_approval(tool), "{tool}");
+            // `auto` still gates shell at this layer; the classifier decides
+            // whether the call reaches the user.
+            assert!(ApprovalMode::Auto.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::FullAccess.requires_approval(tool), "{tool}");
         }
         for tool in edit_tools {
-            assert!(ApprovalMode::ReadOnly.requires_approval(tool), "{tool}");
+            assert!(ApprovalMode::Manual.requires_approval(tool), "{tool}");
             assert!(!ApprovalMode::AutoEdit.requires_approval(tool), "{tool}");
-            assert!(!ApprovalMode::FullAuto.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::Auto.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::FullAccess.requires_approval(tool), "{tool}");
         }
         for tool in network_tools {
-            assert!(ApprovalMode::ReadOnly.requires_approval(tool), "{tool}");
+            assert!(ApprovalMode::Manual.requires_approval(tool), "{tool}");
             assert!(!ApprovalMode::AutoEdit.requires_approval(tool), "{tool}");
-            assert!(!ApprovalMode::FullAuto.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::Auto.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::FullAccess.requires_approval(tool), "{tool}");
         }
         for tool in free_tools {
-            assert!(!ApprovalMode::ReadOnly.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::Manual.requires_approval(tool), "{tool}");
             assert!(!ApprovalMode::AutoEdit.requires_approval(tool), "{tool}");
-            assert!(!ApprovalMode::FullAuto.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::Auto.requires_approval(tool), "{tool}");
+            assert!(!ApprovalMode::FullAccess.requires_approval(tool), "{tool}");
         }
     }
 
     #[test]
+    fn only_auto_mode_classifies_shell_commands() {
+        assert!(!ApprovalMode::Manual.classifies_shell());
+        assert!(!ApprovalMode::AutoEdit.classifies_shell());
+        assert!(ApprovalMode::Auto.classifies_shell());
+        assert!(!ApprovalMode::FullAccess.classifies_shell());
+    }
+
+    #[test]
     fn mcp_approval_matrix_follows_read_only_hint() {
-        // Non-read-only MCP tools gate like shell tools; read-only-hinted
-        // tools run freely in auto-edit but still ask in read-only.
-        assert!(ApprovalMode::ReadOnly.requires_approval_for_mcp(false));
-        assert!(ApprovalMode::ReadOnly.requires_approval_for_mcp(true));
+        // Non-readOnlyHint MCP tools gate like shell tools; read-only-hinted
+        // tools run freely in the auto modes but still ask in manual.
+        assert!(ApprovalMode::Manual.requires_approval_for_mcp(false));
+        assert!(ApprovalMode::Manual.requires_approval_for_mcp(true));
         assert!(ApprovalMode::AutoEdit.requires_approval_for_mcp(false));
         assert!(!ApprovalMode::AutoEdit.requires_approval_for_mcp(true));
-        assert!(!ApprovalMode::FullAuto.requires_approval_for_mcp(false));
-        assert!(!ApprovalMode::FullAuto.requires_approval_for_mcp(true));
+        assert!(ApprovalMode::Auto.requires_approval_for_mcp(false));
+        assert!(!ApprovalMode::Auto.requires_approval_for_mcp(true));
+        assert!(!ApprovalMode::FullAccess.requires_approval_for_mcp(false));
+        assert!(!ApprovalMode::FullAccess.requires_approval_for_mcp(true));
     }
 
     #[test]
     fn requires_approval_gates_mcp_names_conservatively() {
         // Without the hint, the shared name-based check treats every MCP tool
         // as mutating.
-        assert!(ApprovalMode::ReadOnly.requires_approval("mcp__files__read"));
+        assert!(ApprovalMode::Manual.requires_approval("mcp__files__read"));
         assert!(ApprovalMode::AutoEdit.requires_approval("mcp__files__read"));
-        assert!(!ApprovalMode::FullAuto.requires_approval("mcp__files__read"));
+        assert!(!ApprovalMode::FullAccess.requires_approval("mcp__files__read"));
     }
 
     #[test]
@@ -1762,11 +1851,11 @@ mod tests {
     fn read_approval_mode_defaults_and_validates() {
         assert_eq!(
             read_approval_mode(&json!({})).unwrap(),
-            ApprovalMode::ReadOnly
+            ApprovalMode::Manual
         );
         assert_eq!(
             read_approval_mode(&json!({ "approval_mode": "" })).unwrap(),
-            ApprovalMode::ReadOnly
+            ApprovalMode::Manual
         );
         assert_eq!(
             read_approval_mode(&json!({ "approval_mode": "auto-edit" })).unwrap(),

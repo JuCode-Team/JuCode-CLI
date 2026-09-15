@@ -138,9 +138,9 @@ USAGE:
     jucode --headless [PROMPT]           run one prompt non-interactively
                                          (reads stdin when PROMPT is omitted;
                                          emits JSONL events + final_result;
-                                         defaults to read-only, approvals are
+                                         defaults to manual, approvals are
                                          auto-denied — pass --approval-mode
-                                         full-auto for unattended writes)
+                                         full-access for unattended writes)
     jucode serve                         newline-JSON protocol for GUI/IDE
                                          front-ends (jucode's native schema)
     jucode acp                           Agent Client Protocol (ACP v1)
@@ -151,10 +151,11 @@ USAGE:
     jucode version                       print the version
 
 OPTIONS:
-    --approval-mode <read-only|auto-edit|full-auto>
+    --approval-mode <manual|auto-edit|auto|full-access>
                                          tool approval mode for this run
-                                         (full-auto runs shell commands and
-                                         file writes without prompts and is
+                                         (auto runs a safety classifier on
+                                         shell commands; full-access runs
+                                         everything without prompts and is
                                          not confined to the workspace)
     -h, --help                           show this help
     -V, --version                        print the version
@@ -180,7 +181,7 @@ fn take_approval_mode_flag(args: &mut Vec<String>) -> Result<Option<ApprovalMode
         None => {
             if index >= args.len() {
                 return Err(
-                    "--approval-mode requires a value: read-only, auto-edit, or full-auto"
+                    "--approval-mode requires a value: manual, auto-edit, auto, or full-access"
                         .to_string(),
                 );
             }
@@ -192,11 +193,11 @@ fn take_approval_mode_flag(args: &mut Vec<String>) -> Result<Option<ApprovalMode
 
 /// The approval mode a headless run uses. Headless reads no further stdin, so
 /// approval prompts can never be answered interactively; instead of silently
-/// running full-auto (the old behavior), headless defaults to the safest mode
+/// running everything, headless defaults to the safest mode
 /// and auto-denies gated tool calls. Loosen explicitly with
-/// `--approval-mode auto-edit` or `--approval-mode full-auto`.
+/// `--approval-mode auto-edit`, `auto`, or `full-access`.
 fn headless_approval_mode(flag: Option<ApprovalMode>) -> ApprovalMode {
-    flag.unwrap_or(ApprovalMode::ReadOnly)
+    flag.unwrap_or(ApprovalMode::Manual)
 }
 
 fn run_headless(args: Vec<String>, approval_mode: Option<ApprovalMode>) -> io::Result<i32> {
@@ -265,7 +266,7 @@ fn auto_deny_approvals(
     for (call_id, name) in pending.drain(..) {
         stats.denied_approvals += 1;
         let info = AgentEvent::Info(format!(
-            "auto-denying {name} ({call_id}): approvals cannot be answered in --headless mode; rerun with --approval-mode auto-edit or full-auto to allow this class of tools"
+            "auto-denying {name} ({call_id}): approvals cannot be answered in --headless mode; rerun with --approval-mode auto, auto-edit, or full-access to allow this class of tools"
         ));
         record_headless_event(&info, stats);
         write_event(stdout, info)?;
@@ -894,7 +895,7 @@ mod tests {
     fn final_result_contains_status_and_usage() {
         let mut stats = HeadlessStats {
             status: "ready".to_string(),
-            approval_mode: "read-only".to_string(),
+            approval_mode: "manual".to_string(),
             ..Default::default()
         };
         stats.input_tokens = 12;
@@ -908,7 +909,7 @@ mod tests {
         let value = final_result_json(&stats, 123);
         assert_eq!(value["type"], "final_result");
         assert_eq!(value["status"], "ready");
-        assert_eq!(value["approval_mode"], "read-only");
+        assert_eq!(value["approval_mode"], "manual");
         assert_eq!(value["denied_approvals"], 1);
         assert_eq!(value["input_tokens"], 12);
         assert_eq!(value["cached_input_tokens"], 0);
@@ -918,15 +919,15 @@ mod tests {
     }
 
     #[test]
-    fn headless_defaults_to_read_only_and_honors_explicit_flag() {
-        assert_eq!(headless_approval_mode(None), ApprovalMode::ReadOnly);
+    fn headless_defaults_to_manual_and_honors_explicit_flag() {
+        assert_eq!(headless_approval_mode(None), ApprovalMode::Manual);
         assert_eq!(
             headless_approval_mode(Some(ApprovalMode::AutoEdit)),
             ApprovalMode::AutoEdit
         );
         assert_eq!(
-            headless_approval_mode(Some(ApprovalMode::FullAuto)),
-            ApprovalMode::FullAuto
+            headless_approval_mode(Some(ApprovalMode::FullAccess)),
+            ApprovalMode::FullAccess
         );
     }
 
