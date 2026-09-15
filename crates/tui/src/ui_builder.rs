@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use ratatui::{
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 use unicode_width::UnicodeWidthStr;
@@ -40,13 +40,16 @@ fn rounded_box_border(left: char, right: char, width: usize) -> Line<'static> {
 
 fn startup_box_line(
     mascot: &str,
-    text: &str,
+    text: Vec<Span<'static>>,
     mascot_width: usize,
     right_width: usize,
     width: usize,
 ) -> Line<'static> {
     let plain_width = mascot_width + 3 + right_width;
-    let text_width = UnicodeWidthStr::width(text);
+    let text_width: usize = text
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
     let text_padding = " ".repeat(right_width.saturating_sub(text_width));
     let fill = " ".repeat(width.saturating_sub(plain_width));
     let mut spans = vec![
@@ -55,37 +58,10 @@ fn startup_box_line(
         Span::styled(pad_to_width(mascot, mascot_width), STARTUP_ACCENT),
         Span::raw("   "),
     ];
-    spans.extend(startup_text_spans(text));
+    spans.extend(text);
     spans.push(Span::raw(format!("{text_padding}{fill} ")));
     spans.push(Span::styled("│", BOX_BORDER));
     Line::from(spans)
-}
-
-fn startup_text_spans(text: &str) -> Vec<Span<'static>> {
-    if let Some(rest) = text.strip_prefix("Welcome to ") {
-        if let Some(details) = rest.strip_prefix("JuCode") {
-            return vec![
-                Span::styled("Welcome to ", STARTUP_STRONG),
-                Span::styled("JuCode", STARTUP_ACCENT),
-                Span::styled(details.to_string(), STARTUP_DIM),
-            ];
-        }
-    }
-    if let Some(path) = text.strip_prefix("cwd: ") {
-        return vec![
-            Span::styled("cwd: ", STARTUP_TEXT),
-            Span::styled(path.to_string(), STARTUP_STRONG),
-        ];
-    }
-    if text == "/help for commands · /exit to quit" {
-        return vec![
-            Span::styled("/help", STARTUP_STRONG),
-            Span::styled(" for commands · ", STARTUP_TEXT),
-            Span::styled("/exit", STARTUP_STRONG),
-            Span::styled(" to quit", STARTUP_TEXT),
-        ];
-    }
-    vec![Span::styled(text.to_string(), STARTUP_TEXT)]
 }
 
 /// Left/right status layout; `left` spans keep their own styles (e.g. the
@@ -571,17 +547,43 @@ impl UiBuilder {
         context_window: u64,
     ) {
         let mascot = [" \\/", "<'l", " ll", " llama~", " || ||", " '' ''"];
-        let title = format!(
-            "Welcome to JuCode v{} ({} · {} context)",
-            version,
-            model,
-            format_context_window(context_window)
-        );
-        let cwd = format!("cwd: {}", compact_home_path(cwd));
-        let help = "/help for commands · /exit to quit";
-        let content_width = [title.as_str(), cwd.as_str(), help]
+        let brand = STARTUP_ACCENT.add_modifier(Modifier::BOLD);
+        let right_lines: Vec<Vec<Span<'static>>> = vec![
+            vec![
+                Span::styled("Welcome to ", STARTUP_TEXT),
+                Span::styled("JuCode", brand),
+            ],
+            vec![
+                Span::styled(format!("v{version}"), STARTUP_STRONG),
+                Span::styled(
+                    format!(
+                        " · {model} · {} context",
+                        format_context_window(context_window)
+                    ),
+                    STARTUP_DIM,
+                ),
+            ],
+            Vec::new(),
+            vec![
+                Span::styled("cwd: ", STARTUP_DIM),
+                Span::styled(compact_home_path(cwd), STARTUP_STRONG),
+            ],
+            Vec::new(),
+            vec![
+                Span::styled("/help", STARTUP_STRONG),
+                Span::styled(" for commands · ", STARTUP_TEXT),
+                Span::styled("/exit", STARTUP_STRONG),
+                Span::styled(" to quit", STARTUP_TEXT),
+            ],
+        ];
+        let content_width = right_lines
             .iter()
-            .map(|line| UnicodeWidthStr::width(*line))
+            .map(|spans| {
+                spans
+                    .iter()
+                    .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                    .sum::<usize>()
+            })
             .max()
             .unwrap_or(0);
         let mascot_width = mascot
@@ -591,7 +593,6 @@ impl UiBuilder {
             .unwrap_or(0);
         let content_width = (mascot_width + 3 + content_width).min(96);
         let right_width = content_width.saturating_sub(mascot_width + 3);
-        let right_lines = [title.as_str(), "", cwd.as_str(), "", help, ""];
 
         self.history_line(UiKind::Brand, rounded_box_border('╭', '╮', content_width));
         for (index, mascot_line) in mascot.iter().enumerate() {
@@ -599,7 +600,7 @@ impl UiBuilder {
                 UiKind::Brand,
                 startup_box_line(
                     mascot_line,
-                    right_lines[index],
+                    right_lines[index].clone(),
                     mascot_width,
                     right_width,
                     content_width,

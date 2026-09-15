@@ -451,26 +451,32 @@ fn startup_renders_inside_box() {
         .finish();
 
     assert_eq!(document.history[0].plain().chars().next(), Some('╭'));
-    // Box borders keep their dim color as a span style.
+    // Box borders keep their muted accent color as a span style.
     assert!(document.history[0]
         .line
         .spans
         .iter()
-        .any(|span| span.style.fg == Some(Color::DarkGray)));
+        .any(|span| span.style.fg == Some(Color::Rgb(108, 96, 140))));
     assert!(document.history[1].plain().contains(" \\/"));
-    assert!(document.history[1]
-        .plain()
-        .contains("Welcome to JuCode v0.1.2 (claude-opus-4-7 · 1M context)"));
+    assert!(document.history[1].plain().contains("Welcome to JuCode"));
     assert!(document.history[2].plain().contains("<'l"));
-    assert!(!document.history[2].plain().contains("cwd:"));
+    assert!(document.history[2]
+        .plain()
+        .contains("v0.1.2 · claude-opus-4-7 · 1M context"));
     assert!(document.history[3].plain().contains(" ll"));
-    assert!(document.history[3].plain().contains("cwd:"));
+    assert!(document.history[4].plain().contains(" llama~"));
+    assert!(document.history[4].plain().contains("cwd:"));
+    // The brand word and key info are bold.
+    let title = &document.history[1].line;
+    assert!(title.spans.iter().any(|span| {
+        span.content.as_ref() == "JuCode" && span.style.add_modifier.contains(Modifier::BOLD)
+    }));
     assert!(!document
         .history
         .iter()
         .any(|line| line.plain().contains("directory:")));
-    assert!(document.history[5].plain().contains(" || ||"));
-    assert!(document.history[5].plain().contains("/help for commands"));
+    assert!(document.history[6].plain().contains(" '' ''"));
+    assert!(document.history[6].plain().contains("/help for commands"));
     assert_eq!(document.history[7].plain().chars().next(), Some('╰'));
     let border_width = document.history[0].line.width();
     for line in document.history.iter().take(8) {

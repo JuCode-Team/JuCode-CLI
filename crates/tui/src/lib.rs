@@ -61,10 +61,12 @@ const STARTUP_DIM: Style = Style::new().fg(Color::Rgb(125, 121, 134));
 const STARTUP_ACCENT: Style = Style::new().fg(Color::Rgb(190, 160, 255));
 /// Brand accent for turn markers (tool bullets); same hue as the startup card.
 pub(crate) const ACCENT: Style = STARTUP_ACCENT;
-const STARTUP_STRONG: Style = Style::new().fg(Color::Rgb(232, 228, 238));
+const STARTUP_STRONG: Style = Style::new()
+    .fg(Color::Rgb(232, 228, 238))
+    .add_modifier(Modifier::BOLD);
 /// The composer's own text selection (not the mouse drag overlay).
 pub(crate) const INPUT_SELECTION: Style = Style::new().add_modifier(Modifier::REVERSED);
-const BOX_BORDER: Style = Style::new().fg(Color::DarkGray);
+const BOX_BORDER: Style = Style::new().fg(Color::Rgb(108, 96, 140));
 
 #[derive(Debug, Clone)]
 pub(crate) enum ChatLine {
