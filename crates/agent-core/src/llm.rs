@@ -1,6 +1,5 @@
 use crate::{
     config::{is_shell_tool, ApprovalMode},
-    extensions::ExtensionRegistry,
     hooks::Hooks,
     hunks::{self, HunkView},
     mcp::McpManager,
@@ -68,7 +67,6 @@ pub struct OpenAiClient {
     system_prompt: String,
     prompt_cache_key: String,
     turn_state: Arc<OnceLock<String>>,
-    extensions: ExtensionRegistry,
     mcp: McpManager,
     base_url: String,
     max_output_tokens: u64,
@@ -121,7 +119,6 @@ pub struct OpenAiClientConfig<'a> {
     pub model_reasoning_efforts: Vec<(String, Vec<String>)>,
     pub system_prompt: String,
     pub prompt_cache_key: String,
-    pub extensions: ExtensionRegistry,
     pub mcp: McpManager,
     pub base_url: String,
     pub max_output_tokens: u64,
@@ -347,7 +344,6 @@ impl OpenAiClient {
             system_prompt: config.system_prompt,
             prompt_cache_key: config.prompt_cache_key,
             turn_state: Arc::new(OnceLock::new()),
-            extensions: config.extensions,
             mcp: config.mcp,
             base_url: config.base_url,
             max_output_tokens: config.max_output_tokens,
@@ -1168,7 +1164,6 @@ impl OpenAiClient {
         if self.allow_subagents && self.subagent_manager.is_some() {
             definitions.extend(subagent_definitions());
         }
-        definitions.extend(self.extensions.definitions());
         definitions.extend(self.mcp.definitions());
         if self.goal_tool_tx.is_some() {
             definitions.extend(goal_tool_definitions());
@@ -1280,21 +1275,7 @@ impl OpenAiClient {
                 })
             })
         };
-        if result.is_error && result.output.contains("unknown tool") {
-            match self
-                .extensions
-                .run_tool(&request.name, &request.arguments, cwd)
-            {
-                Some((output, is_error)) => tools::ToolExecutionResult {
-                    model_output: tools::project_model_output(&request.name, &output, cwd),
-                    output,
-                    is_error,
-                },
-                None => result,
-            }
-        } else {
-            result
-        }
+        result
     }
 
     fn spawn_agent(
@@ -1406,7 +1387,6 @@ impl OpenAiClient {
             ),
             prompt_cache_key: self.prompt_cache_key.clone(),
             turn_state: Arc::clone(&self.turn_state),
-            extensions: self.extensions.clone(),
             mcp: self.mcp.clone(),
             base_url: self.base_url.clone(),
             max_output_tokens,
@@ -2882,7 +2862,6 @@ mod tests {
             model_reasoning_efforts: Vec::new(),
             system_prompt: "system".to_string(),
             prompt_cache_key: "cache-key".to_string(),
-            extensions: ExtensionRegistry::load(&[], Path::new("."), Path::new(".")),
             mcp: McpManager::default(),
             base_url: "https://api.jucode.cn/v1".to_string(),
             max_output_tokens: 2048,

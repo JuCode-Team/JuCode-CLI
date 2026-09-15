@@ -193,13 +193,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         advanced: true,
     },
     CommandSpec {
-        name: "/extensions",
-        aliases: &[],
-        args: "",
-        description: "List configured extensions",
-        advanced: true,
-    },
-    CommandSpec {
         name: "/mcp",
         aliases: &[],
         args: "[tools|reload|enable|disable] [server]",
@@ -266,7 +259,6 @@ mod tests {
             "/checkout",
             "/fork",
             "/delete",
-            "/extensions",
             "/stats",
             "/exit",
         ] {

@@ -77,7 +77,7 @@ You can switch model and reasoning effort inside the TUI:
 
 `ctrl+t` cycles the effort for the current model; inside the `/model` picker, `tab` cycles it for the highlighted model.
 
-The config also supports custom OpenAI-compatible base URLs, retry settings, model metadata, project-instruction discovery, and optional extensions.
+The config also supports custom OpenAI-compatible base URLs, retry settings, model metadata, and project-instruction discovery.
 
 ### Edit tools (`edit_tools`)
 

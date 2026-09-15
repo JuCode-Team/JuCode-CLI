@@ -266,7 +266,7 @@ pub fn definitions() -> Vec<Value> {
 /// the fixed entries in `definitions()` in the same order, with edit tools
 /// filtered to the enabled set; the subagent tools are only listed when they
 /// would actually be offered. Dynamic tools added per turn in
-/// `OpenAiClient::tool_definitions` (MCP, extensions, goal/plan) are not part
+/// `OpenAiClient::tool_definitions` (MCP, goal/plan) are not part
 /// of this list.
 pub fn prompt_tool_names(edit_tools: &[String], subagents: bool) -> Vec<&'static str> {
     let mut names = vec!["read"];

@@ -256,5 +256,5 @@ GUI                         jucode serve
 ### 仍未覆盖 / 未实测
 
 - `retrying`（需网络抖动）——事件已序列化，未在真实流程触发验证。
-- `command_list` 未列出 `/config /checkout /fork /delete /extensions /stats`，前端需自行知晓
+- `command_list` 未列出 `/config /checkout /fork /delete /stats`，前端需自行知晓
   （桌面端命令面板目前硬编码补齐，长期应由引擎补全 `command_list`）。

@@ -216,16 +216,8 @@ pub struct Config {
     /// Optional additional GitHub skill repository. "anthropic" selects the
     /// pinned built-in index for https://github.com/anthropics/skills.
     pub extra_skills_source: Option<String>,
-    pub extensions: Vec<ExtensionConfig>,
     pub mcp_servers: Vec<McpServerConfig>,
     path: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-pub struct ExtensionConfig {
-    pub name: String,
-    pub command: String,
-    pub lazy: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,7 +349,6 @@ impl Config {
                 approval_mode: ApprovalMode::default(),
                 edit_tools: default_edit_tools(),
                 extra_skills_source: None,
-                extensions: Vec::new(),
                 mcp_servers: Vec::new(),
                 path,
             };
@@ -472,7 +463,6 @@ impl Config {
             approval_mode: read_approval_mode(&value)?,
             edit_tools: read_edit_tools(&value)?,
             extra_skills_source: read_optional_string(&value, "extra_skills_source"),
-            extensions: read_extensions(&value),
             mcp_servers: read_mcp_servers(&value),
             path,
         };
@@ -507,7 +497,6 @@ impl Config {
             "approval_mode": self.approval_mode.as_str(),
             "edit_tools": self.edit_tools,
             "extra_skills_source": self.extra_skills_source,
-            "extensions": self.extensions.iter().map(extension_config_value).collect::<Vec<_>>(),
             "mcp_servers": self.mcp_servers.iter().map(mcp_server_config_value).collect::<Vec<_>>()
         });
         write_atomically(
@@ -927,32 +916,6 @@ fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
     }
 }
 
-fn read_extensions(value: &Value) -> Vec<ExtensionConfig> {
-    let Some(extensions) = value.get("extensions").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    extensions
-        .iter()
-        .filter_map(|extension| {
-            let name = extension
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())?;
-            let command = extension
-                .get("command")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())?;
-            Some(ExtensionConfig {
-                name: name.to_string(),
-                command: command.to_string(),
-                lazy: read_bool(extension, "lazy", false),
-            })
-        })
-        .collect()
-}
-
 fn read_mcp_servers(value: &Value) -> Vec<McpServerConfig> {
     let Some(servers) = value.get("mcp_servers").and_then(Value::as_array) else {
         return Vec::new();
@@ -1119,14 +1082,6 @@ fn model_config_value(model: &ModelConfig) -> Value {
         "input_cost": model.input_cost,
         "cached_input_cost": model.cached_input_cost,
         "output_cost": model.output_cost,
-    })
-}
-
-fn extension_config_value(extension: &ExtensionConfig) -> Value {
-    json!({
-        "name": extension.name,
-        "command": extension.command,
-        "lazy": extension.lazy,
     })
 }
 
@@ -1572,7 +1527,6 @@ mod tests {
             approval_mode: ApprovalMode::default(),
             edit_tools: default_edit_tools(),
             extra_skills_source: None,
-            extensions: Vec::new(),
             mcp_servers: Vec::new(),
             path: PathBuf::from("config.json"),
         };

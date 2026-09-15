@@ -7,7 +7,6 @@ use crate::{
         AgentEvent, CommandView, GoalView, LoginProviderView, ModelOptionView, PlanItem,
         SessionListItemView,
     },
-    extensions::ExtensionRegistry,
     hooks::Hooks,
     llm::{
         ApprovalDecision, ApprovalRequest, GoalToolRequest, OpenAiClient, OpenAiClientConfig,
@@ -649,7 +648,6 @@ impl AgentCore {
             },
             "/permissions" => self.permissions_command_events(args.trim()),
             "/effort" => self.effort_command_events(args.trim()),
-            "/extensions" => self.extension_events(),
             "/mcp" => self.mcp_command_events(args.trim()),
             "/context" => self.context_events(),
             "/stats" => self.stats_events(),
@@ -1691,11 +1689,6 @@ impl AgentCore {
                 .collect(),
             system_prompt,
             prompt_cache_key: self.session.session_id().to_string(),
-            extensions: ExtensionRegistry::load(
-                &self.config.extensions,
-                &self.cwd,
-                self.config.profile_dir(),
-            ),
             mcp: self.mcp.clone(),
             base_url: self.config.base_url.clone(),
             max_output_tokens: self.config.current_model_config().max_output_tokens,
@@ -1932,7 +1925,6 @@ impl AgentCore {
             model_reasoning_efforts: Vec::new(),
             system_prompt: String::new(),
             prompt_cache_key: self.session.session_id().to_string(),
-            extensions: ExtensionRegistry::load(&[], &self.cwd, self.config.profile_dir()),
             mcp: McpManager::default(),
             base_url: self.config.base_url.clone(),
             max_output_tokens: self.config.compact_model_config().max_output_tokens,
@@ -1976,7 +1968,6 @@ impl AgentCore {
             model_reasoning_efforts: Vec::new(),
             system_prompt: String::new(),
             prompt_cache_key: self.session.session_id().to_string(),
-            extensions: ExtensionRegistry::load(&[], &self.cwd, self.config.profile_dir()),
             mcp: McpManager::default(),
             base_url: self.config.base_url.clone(),
             max_output_tokens,
@@ -3053,77 +3044,8 @@ impl AgentCore {
             )),
             Err(error) => lines.push(format!("project instructions: error: {error}")),
         }
-        if self.config.extensions.is_empty() {
-            lines.push("extensions: none".to_string());
-        } else {
-            let extensions = ExtensionRegistry::load(
-                &self.config.extensions,
-                &self.cwd,
-                self.config.profile_dir(),
-            );
-            lines.push(format!(
-                "extensions: {} tool(s), {} error(s)",
-                extensions.definitions().len(),
-                extensions.errors().len()
-            ));
-            lines.extend(self.extension_info_lines());
-        }
         lines.push(self.mcp.doctor_line());
         vec![AgentEvent::Info(lines.join("\n"))]
-    }
-
-    fn extension_events(&self) -> Vec<AgentEvent> {
-        self.extension_info_lines()
-            .into_iter()
-            .map(AgentEvent::Info)
-            .collect()
-    }
-
-    fn extension_info_lines(&self) -> Vec<String> {
-        if self.config.extensions.is_empty() {
-            return vec!["extensions: none".to_string()];
-        }
-
-        let registry = ExtensionRegistry::load(
-            &self.config.extensions,
-            &self.cwd,
-            self.config.profile_dir(),
-        );
-        let mut events = Vec::new();
-        for extension in &self.config.extensions {
-            let tools = registry
-                .summaries()
-                .into_iter()
-                .filter(|summary| summary.extension == extension.name)
-                .map(|summary| {
-                    if summary.description.is_empty() {
-                        summary.tool
-                    } else {
-                        format!("{} - {}", summary.tool, summary.description)
-                    }
-                })
-                .collect::<Vec<_>>();
-            let error = registry
-                .errors()
-                .iter()
-                .find(|(name, _)| name == &extension.name)
-                .map(|(_, error)| error);
-            if let Some(error) = error {
-                events.push(format!(
-                    "extension {}: failed to initialize: {error}",
-                    extension.name
-                ));
-            } else if tools.is_empty() {
-                events.push(format!("extension {}: no tools", extension.name));
-            } else {
-                events.push(format!(
-                    "extension {}: {}",
-                    extension.name,
-                    tools.join(", ")
-                ));
-            }
-        }
-        events
     }
 
     /// `/mcp` — list servers; `tools <server>`, `reload <server>`,
