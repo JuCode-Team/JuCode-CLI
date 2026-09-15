@@ -605,7 +605,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jucode-agent-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -624,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "jucode-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "jucode-agent-core",
  "jucode-tui",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "jucode-tui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "jucode-agent-core",
@@ -644,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "jucode-vendor"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde_json",
 ]
