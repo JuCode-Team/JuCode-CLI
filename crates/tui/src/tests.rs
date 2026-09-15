@@ -1357,7 +1357,7 @@ fn checkout_tree_marks_rows_with_children_as_directories() {
     // Wide tree: the root is expanded ([-]); a child with hidden descendants
     // stays collapsed ([+]).
     let tree = PickerState::checkout(wide_tree_nodes());
-    let document = UiBuilder::new().picker(Some(&tree)).finish();
+    let document = UiBuilder::new().picker(Some(&tree), 80).finish();
 
     assert!(document
         .controls
@@ -1395,7 +1395,7 @@ fn checkout_tree_marks_head_and_active_path() {
         },
     ];
     let tree = PickerState::checkout(nodes);
-    let document = UiBuilder::new().picker(Some(&tree)).finish();
+    let document = UiBuilder::new().picker(Some(&tree), 80).finish();
     let controls = &document.controls;
 
     // The HEAD node is annotated as the current position.
@@ -1474,7 +1474,7 @@ fn model_picker_renders_effort_hint() {
         }],
         "none".to_string(),
     );
-    let document = UiBuilder::new().picker(Some(&picker)).finish();
+    let document = UiBuilder::new().picker(Some(&picker), 80).finish();
     let controls = document
         .controls
         .iter()
@@ -1494,7 +1494,7 @@ fn approval_picker_shows_header_context_and_options() {
         "bash".to_string(),
         "cargo test --workspace".to_string(),
     );
-    let document = UiBuilder::new().picker(Some(&picker)).finish();
+    let document = UiBuilder::new().picker(Some(&picker), 80).finish();
     let controls = document
         .controls
         .iter()
@@ -1521,6 +1521,18 @@ fn approval_picker_shows_header_context_and_options() {
     assert!(!controls
         .iter()
         .any(|text| text.contains("Allow once cargo test")));
+
+    // Long commands truncate to a single line with an ellipsis.
+    let long = PickerState::approval("call-2".to_string(), "bash".to_string(), "x".repeat(200));
+    let document = UiBuilder::new().picker(Some(&long), 60).finish();
+    let context = document
+        .controls
+        .iter()
+        .map(UiLine::plain)
+        .find(|text| text.contains('⎿'))
+        .expect("context line");
+    assert!(context.ends_with('…'));
+    assert!(UnicodeWidthStr::width(context.as_str()) <= 60);
 }
 
 #[test]

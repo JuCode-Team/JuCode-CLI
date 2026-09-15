@@ -218,7 +218,7 @@ impl UiBuilder {
         self
     }
 
-    pub(crate) fn picker(mut self, picker: Option<&PickerState>) -> Self {
+    pub(crate) fn picker(mut self, picker: Option<&PickerState>, width: usize) -> Self {
         let Some(picker) = picker else {
             return self;
         };
@@ -231,7 +231,19 @@ impl UiBuilder {
                 ]),
             );
             if let Some(context) = &picker.context {
-                self.control_line(UiKind::Tool, format!("  ⎿  {context}"));
+                // The request payload (a shell command or path) can be long;
+                // keep the confirmation to one line with an ellipsis.
+                let gutter = "  ⎿  ";
+                let available = width.saturating_sub(gutter.len());
+                let text = if UnicodeWidthStr::width(context.as_str()) > available {
+                    format!(
+                        "{}…",
+                        truncate_to_width(context, available.saturating_sub(1))
+                    )
+                } else {
+                    context.clone()
+                };
+                self.control_line(UiKind::Tool, format!("{gutter}{text}"));
             }
         }
         let hint = match picker.mode {

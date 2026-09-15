@@ -96,7 +96,7 @@ impl TuiState {
         let rendered_history_lines = self.rendered_history_lines(content_width);
         UiBuilder::new()
             .rendered_history_lines(rendered_history_lines)
-            .picker(self.picker_view.as_ref())
+            .picker(self.picker_view.as_ref(), control_width)
             .pending_messages(&self.pending_messages)
             .progress(&self.activity, self.thinking_tokens, now, control_width)
             .input(&input_display, &completion_rows, self.completion_index)
