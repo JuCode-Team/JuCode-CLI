@@ -93,6 +93,9 @@ pub struct OpenAiClient {
     /// When set (subagents), mutating file tools may only target paths under
     /// this root; the main agent has no such restriction.
     write_root: Option<PathBuf>,
+    /// Directories outside the workspace read-only file tools may also read
+    /// (discovered skill directories); inherited by subagents.
+    extra_read_roots: Vec<PathBuf>,
     hooks: Hooks,
     /// Independent one-shot model used by `auto` mode to classify shell
     /// commands. None disables classification (shell calls then always ask).
@@ -136,6 +139,9 @@ pub struct OpenAiClientConfig<'a> {
     pub safety_reasoning_effort: String,
     /// Canonical edit-tool names to expose (see `Config::edit_tools`).
     pub edit_tools: Vec<String>,
+    /// Directories outside the workspace that read-only file tools may also
+    /// read — the directories of the discovered skills.
+    pub extra_read_roots: Vec<PathBuf>,
     pub subagent_manager: Option<SubagentManager>,
     pub hooks: Hooks,
 }
@@ -362,6 +368,7 @@ impl OpenAiClient {
             agent_path: "/root".to_string(),
             agent_depth: 0,
             write_root: None,
+            extra_read_roots: config.extra_read_roots,
             hooks: config.hooks,
             safety,
         })
@@ -549,7 +556,12 @@ impl OpenAiClient {
                         name: request.name.clone(),
                     })?;
                 }
-                run_parallel_builtin_tools(&allowed_requests, cwd, &mut emit)?
+                run_parallel_builtin_tools(
+                    &allowed_requests,
+                    cwd,
+                    &self.extra_read_roots,
+                    &mut emit,
+                )?
             } else {
                 let mut results = Vec::new();
                 for request in allowed_requests {
@@ -1266,14 +1278,20 @@ impl OpenAiClient {
                 ),
             }
         } else {
-            tools::run_tool_with_events(&request.name, &request.arguments, cwd, |event| {
-                let tools::ToolExecutionEvent::Update(output) = event;
-                emit(StreamEvent::ToolUpdate {
-                    call_id: request.call_id.clone(),
-                    name: request.name.clone(),
-                    output,
-                })
-            })
+            tools::run_tool_with_events(
+                &request.name,
+                &request.arguments,
+                cwd,
+                &self.extra_read_roots,
+                |event| {
+                    let tools::ToolExecutionEvent::Update(output) = event;
+                    emit(StreamEvent::ToolUpdate {
+                        call_id: request.call_id.clone(),
+                        name: request.name.clone(),
+                        output,
+                    })
+                },
+            )
         };
         result
     }
@@ -1409,6 +1427,7 @@ impl OpenAiClient {
             agent_path: child_path.clone(),
             agent_depth: child_depth,
             write_root: Some(workspace.root.clone()),
+            extra_read_roots: self.extra_read_roots.clone(),
             hooks: self.hooks.clone(),
             safety: self.safety.clone(),
         };
@@ -1929,6 +1948,7 @@ fn should_run_parallel_tools(requests: &[ToolCallRequest]) -> bool {
 fn run_parallel_builtin_tools(
     requests: &[ToolCallRequest],
     cwd: &Path,
+    extra_read_roots: &[PathBuf],
     emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
 ) -> Result<Vec<ToolCallResult>, String> {
     let (tx, rx) = mpsc::channel();
@@ -1937,21 +1957,28 @@ fn run_parallel_builtin_tools(
     for (index, request) in requests.iter().cloned().enumerate() {
         let tx = tx.clone();
         let cwd = cwd.to_path_buf();
+        let extra_read_roots = extra_read_roots.to_vec();
         handles.push(thread::spawn(move || {
-            let result = tools::run_tool_with_events(&request.name, &request.arguments, &cwd, {
-                let tx = tx.clone();
-                let call_id = request.call_id.clone();
-                let name = request.name.clone();
-                move |event| {
-                    let tools::ToolExecutionEvent::Update(output) = event;
-                    tx.send(ParallelToolMessage::Update {
-                        call_id: call_id.clone(),
-                        name: name.clone(),
-                        output,
-                    })
-                    .map_err(|error| error.to_string())
-                }
-            });
+            let result = tools::run_tool_with_events(
+                &request.name,
+                &request.arguments,
+                &cwd,
+                &extra_read_roots,
+                {
+                    let tx = tx.clone();
+                    let call_id = request.call_id.clone();
+                    let name = request.name.clone();
+                    move |event| {
+                        let tools::ToolExecutionEvent::Update(output) = event;
+                        tx.send(ParallelToolMessage::Update {
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                            output,
+                        })
+                        .map_err(|error| error.to_string())
+                    }
+                },
+            );
             let _ = tx.send(ParallelToolMessage::Done {
                 index,
                 request,
@@ -2615,7 +2642,7 @@ mod tests {
         ];
         let mut events = Vec::new();
 
-        let results = run_parallel_builtin_tools(&requests, &dir, &mut |event| {
+        let results = run_parallel_builtin_tools(&requests, &dir, &[], &mut |event| {
             events.push(event);
             Ok(())
         })
@@ -2876,6 +2903,7 @@ mod tests {
             safety_model: None,
             safety_reasoning_effort: String::new(),
             edit_tools: crate::config::default_edit_tools(),
+            extra_read_roots: Vec::new(),
             subagent_manager: None,
             hooks: Hooks::default(),
         })

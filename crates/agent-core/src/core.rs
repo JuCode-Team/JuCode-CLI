@@ -1673,6 +1673,7 @@ impl AgentCore {
                     return events;
                 }
             };
+        let extra_read_roots = crate::prompt::skill_read_roots(&skills);
         let project_instructions = if self.config.include_project_instructions {
             match discover_project_instructions(&self.cwd) {
                 Ok(instructions) => instructions,
@@ -1733,6 +1734,7 @@ impl AgentCore {
                 .filter(|model| !model.trim().is_empty()),
             safety_reasoning_effort: self.config.safety_reasoning_effort.clone(),
             edit_tools: self.config.edit_tools.clone(),
+            extra_read_roots,
             subagent_manager: Some(self.subagent_manager.clone()),
             hooks: self.hooks.clone(),
         }) else {
@@ -1969,6 +1971,7 @@ impl AgentCore {
             safety_reasoning_effort: String::new(),
             // Summarization clients never expose or execute tools.
             edit_tools: Vec::new(),
+            extra_read_roots: Vec::new(),
             subagent_manager: None,
             hooks: Hooks::default(),
         })
@@ -2012,6 +2015,7 @@ impl AgentCore {
             safety_reasoning_effort: String::new(),
             // Summarization clients never expose or execute tools.
             edit_tools: Vec::new(),
+            extra_read_roots: Vec::new(),
             subagent_manager: None,
             hooks: Hooks::default(),
         })

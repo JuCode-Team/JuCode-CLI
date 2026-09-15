@@ -13,6 +13,12 @@ are used for discovery. A skill named `Code Review` is available as `/code-revie
 the slash command is passed to the skill as the user request. `/pin <skill>` keeps a skill's
 instructions in the current session context.
 
+Skill files usually live outside the workspace (`~/.jucode/skills`, `~/.agents/skills`), so the
+read-only file tools (`read`, `ls`, `outline`, `ripgrep`) may read under each discovered skill's
+directory in addition to the workspace. That lets the model open `SKILL.md` and follow relative
+references inside the skill. Mutating tools stay confined to the workspace, and other outside
+paths remain rejected.
+
 ## Lifecycle commands
 
 ```text

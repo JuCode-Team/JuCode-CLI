@@ -191,6 +191,19 @@ fn skill_commands_from(
     Ok(commands)
 }
 
+/// Directories read-only file tools may read outside the workspace: the
+/// directory each discovered skill lives in, so the model can read SKILL.md
+/// and follow its relative references. Mutating tools stay confined.
+pub fn skill_read_roots(skills: &[SkillPromptItem]) -> Vec<PathBuf> {
+    let mut roots = skills
+        .iter()
+        .filter_map(|skill| skill.path.parent().map(Path::to_path_buf))
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 pub fn skill_message(skill: &SkillPromptItem, request: &str) -> io::Result<String> {
     let content = fs::read_to_string(&skill.path)?;
     let mut message = format!(

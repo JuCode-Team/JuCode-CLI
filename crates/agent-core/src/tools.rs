@@ -310,13 +310,17 @@ fn with_function_tool_defaults(mut definitions: Vec<Value>) -> Vec<Value> {
 
 #[cfg(test)]
 fn run_tool(name: &str, arguments: &str, cwd: &Path) -> String {
-    run_tool_with_events(name, arguments, cwd, |_| Ok(())).output
+    run_tool_with_events(name, arguments, cwd, &[], |_| Ok(())).output
 }
 
+/// `extra_read_roots` lists directories outside the workspace that read-only
+/// file tools may also read (the directories of discovered skills). Mutating
+/// tools stay confined to the workspace.
 pub fn run_tool_with_events(
     name: &str,
     arguments: &str,
     cwd: &Path,
+    extra_read_roots: &[PathBuf],
     mut emit: impl FnMut(ToolExecutionEvent) -> Result<(), String>,
 ) -> ToolExecutionResult {
     let parsed = serde_json::from_str::<Value>(arguments);
@@ -332,16 +336,16 @@ pub fn run_tool_with_events(
     };
 
     let result = match name {
-        "read" => read_file(&args, cwd),
+        "read" => read_file(&args, cwd, extra_read_roots),
         "str_replace" | "edit" => str_replace_file(&args, cwd),
         "hashline_edit" => hashline_edit_file(&args, cwd),
         "write" => write_file(&args, cwd),
         "bash" | "execute" | "exec_command" | "shell_command" => bash(&args, cwd, &mut emit),
         "write_stdin" => write_stdin(&args),
         "apply_patch" => apply_patch(&args, cwd, &mut emit),
-        "ls" => list_dir(&args, cwd),
-        "ripgrep" => ripgrep(&args, cwd),
-        "outline" => outline_file(&args, cwd),
+        "ls" => list_dir(&args, cwd, extra_read_roots),
+        "ripgrep" => ripgrep(&args, cwd, extra_read_roots),
+        "outline" => outline_file(&args, cwd, extra_read_roots),
         "checkpoint" => checkpoint_tool(&args, cwd),
         "web_fetch" => crate::web_fetch::run(&args),
         _ => json!({ "error": format!("unknown tool: {name}") }),
@@ -382,12 +386,12 @@ fn add_soft_hint(value: &mut Value, warning: &str, suggestion: &str) {
     }
 }
 
-fn read_file(args: &Value, cwd: &Path) -> Value {
+fn read_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value {
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return json!({ "error": "missing path" });
     };
 
-    let path = match workspace_path(cwd, path) {
+    let path = match readable_path(cwd, path, extra_read_roots) {
         Ok(path) => path,
         Err(error) => return json!({ "error": error }),
     };
@@ -1992,9 +1996,9 @@ fn apply_patch(
     }
 }
 
-fn list_dir(args: &Value, cwd: &Path) -> Value {
+fn list_dir(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value {
     let path = match args.get("path").and_then(Value::as_str) {
-        Some(path) => match workspace_path(cwd, path) {
+        Some(path) => match readable_path(cwd, path, extra_read_roots) {
             Ok(path) => path,
             Err(error) => return json!({ "error": error }),
         },
@@ -2040,15 +2044,17 @@ fn list_dir(args: &Value, cwd: &Path) -> Value {
     })
 }
 
-fn ripgrep(args: &Value, cwd: &Path) -> Value {
+fn ripgrep(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value {
     let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
         return json!({ "error": "missing pattern" });
     };
-    let search_path = args
-        .get("path")
-        .and_then(Value::as_str)
-        .map(|path| resolve_path(cwd, path))
-        .unwrap_or_else(|| cwd.to_path_buf());
+    let search_path = match args.get("path").and_then(Value::as_str) {
+        Some(path) => match readable_path(cwd, path, extra_read_roots) {
+            Ok(path) => path,
+            Err(error) => return json!({ "error": error }),
+        },
+        None => cwd.to_path_buf(),
+    };
     let limit = match optional_usize(args, "limit") {
         Ok(limit) => limit.map(|limit| limit.max(1)),
         Err(error) => return json!({ "error": error }),
@@ -2144,11 +2150,11 @@ fn add_ripgrep_soft_hint(value: &mut Value, no_limit: bool) {
     }
 }
 
-fn outline_file(args: &Value, cwd: &Path) -> Value {
+fn outline_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value {
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return json!({ "error": "missing path" });
     };
-    let path = match workspace_path(cwd, path) {
+    let path = match readable_path(cwd, path, extra_read_roots) {
         Ok(path) => path,
         Err(error) => return json!({ "error": error }),
     };
@@ -3242,6 +3248,29 @@ pub(crate) fn workspace_path(cwd: &Path, path: &str) -> Result<PathBuf, String> 
     Ok(resolved)
 }
 
+/// Workspace path policy for read-only file tools: the workspace plus any
+/// `extra_roots` (discovered skill directories, so a skill's relative
+/// references resolve). Returns the workspace error unchanged when the path
+/// is under neither.
+fn readable_path(cwd: &Path, path: &str, extra_roots: &[PathBuf]) -> Result<PathBuf, String> {
+    let resolved = resolve_path(cwd, path);
+    match ensure_in_workspace(cwd, &resolved) {
+        Ok(()) => Ok(resolved),
+        Err(workspace_error) => {
+            let normalized = normalize_for_policy(&resolved);
+            if extra_roots.iter().any(|root| {
+                root.canonicalize()
+                    .map(|root| normalized == root || normalized.starts_with(&root))
+                    .unwrap_or(false)
+            }) {
+                Ok(resolved)
+            } else {
+                Err(workspace_error)
+            }
+        }
+    }
+}
+
 /// Errors when `resolved` escapes the workspace root after resolving
 /// symlinks in its existing prefix and `.`/`..` components lexically in the
 /// (necessarily symlink-free) non-existent remainder.
@@ -4117,6 +4146,7 @@ mod tests {
             "bash",
             &json!({ "command": "echo hello", "timeout": 5 }).to_string(),
             &dir,
+            &[],
             |event| {
                 let ToolExecutionEvent::Update(output) = event;
                 updates.push(output);
@@ -4570,6 +4600,7 @@ mod tests {
             "ripgrep",
             &json!({ "pattern": "definitely_not_present_xyz", "path": path }).to_string(),
             &dir,
+            &[],
             |_| Ok(()),
         );
         let value = serde_json::from_str::<Value>(&result.output).unwrap();
@@ -4594,6 +4625,7 @@ mod tests {
             "bash",
             &json!({ "command": "sleep 0.4; echo done > marker.txt", "timeout": 10 }).to_string(),
             &dir,
+            &[],
             |_| Err("interrupted".to_string()),
         );
 
@@ -4619,6 +4651,7 @@ mod tests {
             &json!({ "command": "sleep 30 & echo $! > grandchild.pid; wait", "timeout": 60 })
                 .to_string(),
             &dir,
+            &[],
             |_| {
                 emits.set(emits.get() + 1);
                 if emits.get() == 1 {
@@ -4713,6 +4746,7 @@ mod tests {
             "bash",
             &json!({ "command": "kill -9 $$", "timeout": 10 }).to_string(),
             &dir,
+            &[],
             |_| Ok(()),
         );
         let value = serde_json::from_str::<Value>(&result.output).unwrap();
@@ -4742,6 +4776,78 @@ mod tests {
         // `..` inside a not-yet-existing prefix must not escape either.
         assert!(workspace_path(&dir, "missing/../../escape.txt").is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn read_only_tools_allow_extra_read_roots() {
+        let pid = std::process::id();
+        let workspace = env::temp_dir().join(format!("jucode-read-roots-ws-{pid}"));
+        let skill = env::temp_dir().join(format!("jucode-read-roots-skill-{pid}"));
+        let outside = env::temp_dir().join(format!("jucode-read-roots-out-{pid}"));
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(skill.join("refs")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(skill.join("SKILL.md"), "skill body").unwrap();
+        fs::write(skill.join("refs/guide.md"), "guide").unwrap();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        let roots = vec![skill.clone()];
+        let run = |name: &str, args: Value| {
+            run_tool_with_events(name, &args.to_string(), &workspace, &roots, |_| Ok(()))
+        };
+
+        // The skill file and files it references resolve under the root.
+        let result = run(
+            "read",
+            json!({ "path": skill.join("SKILL.md").display().to_string() }),
+        );
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("skill body"));
+        let result = run(
+            "read",
+            json!({ "path": skill.join("refs/guide.md").display().to_string() }),
+        );
+        assert!(!result.is_error, "{}", result.output);
+        let result = run("ls", json!({ "path": skill.display().to_string() }));
+        assert!(!result.is_error, "{}", result.output);
+
+        // Paths outside the roots are still rejected.
+        let result = run(
+            "read",
+            json!({ "path": outside.join("secret.txt").display().to_string() }),
+        );
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("escapes the workspace"),
+            "{}",
+            result.output
+        );
+        // `..` cannot climb out of a root either.
+        let escape = skill
+            .join("..")
+            .join(outside.file_name().unwrap())
+            .join("secret.txt");
+        let result = run("read", json!({ "path": escape.display().to_string() }));
+        assert!(result.is_error, "{}", result.output);
+
+        // Mutating tools stay confined even under a read root.
+        let result = run(
+            "write",
+            json!({
+                "path": skill.join("evil.txt").display().to_string(),
+                "content": "x"
+            }),
+        );
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("escapes the workspace"),
+            "{}",
+            result.output
+        );
+
+        let _ = fs::remove_dir_all(&workspace);
+        let _ = fs::remove_dir_all(&skill);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]
