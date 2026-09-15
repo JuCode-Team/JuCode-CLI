@@ -262,6 +262,48 @@ pub fn definitions() -> Vec<Value> {
     ])
 }
 
+/// Static tool names for the system prompt's "Available tools" line. Mirrors
+/// the fixed entries in `definitions()` in the same order, with edit tools
+/// filtered to the enabled set; `browser_open` and the subagent tools are only
+/// listed when they would actually be offered. Dynamic tools added per turn in
+/// `OpenAiClient::tool_definitions` (MCP, extensions, goal/plan) are not part
+/// of this list.
+pub fn prompt_tool_names(
+    edit_tools: &[String],
+    browser_open: bool,
+    subagents: bool,
+) -> Vec<&'static str> {
+    let mut names = vec!["read"];
+    for name in crate::config::EDIT_TOOL_NAMES {
+        if edit_tools.iter().any(|tool| tool == name) {
+            names.push(name);
+        }
+    }
+    names.extend([
+        "bash",
+        "exec_command",
+        "write_stdin",
+        "ls",
+        "ripgrep",
+        "outline",
+        "checkpoint",
+        "web_fetch",
+    ]);
+    if browser_open {
+        names.push("browser_open");
+    }
+    if subagents {
+        names.extend([
+            "spawn_agent",
+            "wait_agent",
+            "list_agents",
+            "send_message",
+            "close_agent",
+        ]);
+    }
+    names
+}
+
 /// Tool definition for the JuCode Desktop built-in browser panel. Not part of
 /// `definitions()`: it is only offered when the CLI runs under the desktop app
 /// (JUCODE_DESKTOP is set), wired conditionally in the LLM client.
@@ -3965,6 +4007,56 @@ mod tests {
         assert!(tools
             .iter()
             .all(|tool| tool.get("strict") == Some(&json!(false))));
+    }
+
+    #[test]
+    fn prompt_tool_names_match_filtered_definitions() {
+        // Mirror of the static filter OpenAiClient::tool_definitions applies:
+        // definitions() minus disabled edit tools, before the conditional
+        // browser_open/subagent/dynamic additions.
+        let edit_tools = crate::config::default_edit_tools();
+        let definitions = definitions();
+        let expected = definitions
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .filter(|name| {
+                crate::config::canonical_edit_tool_name(name)
+                    .is_none_or(|canonical| edit_tools.iter().any(|tool| tool == canonical))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prompt_tool_names(&edit_tools, false, false), expected);
+
+        let all = vec![
+            "str_replace".to_string(),
+            "hashline_edit".to_string(),
+            "write".to_string(),
+            "apply_patch".to_string(),
+        ];
+        let names = prompt_tool_names(&all, true, true);
+        assert_eq!(
+            names,
+            [
+                "read",
+                "str_replace",
+                "hashline_edit",
+                "write",
+                "apply_patch",
+                "bash",
+                "exec_command",
+                "write_stdin",
+                "ls",
+                "ripgrep",
+                "outline",
+                "checkpoint",
+                "web_fetch",
+                "browser_open",
+                "spawn_agent",
+                "wait_agent",
+                "list_agents",
+                "send_message",
+                "close_agent",
+            ]
+        );
     }
 
     #[test]

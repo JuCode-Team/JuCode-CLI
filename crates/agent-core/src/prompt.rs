@@ -3,14 +3,45 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const TOOL_GUIDANCE: &str = "prefer read/ls/ripgrep/outline for targeted exploration; use bash or exec_command for shell commands and verification; when several read-only searches or inspections are independent, issue them together in the same assistant response; group dependent shell checks into one command when that reduces round trips; keep dependent edit-after-read and verify-after-edit steps ordered; read an existing file before changing it; write can create new files without a prior read; use str_replace, write, hashline_edit, or apply_patch for file edits; if a tool fails, correct the call or use another suitable tool and continue when feasible.";
+const TOOL_GUIDANCE_PREFIX: &str = "prefer read/ls/ripgrep/outline for targeted exploration; use bash or exec_command for shell commands and verification; when several read-only searches or inspections are independent, issue them together in the same assistant response; group dependent shell checks into one command when that reduces round trips; keep dependent edit-after-read and verify-after-edit steps ordered; read an existing file before changing it;";
+const TOOL_GUIDANCE_SUFFIX: &str =
+    "if a tool fails, correct the call or use another suitable tool and continue when feasible.";
 const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 64 * 1024;
+
+/// Tool guidance assembled from the enabled edit tools so the prompt only
+/// describes edit commands that are actually exposed to the model.
+fn tool_guidance(edit_tools: &[String]) -> String {
+    let enabled = |name: &str| edit_tools.iter().any(|tool| tool == name);
+    let edit_names: Vec<&str> = crate::config::EDIT_TOOL_NAMES
+        .into_iter()
+        .filter(|name| enabled(name))
+        .collect();
+    let mut guidance = TOOL_GUIDANCE_PREFIX.to_string();
+    if enabled("write") {
+        guidance.push_str(" write can create new files without a prior read;");
+    } else if enabled("apply_patch") {
+        guidance.push_str(" apply_patch can create new files;");
+    } else if !edit_names.is_empty() {
+        guidance.push_str(" create new files with bash (e.g. a heredoc);");
+    }
+    match edit_names.as_slice() {
+        [] => {
+            guidance.push_str(" no file-edit tools are enabled; describe needed changes instead;")
+        }
+        [name] => guidance.push_str(&format!(" use {name} for file edits;")),
+        names => guidance.push_str(&format!(" use {} for file edits;", names.join(", "))),
+    }
+    guidance.push(' ');
+    guidance.push_str(TOOL_GUIDANCE_SUFFIX);
+    guidance
+}
 
 #[derive(Debug, Clone)]
 pub struct PromptContext {
     pub date: String,
     pub cwd: PathBuf,
     pub tools: Vec<&'static str>,
+    pub edit_tools: Vec<String>,
     pub project_instructions: Vec<ProjectInstruction>,
     pub skills: Vec<SkillPromptItem>,
 }
@@ -43,7 +74,10 @@ pub fn build_system_prompt(base: &str, context: &PromptContext) -> String {
         context.cwd.display()
     ));
     prompt.push_str(&format!("Available tools: {}\n", context.tools.join(", ")));
-    prompt.push_str(&format!("Tool guidance: {TOOL_GUIDANCE}\n"));
+    prompt.push_str(&format!(
+        "Tool guidance: {}\n",
+        tool_guidance(&context.edit_tools)
+    ));
     prompt.push_str("</runtime_context>");
 
     if !context.project_instructions.is_empty() {
@@ -310,6 +344,7 @@ mod tests {
                 date: "2026-05-27".to_string(),
                 cwd: PathBuf::from("C:/repo"),
                 tools: vec!["read", "bash"],
+                edit_tools: crate::config::default_edit_tools(),
                 project_instructions: vec![ProjectInstruction {
                     path: PathBuf::from("C:/repo/AGENTS.md"),
                     content: "Follow project rules.".to_string(),
@@ -329,6 +364,70 @@ mod tests {
         assert!(prompt.contains("Follow project rules."));
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("Review &lt;code&gt; &amp; tests"));
+    }
+
+    #[test]
+    fn default_prompt_advertises_only_hashline_edit() {
+        let edit_tools = crate::config::default_edit_tools();
+        let prompt = build_system_prompt(
+            "Base",
+            &PromptContext {
+                date: "2026-05-27".to_string(),
+                cwd: PathBuf::from("/repo"),
+                tools: crate::tools::prompt_tool_names(&edit_tools, false, true),
+                edit_tools,
+                project_instructions: Vec::new(),
+                skills: Vec::new(),
+            },
+        );
+        let tools_line = prompt
+            .lines()
+            .find(|line| line.starts_with("Available tools:"))
+            .expect("tools line");
+        let listed: Vec<&str> = tools_line
+            .trim_start_matches("Available tools: ")
+            .split(", ")
+            .collect();
+        assert!(listed.contains(&"hashline_edit"));
+        for disabled in ["str_replace", "write", "apply_patch"] {
+            assert!(
+                !listed.contains(&disabled),
+                "tools list advertises {disabled}"
+            );
+        }
+        let guidance = prompt
+            .lines()
+            .find(|line| line.starts_with("Tool guidance:"))
+            .expect("guidance line");
+        assert!(guidance.contains("use hashline_edit for file edits"));
+        assert!(!guidance.contains("str_replace"));
+        assert!(!guidance.contains("apply_patch"));
+        assert!(!guidance.contains(" write"));
+    }
+
+    #[test]
+    fn prompt_lists_enabled_edit_tools_and_new_file_rule() {
+        let edit_tools = vec![
+            "hashline_edit".to_string(),
+            "write".to_string(),
+            "apply_patch".to_string(),
+        ];
+        let prompt = build_system_prompt(
+            "Base",
+            &PromptContext {
+                date: "2026-05-27".to_string(),
+                cwd: PathBuf::from("/repo"),
+                tools: crate::tools::prompt_tool_names(&edit_tools, true, false),
+                edit_tools,
+                project_instructions: Vec::new(),
+                skills: Vec::new(),
+            },
+        );
+        assert!(prompt.contains("Available tools: read, hashline_edit, write, apply_patch"));
+        assert!(prompt.contains("use hashline_edit, write, apply_patch for file edits"));
+        assert!(prompt.contains("write can create new files without a prior read"));
+        assert!(prompt.contains("browser_open"));
+        assert!(!prompt.contains("spawn_agent"));
     }
 
     #[test]

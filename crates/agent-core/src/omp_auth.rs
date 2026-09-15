@@ -1566,8 +1566,10 @@ mod tests {
 
     #[test]
     fn bearer_token_unwraps_muse_envelope() {
-        let mut credential = OmpCredential::default();
-        credential.access = r#"{"oauthAccessToken":"oauth-tok","apiKey":"muse-key"}"#.to_string();
+        let mut credential = OmpCredential {
+            access: r#"{"oauthAccessToken":"oauth-tok","apiKey":"muse-key"}"#.to_string(),
+            ..OmpCredential::default()
+        };
         assert_eq!(bearer_token(&credential), "muse-key");
         credential.access = "plain-token".to_string();
         assert_eq!(bearer_token(&credential), "plain-token");

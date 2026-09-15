@@ -1656,34 +1656,18 @@ impl AgentCore {
         } else {
             Vec::new()
         };
-        let mut prompt_tools = vec![
-            "read",
-            "str_replace",
-            "hashline_edit",
-            "write",
-            "apply_patch",
-            "bash",
-            "write_stdin",
-            "ls",
-            "ripgrep",
-            "outline",
-            "checkpoint",
-            "web_fetch",
-            "spawn_agent",
-            "wait_agent",
-            "list_agents",
-            "send_message",
-            "close_agent",
-        ];
-        if std::env::var("JUCODE_DESKTOP").is_ok() {
-            prompt_tools.push("browser_open");
-        }
+        let prompt_tools = crate::tools::prompt_tool_names(
+            &self.config.edit_tools,
+            self.config.enable_browser_open && std::env::var("JUCODE_DESKTOP").is_ok(),
+            true,
+        );
         let system_prompt = build_system_prompt(
             &base_prompt,
             &PromptContext {
                 date: current_utc_date(),
                 cwd: self.cwd.clone(),
                 tools: prompt_tools,
+                edit_tools: self.config.edit_tools.clone(),
                 project_instructions,
                 skills,
             },

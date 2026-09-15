@@ -140,6 +140,10 @@ fn is_edit_tool(name: &str) -> bool {
     canonical_edit_tool_name(name).is_some()
 }
 
+/// Canonical edit-tool names in the order they appear in
+/// `tools::definitions()`.
+pub const EDIT_TOOL_NAMES: [&str; 4] = ["str_replace", "hashline_edit", "write", "apply_patch"];
+
 /// Canonical name for an edit tool, accepting the `edit` alias for
 /// `str_replace`. Returns None for anything that is not an edit tool.
 pub fn canonical_edit_tool_name(name: &str) -> Option<&'static str> {
