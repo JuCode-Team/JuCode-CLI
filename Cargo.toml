@@ -1,6 +1,6 @@
 [package]
 name = "jucode-cli"
-version = "0.2.0"
+version.workspace = true
 edition = "2021"
 
 [[bin]]
@@ -10,6 +10,9 @@ path = "src/main.rs"
 [workspace]
 members = [".", "crates/agent-core", "crates/tui", "crates/vendor"]
 resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
 
 [dependencies]
 jucode-agent-core = { path = "crates/agent-core" }
