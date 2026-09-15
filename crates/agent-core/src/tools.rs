@@ -1376,12 +1376,19 @@ fn run_command_session(
     let stdout_file = File::create(&stdout_path).map_err(|error| error.to_string())?;
     let stderr_file = File::create(&stderr_path).map_err(|error| error.to_string())?;
 
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
+        .stderr(Stdio::from(stderr_file));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| format!("failed to start {program}: {error}"))?;
 
@@ -1587,6 +1594,13 @@ fn kill_child(child: &mut Child) {
     }
     #[cfg(not(windows))]
     {
+        // The child is spawned as a process-group leader (process_group(0)),
+        // so a group signal takes descendants down with it. Fall back to
+        // killing just the child if the group is already gone.
+        let pid = child.id() as i32;
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -2690,7 +2704,8 @@ fn run_command_events(
     let stdout_file = File::create(&stdout_path).map_err(|error| error.to_string())?;
     let stderr_file = File::create(&stderr_path).map_err(|error| error.to_string())?;
 
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .current_dir(cwd)
         .stdin(if stdin.is_some() {
@@ -2699,7 +2714,13 @@ fn run_command_events(
             Stdio::null()
         })
         .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
+        .stderr(Stdio::from(stderr_file));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| format!("failed to start {program}: {error}"))?;
 
@@ -4660,6 +4681,70 @@ mod tests {
         assert!(result.is_error);
         std::thread::sleep(Duration::from_millis(900));
         assert!(!marker.exists(), "child kept running after interrupt");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_bash_kills_process_group_descendants() {
+        let dir = test_dir("bash-interrupt-group");
+        fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("grandchild.pid");
+
+        // The shell backgrounds a grandchild that keeps running after the
+        // interrupt; the group kill must take it down too. Fail on the second
+        // update so the grandchild has been spawned before the interrupt.
+        let emits = std::cell::Cell::new(0);
+        let result = run_tool_with_events(
+            "bash",
+            &json!({ "command": "sleep 30 & echo $! > grandchild.pid; wait", "timeout": 60 })
+                .to_string(),
+            &dir,
+            |_| {
+                emits.set(emits.get() + 1);
+                if emits.get() == 1 {
+                    Ok(())
+                } else {
+                    Err("interrupted".to_string())
+                }
+            },
+        );
+
+        assert!(result.is_error);
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .expect("grandchild pid file")
+            .trim()
+            .parse()
+            .expect("pid");
+        // kill(pid, 0) reports whether the process still exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "grandchild survived interrupt");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_bash_kills_process_group_descendants() {
+        let dir = test_dir("bash-timeout-group");
+        fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("grandchild.pid");
+
+        let output = run_tool(
+            "bash",
+            &json!({ "command": "sleep 30 & echo $! > grandchild.pid; wait", "timeout": 1 })
+                .to_string(),
+            &dir,
+        );
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["timed_out"], true);
+
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .expect("grandchild pid file")
+            .trim()
+            .parse()
+            .expect("pid");
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "grandchild survived timeout");
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -612,6 +612,7 @@ dependencies = [
  "flate2",
  "getrandom",
  "jucode-vendor",
+ "libc",
  "semver",
  "serde_json",
  "sha2",
