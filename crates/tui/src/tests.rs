@@ -341,12 +341,13 @@ fn model_and_tokens_render_below_input_without_ready_status() {
                 provider: "openai",
                 model: "gpt-5",
                 reasoning_effort: "medium",
+                approval_mode: "auto-edit",
                 git: None,
                 context_tokens: 12_345,
                 context_window: 400_000,
                 cost: 0.0,
             },
-            64,
+            80,
         )
         .finish();
 
@@ -354,10 +355,10 @@ fn model_and_tokens_render_below_input_without_ready_status() {
     assert_eq!(document.controls[1].plain(), "› hello");
     assert_eq!(document.controls[1].cursor, Some(7));
     let status = document.controls[3].plain();
-    assert!(status.starts_with("openai / gpt-5 (medium)"));
+    assert!(status.starts_with("openai / gpt-5 (medium) | auto-edit"));
     assert!(status.ends_with("tokens 12345/400000 | context 3.1%"));
     assert!(!status.contains("ready"));
-    assert_eq!(document.controls[3].line.width(), 64);
+    assert_eq!(document.controls[3].line.width(), 80);
 }
 
 #[test]
@@ -419,6 +420,7 @@ fn colored_status_line_does_not_wrap_at_visible_width() {
                 provider: "jucode",
                 model: "claude-opus-4.7",
                 reasoning_effort: "high",
+                approval_mode: "manual",
                 git: None,
                 context_tokens: 1633,
                 context_window: 400_000,
@@ -1100,6 +1102,7 @@ fn projection_only_indents_text_not_ui_elements() {
                 provider: "jucode",
                 model: "gpt-5",
                 reasoning_effort: "medium",
+                approval_mode: "manual",
                 git: None,
                 context_tokens: 10,
                 context_window: 100,
@@ -1567,6 +1570,26 @@ fn effort_cycle_wraps() {
 }
 
 #[test]
+fn approval_mode_colors_map_to_permission_level() {
+    assert_eq!(
+        crate::ui_builder::approval_mode_style("auto-edit").fg,
+        Some(Color::Rgb(90, 190, 140))
+    );
+    assert_eq!(
+        crate::ui_builder::approval_mode_style("auto").fg,
+        Some(Color::Rgb(230, 200, 90))
+    );
+    assert_eq!(
+        crate::ui_builder::approval_mode_style("full-access").fg,
+        Some(Color::Rgb(245, 90, 90))
+    );
+    assert_eq!(
+        crate::ui_builder::approval_mode_style("manual").fg,
+        Some(Color::Rgb(150, 150, 150))
+    );
+}
+
+#[test]
 fn backtab_cycles_approval_mode() {
     let mut app = TuiApp::new(TestRuntime::default());
     let now = Instant::now();
@@ -1788,6 +1811,7 @@ fn bottom_status_shows_git_branch_with_dirty_marker() {
                 provider: "p",
                 model: "m",
                 reasoning_effort: "low",
+                approval_mode: "manual",
                 git: Some(&dirty),
                 context_tokens: 1,
                 context_window: 100,

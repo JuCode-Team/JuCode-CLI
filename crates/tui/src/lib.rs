@@ -198,6 +198,7 @@ pub(crate) struct BottomStatus<'a> {
     pub(crate) provider: &'a str,
     pub(crate) model: &'a str,
     pub(crate) reasoning_effort: &'a str,
+    pub(crate) approval_mode: &'a str,
     pub(crate) git: Option<&'a git_bar::GitStatus>,
     pub(crate) context_tokens: u64,
     pub(crate) context_window: u64,

@@ -109,6 +109,7 @@ impl TuiState {
                     provider: &self.provider,
                     model: &self.model,
                     reasoning_effort: &self.reasoning_effort,
+                    approval_mode: &self.approval_mode,
                     git: self.git_status.as_ref(),
                     context_tokens: self.current_context_tokens,
                     context_window: self.context_window,

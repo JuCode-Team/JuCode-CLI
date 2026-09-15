@@ -130,6 +130,18 @@ fn reasoning_effort_span(effort: &str) -> Span<'static> {
     Span::styled(effort.to_string(), reasoning_effort_style(effort))
 }
 
+/// Permission-level colors: green for edit-only, yellow once a classifier is
+/// in the loop, red for unrestricted; manual stays muted.
+pub(crate) fn approval_mode_style(mode: &str) -> Style {
+    let color = match mode {
+        "auto-edit" => Color::Rgb(90, 190, 140),
+        "auto" => Color::Rgb(230, 200, 90),
+        "full-access" => Color::Rgb(245, 90, 90),
+        _ => Color::Rgb(150, 150, 150),
+    };
+    Style::new().fg(color)
+}
+
 pub(crate) struct UiBuilder {
     history: Vec<UiLine>,
     rendered_history_lines: Option<Vec<UiLine>>,
@@ -468,9 +480,13 @@ impl UiBuilder {
             Span::raw(format!("{} / {} (", status.provider, status.model)),
             reasoning_effort_span(status.reasoning_effort),
             Span::raw(format!(
-                "){}",
+                "){} | ",
                 crate::git_bar::format_git_segment(status.git)
             )),
+            Span::styled(
+                status.approval_mode.to_string(),
+                approval_mode_style(status.approval_mode),
+            ),
         ];
         let cost = if status.cost > 0.0 {
             format!(" | ${:.4}", status.cost)
