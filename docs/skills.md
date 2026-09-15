@@ -3,9 +3,10 @@
 JuCode loads skills from these sources:
 
 1. installed user skills under `~/.jucode/skills`;
-2. project skills under `<project>/.jucode/skills` and `<project>/.agents/skills` (the cross-tool convention directory), only after the project is trusted;
-3. the JuCode marketplace returned by `/v1/skills/marketplace`;
-4. one optional extra GitHub source configured in `~/.jucode/config.json`.
+2. user-level skills under `~/.agents/skills` (the cross-tool convention directory);
+3. project skills under `<project>/.jucode/skills` and `<project>/.agents/skills`, only after the project is trusted;
+4. the JuCode marketplace returned by `/v1/skills/marketplace`;
+5. one optional extra GitHub source configured in `~/.jucode/config.json`.
 
 Each skill is a directory containing `SKILL.md`. Frontmatter `name` and `description` fields
 are used for discovery. A skill named `Code Review` is available as `/code-review`; text after

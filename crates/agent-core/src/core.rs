@@ -733,19 +733,22 @@ impl AgentCore {
             self.cwd.join(".jucode").join("skills"),
             self.cwd.join(".agents").join("skills"),
         ];
+        let user_agents_root = crate::secrets::home_dir().map(|home| home.join(".agents"));
+        let discovered =
+            discover_skills(self.config.profile_dir(), &self.cwd, self.project_trusted);
         let project = if !self.project_trusted && project_roots.iter().any(|root| root.exists()) {
             "Project skills: hidden until project is trusted".to_string()
         } else {
-            match discover_skills(self.config.profile_dir(), &self.cwd, self.project_trusted) {
+            match &discovered {
                 Ok(found) => {
                     let names = found
-                        .into_iter()
+                        .iter()
                         .filter(|skill| {
                             project_roots
                                 .iter()
                                 .any(|root| skill.path.starts_with(root))
                         })
-                        .map(|skill| skill.name)
+                        .map(|skill| skill.name.clone())
                         .collect::<Vec<_>>();
                     if names.is_empty() {
                         "Project skills: none".to_string()
@@ -755,6 +758,21 @@ impl AgentCore {
                 }
                 Err(error) => format!("Project skills: failed to read ({error})"),
             }
+        };
+        let user_agents = match (user_agents_root.as_deref(), &discovered) {
+            (Some(root), Ok(found)) => {
+                let names = found
+                    .iter()
+                    .filter(|skill| skill.path.starts_with(root))
+                    .map(|skill| skill.name.clone())
+                    .collect::<Vec<_>>();
+                if names.is_empty() {
+                    String::new()
+                } else {
+                    format!("~/.agents skills:\n{}", names.join("\n"))
+                }
+            }
+            _ => String::new(),
         };
         let marketplace = match self.fetch_marketplace() {
             Ok(marketplace) if marketplace.skills.is_empty() => {
@@ -811,7 +829,11 @@ impl AgentCore {
             Ok(None) => None,
             Err(error) => Some(format!("Extra skills source unavailable: {error}")),
         };
-        let mut sections = vec![installed, project, marketplace];
+        let mut sections = vec![installed, project];
+        if !user_agents.is_empty() {
+            sections.push(user_agents);
+        }
+        sections.push(marketplace);
         sections.extend(extra);
         sections.push(
             "Install with /skills install <id>; update with /skills update <id>; sync JuCode defaults with /skills sync."

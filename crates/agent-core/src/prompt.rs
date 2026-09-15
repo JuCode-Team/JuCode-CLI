@@ -124,6 +124,20 @@ pub fn discover_skills(
     cwd: &Path,
     project_trusted: bool,
 ) -> io::Result<Vec<SkillPromptItem>> {
+    discover_skills_from(
+        profile_dir,
+        cwd,
+        project_trusted,
+        crate::secrets::home_dir().map(|home| home.join(".agents").join("skills")),
+    )
+}
+
+fn discover_skills_from(
+    profile_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+    user_agents_dir: Option<PathBuf>,
+) -> io::Result<Vec<SkillPromptItem>> {
     let mut skills = Vec::new();
     let mut global_skills = Vec::new();
     read_skills_dir(&profile_dir.join("skills"), &mut global_skills)?;
@@ -131,6 +145,10 @@ pub fn discover_skills(
         if crate::skills::is_skill_path_enabled(profile_dir, &skill.path)? {
             skills.push(skill);
         }
+    }
+    // `~/.agents/skills/` is the cross-tool convention for user-level skills.
+    if let Some(dir) = user_agents_dir {
+        read_skills_dir(&dir, &mut skills)?;
     }
     if project_trusted {
         read_skills_dir(&cwd.join(".jucode").join("skills"), &mut skills)?;
@@ -147,7 +165,21 @@ pub fn skill_commands(
     cwd: &Path,
     project_trusted: bool,
 ) -> io::Result<Vec<SkillCommand>> {
-    let mut commands = discover_skills(profile_dir, cwd, project_trusted)?
+    skill_commands_from(
+        profile_dir,
+        cwd,
+        project_trusted,
+        crate::secrets::home_dir().map(|home| home.join(".agents").join("skills")),
+    )
+}
+
+fn skill_commands_from(
+    profile_dir: &Path,
+    cwd: &Path,
+    project_trusted: bool,
+    user_agents_dir: Option<PathBuf>,
+) -> io::Result<Vec<SkillCommand>> {
+    let mut commands = discover_skills_from(profile_dir, cwd, project_trusted, user_agents_dir)?
         .into_iter()
         .map(|skill| SkillCommand {
             command: format!("/{}", skill_command_name(&skill.name)),
@@ -484,7 +516,8 @@ mod tests {
         )
         .unwrap();
 
-        let skills = discover_skills(&root.join("profile"), &root.join("cwd"), true).unwrap();
+        let skills =
+            discover_skills_from(&root.join("profile"), &root.join("cwd"), true, None).unwrap();
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "review");
@@ -514,7 +547,8 @@ mod tests {
         )
         .unwrap();
 
-        let skills = discover_skills(&root.join("profile"), &root.join("cwd"), true).unwrap();
+        let skills =
+            discover_skills_from(&root.join("profile"), &root.join("cwd"), true, None).unwrap();
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "nested-review");
@@ -539,7 +573,8 @@ mod tests {
         )
         .unwrap();
 
-        let commands = skill_commands(&root.join("profile"), &root.join("cwd"), true).unwrap();
+        let commands =
+            skill_commands_from(&root.join("profile"), &root.join("cwd"), true, None).unwrap();
 
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].command, "/code-review");
@@ -559,14 +594,22 @@ mod tests {
         let profile = root.join("profile");
         let cwd = root.join("repo");
         let global = profile.join("skills/global");
+        let user_agents = root.join("home/.agents/skills");
+        let user_agents_skill = user_agents.join("home-skill");
         let project = cwd.join(".jucode/skills/project");
         let agents = cwd.join(".agents/skills/agents-skill");
         fs::create_dir_all(&global).unwrap();
+        fs::create_dir_all(&user_agents_skill).unwrap();
         fs::create_dir_all(&project).unwrap();
         fs::create_dir_all(&agents).unwrap();
         fs::write(
             global.join("SKILL.md"),
             "---\nname: global\ndescription: Global\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            user_agents_skill.join("SKILL.md"),
+            "---\nname: home-agents\ndescription: Home agents dir\n---\n",
         )
         .unwrap();
         fs::write(
@@ -581,17 +624,25 @@ mod tests {
         .unwrap();
         crate::skills::set_skill_enabled(&profile, "global", false).unwrap();
 
-        let trusted = discover_skills(&profile, &cwd, true).unwrap();
-        let untrusted = discover_skills(&profile, &cwd, false).unwrap();
+        let trusted =
+            discover_skills_from(&profile, &cwd, true, Some(user_agents.clone())).unwrap();
+        let untrusted = discover_skills_from(&profile, &cwd, false, Some(user_agents)).unwrap();
 
         assert_eq!(
             trusted
                 .iter()
                 .map(|skill| skill.name.as_str())
                 .collect::<Vec<_>>(),
-            ["agents", "project"]
+            ["agents", "home-agents", "project"]
         );
-        assert!(untrusted.is_empty());
+        // Project trust only gates project dirs; user-level sources always load.
+        assert_eq!(
+            untrusted
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            ["home-agents"]
+        );
         let _ = fs::remove_dir_all(root);
     }
 }
