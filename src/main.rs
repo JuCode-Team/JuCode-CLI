@@ -153,6 +153,9 @@ USAGE:
 OPTIONS:
     --approval-mode <read-only|auto-edit|full-auto>
                                          tool approval mode for this run
+                                         (full-auto runs shell commands and
+                                         file writes without prompts and is
+                                         not confined to the workspace)
     -h, --help                           show this help
     -V, --version                        print the version
 

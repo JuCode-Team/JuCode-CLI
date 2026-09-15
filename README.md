@@ -164,6 +164,10 @@ Headless defaults to the safest approval mode (`read-only`), and any tool call t
 jucode --headless --approval-mode full-auto "Fix the failing test"
 ```
 
+`full-auto` runs the model's shell commands and file writes with your user
+permissions and no prompts — `bash` is not confined to the workspace, so only
+use it for tasks and repositories you trust.
+
 The `final_result` event reports the effective `approval_mode` and how many approvals were auto-denied.
 
 This mode is useful for evaluation harnesses and reproducible agent experiments. A minimal in-repo harness lives in [`evals/`](evals/README.md).

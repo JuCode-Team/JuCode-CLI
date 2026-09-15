@@ -14,9 +14,12 @@ pub(crate) const MAX_LIVE_SUBAGENTS: usize = 4;
 pub(crate) const MAX_SUBAGENT_DEPTH: u64 = 2;
 const MAX_HARVEST_FILES: usize = 200;
 
-/// An isolated working directory for one subagent. Subagent file writes are
-/// confined here so a child can never freely overwrite the parent's cwd files;
-/// the parent harvests results explicitly (reads files, or applies a diff).
+/// An isolated working directory for one subagent. File-tool writes
+/// (write/str_replace/hashline_edit/apply_patch) are confined to this root by
+/// `write_target_escapes_root`; bash commands are not confined, so this is a
+/// write boundary for file tools, not a sandbox — a child shell can still
+/// reach the parent tree via absolute paths. The parent harvests results
+/// explicitly (reads files, or applies a diff).
 #[derive(Debug, Clone)]
 pub(crate) struct SubagentWorkspace {
     pub root: PathBuf,
@@ -28,8 +31,9 @@ pub(crate) struct SubagentWorkspace {
 /// Prepares the isolated workspace for a subagent under
 /// `<parent_cwd>/.jucode/agents/<task>-<millis>`. Inside a git repository this
 /// is a detached `git worktree` (the child sees the committed tree and its
-/// writes stay in the worktree); outside a repository it is a fresh directory
-/// (the child reads the parent tree via absolute paths but writes only here).
+/// file-tool writes stay in the worktree); outside a repository it is a fresh
+/// empty directory (the child sees nothing of the parent tree by default and
+/// must be told which paths to inspect — the same bash caveat applies).
 pub(crate) fn prepare_workspace(
     parent_cwd: &Path,
     task_name: &str,

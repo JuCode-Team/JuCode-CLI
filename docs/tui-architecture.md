@@ -41,9 +41,13 @@ The binary entry point is `src/main.rs`.
 - `startup_events()`
 - `model_status_event()`
 - `submit_user_message()`
-- `steer()`
+- `interrupt()`
 - `handle_command()`
 - `poll_events()`
+
+Steering mid-turn messages is not a trait method: queued input is submitted
+through `submit_user_message`, and the core `steer` command is reached via
+`handle_command` like other slash commands.
 
 This separation is useful because the TUI does not need to know agent internals. It only consumes events and sends user intent back through a small trait.
 
@@ -64,7 +68,7 @@ Important state fields include:
 
 - `input: InputBuffer`: line editor state, selection, cursor, large-paste placeholders
 - `chat: Vec<ChatLine>`: persisted visible transcript in TUI form
-- `live_assistant: Option<String>`: streamed assistant text not yet committed to transcript
+- `assistant_index: Option<usize>`: the `ChatLine::Assistant` entry currently receiving streamed deltas (streaming text lives directly in `chat`)
 - `reasoning_index: Option<usize>` and `thinking_tokens`: reasoning display state
 - `activity: ActivityState`: current phase such as connecting, thinking, output, tool, compacting
 - `commands` and `completion_index`: slash-command completion
