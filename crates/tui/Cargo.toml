@@ -7,6 +7,7 @@ edition = "2021"
 bench = []
 
 [dependencies]
+base64 = "0.22"
 jucode-agent-core = { path = "../agent-core" }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 serde_json = "1"

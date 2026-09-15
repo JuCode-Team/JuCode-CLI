@@ -634,6 +634,7 @@ dependencies = [
 name = "jucode-tui"
 version = "0.1.9"
 dependencies = [
+ "base64",
  "jucode-agent-core",
  "ratatui",
  "serde_json",

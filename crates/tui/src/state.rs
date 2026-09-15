@@ -6,8 +6,12 @@ pub(super) struct TuiState {
     pub(super) chat: Vec<ChatLine>,
     pub(super) history_revision: u64,
     pub(super) rendered_history_cache: RenderedHistoryCache,
-    pub(super) live_assistant: Option<String>,
+    /// Index of the assistant message currently being streamed into `chat`.
+    pub(super) assistant_index: Option<usize>,
     pub(super) reasoning_index: Option<usize>,
+    /// When the active reasoning block started streaming; collapsed blocks keep
+    /// the elapsed time on their header.
+    pub(super) reasoning_started: Option<Instant>,
     pub(super) thinking_tokens: u64,
     pub(super) status: String,
     pub(super) provider: String,
@@ -47,8 +51,9 @@ impl Default for TuiState {
             chat: Vec::new(),
             history_revision: 0,
             rendered_history_cache: RenderedHistoryCache::default(),
-            live_assistant: None,
+            assistant_index: None,
             reasoning_index: None,
+            reasoning_started: None,
             thinking_tokens: 0,
             status: "ready".to_string(),
             provider: "unknown".to_string(),
@@ -85,11 +90,12 @@ impl TuiState {
         let content_width = padded_content_width(width).saturating_sub(1).max(1);
         let control_width = width.max(1);
         let completion_rows = self.completion_rows(input);
-        let input_display = input.render(!self.activity.is_active());
+        // Always emit the caret: the hardware cursor anchors the IME compose
+        // window, and the composer stays editable while a turn streams.
+        let input_display = input.render(true);
         let rendered_history_lines = self.rendered_history_lines(content_width);
         UiBuilder::new()
             .rendered_history_lines(rendered_history_lines)
-            .live_assistant(self.live_assistant.as_deref(), content_width)
             .picker(self.picker_view.as_ref())
             .pending_messages(&self.pending_messages)
             .progress(&self.activity, self.thinking_tokens, now, control_width)
@@ -349,7 +355,7 @@ impl TuiState {
                 AgentEvent::Retrying { attempt } => {
                     // The request is re-sent from scratch, so drop any partial
                     // streamed output to avoid duplicating it on the retry.
-                    self.live_assistant = None;
+                    self.discard_partial_assistant();
                     self.discard_partial_reasoning();
                     self.thinking_tokens = 0;
                     self.activity.start_reconnecting(attempt);
@@ -357,7 +363,7 @@ impl TuiState {
                 }
                 AgentEvent::AssistantStart => {
                     self.collapse_live_thinking();
-                    self.live_assistant = Some(String::new());
+                    self.assistant_index = None;
                     true
                 }
                 AgentEvent::AssistantDelta(delta) => {
@@ -433,6 +439,9 @@ impl TuiState {
                     subagent_id,
                     hunks,
                 } => {
+                    // Stop the thinking clock here: time spent waiting on the
+                    // user's decision is not the model's thinking time.
+                    self.collapse_live_thinking();
                     // Show which subagent asked; main-agent requests are unprefixed.
                     let summary = match subagent_id {
                         Some(id) => format!("[agent {id}] {summary}"),
@@ -551,24 +560,41 @@ impl TuiState {
         changed
     }
 
+    /// Stream the reply straight into its transcript message, exactly where it
+    /// stays — there is no separate live layer to merge later.
     pub(super) fn append_assistant_delta(&mut self, delta: &str) {
-        if let Some(text) = self.live_assistant.as_mut() {
-            text.push_str(delta);
-        } else {
-            self.live_assistant = Some(delta.to_string());
+        if let Some(index) = self.assistant_index {
+            if let Some(ChatLine::Assistant(text)) = self.chat.get_mut(index) {
+                text.push_str(delta);
+                self.mark_history_dirty();
+                return;
+            }
+        }
+        self.chat.push(ChatLine::Assistant(delta.to_string()));
+        self.assistant_index = Some(self.chat.len() - 1);
+        self.mark_history_dirty();
+    }
+
+    /// Drop a partial assistant message before a retry re-streams it.
+    pub(super) fn discard_partial_assistant(&mut self) {
+        if let Some(index) = self.assistant_index.take() {
+            if matches!(self.chat.get(index), Some(ChatLine::Assistant(_))) {
+                if index + 1 == self.chat.len() {
+                    self.chat.pop();
+                } else if let Some(ChatLine::Assistant(text)) = self.chat.get_mut(index) {
+                    text.clear();
+                }
+                self.mark_history_dirty();
+            }
         }
     }
 
-    /// Stream reasoning into a transcript message. A delta after the current
-    /// reasoning message was collapsed starts a new one (e.g. a new phase after a
-    /// tool call).
+    /// Stream reasoning into a transcript message. Deltas keep appending to the
+    /// active block even if the user collapsed it by hand; once reasoning ends
+    /// (index cleared) a later delta starts a new block, e.g. after a tool call.
     pub(super) fn append_thinking_delta(&mut self, delta: &str) {
         if let Some(index) = self.reasoning_index {
-            if let Some(ChatLine::Reasoning {
-                text,
-                collapsed: false,
-            }) = self.chat.get_mut(index)
-            {
+            if let Some(ChatLine::Reasoning { text, .. }) = self.chat.get_mut(index) {
                 text.push_str(delta);
                 self.mark_history_dirty();
                 return;
@@ -577,8 +603,10 @@ impl TuiState {
         self.chat.push(ChatLine::Reasoning {
             text: delta.to_string(),
             collapsed: false,
+            duration_secs: None,
         });
         self.reasoning_index = Some(self.chat.len() - 1);
+        self.reasoning_started = Some(Instant::now());
         self.mark_history_dirty();
     }
 
@@ -591,16 +619,35 @@ impl TuiState {
     /// Forget the current reasoning message and clear the token indicator (next turn).
     pub(super) fn reset_thinking(&mut self) {
         self.reasoning_index = None;
+        self.reasoning_started = None;
         self.thinking_tokens = 0;
     }
 
-    /// Reasoning finished: collapse its transcript message to a short preview.
+    /// Reasoning finished: collapse its transcript message to the duration header.
     pub(super) fn collapse_live_thinking(&mut self) {
         if let Some(index) = self.reasoning_index.take() {
-            if let Some(ChatLine::Reasoning { collapsed, .. }) = self.chat.get_mut(index) {
+            let elapsed = self
+                .reasoning_started
+                .take()
+                .map(|started| started.elapsed().as_secs());
+            if let Some(ChatLine::Reasoning {
+                collapsed,
+                duration_secs,
+                ..
+            }) = self.chat.get_mut(index)
+            {
                 *collapsed = true;
+                *duration_secs = elapsed;
                 self.mark_history_dirty();
             }
+        }
+    }
+
+    /// A click on a thinking header flips its collapsed flag.
+    pub(super) fn toggle_reasoning_collapsed(&mut self, index: usize) {
+        if let Some(ChatLine::Reasoning { collapsed, .. }) = self.chat.get_mut(index) {
+            *collapsed = !*collapsed;
+            self.mark_history_dirty();
         }
     }
 
@@ -625,15 +672,19 @@ impl TuiState {
         }
     }
 
+    /// The reply already lives in `chat`; finishing it just releases the
+    /// streaming index and drops a message that stayed empty.
     pub(super) fn commit_live_assistant(&mut self) -> bool {
-        let Some(text) = self.live_assistant.take() else {
+        let Some(index) = self.assistant_index.take() else {
             return false;
         };
-        if !text.trim().is_empty() {
-            self.chat.push(ChatLine::Assistant(text));
-            self.mark_history_dirty();
-            return true;
+        if matches!(
+            self.chat.get(index),
+            Some(ChatLine::Assistant(text)) if text.trim().is_empty()
+        ) {
+            self.chat.remove(index);
         }
+        self.mark_history_dirty();
         true
     }
 

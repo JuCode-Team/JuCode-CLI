@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::Path;
 
 use crate::{
@@ -12,8 +13,12 @@ const BASH_COMMAND: &str = "\x1b[38;2;220;224;232;48;2;44;48;58m";
 const RESET_STYLE: &str = "\x1b[0m";
 
 pub(crate) fn tool_output_preview(name: &str, output: &str, running: bool) -> String {
-    if name == "bash" && running {
+    if is_shell_tool(name) && running {
         return limited_preview(output);
+    }
+    // Any tool can fail with {"error": "…"}; show the message, not raw JSON.
+    if let Some(error) = json_error(output) {
+        return format!("error: {error}");
     }
     if let Some(preview) = projected_tool_output(name, output) {
         return preview;
@@ -82,14 +87,36 @@ pub(crate) fn format_tool_header(name: &str, running: bool, preview: &str, width
     }
 }
 
-fn tool_action_label(name: &str) -> &'static str {
+fn is_shell_tool(name: &str) -> bool {
+    matches!(name, "bash" | "exec_command" | "execute" | "shell_command")
+}
+
+fn json_error(output: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(output)
+        .ok()?
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn tool_action_label(name: &str) -> Cow<'_, str> {
     match name {
-        "bash" => "Ran",
-        "edit" | "str_replace" | "hashline_edit" | "write" => "Edit",
-        "read" => "Read",
-        "ls" => "Listed",
-        "rg" | "ripgrep" | "search" => "Searched",
-        _ => "Tool",
+        "bash" | "exec_command" | "execute" | "shell_command" => "Ran".into(),
+        "edit" | "str_replace" | "hashline_edit" | "write" | "apply_patch" => "Edit".into(),
+        "read" => "Read".into(),
+        "ls" => "Listed".into(),
+        "rg" | "ripgrep" | "search" | "web_search" => "Searched".into(),
+        "write_stdin" => "Sent".into(),
+        "outline" => "Outlined".into(),
+        "checkpoint" => "Checkpointed".into(),
+        "browser_open" => "Opened".into(),
+        "web_fetch" => "Fetched".into(),
+        // Unknown tools (including MCP) keep their real name; `mcp__a__b` shows
+        // as `a/b` instead of a useless "Tool".
+        other => match other.strip_prefix("mcp__") {
+            Some(rest) => Cow::Owned(rest.replacen("__", "/", 1)),
+            None => Cow::Borrowed(other),
+        },
     }
 }
 
@@ -120,7 +147,7 @@ fn projected_tool_output(name: &str, output: &str) -> Option<String> {
             let path = value.get("path").and_then(serde_json::Value::as_str)?;
             Some(format!("ls {}", path))
         }
-        "bash" => Some(project_bash_output(&value)),
+        _ if is_shell_tool(name) || name == "write_stdin" => Some(project_bash_output(&value)),
         _ => None,
     }
 }
@@ -133,15 +160,34 @@ fn project_bash_output(value: &serde_json::Value) -> String {
         .get("command")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("bash");
-    let exit_code = value
-        .get("exit_code")
-        .and_then(serde_json::Value::as_i64)
-        .map(|code| code.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let timed_out = value
-        .get("timed_out")
+    // A long-running command reported mid-flight carries a session instead of
+    // an exit code (write_stdin polls share this shape).
+    let status = if value
+        .get("running")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(false)
+    {
+        let session = value
+            .get("session_id")
+            .and_then(serde_json::Value::as_u64)
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        format!("session {session} running")
+    } else {
+        let exit_code = value
+            .get("exit_code")
+            .and_then(serde_json::Value::as_i64)
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let timed_out = value
+            .get("timed_out")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        format!(
+            "exit {exit_code}{}",
+            if timed_out { ", timed out" } else { "" }
+        )
+    };
     let stdout = value
         .get("stdout")
         .and_then(serde_json::Value::as_str)
@@ -151,8 +197,7 @@ fn project_bash_output(value: &serde_json::Value) -> String {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     let mut lines = vec![format!(
-        "{BASH_COMMAND}{command}{RESET_STYLE}{DIM}  exit {exit_code}{}{RESET_STYLE}",
-        if timed_out { ", timed out" } else { "" }
+        "{BASH_COMMAND}{command}{RESET_STYLE}{DIM}  {status}{RESET_STYLE}"
     )];
     if !stdout.trim().is_empty() {
         lines.push(format!("stdout:\n{}", tail_lines(stdout, 8)));

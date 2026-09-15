@@ -3,7 +3,7 @@ use crate::markdown::{
     render_markdown, MD_BOLD_OFF, MD_BOLD_ON, MD_CODE_OFF, MD_CODE_ON, MD_DIM_OFF, MD_DIM_ON,
     MD_ITALIC_OFF, MD_ITALIC_ON,
 };
-use crate::tool_preview::tool_output_preview;
+use crate::tool_preview::{format_tool_header, tool_output_preview};
 use jucode_agent_core::{ModelOptionView, SessionListItemView, TreeNodeView};
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -283,16 +283,19 @@ fn cursor_row_is_relative_to_whole_frame() {
                 UiLine {
                     kind: UiKind::User,
                     text: "hello".to_string(),
+                    click: None,
                 },
                 UiLine {
                     kind: UiKind::Assistant,
                     text: "world".to_string(),
+                    click: None,
                 },
             ],
             rendered_history_lines: None,
             controls: vec![UiLine {
                 kind: UiKind::Input,
                 text: format!("› prompt{CURSOR_MARKER}"),
+                click: None,
             }],
             reset_screen: false,
         },
@@ -555,7 +558,9 @@ fn connecting_event_then_thinking_event_switch_states() {
 
 fn reasoning_entry(app: &TuiApp<TestRuntime>) -> Option<(String, bool)> {
     app.state.chat.iter().find_map(|line| match line {
-        ChatLine::Reasoning { text, collapsed } => Some((text.clone(), *collapsed)),
+        ChatLine::Reasoning {
+            text, collapsed, ..
+        } => Some((text.clone(), *collapsed)),
         _ => None,
     })
 }
@@ -583,6 +588,47 @@ fn reasoning_streams_into_transcript_then_collapses() {
         Some(("Let me think about it.".to_string(), true))
     );
     assert!(matches!(app.state.activity.kind, ActivityKind::Output));
+}
+
+#[test]
+fn thinking_header_click_toggles_reasoning_block() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.apply_events(vec![
+        AgentEvent::ThinkingStart,
+        AgentEvent::ReasoningDelta("deep thoughts".to_string()),
+        AgentEvent::AssistantDelta("answer".to_string()),
+    ]);
+    let index = app
+        .state
+        .chat
+        .iter()
+        .position(|line| matches!(line, ChatLine::Reasoning { .. }))
+        .expect("reasoning block");
+    // Collapsed by the reply, with its thinking duration recorded.
+    assert!(matches!(
+        app.state.chat.get(index),
+        Some(ChatLine::Reasoning {
+            collapsed: true,
+            duration_secs: Some(_),
+            ..
+        })
+    ));
+    app.state.toggle_reasoning_collapsed(index);
+    assert!(matches!(
+        app.state.chat.get(index),
+        Some(ChatLine::Reasoning {
+            collapsed: false,
+            ..
+        })
+    ));
+    app.state.toggle_reasoning_collapsed(index);
+    assert!(matches!(
+        app.state.chat.get(index),
+        Some(ChatLine::Reasoning {
+            collapsed: true,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -738,20 +784,41 @@ fn thinking_tokens_reset_after_reply_completes() {
 }
 
 #[test]
-fn collapsed_reasoning_message_keeps_only_first_lines() {
+fn collapsed_reasoning_message_keeps_only_duration_header() {
     let document = UiBuilder::new()
         .chat(&[ChatLine::Reasoning {
             text: "l1\nl2\nl3\nl4\nl5".to_string(),
             collapsed: true,
+            duration_secs: Some(2),
         }])
         .finish();
-    let body: Vec<&str> = document
+    let visible: Vec<&UiLine> = document
         .history
         .iter()
-        .filter(|line| line.text.starts_with("  "))
+        .filter(|line| !line.text.trim().is_empty())
+        .collect();
+    assert_eq!(visible.len(), 1);
+    assert!(visible[0].text.contains("✻ thought for 2s"));
+    // The header is the click target that expands the block again.
+    assert_eq!(visible[0].click, Some(0));
+}
+
+#[test]
+fn expanded_reasoning_message_renders_body_lines() {
+    let document = UiBuilder::new()
+        .chat(&[ChatLine::Reasoning {
+            text: "l1\nl2".to_string(),
+            collapsed: false,
+            duration_secs: Some(90),
+        }])
+        .finish();
+    let visible: Vec<&str> = document
+        .history
+        .iter()
+        .filter(|line| !line.text.trim().is_empty())
         .map(|line| line.text.trim())
         .collect();
-    assert_eq!(body, vec!["l1", "l2", "l3", "…"]);
+    assert_eq!(visible, vec!["✻ thought for 1m 30s", "l1", "l2"]);
 }
 
 #[test]
@@ -934,6 +1001,38 @@ fn tool_output_preview_projects_read_and_ls() {
 }
 
 #[test]
+fn tool_error_json_shows_message_not_raw_json() {
+    let preview = tool_output_preview(
+        "write_stdin",
+        r#"{"error":"shell session not found","session_id":0}"#,
+        false,
+    );
+    assert_eq!(preview, "error: shell session not found");
+    // The header names the real tool instead of a generic "Tool".
+    let header = strip_ansi(&format_tool_header("write_stdin", false, &preview, 60));
+    assert!(header.contains("Sent"));
+    // MCP tools show server/tool rather than the mcp__ prefix form.
+    let header = strip_ansi(&format_tool_header("mcp__fs__read_file", false, "", 60));
+    assert!(header.contains("fs/read_file"));
+}
+
+#[test]
+fn running_session_preview_shows_session_not_exit_code() {
+    let output = serde_json::json!({
+        "command": "cargo test",
+        "session_id": 3,
+        "running": true,
+        "stdout": "compiling…",
+        "stderr": ""
+    })
+    .to_string();
+
+    let preview = strip_ansi(&tool_output_preview("write_stdin", &output, false));
+    assert!(preview.contains("cargo test  session 3 running"));
+    assert!(!preview.contains("exit"));
+}
+
+#[test]
 fn tool_output_preview_projects_bash_latest_logs() {
     let output = serde_json::json!({
         "command": "cargo test",
@@ -1063,27 +1162,70 @@ fn projection_keeps_full_history_for_in_app_scroll() {
 }
 
 #[test]
-fn projection_keeps_live_assistant_out_of_transcript() {
-    let document = UiBuilder::new()
-        .chat(&[ChatLine::User("hello".to_string())])
-        .live_assistant(Some("streaming"), 80)
-        .input("", &[], 0)
-        .finish();
+fn assistant_delta_streams_into_transcript() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.apply_events(vec![
+        AgentEvent::Connecting,
+        AgentEvent::AssistantDelta("streaming".to_string()),
+    ]);
+    // The in-flight reply is already a transcript message, not a live layer.
+    assert!(app
+        .state
+        .chat
+        .iter()
+        .any(|line| matches!(line, ChatLine::Assistant(text) if text == "streaming")));
+    let document = app.build_document(80, Instant::now());
+    let history = document
+        .rendered_history_lines
+        .expect("history lines should be projected");
+    assert!(history.iter().any(|line| line.text.contains("streaming")));
+    // Nothing leaks into the control region above the composer.
+    assert!(!document
+        .controls
+        .iter()
+        .any(|line| line.text.contains("streaming")));
+}
 
-    let projection = ProjectedDocument::from_document(&document, 80);
-
-    assert!(projection
-        .transcript_lines
+#[test]
+fn approval_wait_does_not_extend_thinking_duration() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.apply_events(vec![
+        AgentEvent::ThinkingStart,
+        AgentEvent::ReasoningDelta("plan".to_string()),
+        AgentEvent::ApprovalRequest {
+            call_id: "c1".to_string(),
+            name: "bash".to_string(),
+            summary: "run it".to_string(),
+            subagent_id: None,
+            hunks: None,
+        },
+    ]);
+    let index = app
+        .state
+        .chat
         .iter()
-        .any(|line| line.contains("hello")));
-    assert!(!projection
-        .transcript_lines
+        .position(|line| matches!(line, ChatLine::Reasoning { .. }))
+        .expect("reasoning block");
+    // The reasoning block collapses when the approval prompt appears, so the
+    // user's deliberation time is not counted as thinking.
+    assert!(matches!(
+        app.state.chat.get(index),
+        Some(ChatLine::Reasoning {
+            collapsed: true,
+            duration_secs: Some(_),
+            ..
+        })
+    ));
+    let waited = app
+        .state
+        .chat
         .iter()
-        .any(|line| line.contains("streaming")));
-    assert!(projection
-        .active_lines
-        .iter()
-        .any(|line| line.contains("streaming")));
+        .find_map(|line| match line {
+            ChatLine::Reasoning { duration_secs, .. } => *duration_secs,
+            _ => None,
+        })
+        .unwrap();
+    assert!(waited < 5, "approval wait leaked into thinking time");
 }
 
 #[test]

@@ -27,6 +27,38 @@ const INPUT_BORDER: Color = Color::Rgb(105, 108, 120);
 /// Faint scrollbar track and a slightly brighter thumb.
 const SCROLLBAR_TRACK: Color = Color::Rgb(62, 65, 75);
 const SCROLLBAR_THUMB: Color = Color::Rgb(124, 128, 142);
+/// Uniform drag-selection background — a flat swatch, not per-cell inversion.
+const SELECTION_BG: Color = Color::Rgb(68, 71, 90);
+
+/// A drag selection over the whole screen, in terminal cell coordinates
+/// (`(row, column)`). Covers every painted region — transcript, input box,
+/// status bar — like native terminal selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TextSelection {
+    pub(crate) anchor: (u16, u16),
+    pub(crate) cursor: (u16, u16),
+}
+
+impl TextSelection {
+    pub(crate) fn new(at: (u16, u16)) -> Self {
+        Self {
+            anchor: at,
+            cursor: at,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.anchor == self.cursor
+    }
+
+    fn ordered(&self) -> ((u16, u16), (u16, u16)) {
+        if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+}
 
 /// Renders the UI into a ratatui-owned alternate screen.
 ///
@@ -36,50 +68,124 @@ const SCROLLBAR_THUMB: Color = Color::Rgb(124, 128, 142);
 /// its rect; ratatui writes only the cells that changed between draws.
 pub(crate) struct TerminalRenderer {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    /// The last painted frame; drag-selection copy reads text straight from it.
+    frame: Option<Buffer>,
+    /// Screen rows of clickable transcript lines (e.g. thinking headers),
+    /// mapped to the chat item they toggle. Rebuilt every frame.
+    clickables: ClickTargets,
 }
 
 impl TerminalRenderer {
     pub(crate) fn new() -> io::Result<Self> {
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         terminal.clear()?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            frame: None,
+            clickables: Vec::new(),
+        })
     }
 
     /// `scroll` is how many lines the transcript viewport is lifted above the live tail.
     /// It is clamped to the available range in place so the caller's paging stays bounded.
-    pub(crate) fn render(&mut self, document: &UiDocument, scroll: &mut usize) -> io::Result<()> {
+    pub(crate) fn render(
+        &mut self,
+        document: &UiDocument,
+        scroll: &mut usize,
+        selection: Option<TextSelection>,
+    ) -> io::Result<()> {
         if document.reset_screen {
             self.terminal.clear()?;
         }
+        let mut painted = None;
+        let mut clickables = Vec::new();
         self.terminal.draw(|frame| {
             let area = frame.area();
-            if let Some((x, y)) = draw(frame.buffer_mut(), area, document, scroll) {
+            let (cursor, clicks) = draw(frame.buffer_mut(), area, document, scroll, selection);
+            if let Some((x, y)) = cursor {
                 frame.set_cursor_position((x, y));
             }
+            painted = Some(frame.buffer_mut().clone());
+            clickables = clicks;
         })?;
+        self.frame = painted;
+        self.clickables = clickables;
         Ok(())
+    }
+
+    /// The chat item index whose clickable line paints at this screen row.
+    pub(crate) fn clickable_at(&self, row: u16) -> Option<usize> {
+        self.clickables
+            .iter()
+            .find(|(r, _)| *r == row)
+            .map(|(_, index)| *index)
+    }
+
+    /// Extracts the selected text exactly as painted on screen.
+    pub(crate) fn selected_text(&self, selection: TextSelection) -> String {
+        self.frame
+            .as_ref()
+            .map(|buf| selected_text(buf, selection))
+            .unwrap_or_default()
     }
 }
 
-/// Returns the terminal cursor position (within the input box) to show, if any.
+/// Extracts the selected cell range from a painted buffer, skipping wide-char
+/// continuation cells and trimming each row's trailing blanks.
+fn selected_text(buf: &Buffer, selection: TextSelection) -> String {
+    let area = buf.area;
+    let (from, to) = selection.ordered();
+    let right = area.x + area.width;
+    let bottom = area.y + area.height;
+    let mut out = String::new();
+    for row in from.0..=to.0.min(bottom.saturating_sub(1)) {
+        let col_start = if row == from.0 { from.1 } else { area.x };
+        let col_end = if row == to.0 { to.1 + 1 } else { right };
+        if row > from.0 {
+            out.push('\n');
+        }
+        let mut text = String::new();
+        for col in col_start..col_end.min(right) {
+            if let Some(cell) = buf.cell((col, row)) {
+                if !cell.skip {
+                    text.push_str(cell.symbol());
+                }
+            }
+        }
+        out.push_str(text.trim_end());
+    }
+    out
+}
+
+/// Clickable transcript rows painted this frame: screen row → chat item index.
+type ClickTargets = Vec<(u16, usize)>;
+
+/// Paints the frame, returning the input-box cursor position to show (if any)
+/// and the clickable transcript rows mapped to chat item indexes.
 fn draw(
     buf: &mut Buffer,
     area: Rect,
     document: &UiDocument,
     scroll: &mut usize,
-) -> Option<(u16, u16)> {
+    selection: Option<TextSelection>,
+) -> (Option<(u16, u16)>, ClickTargets) {
     if area.width == 0 || area.height == 0 {
-        return None;
+        return (None, Vec::new());
     }
     let width = area.width as usize;
 
-    let transcript = render_projected_lines(
-        document
-            .rendered_history_lines
-            .clone()
-            .unwrap_or_else(|| wrap_lines(&document.history, padded_content_width(width))),
-        true,
-    );
+    // Transcript lines keep their click target (chat item index) alongside the
+    // projected ANSI text so painted rows map back to toggleable items.
+    let transcript: Vec<(String, Option<usize>)> = document
+        .rendered_history_lines
+        .clone()
+        .unwrap_or_else(|| wrap_lines(&document.history, padded_content_width(width)))
+        .into_iter()
+        .map(|line| {
+            let click = line.click;
+            (render_projected_line(line, true), click)
+        })
+        .collect();
     let regions = ControlRegions::split(&document.controls, width);
 
     // Allocate region heights bottom-up so the input box and status bar always fit; the
@@ -110,13 +216,19 @@ fn draw(
     y += cand_h as u16;
     let status_rect = Rect::new(area.x, y, area.width, status_h as u16);
 
-    draw_transcript(buf, transcript_rect, &transcript, scroll);
+    let mut clickables = Vec::new();
+    draw_transcript(buf, transcript_rect, &transcript, scroll, &mut clickables);
     paint_region_tail(buf, live_rect, &regions.live);
     draw_input_box(buf, box_rect, &regions.input);
     paint_region_tail(buf, cand_rect, &regions.candidates);
     paint_region_tail(buf, status_rect, &regions.status);
 
-    input_cursor_position(box_rect, regions.cursor)
+    // Selection highlight applies last, over every region.
+    if let Some(selection) = selection.filter(|sel| !sel.is_empty()) {
+        paint_selection(buf, area, selection);
+    }
+
+    (input_cursor_position(box_rect, regions.cursor), clickables)
 }
 
 /// Translates a caret position inside the input box content to a screen position for the
@@ -136,7 +248,13 @@ fn input_cursor_position(box_rect: Rect, cursor: Option<CursorTarget>) -> Option
     Some((x, y))
 }
 
-fn draw_transcript(buf: &mut Buffer, rect: Rect, lines: &[String], scroll: &mut usize) {
+fn draw_transcript(
+    buf: &mut Buffer,
+    rect: Rect,
+    lines: &[(String, Option<usize>)],
+    scroll: &mut usize,
+    clickables: &mut ClickTargets,
+) {
     if rect.height == 0 || rect.width == 0 {
         *scroll = 0;
         return;
@@ -151,7 +269,18 @@ fn draw_transcript(buf: &mut Buffer, rect: Rect, lines: &[String], scroll: &mut 
         rect.width.saturating_sub(SCROLLBAR_WIDTH),
         rect.height,
     );
-    paint_lines(buf, text_rect, &lines[start..end]);
+    for (row, (text, click)) in lines[start..end].iter().enumerate() {
+        if let Some(index) = click {
+            clickables.push((text_rect.y + row as u16, *index));
+        }
+        paint_ansi_line(
+            buf,
+            text_rect.x,
+            text_rect.y + row as u16,
+            text_rect.width as usize,
+            text,
+        );
+    }
 
     // Only show the scrollbar when the transcript actually overflows; the column stays
     // reserved either way so the layout never shifts. Thin track + heavier thumb match
@@ -168,6 +297,28 @@ fn draw_transcript(buf: &mut Buffer, rect: Rect, lines: &[String], scroll: &mut 
             .track_style(Style::default().fg(SCROLLBAR_TRACK))
             .thumb_style(Style::default().fg(SCROLLBAR_THUMB))
             .render(rect, buf, &mut state);
+    }
+}
+
+/// Paints a uniform selection background over the dragged screen range. Keeping
+/// the foreground untouched stays readable; inverting per-cell colors would
+/// turn styled text into confetti.
+fn paint_selection(buf: &mut Buffer, area: Rect, selection: TextSelection) {
+    let (from, to) = selection.ordered();
+    let right = area.x + area.width;
+    let bottom = area.y + area.height;
+    for row in from.0..=to.0.min(bottom.saturating_sub(1)) {
+        if row < area.y {
+            continue;
+        }
+        let col_start = if row == from.0 { from.1 } else { area.x };
+        let col_end = if row == to.0 { to.1 + 1 } else { right };
+        for col in col_start..col_end.min(right) {
+            if let Some(cell) = buf.cell_mut((col, row)) {
+                cell.bg = SELECTION_BG;
+                cell.modifier.remove(Modifier::REVERSED);
+            }
+        }
     }
 }
 
@@ -296,7 +447,7 @@ pub(crate) fn render_document_for_bench(document: &UiDocument, width: u16, heigh
     let area = Rect::new(0, 0, width.max(1), height.max(1));
     let mut buffer = Buffer::empty(area);
     let mut scroll = 0usize;
-    let _ = draw(&mut buffer, area, document, &mut scroll);
+    let _ = draw(&mut buffer, area, document, &mut scroll, None);
     buffer_checksum(&buffer)
 }
 
@@ -323,7 +474,10 @@ impl ProjectedDocument {
             .rendered_history_lines
             .clone()
             .unwrap_or_else(|| wrap_lines(&document.history, history_width));
-        let transcript_lines = render_projected_lines(transcript_lines, true);
+        let transcript_lines: Vec<String> = transcript_lines
+            .into_iter()
+            .map(|line| render_projected_line(line, true))
+            .collect();
         let mut controls = wrap_lines(&document.controls, control_width);
         let cursor = extract_cursor(&mut controls);
         let mut active_lines = Vec::new();
@@ -375,13 +529,6 @@ fn render_control_line(line: &UiLine, width: usize) -> UiLine {
         }
     }
     line
-}
-
-fn render_projected_lines(lines: Vec<UiLine>, history: bool) -> Vec<String> {
-    lines
-        .into_iter()
-        .map(|line| render_projected_line(line, history))
-        .collect()
 }
 
 fn render_projected_line(line: UiLine, history: bool) -> String {
@@ -644,26 +791,32 @@ mod tests {
             UiLine {
                 kind: UiKind::Status,
                 text: "  spinner".to_string(),
+                click: None,
             },
             UiLine {
                 kind: UiKind::Input,
                 text: String::new(),
+                click: None,
             },
             UiLine {
                 kind: UiKind::Input,
                 text: "› hi".to_string(),
+                click: None,
             },
             UiLine {
                 kind: UiKind::Input,
                 text: String::new(),
+                click: None,
             },
             UiLine {
                 kind: UiKind::Selected,
                 text: "  /help".to_string(),
+                click: None,
             },
             UiLine {
                 kind: UiKind::BottomStatus,
                 text: "model · tokens".to_string(),
+                click: None,
             },
         ];
 
@@ -726,7 +879,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw(frame.buffer_mut(), area, &document, scroll);
+                draw(frame.buffer_mut(), area, &document, scroll, None);
             })
             .expect("draw");
         let buffer = terminal.backend().buffer();
@@ -797,7 +950,8 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                if let Some((x, y)) = draw(frame.buffer_mut(), area, &document, &mut scroll) {
+                let (cursor, _) = draw(frame.buffer_mut(), area, &document, &mut scroll, None);
+                if let Some((x, y)) = cursor {
                     frame.set_cursor_position((x, y));
                 }
             })
@@ -806,5 +960,77 @@ mod tests {
         // "│› hello wor|ld": border(0) ›(1) space(2) hello(3..8) space(8) wor(9..12) -> col 12,
         // on the input content row (box border at y=4, content at y=5).
         assert_eq!((pos.x, pos.y), (12, 5));
+    }
+
+    #[test]
+    fn thinking_header_row_reports_click_target() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let document = UiBuilder::new()
+            .chat(&[ChatLine::Reasoning {
+                text: "deep".to_string(),
+                collapsed: true,
+                duration_secs: Some(3),
+            }])
+            .input("hi", &[], 0)
+            .finish();
+        let mut scroll = 0usize;
+        let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        let mut clickables = Vec::new();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let (_, clicks) = draw(frame.buffer_mut(), area, &document, &mut scroll, None);
+                clickables = clicks;
+            })
+            .unwrap();
+        // The thinking header is the only clickable row, pointing at chat item 0.
+        assert_eq!(clickables, vec![(0, 0)]);
+    }
+
+    #[test]
+    fn selection_covers_whole_screen_and_extracts_text() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let document = sample_document();
+        let mut scroll = 0usize;
+        let mut terminal = Terminal::new(TestBackend::new(20, 8)).unwrap();
+
+        // Drag from row 0 col 2 to row 2 col 8 across the transcript.
+        let mut selection = TextSelection::new((0, 2));
+        selection.cursor = (2, 8);
+        let mut buffer = None;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw(
+                    frame.buffer_mut(),
+                    area,
+                    &document,
+                    &mut scroll,
+                    Some(selection),
+                );
+                buffer = Some(frame.buffer_mut().clone());
+            })
+            .unwrap();
+        let buffer = buffer.expect("frame painted");
+
+        // First row: selected from col 2 to the right edge, blank cells included.
+        for col in 2..20 {
+            assert_eq!(buffer[(col, 0)].bg, SELECTION_BG, "row0 col{col}");
+        }
+        assert_ne!(buffer[(1, 0)].bg, SELECTION_BG);
+        // Last row: cols 0..=8 selected, col 9 untouched.
+        for col in 0..9 {
+            assert_eq!(buffer[(col, 2)].bg, SELECTION_BG, "row2 col{col}");
+        }
+        assert_ne!(buffer[(9, 2)].bg, SELECTION_BG);
+
+        // Copy reads the painted cells; trailing blanks are trimmed.
+        let text = selected_text(&buffer, selection);
+        assert!(text.contains("line 8"), "copied: {text:?}");
+
+        // A backwards drag covers the same range.
+        let mut back = TextSelection::new((2, 8));
+        back.cursor = (0, 2);
+        assert_eq!(selected_text(&buffer, back), text);
     }
 }

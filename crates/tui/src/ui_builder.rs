@@ -9,7 +9,7 @@ use crate::{
     color_code, compact_home_path, format_context_window, pad_to_width, spinner_char,
     truncate_to_width, ActivityState, BottomStatus, ChatLine, CommandCandidate, UiDocument, UiKind,
     UiLine, BOX_BORDER, RESET, STARTUP_ACCENT, STARTUP_DIM, STARTUP_STRONG, STARTUP_TEXT,
-    THINKING_COLLAPSED_LINES, VISIBLE_CURSOR,
+    VISIBLE_CURSOR,
 };
 
 /// Detail lines under a tool header hang off a `⎿` gutter on the first row,
@@ -19,6 +19,14 @@ const TOOL_GUTTER_REST: &str = "     ";
 const INPUT_PROMPT: &str = "›";
 /// Picker rows rendered at once; longer lists window around the selection.
 pub(crate) const PICKER_MAX_ROWS: usize = 15;
+
+fn format_thinking_duration(secs: u64) -> String {
+    if secs >= 60 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
 
 fn rounded_box_border(left: char, right: char, width: usize) -> String {
     format!("{BOX_BORDER}{left}{}{right}{RESET}", "─".repeat(width + 2))
@@ -131,7 +139,7 @@ impl UiBuilder {
     }
 
     pub(crate) fn chat_with_width(mut self, chat: &[ChatLine], width: usize) -> Self {
-        for item in chat {
+        for (item_index, item) in chat.iter().enumerate() {
             self.separate_block();
             match item {
                 ChatLine::Startup {
@@ -155,19 +163,25 @@ impl UiBuilder {
                         self.history_line(UiKind::Assistant, line);
                     }
                 }
-                ChatLine::Reasoning { text, collapsed } => {
-                    self.history_line(UiKind::Status, "✻ thinking".to_string());
-                    let rendered = render_markdown(text, width, color_code(UiKind::Status));
-                    let shown = if *collapsed {
-                        THINKING_COLLAPSED_LINES.min(rendered.len())
-                    } else {
-                        rendered.len()
+                ChatLine::Reasoning {
+                    text,
+                    collapsed,
+                    duration_secs,
+                } => {
+                    // Clicking the header toggles the block; collapsed keeps
+                    // only the header with its recorded duration.
+                    let header = match duration_secs {
+                        Some(secs) => {
+                            format!("✻ thought for {}", format_thinking_duration(*secs))
+                        }
+                        None if *collapsed => "✻ thought".to_string(),
+                        None => "✻ thinking".to_string(),
                     };
-                    for line in &rendered[..shown] {
-                        self.history_line(UiKind::Status, format!("  {line}"));
-                    }
-                    if *collapsed && rendered.len() > shown {
-                        self.history_line(UiKind::Status, "  …".to_string());
+                    self.history_clickable_line(UiKind::Status, header, item_index);
+                    if !*collapsed {
+                        for line in render_markdown(text, width, color_code(UiKind::Status)) {
+                            self.history_line(UiKind::Status, format!("  {line}"));
+                        }
                     }
                 }
                 ChatLine::Tool {
@@ -179,16 +193,6 @@ impl UiBuilder {
                 ChatLine::System(text) => self.push_history(UiKind::System, text),
                 ChatLine::Error(text) => self.push_history(UiKind::Error, text),
             }
-        }
-        self
-    }
-
-    pub(crate) fn live_assistant(mut self, text: Option<&str>, width: usize) -> Self {
-        if let Some(text) = text.filter(|value| !value.is_empty()) {
-            for line in render_markdown(text, width, color_code(UiKind::Assistant)) {
-                self.control_line(UiKind::Assistant, line);
-            }
-            self.control_line(UiKind::System, String::new());
         }
         self
     }
@@ -570,10 +574,28 @@ impl UiBuilder {
     }
 
     pub(crate) fn history_line(&mut self, kind: UiKind, text: String) {
-        self.history.push(UiLine { kind, text });
+        self.history.push(UiLine {
+            kind,
+            text,
+            click: None,
+        });
+    }
+
+    /// A history line carrying a click target: clicking its painted row toggles
+    /// the chat item at `index`.
+    fn history_clickable_line(&mut self, kind: UiKind, text: String, index: usize) {
+        self.history.push(UiLine {
+            kind,
+            text,
+            click: Some(index),
+        });
     }
 
     fn control_line(&mut self, kind: UiKind, text: String) {
-        self.controls.push(UiLine { kind, text });
+        self.controls.push(UiLine {
+            kind,
+            text,
+            click: None,
+        });
     }
 }

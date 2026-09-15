@@ -20,7 +20,10 @@ use local_shell::{local_shell_command, LocalShellRunner};
 use picker::{PickerMode, PickerState, TreePromptAction};
 use ratatui::crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -30,6 +33,7 @@ use std::{
     time::{Duration, Instant},
 };
 use terminal_renderer::TerminalRenderer;
+use terminal_renderer::TextSelection;
 use ui_builder::UiBuilder;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -78,6 +82,8 @@ pub(crate) enum ChatLine {
     Reasoning {
         text: String,
         collapsed: bool,
+        /// How long the model thought, recorded when the block collapsed.
+        duration_secs: Option<u64>,
     },
     Tool {
         call_id: Option<String>,
@@ -112,6 +118,9 @@ pub(crate) enum UiKind {
 pub(crate) struct UiLine {
     pub(crate) kind: UiKind,
     pub(crate) text: String,
+    /// When set, clicking this line toggles the chat item it points at
+    /// (currently: thinking headers expand/collapse their reasoning block).
+    pub(crate) click: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -326,6 +335,19 @@ pub(crate) fn pasted_image_path(text: &str) -> Option<String> {
     Some(path.to_string())
 }
 
+/// Lines moved per mouse-wheel notch; PageUp/PageDown use a full page.
+const MOUSE_SCROLL_LINES: usize = 3;
+
+/// Writes text to the system clipboard via OSC52 — works over SSH and inside
+/// tmux (where supported), unlike a platform clipboard helper.
+fn copy_to_clipboard(text: &str) {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut stdout = io::stdout();
+    let _ = write!(stdout, "\x1b]52;c;{encoded}\x07");
+    let _ = stdout.flush();
+}
+
 /// Number of transcript lines a PageUp/PageDown moves the viewport, one screen minus a
 /// little overlap so context carries across the jump. Falls back if the size query fails.
 fn scroll_page_size() -> usize {
@@ -361,6 +383,9 @@ pub struct TuiApp<R> {
     /// Lines the transcript viewport is lifted above the live tail (PageUp/PageDown).
     /// Zero follows live output; the renderer clamps it to the available range.
     scroll_offset: usize,
+    /// Active drag selection over the whole screen, in cell coordinates.
+    /// Releasing the drag copies the text via OSC52.
+    mouse_selection: Option<TextSelection>,
 }
 
 #[derive(Debug, Clone)]
@@ -435,6 +460,7 @@ impl<R: TuiRuntime> TuiApp<R> {
             state: TuiState::default(),
             local_shell: LocalShellRunner::default(),
             scroll_offset: 0,
+            mouse_selection: None,
         };
         let events = app.runtime.startup_events();
         app.apply_events(events);
@@ -485,7 +511,7 @@ impl<R: TuiRuntime> TuiApp<R> {
                 let (width, _) = terminal::size()?;
                 let width = width.max(1) as usize;
                 let document = self.build_document(width, now);
-                renderer.render(&document, &mut self.scroll_offset)?;
+                renderer.render(&document, &mut self.scroll_offset, self.mouse_selection)?;
                 if document.reset_screen {
                     self.state.reset_screen = false;
                 }
@@ -520,6 +546,51 @@ impl<R: TuiRuntime> TuiApp<R> {
                             self.handle_paste(&text);
                             frames.request_now(event_now);
                         }
+                        Event::Mouse(mouse) => match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                self.scroll_offset =
+                                    self.scroll_offset.saturating_add(MOUSE_SCROLL_LINES);
+                                self.mouse_selection = None;
+                                frames.request_now(event_now);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                self.scroll_offset =
+                                    self.scroll_offset.saturating_sub(MOUSE_SCROLL_LINES);
+                                self.mouse_selection = None;
+                                frames.request_now(event_now);
+                            }
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                self.mouse_selection =
+                                    Some(TextSelection::new((mouse.row, mouse.column)));
+                                frames.request_now(event_now);
+                            }
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                if let Some(selection) = &mut self.mouse_selection {
+                                    selection.cursor = (mouse.row, mouse.column);
+                                    frames.request_now(event_now);
+                                }
+                            }
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                match self.mouse_selection.take() {
+                                    // A press-release without a drag on a
+                                    // thinking header toggles the block.
+                                    Some(sel) if sel.is_empty() => {
+                                        if let Some(index) = renderer.clickable_at(sel.anchor.0) {
+                                            self.state.toggle_reasoning_collapsed(index);
+                                            frames.request_now(event_now);
+                                        }
+                                    }
+                                    Some(sel) => {
+                                        let text = renderer.selected_text(sel);
+                                        if !text.is_empty() {
+                                            copy_to_clipboard(&text);
+                                        }
+                                    }
+                                    None => {}
+                                }
+                            }
+                            _ => {}
+                        },
                         _ => {}
                     }
                     if !event::poll(Duration::ZERO)? {
@@ -1245,7 +1316,7 @@ impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, Hide)?;
+        execute!(stdout, EnterAlternateScreen, Hide, EnableMouseCapture)?;
         stdout.write_all(ENABLE_BRACKETED_PASTE.as_bytes())?;
         stdout.flush()?;
         Ok(Self)
@@ -1257,7 +1328,7 @@ impl Drop for TerminalGuard {
         let mut stdout = io::stdout();
         let _ = stdout.write_all(DISABLE_BRACKETED_PASTE.as_bytes());
         let _ = stdout.flush();
-        let _ = execute!(stdout, Show, LeaveAlternateScreen);
+        let _ = execute!(stdout, Show, DisableMouseCapture, LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -1283,6 +1354,8 @@ pub(crate) fn padded_content_width(width: usize) -> usize {
 }
 
 fn wrap_line(line: &UiLine, width: usize, output: &mut Vec<UiLine>) {
+    // The click target lives on the first wrapped segment only.
+    let mut click = line.click;
     if line.text.is_empty() {
         output.push(line.clone());
         return;
@@ -1321,6 +1394,7 @@ fn wrap_line(line: &UiLine, width: usize, output: &mut Vec<UiLine>) {
             output.push(UiLine {
                 kind: line.kind,
                 text: current,
+                click: click.take(),
             });
             current = String::new();
             if reverse_active {
@@ -1337,6 +1411,7 @@ fn wrap_line(line: &UiLine, width: usize, output: &mut Vec<UiLine>) {
         output.push(UiLine {
             kind: line.kind,
             text: current,
+            click: click.take(),
         });
     }
 }
@@ -1494,9 +1569,6 @@ fn indeterminate_bar(tick: usize, width: usize) -> String {
         .map(|index| if index <= head { '=' } else { ' ' })
         .collect()
 }
-
-/// Lines of reasoning text kept visible after reasoning completes.
-const THINKING_COLLAPSED_LINES: usize = 3;
 
 pub(crate) fn color_code(kind: UiKind) -> &'static str {
     match kind {
