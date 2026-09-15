@@ -12,6 +12,10 @@ pub(crate) struct PickerState {
     tree: Option<TreeRows>,
     pub(crate) efforts: Vec<String>,
     pub(crate) selected_effort: usize,
+    /// Confirmation-style pickers (approval, trust) show a `● title` header
+    /// plus an optional `⎿ context` line above the option rows.
+    pub(crate) title: Option<String>,
+    pub(crate) context: Option<String>,
     pub(crate) prompt: Option<TreePrompt>,
     /// Login-mode rows that need a pasted API key instead of a browser flow.
     key_rows: HashSet<String>,
@@ -78,6 +82,8 @@ impl PickerState {
             tree: Some(TreeRows { all_rows, expanded }),
             efforts: Vec::new(),
             selected_effort: 0,
+            title: None,
+            context: None,
             prompt: None,
             key_rows: HashSet::new(),
         }
@@ -106,6 +112,8 @@ impl PickerState {
             tree: None,
             efforts: Vec::new(),
             selected_effort: 0,
+            title: None,
+            context: None,
             prompt: None,
             key_rows: HashSet::new(),
         }
@@ -133,6 +141,8 @@ impl PickerState {
             tree: None,
             efforts: Vec::new(),
             selected_effort: 0,
+            title: None,
+            context: None,
             prompt: None,
             key_rows: HashSet::new(),
         }
@@ -173,6 +183,8 @@ impl PickerState {
             tree: None,
             efforts,
             selected_effort,
+            title: None,
+            context: None,
             prompt: None,
             key_rows: HashSet::new(),
         }
@@ -206,6 +218,8 @@ impl PickerState {
             tree: None,
             efforts: Vec::new(),
             selected_effort: 0,
+            title: None,
+            context: None,
             prompt: None,
             key_rows,
         }
@@ -221,6 +235,8 @@ impl PickerState {
             tree: None,
             efforts: Vec::new(),
             selected_effort: 0,
+            title: None,
+            context: None,
             prompt: Some(TreePrompt {
                 action: TreePromptAction::LoginPaste,
                 input: String::new(),
@@ -230,7 +246,7 @@ impl PickerState {
     }
 
     pub(crate) fn approval(call_id: String, name: String, summary: String) -> Self {
-        let row = |suffix: &str, label: String, detail: String| PickerRow {
+        let row = |suffix: &str, label: String| PickerRow {
             id: format!("{call_id} {suffix}"),
             parent_id: None,
             depth: 0,
@@ -238,17 +254,13 @@ impl PickerState {
             label,
             active: false,
             has_children: false,
-            detail,
+            detail: String::new(),
             reasoning_efforts: Vec::new(),
         };
         let rows = vec![
-            row("allow once", "Allow once".to_string(), summary),
-            row(
-                "allow always",
-                format!("Allow {name} for this session"),
-                String::new(),
-            ),
-            row("deny", "Deny".to_string(), String::new()),
+            row("allow once", "Allow once".to_string()),
+            row("allow always", format!("Allow {name} for this session")),
+            row("deny", "Deny".to_string()),
         ];
         Self {
             rows,
@@ -257,6 +269,8 @@ impl PickerState {
             tree: None,
             efforts: Vec::new(),
             selected_effort: 0,
+            title: Some(format!("Approve {name}")),
+            context: (!summary.is_empty()).then_some(summary),
             prompt: None,
             key_rows: HashSet::new(),
         }
@@ -274,7 +288,7 @@ impl PickerState {
             detail,
             reasoning_efforts: Vec::new(),
         };
-        let mut rows = vec![row("yes", "Trust this folder", cwd)];
+        let mut rows = vec![row("yes", "Trust this folder", String::new())];
         if let Some(root) = repo_root {
             rows.push(row("repo", "Trust the whole repository", root));
         }
@@ -290,6 +304,8 @@ impl PickerState {
             tree: None,
             efforts: Vec::new(),
             selected_effort: 0,
+            title: Some("Trust project?".to_string()),
+            context: Some(cwd),
             prompt: None,
             key_rows: HashSet::new(),
         }

@@ -222,23 +222,39 @@ impl UiBuilder {
         let Some(picker) = picker else {
             return self;
         };
+        if let Some(title) = &picker.title {
+            self.control_line(
+                UiKind::Brand,
+                Line::from(vec![
+                    Span::styled("● ", STARTUP_ACCENT),
+                    Span::styled(title.clone(), STARTUP_STRONG),
+                ]),
+            );
+            if let Some(context) = &picker.context {
+                self.control_line(UiKind::Tool, format!("  ⎿  {context}"));
+            }
+        }
         let hint = match picker.mode {
             PickerMode::Checkout => {
                 "tree: arrows move/expand, enter checkout, f fork, delete branch, esc close"
             }
             PickerMode::Resume => "resume: arrows move, enter resume, esc close",
             PickerMode::Rewind => "rewind: arrows move, enter rewind to turn, esc close",
-            PickerMode::Approval => "approve tool? arrows move, enter select, esc deny",
+            PickerMode::Approval => "arrows move, enter select, esc deny",
             PickerMode::Model => "model: arrows move, shift+tab effort, enter select, esc close",
             PickerMode::Trust => {
-                "trust project? arrows move, enter select (loads project skills & hooks if trusted)"
+                "arrows move, enter select (loads project skills & hooks if trusted)"
             }
             PickerMode::Login => "login: arrows move, pgup/pgdn page, enter select, esc close",
             PickerMode::LoginPaste => {
                 "finish sign-in: paste the redirect URL or code, enter submit, esc close"
             }
         };
-        self.control_line(UiKind::Status, hint.to_string());
+        // Titled pickers (approval, trust) read header → options → footer
+        // hint; untitled ones keep the hint up top as before.
+        if picker.title.is_none() {
+            self.control_line(UiKind::Status, hint.to_string());
+        }
         if let Some(prompt) = picker.prompt.as_ref() {
             let label = match prompt.action {
                 TreePromptAction::Fork => "fork branch",
@@ -291,6 +307,8 @@ impl UiBuilder {
             let index = index + start;
             let selected = index == picker.selected;
             let cursor = if selected { "\u{203a} " } else { "  " };
+            // Tree rows reserve a column for the [-]/[+] expander; flat
+            // pickers skip it so options sit tight under the cursor marker.
             let directory = if row.has_children {
                 if picker.is_expanded_tree_row(&row.id) {
                     "[-] "
@@ -298,7 +316,7 @@ impl UiBuilder {
                     "[+] "
                 }
             } else {
-                "    "
+                ""
             };
             let kind = if selected {
                 UiKind::Selected
@@ -344,6 +362,9 @@ impl UiBuilder {
                 UiKind::Status,
                 format!("({}/{})", picker.selected + 1, total),
             );
+        }
+        if picker.title.is_some() {
+            self.control_line(UiKind::Status, hint.to_string());
         }
         self.control_line(UiKind::System, String::new());
         self

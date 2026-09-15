@@ -1600,9 +1600,10 @@ pub(crate) fn kind_style(kind: UiKind) -> Style {
     match kind {
         // Brand/active rows share the startup accent hue.
         UiKind::Brand => STARTUP_ACCENT,
-        UiKind::User | UiKind::Assistant | UiKind::ToolHeader | UiKind::Selected => {
-            Style::new().fg(Color::White)
-        }
+        UiKind::User | UiKind::Assistant | UiKind::ToolHeader => Style::new().fg(Color::White),
+        UiKind::Selected => Style::new()
+            .fg(STARTUP_ACCENT.fg.unwrap_or(Color::White))
+            .add_modifier(Modifier::BOLD),
         UiKind::Tool | UiKind::System | UiKind::Status => Style::new().fg(Color::DarkGray),
         UiKind::BottomStatus => Style::new().fg(Color::White),
         UiKind::Error => Style::new().fg(Color::Red),

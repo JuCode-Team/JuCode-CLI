@@ -1488,6 +1488,42 @@ fn model_picker_renders_effort_hint() {
 }
 
 #[test]
+fn approval_picker_shows_header_context_and_options() {
+    let picker = PickerState::approval(
+        "call-1".to_string(),
+        "bash".to_string(),
+        "cargo test --workspace".to_string(),
+    );
+    let document = UiBuilder::new().picker(Some(&picker)).finish();
+    let controls = document
+        .controls
+        .iter()
+        .map(UiLine::plain)
+        .collect::<Vec<_>>();
+
+    let title_row = controls
+        .iter()
+        .position(|text| text.contains("Approve bash"))
+        .expect("title row");
+    assert!(controls[title_row + 1].contains("⎿  cargo test --workspace"));
+    assert!(controls.iter().any(|text| text.contains("› Allow once")));
+    assert!(controls
+        .iter()
+        .any(|text| text.contains("Allow bash for this session")));
+    assert!(controls.iter().any(|text| text.contains("Deny")));
+    // The key hint sits under the options as a footer.
+    let deny_row = controls
+        .iter()
+        .position(|text| text.contains("Deny"))
+        .expect("deny row");
+    assert!(controls[deny_row + 1].contains("esc deny"));
+    // The command lives in the header context line, not on the option rows.
+    assert!(!controls
+        .iter()
+        .any(|text| text.contains("Allow once cargo test")));
+}
+
+#[test]
 fn login_paste_picker_submits_paste_command() {
     let mut picker = PickerState::login_paste();
     assert!(picker.prompt.is_some());
