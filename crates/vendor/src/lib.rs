@@ -3,8 +3,9 @@
 //! This crate owns the hand-written LLM wire protocols so `agent-core` does
 //! not accumulate ad-hoc HTTP clients:
 //!
-//! - [`responses`]: OpenAI Responses API (SSE) — used by the jucode gateway
-//!   and official OpenAI.
+//! - [`responses`]: OpenAI Responses API (SSE) — used by the jucode gateway,
+//!   official OpenAI, the ChatGPT Codex backend, and Azure OpenAI. All four
+//!   share the event stream and differ only in path, query, and auth headers.
 //! - [`anthropic`]: Anthropic Messages API (SSE) — used by official Anthropic
 //!   and Anthropic-compatible gateways (e.g. DeepSeek).
 //! - [`chat`]: OpenAI Chat Completions API (SSE) — used by OpenAI-compatible
@@ -30,6 +31,13 @@ pub use providers::{templates, ModelTemplate, ProviderTemplate};
 pub enum Protocol {
     /// OpenAI Responses API (`POST {base}/responses`).
     OpenAiResponses,
+    /// Responses API on the ChatGPT Codex backend
+    /// (`POST {base}/codex/responses`), authenticated with a ChatGPT OAuth
+    /// access token rather than an API key.
+    OpenAiCodexResponses,
+    /// Azure OpenAI Responses API (`POST {base}/responses?api-version=…`),
+    /// authenticated with an `api-key` header.
+    AzureOpenAiResponses,
     /// Anthropic Messages API (`POST .../v1/messages`).
     AnthropicMessages,
     /// OpenAI Chat Completions API (`POST {base}/chat/completions`).
@@ -37,10 +45,12 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    /// Config wire name: "responses" | "anthropic" | "chat".
+    /// Config wire name: "responses" | "codex" | "azure" | "anthropic" | "chat".
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::OpenAiResponses => "responses",
+            Self::OpenAiCodexResponses => "codex",
+            Self::AzureOpenAiResponses => "azure",
             Self::AnthropicMessages => "anthropic",
             Self::OpenAiChatCompletions => "chat",
         }
@@ -52,6 +62,8 @@ impl Protocol {
         match protocol {
             "anthropic" => Self::AnthropicMessages,
             "responses" => Self::OpenAiResponses,
+            "codex" => Self::OpenAiCodexResponses,
+            "azure" => Self::AzureOpenAiResponses,
             "chat" => Self::OpenAiChatCompletions,
             _ => Self::from_model(model),
         }
@@ -187,6 +199,8 @@ mod tests {
     fn protocol_wire_names_round_trip_through_resolve() {
         for protocol in [
             Protocol::OpenAiResponses,
+            Protocol::OpenAiCodexResponses,
+            Protocol::AzureOpenAiResponses,
             Protocol::AnthropicMessages,
             Protocol::OpenAiChatCompletions,
         ] {

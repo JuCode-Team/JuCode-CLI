@@ -83,6 +83,8 @@ try {
 		"openai-completions",
 		"openrouter",
 		"openai-responses",
+		"openai-codex-responses",
+		"azure-openai-responses",
 	]);
 	const routesByProvider = new Map(
 		(rules.behavior.apiRoutes ?? []).map((r) => [r.provider, r]),

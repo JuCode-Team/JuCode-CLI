@@ -184,8 +184,9 @@ fn is_network_tool(name: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub provider: String,
-    /// Wire protocol override: "responses" | "anthropic" | "chat". Empty falls
-    /// back to the per-model heuristic (claude-* → anthropic, else responses).
+    /// Wire protocol override: "responses" | "codex" | "azure" | "anthropic" |
+    /// "chat". Empty falls back to the per-model heuristic (claude-* →
+    /// anthropic, else responses).
     pub protocol: String,
     pub model: String,
     pub reasoning_effort: String,
@@ -1425,11 +1426,18 @@ mod tests {
             "catalog providers should far exceed the old 5 templates"
         );
         for (id, base_url, protocol) in &providers {
-            assert!(!base_url.is_empty(), "{id}");
             assert!(
-                matches!(protocol.as_str(), "responses" | "anthropic" | "chat"),
+                matches!(
+                    protocol.as_str(),
+                    "responses" | "codex" | "azure" | "anthropic" | "chat"
+                ),
                 "{id}: {protocol}"
             );
+            // Azure deployments live at a per-resource endpoint the catalog
+            // cannot know; every other provider ships a usable default.
+            if id != "azure" {
+                assert!(!base_url.is_empty(), "{id}");
+            }
             assert!(!models_for_provider(id).is_empty(), "{id}");
         }
     }

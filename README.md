@@ -67,6 +67,11 @@ export OPENAI_API_KEY="..."
 jucode
 ```
 
+The vendored provider catalog adds the subscription and cloud endpoints on top of those templates:
+
+- `openai-codex` — ChatGPT Plus/Pro subscription, signed in with `/login openai-codex` (browser flow on `localhost:1455`). Requests go to the Codex backend (`https://chatgpt.com/backend-api/codex/responses`) with the ChatGPT workspace taken from the token.
+- `azure` — Azure OpenAI deployments. Set `provider` and your own `base_url` (e.g. `https://<resource>.openai.azure.com/openai/v1`) in `config.json`, put the key under `providers.azure` in `auth.json`, and requests go to `/responses?api-version=…` with the `api-key` header. `AZURE_OPENAI_API_VERSION` overrides the default `v1`.
+
 You can switch model and reasoning effort inside the TUI:
 
 ```text

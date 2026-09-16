@@ -6,9 +6,9 @@
 //! api-routes table, and model catalog, so JuCode reuses the ecosystem data
 //! instead of maintaining provider tables by hand.
 //!
-//! Only the three wire dialects JuCode speaks are routable; providers whose
-//! models all resolve to unsupported APIs stay visible for BYOK config but
-//! cannot be logged in or picked.
+//! Only the wire dialects JuCode speaks are routable; providers whose models
+//! all resolve to unsupported APIs stay visible for BYOK config but cannot be
+//! logged in or picked.
 
 use crate::Protocol;
 use serde_json::Value;
@@ -279,14 +279,16 @@ pub fn catalog() -> &'static OmpCatalog {
 }
 
 /// Maps an upstream wire-dialect id to a protocol JuCode implements.
-/// `openai-codex-responses`/`azure-openai-responses`/`google-*`/`bedrock-*`
-/// and agent-specific dialects (`cursor-agent`, `devin-agent`, …) need
-/// request shaping we don't have — deliberately unmapped.
+/// `google-*`/`bedrock-*` and agent-specific dialects (`cursor-agent`,
+/// `devin-agent`, …) need request shaping we don't have — deliberately
+/// unmapped.
 pub fn protocol_for_api(api: &str) -> Option<Protocol> {
     match api {
         "anthropic-messages" => Some(Protocol::AnthropicMessages),
         "openai-completions" | "openrouter" => Some(Protocol::OpenAiChatCompletions),
         "openai-responses" => Some(Protocol::OpenAiResponses),
+        "openai-codex-responses" => Some(Protocol::OpenAiCodexResponses),
+        "azure-openai-responses" => Some(Protocol::AzureOpenAiResponses),
         _ => None,
     }
 }
@@ -811,7 +813,14 @@ mod tests {
             protocol_for_api("openai-responses"),
             Some(Protocol::OpenAiResponses)
         );
-        assert_eq!(protocol_for_api("openai-codex-responses"), None);
+        assert_eq!(
+            protocol_for_api("openai-codex-responses"),
+            Some(Protocol::OpenAiCodexResponses)
+        );
+        assert_eq!(
+            protocol_for_api("azure-openai-responses"),
+            Some(Protocol::AzureOpenAiResponses)
+        );
         assert_eq!(protocol_for_api("google-generative-ai"), None);
         assert_eq!(protocol_for_api("bedrock-converse-stream"), None);
     }

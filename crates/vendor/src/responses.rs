@@ -6,6 +6,26 @@ use crate::{normalized_arguments, read_sse_data, Usage, WireEvent};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+/// Responses endpoint for a base URL that mounts the API at its root
+/// (the jucode gateway, official OpenAI, OpenAI-compatible proxies).
+pub fn responses_url(base_url: &str) -> String {
+    format!("{}/responses", base_url.trim_end_matches('/'))
+}
+
+/// The ChatGPT Codex backend mounts Responses under `/codex/responses`.
+pub fn codex_responses_url(base_url: &str) -> String {
+    format!("{}/codex/responses", base_url.trim_end_matches('/'))
+}
+
+/// Azure selects its API revision with a query parameter; the path itself is
+/// the same `/responses` (no `/deployments/{name}` rewriting).
+pub fn azure_responses_url(base_url: &str, api_version: &str) -> String {
+    format!(
+        "{}/responses?api-version={api_version}",
+        base_url.trim_end_matches('/')
+    )
+}
+
 /// Parses a Responses SSE stream, emitting deltas/items/usage as [`WireEvent`]s
 /// and returning the completed output items. Errors if the stream ends before
 /// `response.completed` (or `response.incomplete`).
@@ -440,5 +460,21 @@ mod tests {
         assert_eq!(sanitized.len(), 1);
         assert!(sanitized[0].get("is_error").is_none());
         assert_eq!(sanitized[0]["output"], "boom");
+    }
+
+    #[test]
+    fn urls_place_each_responses_dialect_at_its_own_endpoint() {
+        assert_eq!(
+            responses_url("https://api.openai.com/v1/"),
+            "https://api.openai.com/v1/responses"
+        );
+        assert_eq!(
+            codex_responses_url("https://chatgpt.com/backend-api"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            azure_responses_url("https://res.openai.azure.com/openai/v1", "v1"),
+            "https://res.openai.azure.com/openai/v1/responses?api-version=v1"
+        );
     }
 }

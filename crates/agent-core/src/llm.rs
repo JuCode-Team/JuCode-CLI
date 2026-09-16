@@ -31,6 +31,13 @@ const DEFAULT_SUBAGENT_MAX_OUTPUT_TOKENS: u64 = 4096;
 const RETRY_BACKOFF_BASE_MS: u64 = 250;
 const RETRY_BACKOFF_MAX_MS: u64 = 4_000;
 const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
+/// Codex backend client identity. The backend version-gates model
+/// availability on `version` and expects the Responses beta opt-in.
+const CODEX_CLIENT_VERSION: &str = "0.153.0";
+const CODEX_ORIGINATOR: &str = "jucode";
+const CODEX_BETA_RESPONSES: &str = "responses=experimental";
+/// Azure API revision used when `AZURE_OPENAI_API_VERSION` is unset.
+const AZURE_DEFAULT_API_VERSION: &str = "v1";
 const MAX_EMPTY_RESPONSE_CONTINUATIONS: usize = 2;
 /// Read cap for the `auto` mode safety-classifier call so a slow or stuck
 /// classification falls back to the interactive prompt quickly.
@@ -335,6 +342,15 @@ impl OpenAiClient {
         let provider_kind = jucode_vendor::omp::catalog()
             .protocol_for(&config.provider, &config.model)
             .unwrap_or_else(|| Protocol::resolve(&config.protocol, &config.model));
+        // Azure is the one provider whose endpoint the catalog cannot supply —
+        // deployments live at a per-resource host — so fail with the reason
+        // instead of sending a request to a relative URL.
+        if config.base_url.trim().is_empty() {
+            return Err(format!(
+                "provider {} has no base_url; set one in config.json (Azure OpenAI needs your own endpoint, e.g. https://<resource>.openai.azure.com/openai/v1)",
+                config.provider
+            ));
+        }
         let safety = config.safety_model.map(|model| SafetySpec {
             protocol: jucode_vendor::omp::catalog()
                 .protocol_for(&config.provider, &model)
@@ -392,7 +408,9 @@ impl OpenAiClient {
             self.append_queued_subagent_messages(&mut input, &mut emit)?;
             emit(StreamEvent::CallStart)?;
             let output_items = match self.provider_kind {
-                Protocol::OpenAiResponses => {
+                Protocol::OpenAiResponses
+                | Protocol::OpenAiCodexResponses
+                | Protocol::AzureOpenAiResponses => {
                     self.create_response_streaming(input.clone(), &mut emit)?
                 }
                 Protocol::AnthropicMessages => {
@@ -635,11 +653,13 @@ impl OpenAiClient {
             emit_output_tokens(output_tokens)
         };
         let summary = match self.provider_kind {
-            Protocol::OpenAiResponses => {
+            Protocol::OpenAiResponses
+            | Protocol::OpenAiCodexResponses
+            | Protocol::AzureOpenAiResponses => {
                 let body = self.openai_summarize_body(system, user);
-                let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
+                let url = responses_endpoint(self.provider_kind, &self.base_url);
                 let response = self.send_with_retry(&url, &body, &mut |_| Ok(()))?;
-                self.collect_text(response, Protocol::OpenAiResponses, &mut record_delta)?
+                self.collect_text(response, self.provider_kind, &mut record_delta)?
             }
             Protocol::AnthropicMessages => {
                 let body = json!({
@@ -711,7 +731,9 @@ impl OpenAiClient {
             let body = response.into_string().map_err(|error| error.to_string())?;
             let value = serde_json::from_str::<Value>(&body).map_err(|error| error.to_string())?;
             let items = match protocol {
-                Protocol::OpenAiResponses => value
+                Protocol::OpenAiResponses
+                | Protocol::OpenAiCodexResponses
+                | Protocol::AzureOpenAiResponses => value
                     .get("output")
                     .and_then(Value::as_array)
                     .cloned()
@@ -729,7 +751,9 @@ impl OpenAiClient {
             return Ok(text);
         }
         match protocol {
-            Protocol::OpenAiResponses => {
+            Protocol::OpenAiResponses
+            | Protocol::OpenAiCodexResponses
+            | Protocol::AzureOpenAiResponses => {
                 responses::read_sse_stream(response.into_reader(), accumulate)?
             }
             Protocol::AnthropicMessages => {
@@ -775,7 +799,7 @@ impl OpenAiClient {
         mut emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<Vec<Value>, String> {
         let body = self.openai_responses_body(input);
-        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
+        let url = responses_endpoint(self.provider_kind, &self.base_url);
         let max_attempts = self.max_attempts();
         for attempt in 1..=max_attempts {
             // Single send per attempt: this loop owns all retries, so send and
@@ -1100,15 +1124,27 @@ impl OpenAiClient {
             .set("session-id", &self.prompt_cache_key)
             .set("thread-id", &self.prompt_cache_key)
             .set("x-client-request-id", &self.prompt_cache_key);
-        // The official Anthropic API authenticates with x-api-key; gateways keep
-        // the Bearer scheme. anthropic-version is required on Anthropic requests.
-        if anthropic::is_official_url(url) {
+        // Azure authenticates with an `api-key` header, the official Anthropic
+        // API with x-api-key; everything else, the Codex backend included,
+        // takes the Bearer scheme.
+        if protocol == Protocol::AzureOpenAiResponses {
+            request = request.set("api-key", &self.api_key);
+        } else if anthropic::is_official_url(url) {
             request = request.set("x-api-key", &self.api_key);
         } else {
             request = request.set("Authorization", &format!("Bearer {}", self.api_key));
         }
         if protocol == Protocol::AnthropicMessages {
             request = request.set("anthropic-version", anthropic::ANTHROPIC_VERSION);
+        }
+        if protocol == Protocol::OpenAiCodexResponses {
+            request = request
+                .set("OpenAI-Beta", CODEX_BETA_RESPONSES)
+                .set("originator", CODEX_ORIGINATOR)
+                .set("version", CODEX_CLIENT_VERSION);
+            if let Some(account_id) = codex_account_id(&self.api_key) {
+                request = request.set("chatgpt-account-id", &account_id);
+            }
         }
         if let Some(turn_state) = self.turn_state.get() {
             request = request.set(X_CODEX_TURN_STATE_HEADER, turn_state);
@@ -1675,8 +1711,10 @@ impl OpenAiClient {
             serde_json::to_string_pretty(&evidence).unwrap_or_default()
         );
         let (url, body) = match safety.protocol {
-            Protocol::OpenAiResponses => (
-                format!("{}/responses", self.base_url.trim_end_matches('/')),
+            Protocol::OpenAiResponses
+            | Protocol::OpenAiCodexResponses
+            | Protocol::AzureOpenAiResponses => (
+                responses_endpoint(safety.protocol, &self.base_url),
                 json!({
                     "model": safety.model,
                     "instructions": SAFETY_CLASSIFIER_PROMPT,
@@ -2375,6 +2413,41 @@ fn cache_debug_enabled() -> bool {
     env::var("JUCODE_CACHE_DEBUG")
         .ok()
         .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+/// Responses-family endpoint for a protocol. The dialects share one event
+/// stream but differ in path and query.
+fn responses_endpoint(protocol: Protocol, base_url: &str) -> String {
+    match protocol {
+        Protocol::OpenAiCodexResponses => responses::codex_responses_url(base_url),
+        Protocol::AzureOpenAiResponses => {
+            responses::azure_responses_url(base_url, &azure_api_version())
+        }
+        Protocol::OpenAiResponses
+        | Protocol::AnthropicMessages
+        | Protocol::OpenAiChatCompletions => responses::responses_url(base_url),
+    }
+}
+
+/// Azure API revision, overridable the same way the Azure SDKs do it.
+fn azure_api_version() -> String {
+    env::var("AZURE_OPENAI_API_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| AZURE_DEFAULT_API_VERSION.to_string())
+}
+
+/// `chatgpt-account-id` for the Codex backend: the ChatGPT workspace the token
+/// draws its limits from rides in the access token's `https://api.openai.com/auth`
+/// claim.
+fn codex_account_id(access_token: &str) -> Option<String> {
+    crate::omp_auth::decode_jwt_payload(access_token)?
+        .get("https://api.openai.com/auth")?
+        .get("chatgpt_account_id")?
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 fn capture_turn_state(response: &ureq::Response, turn_state: &OnceLock<String>) -> bool {
@@ -3294,5 +3367,39 @@ mod tests {
         assert_eq!(response_content_text(&all[1], "input_text"), "second");
         assert_eq!(none.len(), 1);
         assert!(response_content_text(&none[0], "input_text").contains("inspect"));
+    }
+
+    #[test]
+    fn responses_endpoint_follows_the_protocol_dialect() {
+        let base = "https://api.example.com/v1";
+        assert_eq!(
+            responses_endpoint(Protocol::OpenAiResponses, base),
+            "https://api.example.com/v1/responses"
+        );
+        assert_eq!(
+            responses_endpoint(
+                Protocol::OpenAiCodexResponses,
+                "https://chatgpt.com/backend-api"
+            ),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        let azure = responses_endpoint(
+            Protocol::AzureOpenAiResponses,
+            "https://res.openai.azure.com/openai/v1",
+        );
+        assert!(
+            azure.starts_with("https://res.openai.azure.com/openai/v1/responses?api-version="),
+            "{azure}"
+        );
+    }
+
+    #[test]
+    fn codex_account_id_reads_the_chatgpt_workspace_claim() {
+        // {"https://api.openai.com/auth":{"chatgpt_account_id":"acct_1"}}
+        let claims =
+            "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xIn19";
+        let token = format!("header.{claims}.signature");
+        assert_eq!(codex_account_id(&token), Some("acct_1".to_string()));
+        assert_eq!(codex_account_id("not-a-jwt"), None);
     }
 }

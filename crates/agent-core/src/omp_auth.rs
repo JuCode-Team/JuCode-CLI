@@ -852,7 +852,7 @@ fn json_path_u64(body: &Value, path: Option<&str>) -> Option<u64> {
 }
 
 /// Decodes a JWT payload without verifying; None when malformed.
-fn decode_jwt_payload(token: &str) -> Option<Value> {
+pub(crate) fn decode_jwt_payload(token: &str) -> Option<Value> {
     use base64::Engine;
     let payload = token.split('.').nth(1)?;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
