@@ -2600,11 +2600,8 @@ impl AgentCore {
             let store_id = provider.store_as.as_deref().unwrap_or(&provider.id);
             let signed_in = self.auth.oauth_credential(store_id).is_some()
                 || self.auth.key_for(&provider.id).is_some();
-            let (kind, wants_key) = match login {
-                jucode_vendor::omp::LoginRule::OauthCode(_) => ("oauth", false),
-                jucode_vendor::omp::LoginRule::DeviceCode(_) => ("device code", false),
-                jucode_vendor::omp::LoginRule::ApiKey(_) => ("api key", true),
-                jucode_vendor::omp::LoginRule::Custom { .. } => ("custom · unsupported", false),
+            let Some((kind, wants_key)) = login_kind(login) else {
+                continue;
             };
             let detail = if signed_in {
                 format!("{kind} · signed in")
@@ -2633,11 +2630,8 @@ impl AgentCore {
             let Some(login) = &provider.login else {
                 continue;
             };
-            let kind = match login {
-                jucode_vendor::omp::LoginRule::OauthCode(_) => "oauth",
-                jucode_vendor::omp::LoginRule::DeviceCode(_) => "device code",
-                jucode_vendor::omp::LoginRule::ApiKey(_) => "api key",
-                jucode_vendor::omp::LoginRule::Custom { .. } => "unsupported",
+            let Some((kind, _)) = login_kind(login) else {
+                continue;
             };
             if !catalog.provider_usable(&provider.id) {
                 continue;
@@ -3693,6 +3687,20 @@ fn resolve_approval_decision(
     Ok(())
 }
 
+/// Label and key-prompt flag for a catalog login flow, or None when JuCode
+/// cannot run it. Whole-flow hooks (github-copilot, cursor, …) have no Rust
+/// port, so callers skip those providers instead of listing a login that would
+/// only mint a credential no request can use.
+fn login_kind(login: &jucode_vendor::omp::LoginRule) -> Option<(&'static str, bool)> {
+    use jucode_vendor::omp::LoginRule;
+    match login {
+        LoginRule::OauthCode(_) => Some(("oauth", false)),
+        LoginRule::DeviceCode(_) => Some(("device code", false)),
+        LoginRule::ApiKey(_) => Some(("api key", true)),
+        LoginRule::Custom { .. } => None,
+    }
+}
+
 #[cfg(test)]
 mod approval_decision_tests {
     use super::*;
@@ -3919,5 +3927,39 @@ mod model_config_tests {
         assert_eq!(config.reasoning_efforts, vec!["low", "high"]);
         assert_eq!(config.max_output_tokens, 64_000);
         assert_eq!(config.context_window, 1_000_000);
+    }
+}
+
+#[cfg(test)]
+mod login_kind_tests {
+    use super::*;
+    use jucode_vendor::omp::{catalog, LoginRule};
+
+    fn kind_of(id: &str) -> Option<(&'static str, bool)> {
+        let login = catalog().auth_provider(id).and_then(|p| p.login.as_ref());
+        login.and_then(login_kind)
+    }
+
+    #[test]
+    fn login_kind_labels_the_ported_flows() {
+        assert_eq!(kind_of("anthropic"), Some(("oauth", false)));
+        assert_eq!(kind_of("openai-codex"), Some(("oauth", false)));
+        assert_eq!(kind_of("kimi-code"), Some(("device code", false)));
+        assert_eq!(kind_of("deepseek"), Some(("api key", true)));
+    }
+
+    #[test]
+    fn login_kind_drops_unported_flows_and_providers_without_one() {
+        // Custom hooks have no Rust port; azure (BYOK endpoint + api-key) and
+        // the codex device flow declare no runnable login either.
+        assert_eq!(kind_of("github-copilot"), None);
+        assert_eq!(kind_of("openai-codex-device"), None);
+        assert_eq!(kind_of("azure"), None);
+        assert_eq!(
+            login_kind(&LoginRule::Custom {
+                hook: "whatever".to_string()
+            }),
+            None
+        );
     }
 }
