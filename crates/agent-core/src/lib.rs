@@ -9,7 +9,6 @@ mod llm;
 pub mod logging;
 mod mcp;
 mod oauth;
-mod omp_auth;
 mod prompt;
 mod providers;
 mod secrets;

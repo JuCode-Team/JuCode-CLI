@@ -14,7 +14,6 @@ use crate::{
     },
     mcp::McpManager,
     oauth::{self, OAuthLoginResult, OAuthModel},
-    omp_auth::{self, OmpLoginOutcome},
     prompt::{
         build_system_prompt, discover_project_instructions, discover_skills, skill_commands,
         skill_message, skill_pin_message, PromptContext,
@@ -28,6 +27,7 @@ use crate::{
     trust::{self, TrustStore},
     update::{self, UpdateNotice},
 };
+use llm_provider_kit::auth::{self as provider_auth, LoginContext, LoginOutcome};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -45,6 +45,9 @@ use std::{
 
 /// Recent context (in tokenizer-counted tokens) kept verbatim when compacting; older
 /// turns are folded into the summary.
+/// Client name this binary presents when a provider mints a labeled
+/// credential (Z.ai's API key name).
+const CLIENT_NAME: &str = "jucode";
 const COMPACTION_KEEP_RECENT_TOKENS: usize = 20_000;
 const RESUME_SUMMARY_IDLE_SECONDS: u64 = 5 * 60;
 const RESUME_SUMMARY_MODEL: &str = "gpt-5.4-mini";
@@ -170,7 +173,7 @@ enum OmpLoginEvent {
     Notice(String),
     Done {
         provider: String,
-        result: Result<OmpLoginOutcome, String>,
+        result: Result<LoginOutcome, String>,
     },
 }
 
@@ -993,7 +996,7 @@ impl AgentCore {
             .and_then(|p| p.store_as.as_deref())
             .unwrap_or(&self.config.provider);
         if let Some(credential) = self.auth.oauth_credential(store_id) {
-            return Some(omp_auth::bearer_token(credential));
+            return Some(provider_auth::bearer_token(credential));
         }
         self.auth.key_for(&self.config.provider).map(str::to_string)
     }
@@ -1069,7 +1072,7 @@ impl AgentCore {
         let Some(credential) = self.auth.oauth_credential(&store_id) else {
             return Ok(());
         };
-        let now_ms = oauth::unix_now().saturating_mul(1000);
+        let now_ms = llm_provider_kit::oauth::unix_now().saturating_mul(1000);
         // Refresh slightly ahead of expiry; the credential's declared skew is
         // already baked into expires_at_ms.
         if credential.expires_at_ms > now_ms + 120_000 {
@@ -1080,7 +1083,11 @@ impl AgentCore {
                 "{provider} session expired and cannot be refreshed. Run /login {provider}."
             ));
         }
-        match omp_auth::refresh(&store_id, credential, &self.profile_dir) {
+        let context = LoginContext {
+            profile_dir: &self.profile_dir,
+            client_name: CLIENT_NAME,
+        };
+        match provider_auth::refresh(&store_id, credential, &context) {
             Ok(refreshed) => {
                 crate::log_info!("oauth", "refreshed provider token");
                 self.auth.set_oauth_credential(&store_id, refreshed);
@@ -2535,9 +2542,12 @@ impl AgentCore {
             let on_notice = |text: &str| {
                 let _ = tx.send(OmpLoginEvent::Notice(text.to_string()));
             };
-            let result = omp_auth::login(
+            let result = provider_auth::login(
                 &provider_id,
-                &profile_dir,
+                &LoginContext {
+                    profile_dir: &profile_dir,
+                    client_name: CLIENT_NAME,
+                },
                 &on_auth,
                 &on_notice,
                 manual.then_some(code_rx),
@@ -2646,7 +2656,7 @@ impl AgentCore {
     fn apply_omp_login_result(
         &mut self,
         provider_id: String,
-        result: Result<OmpLoginOutcome, String>,
+        result: Result<LoginOutcome, String>,
     ) -> Vec<AgentEvent> {
         let catalog = llm_provider_kit::omp::catalog();
         let name = catalog
@@ -2657,8 +2667,8 @@ impl AgentCore {
             Ok(outcome) => outcome,
             Err(error) => return vec![AgentEvent::Error(format!("{name} login failed: {error}"))],
         };
-        let OmpLoginOutcome::Credentials(credential) = outcome else {
-            let OmpLoginOutcome::ApiKeyInstructions {
+        let LoginOutcome::Credentials(credential) = outcome else {
+            let LoginOutcome::ApiKeyInstructions {
                 auth_url,
                 instructions,
                 prompt,

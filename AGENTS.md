@@ -4,6 +4,8 @@
 
 This is a lightweight Rust CLI/TUI workspace. The binary entry point is `src/main.rs`; agent state, sessions, tools, and LLM streaming live in `crates/agent-core/`; terminal rendering and input handling live in `crates/tui/`. Keep tests next to the module they cover with `#[cfg(test)]`. Build artifacts such as `target/` and `target-msvc/` are generated outputs.
 
+`crates/llm-provider-kit/` is a git submodule (github.com/JuCode-Team/llm-provider-kit) holding the provider layer: wire protocols (Responses/Codex/Azure, Anthropic Messages, Chat Completions), the vendored provider catalog (`omp`), provider templates, and the catalog-driven login flows (`auth`, `oauth`). It is a workspace member, so `cargo fmt/clippy/test --workspace` covers it. Changes to the provider layer belong there, not in `agent-core`; commit them in the submodule repo first, then bump the pointer here. JuCode-specific pieces stay in this repo: the gateway OAuth flow and auth.json layout (`crates/agent-core/src/oauth.rs`, `config.rs`), the gateway provider template (`crates/agent-core/src/providers.rs`), and request shaping in `llm.rs`.
+
 ## Build, Test, and Development Commands
 
 - `cargo run`: run the local JuCode TUI.

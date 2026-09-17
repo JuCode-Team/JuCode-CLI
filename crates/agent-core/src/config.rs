@@ -306,7 +306,7 @@ impl ModelConfig {
 pub struct AuthStore {
     keys: BTreeMap<String, String>,
     jucode: Option<JucodeTokens>,
-    oauth: BTreeMap<String, crate::omp_auth::OmpCredential>,
+    oauth: BTreeMap<String, llm_provider_kit::auth::StoredCredential>,
     encryption_key: Option<crate::secrets::SecretKey>,
     path: PathBuf,
 }
@@ -579,7 +579,7 @@ impl AuthStore {
                 entries
                     .iter()
                     .filter_map(|(id, entry)| {
-                        read_omp_credential(entry).map(|cred| (id.clone(), cred))
+                        read_stored_credential(entry).map(|cred| (id.clone(), cred))
                     })
                     .collect()
             })
@@ -621,14 +621,17 @@ impl AuthStore {
     }
 
     /// Stored OAuth credential for an omp provider (`oauth.<id>` block).
-    pub fn oauth_credential(&self, provider: &str) -> Option<&crate::omp_auth::OmpCredential> {
+    pub fn oauth_credential(
+        &self,
+        provider: &str,
+    ) -> Option<&llm_provider_kit::auth::StoredCredential> {
         self.oauth.get(provider)
     }
 
     pub fn set_oauth_credential(
         &mut self,
         provider: &str,
-        credential: crate::omp_auth::OmpCredential,
+        credential: llm_provider_kit::auth::StoredCredential,
     ) {
         self.oauth.insert(provider.to_string(), credential);
     }
@@ -655,7 +658,7 @@ impl AuthStore {
             value["oauth"] = json!(self
                 .oauth
                 .iter()
-                .map(|(id, cred)| (id.clone(), omp_credential_json(cred)))
+                .map(|(id, cred)| (id.clone(), stored_credential_json(cred)))
                 .collect::<Map<String, Value>>());
         }
         // MCP transports refresh their own credentials while the agent is
@@ -1253,9 +1256,9 @@ fn read_provider_keys(providers: &Map<String, Value>) -> BTreeMap<String, String
     keys
 }
 
-fn read_omp_credential(value: &Value) -> Option<crate::omp_auth::OmpCredential> {
+fn read_stored_credential(value: &Value) -> Option<llm_provider_kit::auth::StoredCredential> {
     let str_opt = |key: &str| read_optional_string(value, key);
-    Some(crate::omp_auth::OmpCredential {
+    Some(llm_provider_kit::auth::StoredCredential {
         access: str_opt("access_token")?,
         refresh: str_opt("refresh_token").unwrap_or_default(),
         expires_at_ms: value
@@ -1272,7 +1275,7 @@ fn read_omp_credential(value: &Value) -> Option<crate::omp_auth::OmpCredential> 
     })
 }
 
-fn omp_credential_json(cred: &crate::omp_auth::OmpCredential) -> Value {
+fn stored_credential_json(cred: &llm_provider_kit::auth::StoredCredential) -> Value {
     let mut value = json!({
         "access_token": cred.access,
         "refresh_token": cred.refresh,
@@ -1390,6 +1393,35 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn stored_credential_round_trips_through_auth_json() {
+        let credential = llm_provider_kit::auth::StoredCredential {
+            access: "access-1".to_string(),
+            refresh: "refresh-1".to_string(),
+            expires_at_ms: 1_700_000_000_000,
+            email: Some("dev@example.com".to_string()),
+            account_id: Some("acct_1".to_string()),
+            org_id: None,
+            org_name: None,
+            project_id: Some("proj_1".to_string()),
+            api_endpoint: None,
+            enterprise_url: None,
+        };
+
+        let value = stored_credential_json(&credential);
+        assert_eq!(value["access_token"], "access-1");
+        assert!(value.get("org_id").is_none(), "absent fields stay absent");
+
+        let restored = read_stored_credential(&value).expect("credential parses");
+        assert_eq!(restored.access, credential.access);
+        assert_eq!(restored.refresh, credential.refresh);
+        assert_eq!(restored.expires_at_ms, credential.expires_at_ms);
+        assert_eq!(restored.email, credential.email);
+        assert_eq!(restored.account_id, credential.account_id);
+        assert_eq!(restored.project_id, credential.project_id);
+        assert_eq!(restored.org_id, None);
+    }
 
     #[test]
     fn cost_for_prices_cached_input_separately() {

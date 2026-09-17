@@ -1142,7 +1142,7 @@ impl OpenAiClient {
                 .set("OpenAI-Beta", CODEX_BETA_RESPONSES)
                 .set("originator", CODEX_ORIGINATOR)
                 .set("version", CODEX_CLIENT_VERSION);
-            if let Some(account_id) = codex_account_id(&self.api_key) {
+            if let Some(account_id) = responses::codex_account_id(&self.api_key) {
                 request = request.set("chatgpt-account-id", &account_id);
             }
         }
@@ -2438,18 +2438,6 @@ fn azure_api_version() -> String {
         .unwrap_or_else(|| AZURE_DEFAULT_API_VERSION.to_string())
 }
 
-/// `chatgpt-account-id` for the Codex backend: the ChatGPT workspace the token
-/// draws its limits from rides in the access token's `https://api.openai.com/auth`
-/// claim.
-fn codex_account_id(access_token: &str) -> Option<String> {
-    crate::omp_auth::decode_jwt_payload(access_token)?
-        .get("https://api.openai.com/auth")?
-        .get("chatgpt_account_id")?
-        .as_str()
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
-}
-
 fn capture_turn_state(response: &ureq::Response, turn_state: &OnceLock<String>) -> bool {
     if let Some(value) = response
         .header(X_CODEX_TURN_STATE_HEADER)
@@ -3391,15 +3379,5 @@ mod tests {
             azure.starts_with("https://res.openai.azure.com/openai/v1/responses?api-version="),
             "{azure}"
         );
-    }
-
-    #[test]
-    fn codex_account_id_reads_the_chatgpt_workspace_claim() {
-        // {"https://api.openai.com/auth":{"chatgpt_account_id":"acct_1"}}
-        let claims =
-            "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xIn19";
-        let token = format!("header.{claims}.signature");
-        assert_eq!(codex_account_id(&token), Some("acct_1".to_string()));
-        assert_eq!(codex_account_id("not-a-jwt"), None);
     }
 }

@@ -1,9 +1,18 @@
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+//! JuCode gateway OAuth: the `/cli/oauth` authorization-code flow against the
+//! JuCode web/API pair, plus the token refresh the LLM client uses.
+//!
+//! Provider-agnostic pieces (PKCE, loopback callbacks, URL encoding, browser
+//! launch, JSON plumbing) live in `llm_provider_kit::oauth`; this module owns
+//! what is JuCode's own: the gateway endpoints, the device label, and the
+//! marketplace model list.
+
+use llm_provider_kit::oauth::{
+    open_browser, parse_callback_query, pkce_challenge, random_token, unix_now, url_encode,
+    write_callback_response,
+};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader},
     net::TcpListener,
     process::Command,
     thread,
@@ -12,6 +21,9 @@ use std::{
 
 const CLIENT_ID: &str = "jucode-cli";
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+/// Text the browser shows after landing on the CLI callback.
+const CALLBACK_LOGIN_COMPLETE: &str = "JuCode CLI login complete. You can close this tab.";
+const CALLBACK_LOGIN_FAILED: &str = "JuCode CLI login failed. Return to the terminal.";
 
 #[derive(Debug)]
 pub struct OAuthLoginResult {
@@ -100,14 +112,14 @@ pub fn login(web_url: &str, api_url: &str) -> Result<OAuthLoginResult, String> {
     let mut stream = reader.into_inner();
 
     if params.get("state") != Some(&state) {
-        write_callback_response(&mut stream, false)?;
+        write_callback_response(&mut stream, CALLBACK_LOGIN_FAILED)?;
         return Err("OAuth state mismatch".to_string());
     }
     let Some(code) = params.get("code").filter(|value| !value.is_empty()) else {
-        write_callback_response(&mut stream, false)?;
+        write_callback_response(&mut stream, CALLBACK_LOGIN_FAILED)?;
         return Err("OAuth callback did not include code".to_string());
     };
-    write_callback_response(&mut stream, true)?;
+    write_callback_response(&mut stream, CALLBACK_LOGIN_COMPLETE)?;
 
     let tokens = exchange_code(&api_url, code, &redirect_uri, &verifier, &device_name())?;
     let models = fetch_models(&api_url, &tokens.access_token).unwrap_or_default();
@@ -209,13 +221,6 @@ fn fetch_models(base_url: &str, access_token: &str) -> Result<Vec<OAuthModel>, S
     Ok(parse_models_response(&value))
 }
 
-pub(crate) fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// A human-facing device label shown under 授权设备管理. Best-effort
 /// hostname + OS; never fails (falls back to a generic label).
 fn device_name() -> String {
@@ -287,117 +292,10 @@ fn read_u64_field(value: &Value, keys: &[&str]) -> Option<u64> {
         .find_map(Value::as_u64)
 }
 
-pub(crate) fn json_response(
-    response: Result<ureq::Response, ureq::Error>,
-) -> Result<Value, String> {
-    match response {
-        Ok(response) => response
-            .into_json::<Value>()
-            .map_err(|error| error.to_string()),
-        Err(ureq::Error::Status(code, response)) => {
-            let body = response
-                .into_string()
-                .unwrap_or_else(|_| "<failed to read error body>".to_string());
-            Err(format!("JuCode OAuth returned HTTP {code}: {body}"))
-        }
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-pub(crate) fn parse_callback_query(request_line: &str) -> Result<HashMap<String, String>, String> {
-    let path = request_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| "invalid OAuth callback request".to_string())?;
-    let query = path
-        .split_once('?')
-        .map(|(_, query)| query)
-        .unwrap_or_default();
-    Ok(query
-        .split('&')
-        .filter_map(|part| {
-            let (key, value) = part.split_once('=')?;
-            Some((url_decode(key), url_decode(value)))
-        })
-        .collect())
-}
-
-pub(crate) fn write_callback_response(stream: &mut impl Write, ok: bool) -> Result<(), String> {
-    let body = if ok {
-        "JuCode CLI login complete. You can close this tab."
-    } else {
-        "JuCode CLI login failed. Return to the terminal."
-    };
-    write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    )
-    .map_err(|error| error.to_string())
-}
-
-pub(crate) fn random_token(bytes: usize) -> Result<String, String> {
-    let mut data = vec![0_u8; bytes];
-    getrandom::getrandom(&mut data).map_err(|error| error.to_string())?;
-    Ok(URL_SAFE_NO_PAD.encode(data))
-}
-
-pub(crate) fn pkce_challenge(verifier: &str) -> String {
-    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
-}
-
-pub(crate) fn open_browser(url: &str) -> Result<(), String> {
-    let status = if cfg!(windows) {
-        Command::new("rundll32")
-            .arg("url.dll,FileProtocolHandler")
-            .arg(url)
-            .status()
-    } else if cfg!(target_os = "macos") {
-        Command::new("open").arg(url).status()
-    } else {
-        Command::new("xdg-open").arg(url).status()
-    }
-    .map_err(|error| error.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("failed to open browser: {status}"))
-    }
-}
-
-pub(crate) fn url_encode(value: &str) -> String {
-    value
-        .bytes()
-        .flat_map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                vec![byte as char]
-            }
-            _ => format!("%{byte:02X}").chars().collect(),
-        })
-        .collect()
-}
-
-pub(crate) fn url_decode(value: &str) -> String {
-    let mut output = Vec::new();
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let Ok(hex) = u8::from_str_radix(&value[index + 1..index + 3], 16) {
-                output.push(hex);
-                index += 3;
-                continue;
-            }
-        }
-        output.push(if bytes[index] == b'+' {
-            b' '
-        } else {
-            bytes[index]
-        });
-        index += 1;
-    }
-    String::from_utf8_lossy(&output).to_string()
+/// Gateway errors name the service; the kit's helper reports the bare status.
+fn json_response(response: Result<ureq::Response, ureq::Error>) -> Result<Value, String> {
+    llm_provider_kit::oauth::json_response(response)
+        .map_err(|error| format!("JuCode OAuth returned {error}"))
 }
 
 #[cfg(test)]
