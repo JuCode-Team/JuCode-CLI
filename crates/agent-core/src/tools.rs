@@ -4635,6 +4635,40 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// Waits for `pid` to stop running. SIGKILL is delivered asynchronously, and a
+    /// process that has exited but not been reaped still answers `kill(pid, 0)`, so
+    /// a single check right after the kill can observe a survivor that is on its
+    /// way out (or already a zombie).
+    #[cfg(unix)]
+    fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if process_exited(pid) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// True when `pid` is gone. A zombie counts as exited — it holds no CPU and
+    /// is only waiting to be reaped, which is the kernel's business — so on
+    /// Linux the `/proc` state is checked first. Everywhere else (no `/proc`)
+    /// the existence probe alone decides.
+    #[cfg(unix)]
+    fn process_exited(pid: i32) -> bool {
+        let state = fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')').map(|(_, rest)| rest.to_string()))
+            .and_then(|rest| rest.split_whitespace().next().map(str::to_string));
+        if matches!(state.as_deref(), Some("Z" | "X")) {
+            return true;
+        }
+        unsafe { libc::kill(pid, 0) != 0 }
+    }
+
     #[cfg(unix)]
     #[test]
     fn interrupted_bash_kills_process_group_descendants() {
@@ -4668,9 +4702,10 @@ mod tests {
             .trim()
             .parse()
             .expect("pid");
-        // kill(pid, 0) reports whether the process still exists.
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
-        assert!(!alive, "grandchild survived interrupt");
+        assert!(
+            wait_for_process_exit(pid, Duration::from_secs(5)),
+            "grandchild survived interrupt"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -4695,8 +4730,10 @@ mod tests {
             .trim()
             .parse()
             .expect("pid");
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
-        assert!(!alive, "grandchild survived timeout");
+        assert!(
+            wait_for_process_exit(pid, Duration::from_secs(5)),
+            "grandchild survived timeout"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
