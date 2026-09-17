@@ -987,7 +987,7 @@ impl AgentCore {
         if self.config.provider == "jucode" {
             return self.auth.jucode_access_token().map(str::to_string);
         }
-        let catalog = jucode_vendor::omp::catalog();
+        let catalog = llm_provider_kit::omp::catalog();
         let store_id = catalog
             .auth_provider(&self.config.provider)
             .and_then(|p| p.store_as.as_deref())
@@ -1055,7 +1055,7 @@ impl AgentCore {
     /// [`Self::ensure_provider_credentials`]). No-op when the active provider
     /// has no stored credential — BYOK keys don't expire here.
     fn ensure_omp_credentials(&mut self) -> Result<(), String> {
-        let catalog = jucode_vendor::omp::catalog();
+        let catalog = llm_provider_kit::omp::catalog();
         let provider = &self.config.provider;
         let store_id = catalog
             .auth_provider(provider)
@@ -2458,7 +2458,9 @@ impl AgentCore {
         }
         if !first.is_empty()
             && first != "jucode"
-            && jucode_vendor::omp::catalog().auth_provider(first).is_some()
+            && llm_provider_kit::omp::catalog()
+                .auth_provider(first)
+                .is_some()
         {
             return match parts.next() {
                 Some(key) => self.omp_api_key_events(first, key),
@@ -2503,7 +2505,7 @@ impl AgentCore {
                 "a login is already in progress".to_string(),
             )];
         }
-        let catalog = jucode_vendor::omp::catalog();
+        let catalog = llm_provider_kit::omp::catalog();
         let name = catalog
             .auth_provider(provider)
             .map(|p| p.name.clone())
@@ -2516,7 +2518,7 @@ impl AgentCore {
             catalog
                 .auth_provider(&provider_id)
                 .and_then(|p| p.login.as_ref()),
-            Some(jucode_vendor::omp::LoginRule::OauthCode(rule))
+            Some(llm_provider_kit::omp::LoginRule::OauthCode(rule))
                 if rule.callback.manual_only || rule.callback.native_scheme
         );
         let (code_tx, code_rx) = mpsc::channel();
@@ -2578,7 +2580,7 @@ impl AgentCore {
     /// JuCode's own gateway stays first; the rest follow catalog order with
     /// their flow kind and sign-in state.
     fn login_picker_event(&self) -> AgentEvent {
-        let catalog = jucode_vendor::omp::catalog();
+        let catalog = llm_provider_kit::omp::catalog();
         let mut rows = vec![LoginProviderView {
             id: "jucode".to_string(),
             label: "JuCode".to_string(),
@@ -2621,7 +2623,7 @@ impl AgentCore {
 
     /// `/login list` — the catalog's login-capable providers grouped by flow.
     fn omp_login_list_events(&self) -> Vec<AgentEvent> {
-        let catalog = jucode_vendor::omp::catalog();
+        let catalog = llm_provider_kit::omp::catalog();
         let mut lines = vec![format!(
             "provider logins (omp catalog {}) — /login <id>:",
             catalog.omp_version
@@ -2646,7 +2648,7 @@ impl AgentCore {
         provider_id: String,
         result: Result<OmpLoginOutcome, String>,
     ) -> Vec<AgentEvent> {
-        let catalog = jucode_vendor::omp::catalog();
+        let catalog = llm_provider_kit::omp::catalog();
         let name = catalog
             .auth_provider(&provider_id)
             .map(|p| p.name.clone())
@@ -2700,7 +2702,7 @@ impl AgentCore {
     /// under `providers.<id>` and switches the active provider, mirroring
     /// what a successful OAuth login does.
     fn omp_api_key_events(&mut self, provider: &str, key: &str) -> Vec<AgentEvent> {
-        let catalog = jucode_vendor::omp::catalog();
+        let catalog = llm_provider_kit::omp::catalog();
         let Some(auth_provider) = catalog.auth_provider(provider) else {
             return vec![AgentEvent::Error(format!(
                 "unknown provider \"{provider}\""
@@ -2709,7 +2711,7 @@ impl AgentCore {
         let mut key = key.trim();
         if matches!(
             &auth_provider.login,
-            Some(jucode_vendor::omp::LoginRule::ApiKey(rule))
+            Some(llm_provider_kit::omp::LoginRule::ApiKey(rule))
                 if rule.normalize.as_deref() == Some("strip-bearer")
         ) {
             key = key
@@ -2739,7 +2741,7 @@ impl AgentCore {
     /// catalog model table, a sensible default model, its base URL, and a
     /// valid reasoning effort for that model.
     fn adopt_provider(&mut self, provider_id: &str) {
-        let catalog = jucode_vendor::omp::catalog();
+        let catalog = llm_provider_kit::omp::catalog();
         self.config.provider = provider_id.to_string();
         self.config.models = models_for_provider(provider_id);
         let models = catalog.models(provider_id);
@@ -3691,8 +3693,8 @@ fn resolve_approval_decision(
 /// cannot run it. Whole-flow hooks (github-copilot, cursor, …) have no Rust
 /// port, so callers skip those providers instead of listing a login that would
 /// only mint a credential no request can use.
-fn login_kind(login: &jucode_vendor::omp::LoginRule) -> Option<(&'static str, bool)> {
-    use jucode_vendor::omp::LoginRule;
+fn login_kind(login: &llm_provider_kit::omp::LoginRule) -> Option<(&'static str, bool)> {
+    use llm_provider_kit::omp::LoginRule;
     match login {
         LoginRule::OauthCode(_) => Some(("oauth", false)),
         LoginRule::DeviceCode(_) => Some(("device code", false)),
@@ -3933,7 +3935,7 @@ mod model_config_tests {
 #[cfg(test)]
 mod login_kind_tests {
     use super::*;
-    use jucode_vendor::omp::{catalog, LoginRule};
+    use llm_provider_kit::omp::{catalog, LoginRule};
 
     fn kind_of(id: &str) -> Option<(&'static str, bool)> {
         let login = catalog().auth_provider(id).and_then(|p| p.login.as_ref());

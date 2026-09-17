@@ -1,0 +1,3 @@
+[submodule "crates/llm-provider-kit"]
+	path = crates/llm-provider-kit
+	url = https://github.com/JuCode-Team/llm-provider-kit.git

@@ -29,6 +29,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # crates/llm-provider-kit is a submodule in another private repo;
+          # PROVIDER_KIT_TOKEN needs read access to both repositories.
+          submodules: true
+          token: ${{ secrets.PROVIDER_KIT_TOKEN }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -78,6 +83,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # crates/llm-provider-kit is a submodule in another private repo;
+          # PROVIDER_KIT_TOKEN needs read access to both repositories.
+          submodules: true
+          token: ${{ secrets.PROVIDER_KIT_TOKEN }}
 
       - uses: actions/setup-node@v4
         with:

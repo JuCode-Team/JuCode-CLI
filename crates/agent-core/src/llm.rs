@@ -10,7 +10,7 @@ use crate::{
     },
     tools,
 };
-use jucode_vendor::{anthropic, chat, responses, Protocol, WireEvent};
+use llm_provider_kit::{anthropic, chat, responses, Protocol, WireEvent};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -253,7 +253,7 @@ fn wire_to_stream(event: WireEvent) -> StreamEvent {
     }
 }
 
-fn usage_event(usage: jucode_vendor::Usage) -> StreamEvent {
+fn usage_event(usage: llm_provider_kit::Usage) -> StreamEvent {
     StreamEvent::Usage {
         input_tokens: usage.input_tokens,
         cached_input_tokens: usage.cached_input_tokens,
@@ -339,7 +339,7 @@ impl OpenAiClient {
                 )
             })?,
         };
-        let provider_kind = jucode_vendor::omp::catalog()
+        let provider_kind = llm_provider_kit::omp::catalog()
             .protocol_for(&config.provider, &config.model)
             .unwrap_or_else(|| Protocol::resolve(&config.protocol, &config.model));
         // Azure is the one provider whose endpoint the catalog cannot supply —
@@ -352,7 +352,7 @@ impl OpenAiClient {
             ));
         }
         let safety = config.safety_model.map(|model| SafetySpec {
-            protocol: jucode_vendor::omp::catalog()
+            protocol: llm_provider_kit::omp::catalog()
                 .protocol_for(&config.provider, &model)
                 .unwrap_or_else(|| Protocol::resolve(&config.protocol, &model)),
             reasoning_effort: config.safety_reasoning_effort,
@@ -2589,7 +2589,7 @@ fn truncate_error_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jucode_vendor::response_content_text;
+    use llm_provider_kit::response_content_text;
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},

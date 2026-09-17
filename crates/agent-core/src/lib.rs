@@ -11,6 +11,7 @@ mod mcp;
 mod oauth;
 mod omp_auth;
 mod prompt;
+mod providers;
 mod secrets;
 mod session;
 pub mod skills;

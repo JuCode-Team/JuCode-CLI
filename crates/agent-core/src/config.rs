@@ -1116,7 +1116,7 @@ pub(crate) fn is_thinking_disabled(efforts: &[String]) -> bool {
 /// Reasoning-effort tiers for a catalog model. Upstream's exact ladders live
 /// in KDL class rules we don't compile; this maps the model's dialect to the
 /// tiers JuCode's wire protocols understand.
-fn efforts_for_catalog_model(model: &jucode_vendor::omp::CatalogModel) -> Vec<String> {
+fn efforts_for_catalog_model(model: &llm_provider_kit::omp::CatalogModel) -> Vec<String> {
     if !model.reasoning {
         return vec!["none".to_string()];
     }
@@ -1133,7 +1133,7 @@ fn efforts_for_catalog_model(model: &jucode_vendor::omp::CatalogModel) -> Vec<St
     }
 }
 
-fn model_config_from_catalog(model: &jucode_vendor::omp::CatalogModel) -> ModelConfig {
+fn model_config_from_catalog(model: &llm_provider_kit::omp::CatalogModel) -> ModelConfig {
     ModelConfig {
         name: model.id.clone(),
         context_window: model.context_window,
@@ -1145,7 +1145,7 @@ fn model_config_from_catalog(model: &jucode_vendor::omp::CatalogModel) -> ModelC
     }
 }
 
-fn model_config_from_template(model: &jucode_vendor::ModelTemplate) -> ModelConfig {
+fn model_config_from_template(model: &llm_provider_kit::ModelTemplate) -> ModelConfig {
     ModelConfig {
         name: model.name.to_string(),
         context_window: model.context_window,
@@ -1166,9 +1166,9 @@ fn model_config_from_template(model: &jucode_vendor::ModelTemplate) -> ModelConf
 /// catalog's login order, listing providers with at least one servable model
 /// or no declared table (manual/BYOK providers like ollama).
 pub fn builtin_providers() -> Vec<(String, String, String)> {
-    let catalog = jucode_vendor::omp::catalog();
+    let catalog = llm_provider_kit::omp::catalog();
     let mut providers: Vec<(String, String, String)> = Vec::new();
-    if let Some(jucode) = jucode_vendor::providers::template("jucode") {
+    if let Some(jucode) = crate::providers::template("jucode") {
         providers.push((
             jucode.id.to_string(),
             jucode.base_url.to_string(),
@@ -1178,7 +1178,7 @@ pub fn builtin_providers() -> Vec<(String, String, String)> {
     for auth in catalog.auth_providers() {
         let models = catalog.models(&auth.id);
         let supported = catalog.supported_models(&auth.id, models);
-        let template = jucode_vendor::providers::template(&auth.id);
+        let template = crate::providers::template(&auth.id);
         if supported.is_empty() && template.is_none() {
             // Either every declared model speaks a dialect JuCode doesn't
             // serve, or the catalog has no models for it (discovery-driven
@@ -1205,7 +1205,7 @@ pub fn builtin_providers() -> Vec<(String, String, String)> {
 /// costs and context sizes); providers without catalog entries keep the
 /// legacy template, and unknown ids fall back to the jucode set.
 pub fn models_for_provider(id: &str) -> Vec<ModelConfig> {
-    let catalog = jucode_vendor::omp::catalog();
+    let catalog = llm_provider_kit::omp::catalog();
     let models = catalog.models(id);
     let supported = catalog.supported_models(id, models);
     if !supported.is_empty() {
@@ -1214,22 +1214,21 @@ pub fn models_for_provider(id: &str) -> Vec<ModelConfig> {
             .map(|model| model_config_from_catalog(model))
             .collect();
     }
-    jucode_vendor::providers::template(id)
-        .or_else(|| jucode_vendor::providers::template("jucode"))
+    crate::providers::template(id)
+        .or_else(|| crate::providers::template("jucode"))
         .map(|p| p.models.iter().map(model_config_from_template).collect())
         .unwrap_or_default()
 }
 
 fn default_base_url_for_provider(id: &str) -> Option<String> {
-    jucode_vendor::omp::catalog()
+    llm_provider_kit::omp::catalog()
         .default_base_url(id)
         .map(str::to_string)
-        .or_else(|| jucode_vendor::providers::template(id).map(|p| p.base_url.to_string()))
+        .or_else(|| crate::providers::template(id).map(|p| p.base_url.to_string()))
 }
 
 fn default_model_config(name: &str) -> ModelConfig {
-    jucode_vendor::templates()
-        .iter()
+    crate::providers::templates()
         .flat_map(|p| p.models.iter())
         .find(|entry| entry.name == name)
         .map(model_config_from_template)

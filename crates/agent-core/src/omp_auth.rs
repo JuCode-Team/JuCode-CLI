@@ -12,7 +12,7 @@
 //! the rest are reported unsupported rather than half-working.
 
 use crate::oauth;
-use jucode_vendor::omp::{
+use llm_provider_kit::omp::{
     catalog, AuthProvider, AuthValue, CredentialField, CredentialMap, DeviceCodeLogin, ExpiresRule,
     LoginRule, OauthCodeLogin, TokenRequest, UserinfoRule,
 };

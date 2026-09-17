@@ -8,7 +8,7 @@ name = "jucode"
 path = "src/main.rs"
 
 [workspace]
-members = [".", "crates/agent-core", "crates/tui", "crates/vendor"]
+members = [".", "crates/agent-core", "crates/llm-provider-kit", "crates/tui"]
 resolver = "2"
 
 [workspace.package]
