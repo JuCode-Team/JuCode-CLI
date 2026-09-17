@@ -1,3 +1,4 @@
+use crate::providers::CLIENT_NAME;
 use crate::{
     config::{is_shell_tool, ApprovalMode},
     hooks::Hooks,
@@ -9,6 +10,9 @@ use crate::{
         MAX_SUBAGENT_DEPTH,
     },
     tools,
+};
+use llm_provider_kit::transport::{
+    self, Client as TransportClient, ClientConfig as TransportConfig, StreamEvent as TransportEvent,
 };
 use llm_provider_kit::{anthropic, chat, responses, Protocol, WireEvent};
 use serde_json::{json, Value};
@@ -28,16 +32,6 @@ const MAX_SUBAGENT_OUTPUT_BYTES: usize = 16 * 1024;
 const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_SUBAGENT_MAX_TOOL_CALLS: u64 = 12;
 const DEFAULT_SUBAGENT_MAX_OUTPUT_TOKENS: u64 = 4096;
-const RETRY_BACKOFF_BASE_MS: u64 = 250;
-const RETRY_BACKOFF_MAX_MS: u64 = 4_000;
-const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
-/// Codex backend client identity. The backend version-gates model
-/// availability on `version` and expects the Responses beta opt-in.
-const CODEX_CLIENT_VERSION: &str = "0.153.0";
-const CODEX_ORIGINATOR: &str = "jucode";
-const CODEX_BETA_RESPONSES: &str = "responses=experimental";
-/// Azure API revision used when `AZURE_OPENAI_API_VERSION` is unset.
-const AZURE_DEFAULT_API_VERSION: &str = "v1";
 const MAX_EMPTY_RESPONSE_CONTINUATIONS: usize = 2;
 /// Read cap for the `auto` mode safety-classifier call so a slow or stuck
 /// classification falls back to the interactive prompt quickly.
@@ -66,6 +60,8 @@ const EMPTY_RESPONSE_REMINDER: &str = "<runtime_reminder>\nYou have not produced
 
 pub struct OpenAiClient {
     api_key: String,
+    /// Blocking HTTP for the wire protocols: auth headers, retries, decoding.
+    transport: TransportClient,
     pub model: String,
     reasoning_effort: String,
     /// Supported reasoning-effort tiers per model name (low→high), used to default
@@ -342,6 +338,14 @@ impl OpenAiClient {
         let provider_kind = llm_provider_kit::omp::catalog()
             .protocol_for(&config.provider, &config.model)
             .unwrap_or_else(|| Protocol::resolve(&config.protocol, &config.model));
+        let transport = TransportClient::new(TransportConfig {
+            api_key: &api_key,
+            prompt_cache_key: &config.prompt_cache_key,
+            client_name: CLIENT_NAME,
+            connect_timeout: config.connect_timeout,
+            retry_attempts: retry_attempts_from_env(config.retry_attempts),
+            cache_debug: cache_debug_enabled(),
+        });
         // Azure is the one provider whose endpoint the catalog cannot supply —
         // deployments live at a per-resource host — so fail with the reason
         // instead of sending a request to a relative URL.
@@ -360,6 +364,7 @@ impl OpenAiClient {
         });
         Ok(Self {
             api_key,
+            transport,
             model: config.model,
             reasoning_effort: config.reasoning_effort,
             model_reasoning_efforts: config.model_reasoning_efforts,
@@ -617,15 +622,6 @@ impl OpenAiClient {
         }
     }
 
-    fn max_attempts(&self) -> usize {
-        env::var("JUCODE_RETRY_ATTEMPTS")
-            .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or(self.retry_attempts)
-            .saturating_add(1)
-            .max(1)
-    }
-
     /// One-shot summarization used for context compaction. No tools, no thinking;
     /// returns the summary text. Errors (including empty output) let the caller fall
     /// back to sending the full context.
@@ -656,10 +652,28 @@ impl OpenAiClient {
             Protocol::OpenAiResponses
             | Protocol::OpenAiCodexResponses
             | Protocol::AzureOpenAiResponses => {
-                let body = self.openai_summarize_body(system, user);
-                let url = responses_endpoint(self.provider_kind, &self.base_url);
-                let response = self.send_with_retry(&url, &body, &mut |_| Ok(()))?;
-                self.collect_text(response, self.provider_kind, &mut record_delta)?
+                let body = responses::one_shot_body(
+                    &self.model,
+                    system,
+                    &self.reasoning_effort,
+                    user,
+                    self.max_output_tokens,
+                );
+                let url = transport::endpoint(self.provider_kind, &self.base_url);
+                let response = self.transport.send_with_retry(
+                    self.provider_kind,
+                    &url,
+                    &body,
+                    self.read_timeout,
+                    &mut |_| Ok(()),
+                )?;
+                self.transport
+                    .read_text(response, self.provider_kind, &mut |event| {
+                        if let WireEvent::Delta(delta) = event {
+                            record_delta(&delta)?;
+                        }
+                        Ok(())
+                    })?
             }
             Protocol::AnthropicMessages => {
                 let body = json!({
@@ -670,8 +684,20 @@ impl OpenAiClient {
                     "stream": true
                 });
                 let url = anthropic::messages_url(&self.base_url);
-                let response = self.send_with_retry(&url, &body, &mut |_| Ok(()))?;
-                self.collect_text(response, Protocol::AnthropicMessages, &mut record_delta)?
+                let response = self.transport.send_with_retry(
+                    Protocol::AnthropicMessages,
+                    &url,
+                    &body,
+                    self.read_timeout,
+                    &mut |_| Ok(()),
+                )?;
+                self.transport
+                    .read_text(response, Protocol::AnthropicMessages, &mut |event| {
+                        if let WireEvent::Delta(delta) = event {
+                            record_delta(&delta)?;
+                        }
+                        Ok(())
+                    })?
             }
             Protocol::OpenAiChatCompletions => {
                 let body = json!({
@@ -684,8 +710,23 @@ impl OpenAiClient {
                     "stream": true
                 });
                 let url = chat::completions_url(&self.base_url);
-                let response = self.send_with_retry(&url, &body, &mut |_| Ok(()))?;
-                self.collect_text(response, Protocol::OpenAiChatCompletions, &mut record_delta)?
+                let response = self.transport.send_with_retry(
+                    Protocol::OpenAiChatCompletions,
+                    &url,
+                    &body,
+                    self.read_timeout,
+                    &mut |_| Ok(()),
+                )?;
+                self.transport.read_text(
+                    response,
+                    Protocol::OpenAiChatCompletions,
+                    &mut |event| {
+                        if let WireEvent::Delta(delta) = event {
+                            record_delta(&delta)?;
+                        }
+                        Ok(())
+                    },
+                )?
             }
         };
         let summary = summary.trim().to_string();
@@ -697,201 +738,29 @@ impl OpenAiClient {
 
     /// Body for the one-shot summarization call on the OpenAI Responses path.
     /// Matches the main path's `store: false` and output cap.
-    fn openai_summarize_body(&self, system: &str, user: &str) -> Value {
-        json!({
-            "model": self.model,
-            "instructions": system,
-            "reasoning": { "effort": self.reasoning_effort },
-            "max_output_tokens": self.max_output_tokens.max(1),
-            "input": [{ "role": "user", "content": [{ "type": "input_text", "text": user }] }],
-            "store": false,
-            "stream": true
-        })
-    }
-
-    fn collect_text(
-        &self,
-        response: ureq::Response,
-        protocol: Protocol,
-        emit_text: &mut impl FnMut(&str) -> Result<(), String>,
-    ) -> Result<String, String> {
-        let content_type = response
-            .header("content-type")
-            .unwrap_or_default()
-            .to_string();
-        let mut text = String::new();
-        let accumulate = |event: WireEvent| {
-            if let WireEvent::Delta(delta) = event {
-                emit_text(&delta)?;
-                text.push_str(&delta);
-            }
-            Ok(())
-        };
-        if content_type.contains("application/json") {
-            let body = response.into_string().map_err(|error| error.to_string())?;
-            let value = serde_json::from_str::<Value>(&body).map_err(|error| error.to_string())?;
-            let items = match protocol {
-                Protocol::OpenAiResponses
-                | Protocol::OpenAiCodexResponses
-                | Protocol::AzureOpenAiResponses => value
-                    .get("output")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default(),
-                Protocol::AnthropicMessages => anthropic_message_items(&value),
-                Protocol::OpenAiChatCompletions => chat::completion_to_items(&value).0,
-            };
-            for item in &items {
-                let delta = extract_response_text(item);
-                if !delta.is_empty() {
-                    emit_text(&delta)?;
-                    text.push_str(&delta);
-                }
-            }
-            return Ok(text);
-        }
-        match protocol {
-            Protocol::OpenAiResponses
-            | Protocol::OpenAiCodexResponses
-            | Protocol::AzureOpenAiResponses => {
-                responses::read_sse_stream(response.into_reader(), accumulate)?
-            }
-            Protocol::AnthropicMessages => {
-                anthropic::read_sse_stream(response.into_reader(), accumulate)?
-            }
-            Protocol::OpenAiChatCompletions => {
-                chat::read_sse_stream(response.into_reader(), accumulate)?
-            }
-        };
-        Ok(text)
-    }
-
-    /// Body for the main streaming call on the OpenAI Responses path.
-    /// `include` requests encrypted reasoning so multi-turn tool calls can
-    /// replay it under `store: false`.
-    fn openai_responses_body(&self, input: Vec<Value>) -> Value {
-        // Request a reasoning summary so the thinking phase can stream content.
-        // With effort "none" the model does not reason, so no summary is requested.
-        let reasoning = if self.reasoning_effort == "none" {
-            json!({ "effort": self.reasoning_effort })
-        } else {
-            json!({ "effort": self.reasoning_effort, "summary": "auto" })
-        };
-        json!({
-            "model": self.model,
-            "instructions": self.system_prompt,
-            "prompt_cache_key": self.prompt_cache_key,
-            "reasoning": reasoning,
-            "input": responses::sanitize_input(input),
-            "tools": self.tool_definitions(),
-            "tool_choice": "auto",
-            "parallel_tool_calls": true,
-            "max_output_tokens": self.max_output_tokens.max(1),
-            "store": false,
-            "include": ["reasoning.encrypted_content"],
-            "stream": true
-        })
-    }
-
     fn create_response_streaming(
         &self,
         input: Vec<Value>,
         mut emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<Vec<Value>, String> {
-        let body = self.openai_responses_body(input);
-        let url = responses_endpoint(self.provider_kind, &self.base_url);
-        let max_attempts = self.max_attempts();
-        for attempt in 1..=max_attempts {
-            // Single send per attempt: this loop owns all retries, so send and
-            // stream failures cannot multiply into nested retry rounds.
-            let response = match self.send_once(&url, &body) {
-                Ok(response) => response,
-                Err(error) if attempt < max_attempts && is_retryable_error(&error) => {
-                    crate::log_warn!(
-                        "llm",
-                        "retrying request",
-                        attempt = attempt + 1,
-                        error = error.to_string()
-                    );
-                    emit(StreamEvent::Retrying {
-                        attempt: attempt + 1,
-                    })?;
-                    std::thread::sleep(retry_backoff(attempt));
-                    continue;
-                }
-                Err(error) => return handle_response_error(*error),
-            };
-            emit(StreamEvent::Connected)?;
-            let content_type = response
-                .header("content-type")
-                .unwrap_or_default()
-                .to_string();
-            if !content_type.contains("text/event-stream")
-                && !content_type.contains("application/json")
-            {
-                let body = response.into_string().map_err(|error| error.to_string())?;
-                let snippet = truncate_error_body(&body);
-                return Err(format!(
-                    "OpenAI API returned non-JSON response from {url} (content-type: {content_type}). Check base_url; OpenAI-compatible endpoints usually end with /v1. Body starts: {snippet}"
-                ));
-            }
-            if content_type.contains("application/json") {
-                let body = response.into_string().map_err(|error| error.to_string())?;
-                let value =
-                    serde_json::from_str::<Value>(&body).map_err(|error| error.to_string())?;
-                let output_items = value
-                    .get("output")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                for item in &output_items {
-                    let text = extract_response_text(item);
-                    if !text.is_empty() {
-                        emit(StreamEvent::Delta(text))?;
-                    }
-                    emit(StreamEvent::ResponseItem(item.clone()))?;
-                }
-                if let Some(usage) = responses::extract_usage(&value) {
-                    emit(usage_event(usage))?;
-                }
-                return Ok(output_items);
-            }
-            // Stream live text but buffer session-mutating events so a mid-stream
-            // failure can be retried (re-read from scratch) without duplicating
-            // response items in the session.
-            let mut buffered: Vec<StreamEvent> = Vec::new();
-            let read = responses::read_sse_stream(response.into_reader(), |event| {
-                match wire_to_stream(event) {
-                    event @ (StreamEvent::Delta(_) | StreamEvent::ReasoningDelta(_)) => emit(event),
-                    other => {
-                        buffered.push(other);
-                        Ok(())
-                    }
-                }
-            });
-            match read {
-                Ok(output_items) => {
-                    for event in buffered {
-                        emit(event)?;
-                    }
-                    return Ok(output_items);
-                }
-                Err(error) if attempt < max_attempts && is_retryable_stream_error(&error) => {
-                    crate::log_warn!(
-                        "llm",
-                        "retrying after stream error",
-                        attempt = attempt + 1,
-                        error = error.clone()
-                    );
-                    emit(StreamEvent::Retrying {
-                        attempt: attempt + 1,
-                    })?;
-                    std::thread::sleep(retry_backoff(attempt));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        unreachable!("streaming retry loop always returns")
+        let tools = self.tool_definitions();
+        let body = responses::request_body(responses::ResponsesRequest {
+            model: &self.model,
+            instructions: &self.system_prompt,
+            prompt_cache_key: &self.prompt_cache_key,
+            reasoning_effort: &self.reasoning_effort,
+            input,
+            tools: &tools,
+            max_output_tokens: self.max_output_tokens,
+        });
+        let url = transport::endpoint(self.provider_kind, &self.base_url);
+        self.transport.stream(
+            self.provider_kind,
+            &url,
+            &body,
+            self.read_timeout,
+            &mut |event| emit(map_transport_event(event)?),
+        )
     }
 
     fn create_anthropic_message_streaming(
@@ -899,97 +768,23 @@ impl OpenAiClient {
         input: Vec<Value>,
         mut emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<Vec<Value>, String> {
-        // Cap the thinking budget so it stays below max_tokens.
-        let thinking_budget = anthropic::thinking_budget(&self.reasoning_effort)
-            .map(|budget| budget.min(self.max_output_tokens.saturating_sub(1024).max(1024)));
-        let mut body = json!({
-            "model": self.model,
-            "system": self.system_prompt,
-            "max_tokens": self.max_output_tokens.max(1),
-            "messages": anthropic::input_to_messages(&input, thinking_budget.is_some()),
-            "tools": self.anthropic_tool_definitions(),
-            "tool_choice": { "type": "auto" },
-            "stream": true
+        let tools = anthropic::tool_definitions(&self.tool_definitions());
+        let body = anthropic::request_body(&anthropic::AnthropicRequest {
+            model: &self.model,
+            system_prompt: &self.system_prompt,
+            input: &input,
+            tools: &tools,
+            max_output_tokens: self.max_output_tokens,
+            reasoning_effort: &self.reasoning_effort,
         });
-        if let Some(budget) = thinking_budget {
-            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
-        }
-
         let url = anthropic::messages_url(&self.base_url);
-        let max_attempts = self.max_attempts();
-        for attempt in 1..=max_attempts {
-            // Single send per attempt: this loop owns all retries, so send and
-            // stream failures cannot multiply into nested retry rounds.
-            let response = match self.send_once(&url, &body) {
-                Ok(response) => response,
-                Err(error) if attempt < max_attempts && is_retryable_error(&error) => {
-                    crate::log_warn!(
-                        "llm",
-                        "retrying request",
-                        attempt = attempt + 1,
-                        error = error.to_string()
-                    );
-                    emit(StreamEvent::Retrying {
-                        attempt: attempt + 1,
-                    })?;
-                    std::thread::sleep(retry_backoff(attempt));
-                    continue;
-                }
-                Err(error) => return handle_response_error(*error),
-            };
-            emit(StreamEvent::Connected)?;
-            let content_type = response
-                .header("content-type")
-                .unwrap_or_default()
-                .to_string();
-            if !content_type.contains("text/event-stream")
-                && !content_type.contains("application/json")
-            {
-                let body = response.into_string().map_err(|error| error.to_string())?;
-                let snippet = truncate_error_body(&body);
-                return Err(format!(
-                    "Anthropic API returned non-JSON response from {url} (content-type: {content_type}). Body starts: {snippet}"
-                ));
-            }
-            if content_type.contains("application/json") {
-                let body = response.into_string().map_err(|error| error.to_string())?;
-                let value =
-                    serde_json::from_str::<Value>(&body).map_err(|error| error.to_string())?;
-                return emit_anthropic_message(&value, &mut emit);
-            }
-            let mut buffered: Vec<StreamEvent> = Vec::new();
-            let read = anthropic::read_sse_stream(response.into_reader(), |event| {
-                match wire_to_stream(event) {
-                    event @ (StreamEvent::Delta(_) | StreamEvent::ReasoningDelta(_)) => emit(event),
-                    other => {
-                        buffered.push(other);
-                        Ok(())
-                    }
-                }
-            });
-            match read {
-                Ok(output_items) => {
-                    for event in buffered {
-                        emit(event)?;
-                    }
-                    return Ok(output_items);
-                }
-                Err(error) if attempt < max_attempts && is_retryable_stream_error(&error) => {
-                    crate::log_warn!(
-                        "llm",
-                        "retrying after stream error",
-                        attempt = attempt + 1,
-                        error = error.clone()
-                    );
-                    emit(StreamEvent::Retrying {
-                        attempt: attempt + 1,
-                    })?;
-                    std::thread::sleep(retry_backoff(attempt));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        unreachable!("streaming retry loop always returns")
+        self.transport.stream(
+            Protocol::AnthropicMessages,
+            &url,
+            &body,
+            self.read_timeout,
+            &mut |event| emit(map_transport_event(event)?),
+        )
     }
 
     fn create_chat_completion_streaming(
@@ -997,206 +792,23 @@ impl OpenAiClient {
         input: Vec<Value>,
         mut emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<Vec<Value>, String> {
+        let tools = self.tool_definitions();
         let body = chat::request_body(&chat::ChatRequest {
             model: &self.model,
             system_prompt: &self.system_prompt,
             input: &input,
-            tools: &self.tool_definitions(),
+            tools: &tools,
             max_output_tokens: self.max_output_tokens,
             reasoning_effort: &self.reasoning_effort,
         });
         let url = chat::completions_url(&self.base_url);
-        let max_attempts = self.max_attempts();
-        for attempt in 1..=max_attempts {
-            // Single send per attempt: this loop owns all retries, so send and
-            // stream failures cannot multiply into nested retry rounds.
-            let response = match self.send_once(&url, &body) {
-                Ok(response) => response,
-                Err(error) if attempt < max_attempts && is_retryable_error(&error) => {
-                    crate::log_warn!(
-                        "llm",
-                        "retrying request",
-                        attempt = attempt + 1,
-                        error = error.to_string()
-                    );
-                    emit(StreamEvent::Retrying {
-                        attempt: attempt + 1,
-                    })?;
-                    std::thread::sleep(retry_backoff(attempt));
-                    continue;
-                }
-                Err(error) => return handle_response_error(*error),
-            };
-            emit(StreamEvent::Connected)?;
-            let content_type = response
-                .header("content-type")
-                .unwrap_or_default()
-                .to_string();
-            if !content_type.contains("text/event-stream")
-                && !content_type.contains("application/json")
-            {
-                let body = response.into_string().map_err(|error| error.to_string())?;
-                let snippet = truncate_error_body(&body);
-                return Err(format!(
-                    "Chat Completions API returned non-JSON response from {url} (content-type: {content_type}). Check base_url; OpenAI-compatible endpoints usually end with /v1. Body starts: {snippet}"
-                ));
-            }
-            if content_type.contains("application/json") {
-                let body = response.into_string().map_err(|error| error.to_string())?;
-                let value =
-                    serde_json::from_str::<Value>(&body).map_err(|error| error.to_string())?;
-                let (output_items, usage) = chat::completion_to_items(&value);
-                for item in &output_items {
-                    let text = extract_response_text(item);
-                    if !text.is_empty() {
-                        emit(StreamEvent::Delta(text))?;
-                    }
-                    emit(StreamEvent::ResponseItem(item.clone()))?;
-                }
-                if let Some(usage) = usage {
-                    emit(usage_event(usage))?;
-                }
-                return Ok(output_items);
-            }
-            let mut buffered: Vec<StreamEvent> = Vec::new();
-            let read =
-                chat::read_sse_stream(response.into_reader(), |event| {
-                    match wire_to_stream(event) {
-                        event @ (StreamEvent::Delta(_) | StreamEvent::ReasoningDelta(_)) => {
-                            emit(event)
-                        }
-                        other => {
-                            buffered.push(other);
-                            Ok(())
-                        }
-                    }
-                });
-            match read {
-                Ok(output_items) => {
-                    for event in buffered {
-                        emit(event)?;
-                    }
-                    return Ok(output_items);
-                }
-                Err(error) if attempt < max_attempts && is_retryable_stream_error(&error) => {
-                    crate::log_warn!(
-                        "llm",
-                        "retrying after stream error",
-                        attempt = attempt + 1,
-                        error = error.clone()
-                    );
-                    emit(StreamEvent::Retrying {
-                        attempt: attempt + 1,
-                    })?;
-                    std::thread::sleep(retry_backoff(attempt));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        unreachable!("streaming retry loop always returns")
-    }
-
-    /// Builds and sends the request once with the configured timeouts. Retry
-    /// policy belongs to the caller: streaming paths own their retry loop,
-    /// `send_with_retry` wraps this for one-shot calls.
-    fn send_once(&self, url: &str, body: &Value) -> Result<ureq::Response, Box<ureq::Error>> {
-        self.send_once_with_options(url, body, self.read_timeout, self.provider_kind)
-    }
-
-    /// `send_once` with a per-call read timeout and protocol, used by the
-    /// safety classifier: its model may speak a different protocol than the
-    /// main one, and a slow classification must not stall the approval gate.
-    fn send_once_with_options(
-        &self,
-        url: &str,
-        body: &Value,
-        read_timeout: Duration,
-        protocol: Protocol,
-    ) -> Result<ureq::Response, Box<ureq::Error>> {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(self.connect_timeout)
-            .timeout_read(read_timeout)
-            .build();
-        let mut request = agent
-            .post(url)
-            .set("Accept", "text/event-stream")
-            .set("Content-Type", "application/json")
-            .set("session-id", &self.prompt_cache_key)
-            .set("thread-id", &self.prompt_cache_key)
-            .set("x-client-request-id", &self.prompt_cache_key);
-        // Azure authenticates with an `api-key` header, the official Anthropic
-        // API with x-api-key; everything else, the Codex backend included,
-        // takes the Bearer scheme.
-        if protocol == Protocol::AzureOpenAiResponses {
-            request = request.set("api-key", &self.api_key);
-        } else if anthropic::is_official_url(url) {
-            request = request.set("x-api-key", &self.api_key);
-        } else {
-            request = request.set("Authorization", &format!("Bearer {}", self.api_key));
-        }
-        if protocol == Protocol::AnthropicMessages {
-            request = request.set("anthropic-version", anthropic::ANTHROPIC_VERSION);
-        }
-        if protocol == Protocol::OpenAiCodexResponses {
-            request = request
-                .set("OpenAI-Beta", CODEX_BETA_RESPONSES)
-                .set("originator", CODEX_ORIGINATOR)
-                .set("version", CODEX_CLIENT_VERSION);
-            if let Some(account_id) = responses::codex_account_id(&self.api_key) {
-                request = request.set("chatgpt-account-id", &account_id);
-            }
-        }
-        if let Some(turn_state) = self.turn_state.get() {
-            request = request.set(X_CODEX_TURN_STATE_HEADER, turn_state);
-        }
-        if cache_debug_enabled() {
-            eprintln!(
-                "[jucode-cache] send provider={:?} turn_state={}",
-                self.provider_kind,
-                self.turn_state.get().is_some()
-            );
-        }
-        let response = request.send_json(body.clone()).map_err(Box::new)?;
-        let saw_turn_state = capture_turn_state(&response, &self.turn_state);
-        if cache_debug_enabled() {
-            eprintln!(
-                "[jucode-cache] response turn_state_header={} turn_state_stored={}",
-                saw_turn_state,
-                self.turn_state.get().is_some()
-            );
-        }
-        Ok(response)
-    }
-
-    /// Send the request with the configured timeouts, retrying on transport
-    /// errors, 429, and 5xx responses. Other 4xx responses are returned
-    /// immediately without retry.
-    fn send_with_retry(
-        &self,
-        url: &str,
-        body: &Value,
-        emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
-    ) -> Result<ureq::Response, String> {
-        let max_attempts = self.max_attempts();
-        for attempt in 1..=max_attempts {
-            match self.send_once(url, body) {
-                Ok(response) => return Ok(response),
-                Err(error) if attempt < max_attempts && is_retryable_error(&error) => {
-                    crate::log_warn!(
-                        "llm",
-                        "retrying request",
-                        attempt = attempt + 1,
-                        error = error.to_string()
-                    );
-                    emit(StreamEvent::Retrying {
-                        attempt: attempt + 1,
-                    })?;
-                    std::thread::sleep(retry_backoff(attempt));
-                }
-                Err(error) => return handle_response_error(*error),
-            }
-        }
-        unreachable!("retry loop always returns a response or error")
+        self.transport.stream(
+            Protocol::OpenAiChatCompletions,
+            &url,
+            &body,
+            self.read_timeout,
+            &mut |event| emit(map_transport_event(event)?),
+        )
     }
 
     fn tool_definitions(&self) -> Vec<Value> {
@@ -1218,23 +830,6 @@ impl OpenAiClient {
             definitions.push(plan_tool_definition());
         }
         definitions
-    }
-
-    fn anthropic_tool_definitions(&self) -> Vec<Value> {
-        self.tool_definitions()
-            .into_iter()
-            .filter_map(|definition| {
-                let name = definition.get("name")?.clone();
-                let mut tool = json!({
-                    "name": name,
-                    "input_schema": definition.get("parameters").cloned().unwrap_or_else(|| json!({ "type": "object" })),
-                });
-                if let Some(description) = definition.get("description") {
-                    tool["description"] = description.clone();
-                }
-                Some(tool)
-            })
-            .collect()
     }
 
     fn run_subagent_tool(
@@ -1431,6 +1026,7 @@ impl OpenAiClient {
         let child_cwd = workspace.root.clone();
         let child = OpenAiClient {
             api_key: self.api_key.clone(),
+            transport: self.transport.clone(),
             model: model.clone(),
             reasoning_effort,
             model_reasoning_efforts: self.model_reasoning_efforts.clone(),
@@ -1714,16 +1310,14 @@ impl OpenAiClient {
             Protocol::OpenAiResponses
             | Protocol::OpenAiCodexResponses
             | Protocol::AzureOpenAiResponses => (
-                responses_endpoint(safety.protocol, &self.base_url),
-                json!({
-                    "model": safety.model,
-                    "instructions": SAFETY_CLASSIFIER_PROMPT,
-                    "reasoning": { "effort": safety.reasoning_effort },
-                    "max_output_tokens": SAFETY_REVIEW_MAX_OUTPUT_TOKENS,
-                    "input": [{ "role": "user", "content": [{ "type": "input_text", "text": user }] }],
-                    "store": false,
-                    "stream": true
-                }),
+                transport::endpoint(safety.protocol, &self.base_url),
+                responses::one_shot_body(
+                    &safety.model,
+                    SAFETY_CLASSIFIER_PROMPT,
+                    &safety.reasoning_effort,
+                    &user,
+                    SAFETY_REVIEW_MAX_OUTPUT_TOKENS,
+                ),
             ),
             Protocol::AnthropicMessages => (
                 anthropic::messages_url(&self.base_url),
@@ -1748,10 +1342,16 @@ impl OpenAiClient {
                 }),
             ),
         };
+        // One attempt only: a stalled classifier must not hold the approval
+        // gate, so this path fails fast instead of retrying.
         let result = self
-            .send_once_with_options(&url, &body, SAFETY_REVIEW_READ_TIMEOUT, safety.protocol)
-            .map_err(|error| error.to_string())
-            .and_then(|response| self.collect_text(response, safety.protocol, &mut |_| Ok(())))
+            .transport
+            .send(safety.protocol, &url, &body, SAFETY_REVIEW_READ_TIMEOUT)
+            .map_err(|error| error.message)
+            .and_then(|response| {
+                self.transport
+                    .read_text(response, safety.protocol, &mut |_| Ok(()))
+            })
             .map(|text| safety_verdict_allows(&text));
         match result {
             Ok(allow) => {
@@ -2341,22 +1941,6 @@ fn truncate_subagent_output(value: &str) -> String {
     )
 }
 
-fn handle_response_error<T>(error: ureq::Error) -> Result<T, String> {
-    match error {
-        ureq::Error::Status(code, response) => {
-            let body = response
-                .into_string()
-                .unwrap_or_else(|_| "<failed to read error body>".to_string());
-            crate::log_error!("llm", "http request failed", status = code);
-            Err(format!("LLM API returned HTTP {code}: {body}"))
-        }
-        error => {
-            crate::log_error!("llm", "http request failed", error = error.to_string());
-            Err(error.to_string())
-        }
-    }
-}
-
 fn estimate_text_tokens(text: &str) -> u64 {
     if text.is_empty() {
         return 0;
@@ -2394,184 +1978,30 @@ fn inject_input_item(
     Ok(())
 }
 
-/// Retry on transport errors (timeouts, dropped connections, DNS), 429 rate
-/// limits, and 5xx responses. Other 4xx responses are client errors and are
-/// never retried.
-fn is_retryable_error(error: &ureq::Error) -> bool {
-    match error {
-        ureq::Error::Status(code, _) => *code == 429 || *code >= 500,
-        ureq::Error::Transport(_) => true,
-    }
+/// Retries after the first attempt, overridable for debugging.
+fn retry_attempts_from_env(configured: usize) -> usize {
+    env::var("JUCODE_RETRY_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(configured)
 }
 
-fn retry_backoff(attempt: usize) -> Duration {
-    let multiplier = 1u64 << attempt.saturating_sub(1).min(4);
-    Duration::from_millis((RETRY_BACKOFF_BASE_MS * multiplier).min(RETRY_BACKOFF_MAX_MS))
+/// Maps a transport event onto the agent's stream event.
+fn map_transport_event(event: TransportEvent) -> Result<StreamEvent, String> {
+    Ok(match event {
+        TransportEvent::Connected => StreamEvent::Connected,
+        TransportEvent::Retrying { attempt } => {
+            crate::log_warn!("llm", "retrying request", attempt = attempt);
+            StreamEvent::Retrying { attempt }
+        }
+        TransportEvent::Wire(wire) => wire_to_stream(wire),
+    })
 }
 
 fn cache_debug_enabled() -> bool {
     env::var("JUCODE_CACHE_DEBUG")
         .ok()
         .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
-}
-
-/// Responses-family endpoint for a protocol. The dialects share one event
-/// stream but differ in path and query.
-fn responses_endpoint(protocol: Protocol, base_url: &str) -> String {
-    match protocol {
-        Protocol::OpenAiCodexResponses => responses::codex_responses_url(base_url),
-        Protocol::AzureOpenAiResponses => {
-            responses::azure_responses_url(base_url, &azure_api_version())
-        }
-        Protocol::OpenAiResponses
-        | Protocol::AnthropicMessages
-        | Protocol::OpenAiChatCompletions => responses::responses_url(base_url),
-    }
-}
-
-/// Azure API revision, overridable the same way the Azure SDKs do it.
-fn azure_api_version() -> String {
-    env::var("AZURE_OPENAI_API_VERSION")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| AZURE_DEFAULT_API_VERSION.to_string())
-}
-
-fn capture_turn_state(response: &ureq::Response, turn_state: &OnceLock<String>) -> bool {
-    if let Some(value) = response
-        .header(X_CODEX_TURN_STATE_HEADER)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let _ = turn_state.set(value.to_string());
-        true
-    } else {
-        false
-    }
-}
-
-/// True for transport-level failures that occur while reading the streamed body
-/// (e.g. a dropped/garbled chunked connection). Re-sending the request is safe and
-/// usually succeeds; data errors (bad JSON, `response.failed`) won't match.
-fn is_stream_decode_error(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    [
-        "decoding chunk",
-        "while decoding",
-        "timed out",
-        "timeout",
-        "connection reset",
-        "connection closed",
-        "connection aborted",
-        "peer closed connection",
-        "broken pipe",
-        "tls close_notify",
-        "stream closed before response.completed",
-        "stream closed before message_stop",
-        "stream closed before finish_reason",
-        "unexpected end of file",
-        "unexpected eof",
-        "unexpected-eof",
-        "eof while",
-        "io error",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle))
-}
-
-fn is_retryable_stream_error(message: &str) -> bool {
-    is_stream_decode_error(message)
-        || is_retryable_response_failed(message)
-        || is_retryable_anthropic_error(message)
-}
-
-/// Anthropic in-stream `error` events for transient conditions are safe to
-/// re-send; other error types (invalid_request, authentication, ...) are not.
-fn is_retryable_anthropic_error(message: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<Value>(message) else {
-        return false;
-    };
-    if value.get("type").and_then(Value::as_str) != Some("error") {
-        return false;
-    }
-    let kind = value
-        .get("error")
-        .and_then(|error| error.get("type"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    matches!(kind, "overloaded_error" | "api_error")
-}
-
-fn is_retryable_response_failed(message: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<Value>(message) else {
-        return false;
-    };
-    if value.get("type").and_then(Value::as_str) != Some("response.failed") {
-        return false;
-    }
-    let error = value
-        .get("response")
-        .and_then(|response| response.get("error"));
-    let code = error
-        .and_then(|error| error.get("code"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let detail = error
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    code == "upstream_error" || detail.contains("upstream request failed")
-}
-
-/// Output items of a complete (non-streaming) Anthropic message body.
-fn anthropic_message_items(message: &Value) -> Vec<Value> {
-    message
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(anthropic::content_block_to_response_item)
-        .collect()
-}
-
-fn emit_anthropic_message(
-    message: &Value,
-    emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
-) -> Result<Vec<Value>, String> {
-    let output_items = anthropic_message_items(message);
-    for item in &output_items {
-        let text = extract_response_text(item);
-        if !text.is_empty() {
-            emit(StreamEvent::Delta(text))?;
-        }
-        emit(StreamEvent::ResponseItem(item.clone()))?;
-    }
-    if let Some(usage) = message.get("usage") {
-        let (input_tokens, cached_input_tokens) = anthropic::normalize_usage(Some(usage));
-        emit(StreamEvent::Usage {
-            input_tokens,
-            cached_input_tokens,
-            output_tokens: usage
-                .get("output_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            reasoning_tokens: 0,
-        })?;
-    }
-    Ok(output_items)
-}
-
-fn truncate_error_body(body: &str) -> String {
-    let mut chars = body.chars();
-    let snippet = chars.by_ref().take(180).collect::<String>();
-    if chars.next().is_some() {
-        format!("{snippet}...")
-    } else {
-        snippet
-    }
 }
 
 #[cfg(test)]
@@ -2724,183 +2154,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(output_call_ids, ["first", "second"]);
         let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn stream_decode_errors_are_retryable_but_data_errors_are_not() {
-        assert!(is_stream_decode_error("Error while decoding chunks"));
-        assert!(is_stream_decode_error("connection reset by peer"));
-        assert!(is_stream_decode_error("the operation timed out"));
-        assert!(is_stream_decode_error(
-            "peer closed connection without sending TLS close_notify"
-        ));
-        assert!(is_stream_decode_error(
-            "https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
-        ));
-        assert!(is_stream_decode_error(
-            "tls connection init failed: unexpected end of file"
-        ));
-        assert!(is_stream_decode_error(
-            "stream closed before response.completed"
-        ));
-        assert!(is_retryable_stream_error(
-            r#"{"type":"response.failed","response":{"error":{"code":"upstream_error","message":"Upstream request failed"}}}"#
-        ));
-        assert!(!is_stream_decode_error(
-            "{\"type\":\"response.failed\",\"response\":{}}"
-        ));
-        assert!(!is_retryable_stream_error(
-            r#"{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"bad request"}}}"#
-        ));
-        assert!(!is_stream_decode_error("expected value at line 1 column 1"));
-    }
-
-    #[test]
-    fn captures_codex_turn_state_once() {
-        let turn_state = OnceLock::new();
-        let response: ureq::Response = "HTTP/1.1 200 OK\r\n\
-             x-codex-turn-state: sticky-1\r\n\
-             \r\n"
-            .parse()
-            .unwrap();
-
-        capture_turn_state(&response, &turn_state);
-
-        assert_eq!(turn_state.get().map(String::as_str), Some("sticky-1"));
-
-        let response: ureq::Response = "HTTP/1.1 200 OK\r\n\
-             x-codex-turn-state: sticky-2\r\n\
-             \r\n"
-            .parse()
-            .unwrap();
-
-        capture_turn_state(&response, &turn_state);
-
-        assert_eq!(turn_state.get().map(String::as_str), Some("sticky-1"));
-    }
-
-    // The vendor parsers' terminal error messages must stay in sync with the
-    // retry classification here: truncated streams are transport failures
-    // (safe to re-send), while in-stream data errors are not.
-    #[test]
-    fn vendor_truncated_stream_errors_are_retryable() {
-        let error = responses::read_sse_stream(
-            "data: {\"type\":\"response.created\"}\n\n".as_bytes(),
-            |_| Ok(()),
-        )
-        .expect_err("stream without response.completed should fail");
-        assert!(error.contains("stream closed before response.completed"));
-        assert!(is_retryable_stream_error(&error));
-
-        let sse = concat!(
-            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
-        );
-        let error = anthropic::read_sse_stream(sse.as_bytes(), |_| Ok(()))
-            .expect_err("truncated stream should fail");
-        assert!(error.contains("stream closed before message_stop"));
-        assert!(is_retryable_stream_error(&error));
-
-        let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
-        let error =
-            chat::read_sse_stream(sse.as_bytes(), |_| Ok(())).expect_err("truncated chat stream");
-        assert!(error.contains("stream closed before finish_reason"));
-        assert!(is_retryable_stream_error(&error));
-    }
-
-    #[test]
-    fn vendor_data_errors_are_not_retryable() {
-        let sse =
-            "data: {\"type\":\"error\",\"code\":\"invalid_api_key\",\"message\":\"bad key\"}\n\n";
-        let error = responses::read_sse_stream(sse.as_bytes(), |_| Ok(()))
-            .expect_err("in-stream error event should fail");
-        assert!(error.contains("invalid_api_key"));
-        assert!(!is_retryable_stream_error(&error));
-
-        // A truncated tool call is a data error: retrying would replay the
-        // whole (expensive) response for the same likely outcome.
-        let sse = concat!(
-            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"write\",\"input\":{}}}\n\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"a.txt\\\",\\\"content\"}}\n\n",
-            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":9}}\n\n",
-            "data: {\"type\":\"message_stop\"}\n\n",
-        );
-        let error = anthropic::read_sse_stream(sse.as_bytes(), |_| Ok(()))
-            .expect_err("truncated tool_use should fail");
-        assert!(!is_retryable_stream_error(&error));
-    }
-
-    #[test]
-    fn anthropic_transient_stream_errors_are_retryable() {
-        assert!(is_retryable_stream_error(
-            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#
-        ));
-        assert!(is_retryable_stream_error(
-            r#"{"type":"error","error":{"type":"api_error","message":"Internal server error"}}"#
-        ));
-        assert!(!is_retryable_stream_error(
-            r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad request"}}"#
-        ));
-    }
-
-    #[test]
-    fn retry_policy_retries_429_and_5xx_but_not_other_4xx() {
-        assert!(!is_retryable_error(&ureq::Error::Status(
-            400,
-            ureq::Response::new(400, "Bad Request", "").unwrap()
-        )));
-        assert!(is_retryable_error(&ureq::Error::Status(
-            429,
-            ureq::Response::new(429, "Too Many Requests", "").unwrap()
-        )));
-        assert!(is_retryable_error(&ureq::Error::Status(
-            500,
-            ureq::Response::new(500, "Server Error", "").unwrap()
-        )));
-    }
-
-    #[test]
-    fn retry_backoff_increases_and_caps() {
-        assert_eq!(retry_backoff(1), Duration::from_millis(250));
-        assert_eq!(retry_backoff(2), Duration::from_millis(500));
-        assert_eq!(retry_backoff(3), Duration::from_millis(1000));
-        assert_eq!(retry_backoff(5), Duration::from_millis(4000));
-        assert_eq!(retry_backoff(99), Duration::from_millis(4000));
-    }
-
-    #[test]
-    fn non_streaming_anthropic_message_normalizes_usage_and_emits_items() {
-        // Anthropic reports input, cache_read and cache_creation disjointly;
-        // normalized: input = 10 + 90 + 20 = 120, cached = 90.
-        let message = json!({
-            "content": [{ "type": "text", "text": "hello" }],
-            "usage": {
-                "input_tokens": 10,
-                "cache_read_input_tokens": 90,
-                "cache_creation_input_tokens": 20,
-                "output_tokens": 5
-            }
-        });
-        let mut usage = None;
-        let mut deltas = String::new();
-        let items = emit_anthropic_message(&message, &mut |event| {
-            match event {
-                StreamEvent::Delta(delta) => deltas.push_str(&delta),
-                StreamEvent::Usage {
-                    input_tokens,
-                    cached_input_tokens,
-                    ..
-                } => usage = Some((input_tokens, cached_input_tokens)),
-                _ => {}
-            }
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(usage, Some((120, 90)));
-        assert_eq!(deltas, "hello");
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["type"], "message");
     }
 
     fn test_dir(name: &str) -> PathBuf {
@@ -3258,23 +2511,6 @@ mod tests {
     }
 
     #[test]
-    fn openai_responses_body_sets_output_cap_store_and_reasoning_include() {
-        let body = test_client().openai_responses_body(Vec::new());
-
-        assert_eq!(body["max_output_tokens"], 2048);
-        assert_eq!(body["store"], false);
-        assert_eq!(body["include"][0], "reasoning.encrypted_content");
-    }
-
-    #[test]
-    fn openai_summarize_body_sets_store_false_and_output_cap() {
-        let body = test_client().openai_summarize_body("sys", "user");
-
-        assert_eq!(body["store"], false);
-        assert_eq!(body["max_output_tokens"], 2048);
-    }
-
-    #[test]
     fn retrying_event_discards_replayed_subagent_deltas() {
         let mut stats = SubagentTurnStats::default();
         stats.record(StreamEvent::CallStart);
@@ -3355,29 +2591,5 @@ mod tests {
         assert_eq!(response_content_text(&all[1], "input_text"), "second");
         assert_eq!(none.len(), 1);
         assert!(response_content_text(&none[0], "input_text").contains("inspect"));
-    }
-
-    #[test]
-    fn responses_endpoint_follows_the_protocol_dialect() {
-        let base = "https://api.example.com/v1";
-        assert_eq!(
-            responses_endpoint(Protocol::OpenAiResponses, base),
-            "https://api.example.com/v1/responses"
-        );
-        assert_eq!(
-            responses_endpoint(
-                Protocol::OpenAiCodexResponses,
-                "https://chatgpt.com/backend-api"
-            ),
-            "https://chatgpt.com/backend-api/codex/responses"
-        );
-        let azure = responses_endpoint(
-            Protocol::AzureOpenAiResponses,
-            "https://res.openai.azure.com/openai/v1",
-        );
-        assert!(
-            azure.starts_with("https://res.openai.azure.com/openai/v1/responses?api-version="),
-            "{azure}"
-        );
     }
 }

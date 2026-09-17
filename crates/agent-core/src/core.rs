@@ -1,3 +1,4 @@
+use crate::providers::CLIENT_NAME;
 use crate::{
     config::{
         models_for_provider, profile_dir, ApprovalMode, AuthStore, Config, JucodeTokens,
@@ -45,9 +46,6 @@ use std::{
 
 /// Recent context (in tokenizer-counted tokens) kept verbatim when compacting; older
 /// turns are folded into the summary.
-/// Client name this binary presents when a provider mints a labeled
-/// credential (Z.ai's API key name).
-const CLIENT_NAME: &str = "jucode";
 const COMPACTION_KEEP_RECENT_TOKENS: usize = 20_000;
 const RESUME_SUMMARY_IDLE_SECONDS: u64 = 5 * 60;
 const RESUME_SUMMARY_MODEL: &str = "gpt-5.4-mini";

@@ -6,6 +6,10 @@
 use llm_provider_kit::providers::GPT_MODELS;
 use llm_provider_kit::{Protocol, ProviderTemplate};
 
+/// Name this client presents where a provider expects one: the Codex
+/// `originator` header and the Z.ai API-key label minted at login.
+pub const CLIENT_NAME: &str = "jucode";
+
 /// The JuCode gateway: the OpenAI Responses API serving the gpt-5 family (plus
 /// claude-* models, which users configure by name).
 pub const JUCODE_TEMPLATE: ProviderTemplate = ProviderTemplate {
