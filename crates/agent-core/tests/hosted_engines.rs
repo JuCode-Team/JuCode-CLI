@@ -238,3 +238,81 @@ fn host_tools_run_in_the_host_and_host_prompt_reaches_the_model() {
     let events = pump(&mut core, is_ready);
     assert!(assistant_text(&events).contains("<host-marker>brief goes here</host-marker>"));
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sandboxed_engine_runs_commands_inside_and_asks_to_leave() {
+    use jucode_agent_core::sandbox::{CommandRule, RuleAction, SandboxMode, SandboxPolicy};
+    let _guard = setup();
+    let dir = temp_dir("sandboxed");
+    fs::create_dir_all(dir.join(".git")).unwrap();
+    // auto-edit asks for every shell command without a sandbox.
+    let mut core = open(&dir, ApprovalMode::AutoEdit);
+    core.set_sandbox(Some(SandboxPolicy {
+        mode: SandboxMode::WorkspaceWrite,
+        writable_dirs: Vec::new(),
+        readable_dirs: Vec::new(),
+        network: true,
+        rules: vec![
+            CommandRule {
+                prefix: "touch".into(),
+                action: RuleAction::Allow,
+            },
+            CommandRule {
+                prefix: "rm -rf".into(),
+                action: RuleAction::Forbid,
+            },
+        ],
+    }));
+    let approvals = |events: &[AgentEvent]| {
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ApprovalRequest { .. }))
+            .count()
+    };
+
+    // Inside the sandbox: no approval, workspace writable, .git not.
+    core.submit_user_message("RUN: printf ok > inside.txt; printf no > .git/config".to_string());
+    let events = pump(&mut core, is_ready);
+    assert_eq!(approvals(&events), 0);
+    assert_eq!(fs::read_to_string(dir.join("inside.txt")).unwrap(), "ok");
+    assert!(!dir.join(".git/config").exists());
+
+    // Leaving the sandbox asks; once allowed it runs outside.
+    core.submit_user_message(
+        r#"CALL bash {"command":"printf yes > .git/config","escalate":true,"justification":"test"}"#.to_string(),
+    );
+    let events = pump(&mut core, |event| {
+        matches!(event, AgentEvent::ApprovalRequest { .. })
+    });
+    let call_id = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ApprovalRequest { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    core.approve(&call_id, true, false, None);
+    pump(&mut core, is_ready);
+    assert_eq!(fs::read_to_string(dir.join(".git/config")).unwrap(), "yes");
+
+    // An allow rule lets that escalation through without asking.
+    core.submit_user_message(
+        r#"CALL bash {"command":"touch .git/marker","escalate":true}"#.to_string(),
+    );
+    let events = pump(&mut core, is_ready);
+    assert_eq!(approvals(&events), 0);
+    assert!(dir.join(".git/marker").exists());
+
+    // A forbid rule never runs.
+    fs::write(dir.join("keep.txt"), "keep").unwrap();
+    core.submit_user_message(r#"CALL bash {"command":"rm -rf keep.txt"}"#.to_string());
+    let events = pump(&mut core, is_ready);
+    assert!(assistant_text(&events).contains("forbidden"));
+    assert!(dir.join("keep.txt").exists());
+
+    // The model is told about the sandbox and gets the escalate parameter.
+    core.submit_user_message("SYSTEM".to_string());
+    let events = pump(&mut core, is_ready);
+    assert!(assistant_text(&events).contains("<sandbox mode=\"workspace-write\">"));
+}

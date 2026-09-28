@@ -292,6 +292,12 @@ impl AgentCore {
         &self.cwd
     }
 
+    /// Runs this engine's shell commands in `sandbox` and checks file writes
+    /// against it (None: no sandbox). Applies to the next tool call.
+    pub fn set_sandbox(&mut self, sandbox: Option<crate::sandbox::SandboxPolicy>) {
+        self.tool_state.set_sandbox(sandbox);
+    }
+
     /// Adds host tools and prompt text; they apply from the next turn.
     pub fn set_host_extensions(&mut self, host: crate::host::HostExtensions) {
         self.host = Some(host);
@@ -1779,6 +1785,13 @@ impl AgentCore {
                 skills,
             },
         );
+        if let Some(sandbox) = self.tool_state.sandbox() {
+            let note = sandbox.prompt(&self.cwd);
+            if !note.is_empty() {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&note);
+            }
+        }
         if let Some(host) = &self.host {
             let extra = (host.prompt)();
             if !extra.trim().is_empty() {

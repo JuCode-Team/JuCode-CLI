@@ -347,13 +347,21 @@ pub fn run_tool_with_events(
         }
     };
 
+    // The sandbox's extra directories are readable by the file tools too.
+    let sandbox = state.sandbox();
+    let mut read_roots = extra_read_roots.to_vec();
+    if let Some(sandbox) = &sandbox {
+        read_roots.extend(sandbox.readable_dirs.iter().cloned());
+        read_roots.extend(sandbox.writable_dirs.iter().cloned());
+    }
+    let extra_read_roots = read_roots.as_slice();
     let result = match name {
         "read" => read_file(&args, cwd, extra_read_roots, state),
         "str_replace" | "edit" => str_replace_file(&args, cwd, state),
         "hashline_edit" => hashline_edit_file(&args, cwd, state),
         "write" => write_file(&args, cwd, state),
         "bash" | "execute" | "exec_command" | "shell_command" => {
-            let value = bash(&args, cwd, &mut emit);
+            let value = bash(&args, cwd, sandbox.as_ref(), &mut emit);
             if let Some(session_id) = value.get("session_id").and_then(Value::as_u64) {
                 state.own_shell(session_id);
             }
@@ -365,7 +373,7 @@ pub fn run_tool_with_events(
             }
             _ => write_stdin(&args),
         },
-        "apply_patch" => apply_patch(&args, cwd, &mut emit),
+        "apply_patch" => apply_patch(&args, cwd, sandbox.as_ref(), &mut emit),
         "ls" => list_dir(&args, cwd, extra_read_roots),
         "ripgrep" => ripgrep(&args, cwd, extra_read_roots),
         "outline" => outline_file(&args, cwd, extra_read_roots),
@@ -532,7 +540,7 @@ fn str_replace_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         return json!({ "error": "edits must not be empty" });
     }
 
-    let path = match workspace_path(cwd, path) {
+    let path = match write_target(cwd, path, state) {
         Ok(path) => path,
         Err(error) => return json!({ "error": error }),
     };
@@ -635,7 +643,7 @@ fn hashline_edit_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         return json!({ "error": "edits must not be empty" });
     }
 
-    let path = match workspace_path(cwd, path) {
+    let path = match write_target(cwd, path, state) {
         Ok(path) => path,
         Err(error) => return json!({ "error": error }),
     };
@@ -686,7 +694,7 @@ fn write_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         return json!({ "error": "missing content" });
     };
 
-    let path = match workspace_path(cwd, path) {
+    let path = match write_target(cwd, path, state) {
         Ok(path) => path,
         Err(error) => return json!({ "error": error }),
     };
@@ -1256,9 +1264,12 @@ fn post_edit_anchor_block(content: &str, first: usize, last: usize) -> Option<St
     Some(out.join("\n"))
 }
 
+/// Runs a shell command. With a sandbox it runs inside it, unless the call
+/// carries `escalate: true` (the approval gate has already let it through).
 fn bash(
     args: &Value,
     cwd: &Path,
+    sandbox: Option<&crate::sandbox::SandboxPolicy>,
     emit: &mut impl FnMut(ToolExecutionEvent) -> Result<(), String>,
 ) -> Value {
     let Some(command) = args
@@ -1282,6 +1293,19 @@ fn bash(
     };
 
     let (program, shell_args) = shell_command(command);
+    let escalated = args.get("escalate").and_then(Value::as_bool) == Some(true);
+    let (program, shell_args) = match sandbox.filter(|_| !escalated) {
+        Some(sandbox) => match sandbox.wrap(program, &shell_args, &workdir) {
+            Ok(wrapped) => wrapped,
+            Err(error) => return json!({ "command": command, "error": error }),
+        },
+        None => (
+            program.to_string(),
+            shell_args.iter().map(|arg| arg.to_string()).collect(),
+        ),
+    };
+    let program = program.as_str();
+    let shell_args: Vec<&str> = shell_args.iter().map(String::as_str).collect();
     let result = if let Some(yield_time) = yield_time {
         run_command_session(
             program,
@@ -1956,6 +1980,7 @@ fn write_full_tool_output(name: &str, output: &str, cwd: &Path) -> PathBuf {
 fn apply_patch(
     args: &Value,
     cwd: &Path,
+    sandbox: Option<&crate::sandbox::SandboxPolicy>,
     emit: &mut impl FnMut(ToolExecutionEvent) -> Result<(), String>,
 ) -> Value {
     let Some(patch) = args.get("patch").and_then(Value::as_str) else {
@@ -1968,7 +1993,9 @@ fn apply_patch(
     // the workspace, before anything is checked or applied.
     let targets = patch_target_paths(patch, cwd);
     for target in &targets {
-        if let Err(error) = ensure_in_workspace(cwd, target) {
+        if let Err(error) = ensure_in_workspace(cwd, target)
+            .and_then(|()| sandbox.map_or(Ok(()), |sandbox| sandbox.check_write(cwd, target)))
+        {
             return json!({ "error": error });
         }
     }
@@ -2353,9 +2380,22 @@ pub struct ToolState(Arc<Mutex<ToolStateInner>>);
 struct ToolStateInner {
     reads: HashSet<String>,
     shells: HashSet<u64>,
+    /// When set, shell commands run in this OS sandbox and file writes are
+    /// checked against it.
+    sandbox: Option<crate::sandbox::SandboxPolicy>,
 }
 
 impl ToolState {
+    pub fn set_sandbox(&self, sandbox: Option<crate::sandbox::SandboxPolicy>) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.sandbox = sandbox;
+        }
+    }
+
+    pub fn sandbox(&self) -> Option<crate::sandbox::SandboxPolicy> {
+        self.0.lock().ok().and_then(|inner| inner.sandbox.clone())
+    }
+
     fn mark_read(&self, path: &Path) {
         if let Ok(mut inner) = self.0.lock() {
             inner.reads.insert(normalize_path_key(path));
@@ -3293,6 +3333,21 @@ pub(crate) fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
 /// intentionally not gated. Symlinks in the existing part of the path are
 /// resolved before the check, so a symlink pointing outside the workspace is
 /// rejected too.
+/// Where a mutating file tool may write: the workspace, or one of the
+/// sandbox's read-write directories, and never where the sandbox forbids.
+fn write_target(cwd: &Path, path: &str, state: &ToolState) -> Result<PathBuf, String> {
+    let sandbox = state.sandbox();
+    let resolved = resolve_path(cwd, path);
+    let target = match &sandbox {
+        Some(sandbox) if sandbox.in_writable_dir(&resolved) => resolved,
+        _ => workspace_path(cwd, path)?,
+    };
+    if let Some(sandbox) = sandbox {
+        sandbox.check_write(cwd, &target)?;
+    }
+    Ok(target)
+}
+
 pub(crate) fn workspace_path(cwd: &Path, path: &str) -> Result<PathBuf, String> {
     let resolved = resolve_path(cwd, path);
     ensure_in_workspace(cwd, &resolved)?;
@@ -5204,6 +5259,55 @@ mod tests {
             &owner,
         );
         assert!(own.get("error").is_none(), "{own}");
+    }
+
+    #[test]
+    fn file_writes_follow_the_sandbox() {
+        use crate::sandbox::{SandboxMode, SandboxPolicy};
+        let dir = test_dir("sandbox-writes");
+        let extra = test_dir("sandbox-extra");
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::create_dir_all(&extra).unwrap();
+        let state = ToolState::default();
+        let policy = SandboxPolicy {
+            mode: SandboxMode::WorkspaceWrite,
+            writable_dirs: vec![extra.clone()],
+            readable_dirs: Vec::new(),
+            network: true,
+            rules: Vec::new(),
+        };
+        state.set_sandbox(Some(policy.clone()));
+        let write = |state: &ToolState, path: String| -> Value {
+            let args = json!({ "path": path, "content": "x" }).to_string();
+            serde_json::from_str(
+                &run_tool_with_events("write", &args, &dir, &[], state, |_| Ok(())).output,
+            )
+            .unwrap()
+        };
+        assert!(write(&state, "src/a.txt".into()).get("error").is_none());
+        let blocked = write(&state, ".git/config".into());
+        assert!(
+            blocked["error"]
+                .as_str()
+                .unwrap()
+                .contains("read-only in the sandbox"),
+            "{blocked}"
+        );
+        // A read-write directory outside the workspace is writable.
+        let outside = extra.join("deploy.sh").display().to_string();
+        assert!(write(&state, outside).get("error").is_none());
+        assert!(extra.join("deploy.sh").exists());
+
+        let read_only = ToolState::default();
+        read_only.set_sandbox(Some(SandboxPolicy {
+            mode: SandboxMode::ReadOnly,
+            ..policy
+        }));
+        assert!(write(&read_only, "src/b.txt".into())["error"]
+            .as_str()
+            .unwrap()
+            .contains("read-only"));
+        assert!(!dir.join("src/b.txt").exists());
     }
 
     fn test_dir(name: &str) -> PathBuf {

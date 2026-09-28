@@ -14,6 +14,7 @@ mod oauth;
 mod prompt;
 pub mod protocol;
 mod providers;
+pub mod sandbox;
 mod secrets;
 mod session;
 pub mod skills;

@@ -4,6 +4,7 @@ use crate::{
     hooks::Hooks,
     hunks::{self, HunkView},
     mcp::McpManager,
+    sandbox::RuleAction,
     session::extract_response_text,
     subagents::{
         prepare_workspace, SubagentManager, SubagentRunResult, SubagentSpawn, MAX_LIVE_SUBAGENTS,
@@ -157,6 +158,18 @@ pub struct GoalToolRequest {
     pub name: String,
     pub arguments: String,
     pub response_tx: Sender<ToolGoalResponse>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxGate {
+    /// Runs without approval (inside the sandbox, or an allowed escalation).
+    Run,
+    /// Always asks a person.
+    Ask,
+    /// Never runs.
+    Forbid,
+    /// Decided by the approval mode as without a sandbox.
+    Mode,
 }
 
 /// A gated tool call awaiting the user's allow/deny decision. The worker thread
@@ -536,14 +549,35 @@ impl OpenAiClient {
             let mut partial_approvals: BTreeMap<String, (Vec<String>, Vec<String>)> =
                 BTreeMap::new();
             for mut request in allowed_requests {
-                if !self.needs_approval(&request.name) {
+                let gate = self.sandbox_gate(&request);
+                if gate == SandboxGate::Forbid {
+                    emit(StreamEvent::ToolStart {
+                        call_id: request.call_id.clone(),
+                        name: request.name.clone(),
+                    })?;
+                    let result = json_tool_result(
+                        json!({ "error": "this command is forbidden by the agent's command rules; do not retry it" }),
+                        true,
+                    );
+                    emit_tool_output(&request, &result, &mut emit)?;
+                    blocked_results.push(ToolCallResult { request, result });
+                    continue;
+                }
+                let needs_approval = match gate {
+                    SandboxGate::Ask => true,
+                    SandboxGate::Run => false,
+                    SandboxGate::Mode | SandboxGate::Forbid => self.needs_approval(&request.name),
+                };
+                if !needs_approval {
                     approved_requests.push(request);
                     continue;
                 }
                 // `auto` mode consults the safety classifier before asking: an
                 // explicit allow skips the prompt entirely, everything else —
                 // deny, malformed output, classifier failure — still asks.
-                let classified_allow = self.approval_mode.classifies_shell()
+                // A command rule that says "ask" always reaches a person.
+                let classified_allow = gate != SandboxGate::Ask
+                    && self.approval_mode.classifies_shell()
                     && is_shell_tool(&request.name)
                     && self.classify_shell_command(
                         &request,
@@ -852,6 +886,32 @@ impl OpenAiClient {
         definitions.extend(self.mcp.definitions());
         if let Some(host) = &self.host {
             definitions.extend(host.tools.iter().cloned());
+        }
+        if self
+            .tool_state
+            .sandbox()
+            .is_some_and(|sandbox| sandbox.is_sandboxed())
+        {
+            for definition in &mut definitions {
+                let shell = definition
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| is_shell_tool(name) && name != "write_stdin");
+                if let Some(properties) = definition
+                    .pointer_mut("/parameters/properties")
+                    .and_then(Value::as_object_mut)
+                    .filter(|_| shell)
+                {
+                    properties.insert("escalate".to_string(), json!({
+                        "type": "boolean",
+                        "description": "Run outside the sandbox (for example to commit to git or write outside the writable directories). Needs approval."
+                    }));
+                    properties.insert("justification".to_string(), json!({
+                        "type": "string",
+                        "description": "With escalate: one line on why the command must run outside the sandbox."
+                    }));
+                }
+            }
         }
         if self.goal_tool_tx.is_some() {
             definitions.extend(goal_tool_definitions());
@@ -1304,6 +1364,39 @@ impl OpenAiClient {
     /// wired (interactive serve / TUI); the class-per-mode policy lives in
     /// `ApprovalMode::requires_approval`. Requests that do go out may still be
     /// auto-approved core-side by the session allowlist or a looser live mode.
+    /// How the sandbox and the command rules treat a shell call; `Mode`
+    /// defers to the approval mode as without a sandbox.
+    fn sandbox_gate(&self, request: &ToolCallRequest) -> SandboxGate {
+        if !is_shell_tool(&request.name) || request.name == "write_stdin" {
+            return SandboxGate::Mode;
+        }
+        let Some(sandbox) = self.tool_state.sandbox() else {
+            return SandboxGate::Mode;
+        };
+        let args = serde_json::from_str::<Value>(&request.arguments).unwrap_or(Value::Null);
+        let command = args
+            .get("command")
+            .or_else(|| args.get("cmd"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let escalated = args.get("escalate").and_then(Value::as_bool) == Some(true);
+        match sandbox.rule_for(command) {
+            Some(RuleAction::Forbid) => SandboxGate::Forbid,
+            Some(RuleAction::Ask) => SandboxGate::Ask,
+            Some(RuleAction::Allow) if escalated => SandboxGate::Run,
+            // Inside the sandbox a command needs no approval; only the
+            // strictest mode still asks for every command.
+            _ if sandbox.is_sandboxed() && !escalated => {
+                if self.approval_mode == ApprovalMode::Manual {
+                    SandboxGate::Ask
+                } else {
+                    SandboxGate::Run
+                }
+            }
+            _ => SandboxGate::Mode,
+        }
+    }
+
     fn needs_approval(&self, name: &str) -> bool {
         if self.approval_tx.is_none() {
             return false;
