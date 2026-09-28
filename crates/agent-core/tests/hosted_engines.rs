@@ -166,3 +166,36 @@ fn going_unattended_releases_a_call_waiting_on_a_prompt() {
     assert!(assistant_text(&events).contains("submitted for confirmation"));
     assert!(!dir.join("marker.txt").exists());
 }
+
+#[test]
+fn config_changes_from_two_engines_both_land() {
+    let _guard = setup();
+    let mut first = open(&temp_dir("config-first"), ApprovalMode::Manual);
+    let mut second = open(&temp_dir("config-second"), ApprovalMode::Manual);
+    let server = |name: &str| {
+        serde_json::json!({
+            "name": name, "transport": "stdio", "command": "true", "enabled": false,
+        })
+    };
+    // `second` loaded the config before `first` changed it; its save must
+    // not drop `first`'s server.
+    first.mcp_set(&server("from_first"));
+    second.mcp_set(&server("from_second"));
+
+    let config_path = std::path::PathBuf::from(env::var("HOME").unwrap())
+        .join(".jucode")
+        .join("config.json");
+    let saved: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    let names: Vec<&str> = saved["mcp_servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["name"].as_str())
+        .collect();
+    assert!(names.contains(&"from_first"), "{names:?}");
+    assert!(names.contains(&"from_second"), "{names:?}");
+
+    second.mcp_remove("from_first");
+    second.mcp_remove("from_second");
+}

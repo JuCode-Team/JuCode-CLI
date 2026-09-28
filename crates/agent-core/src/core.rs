@@ -3446,16 +3446,14 @@ impl AgentCore {
             Ok(config) => config,
             Err(error) => return vec![AgentEvent::Error(error)],
         };
-        match self
-            .config
-            .mcp_servers
+        let upsert = |servers: &mut Vec<crate::config::McpServerConfig>| match servers
             .iter_mut()
             .find(|existing| existing.name == config.name)
         {
             Some(existing) => *existing = config.clone(),
-            None => self.config.mcp_servers.push(config.clone()),
-        }
-        if let Err(error) = self.config.save() {
+            None => servers.push(config.clone()),
+        };
+        if let Err(error) = self.change_config(|current| upsert(&mut current.mcp_servers)) {
             return vec![AgentEvent::Error(format!("failed to save config: {error}"))];
         }
         self.mcp.upsert(config, &self.cwd);
@@ -3464,12 +3462,18 @@ impl AgentCore {
 
     /// Remove one MCP server by name, persisting the change (serve `mcp_remove`).
     pub fn mcp_remove(&mut self, name: &str) -> Vec<AgentEvent> {
-        let before = self.config.mcp_servers.len();
-        self.config.mcp_servers.retain(|server| server.name != name);
-        if self.config.mcp_servers.len() == before && !self.mcp.contains(name) {
+        if !self
+            .config
+            .mcp_servers
+            .iter()
+            .any(|server| server.name == name)
+            && !self.mcp.contains(name)
+        {
             return vec![AgentEvent::Error(format!("unknown MCP server: {name}"))];
         }
-        if let Err(error) = self.config.save() {
+        if let Err(error) =
+            self.change_config(|current| current.mcp_servers.retain(|server| server.name != name))
+        {
             return vec![AgentEvent::Error(format!("failed to save config: {error}"))];
         }
         self.mcp.remove(name);
@@ -3479,16 +3483,21 @@ impl AgentCore {
     /// Enable/disable one MCP server, persisting the change (serve `mcp_toggle`
     /// and `/mcp enable|disable`).
     pub fn mcp_toggle(&mut self, name: &str, enabled: bool) -> Vec<AgentEvent> {
-        let Some(server) = self
+        if !self
             .config
             .mcp_servers
-            .iter_mut()
-            .find(|server| server.name == name)
-        else {
+            .iter()
+            .any(|server| server.name == name)
+        {
             return vec![AgentEvent::Error(format!("unknown MCP server: {name}"))];
-        };
-        server.enabled = enabled;
-        if let Err(error) = self.config.save() {
+        }
+        if let Err(error) = self.change_config(|current| {
+            for server in &mut current.mcp_servers {
+                if server.name == name {
+                    server.enabled = enabled;
+                }
+            }
+        }) {
             return vec![AgentEvent::Error(format!("failed to save config: {error}"))];
         }
         if let Err(error) = self.mcp.set_enabled(name, enabled, &self.cwd) {
@@ -3533,6 +3542,18 @@ impl AgentCore {
         }
     }
 
+    /// Applies `change` to the config file as it is on disk now, then to this
+    /// engine's copy. Other engines (in this process or another) may have
+    /// saved since this one loaded the file; saving the whole in-memory copy
+    /// would silently undo their changes.
+    fn change_config(&mut self, change: impl Fn(&mut Config)) -> io::Result<()> {
+        let mut current = Config::load_or_create()?;
+        change(&mut current);
+        current.save()?;
+        change(&mut self.config);
+        Ok(())
+    }
+
     fn set_model_config(&mut self, model: String, reasoning_effort: String) -> Vec<AgentEvent> {
         if model.trim().is_empty() {
             return vec![AgentEvent::Error("model cannot be empty".to_string())];
@@ -3548,9 +3569,10 @@ impl AgentCore {
             ))];
         }
 
-        self.config.model = model;
-        self.config.reasoning_effort = reasoning_effort;
-        match self.config.save() {
+        match self.change_config(|config| {
+            config.model = model.clone();
+            config.reasoning_effort = reasoning_effort.clone();
+        }) {
             Ok(()) => vec![self.model_status_event()],
             Err(error) => vec![AgentEvent::Error(format!("failed to save config: {error}"))],
         }
