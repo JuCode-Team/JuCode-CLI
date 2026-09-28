@@ -286,7 +286,26 @@ impl AgentCore {
         &self.cwd
     }
 
+    /// The current branch as a transcript, for a client that attaches to a
+    /// running session and needs the conversation so far.
+    pub fn transcript_event(&self) -> AgentEvent {
+        AgentEvent::Transcript(self.session.transcript_items())
+    }
+
+    /// Startup batch: the session state plus the trust prompt and the
+    /// output of session_start hooks, which run here.
     pub fn startup_events(&self) -> Vec<AgentEvent> {
+        let mut events = self.state_events();
+        for message in self.hooks.session_start(&self.cwd) {
+            events.push(AgentEvent::Info(message));
+        }
+        events
+    }
+
+    /// The session state a client needs to show it (identity, model,
+    /// commands, approval mode, MCP servers, a pending trust prompt), with
+    /// no side effects, so it can be sent again to a client that attaches.
+    pub fn state_events(&self) -> Vec<AgentEvent> {
         let model_config = self.config.current_model_config();
         let mut events = vec![
             AgentEvent::Startup {
@@ -312,9 +331,6 @@ impl AgentCore {
                 cwd: self.cwd.display().to_string(),
                 repo_root: trust::repo_root(&self.cwd).map(|path| path.display().to_string()),
             });
-        }
-        for message in self.hooks.session_start(&self.cwd) {
-            events.push(AgentEvent::Info(message));
         }
         events
     }

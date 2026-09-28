@@ -238,6 +238,34 @@ fn a_closed_session_reopens_with_its_open_actions() {
 }
 
 #[test]
+fn watching_sends_that_client_a_snapshot_of_the_session() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-snapshot");
+    let mut first = Client::connect(&daemon);
+    let session = first.create_session(&dir);
+    first.send(json!({ "op": "user_message", "session": session, "content": "hello there" }));
+    first.until(ready(&session));
+
+    // A client that attaches later gets the session identity and the
+    // conversation so far, without asking the engine to start over.
+    let mut late = Client::connect(&daemon);
+    late.send(json!({ "op": "watch", "session": session }));
+    let frames =
+        late.until(|frame| frame["type"] == "transcript" && frame["session"] == session.as_str());
+    let startup = frames
+        .iter()
+        .find(|frame| frame["type"] == "startup")
+        .expect("snapshot starts with the startup state");
+    assert_eq!(startup["session_id"], session.as_str());
+    assert_eq!(startup["cwd"], dir.display().to_string());
+    let transcript = frames.last().unwrap()["items"].as_array().unwrap().clone();
+    assert!(transcript
+        .iter()
+        .any(|item| item["content"] == "hello there"));
+}
+
+#[test]
 fn session_switching_commands_are_refused() {
     let _guard = setup();
     let daemon = start_daemon();

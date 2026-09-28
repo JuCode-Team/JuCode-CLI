@@ -105,6 +105,12 @@ fn run(hub: &Hub, mut core: AgentCore, id: &str, ops: Receiver<Value>) {
 
 /// Applies one op; returns true when the session should stop.
 fn apply(hub: &Hub, core: &mut AgentCore, id: &str, op: &Value) -> bool {
+    if op["op"] == "snapshot" {
+        if let Some(client) = op["client"].as_u64() {
+            send_snapshot(hub, core, id, client);
+        }
+        return false;
+    }
     if let Some(reason) = rejected(op) {
         publish(hub, id, AgentEvent::Error(reason));
         return false;
@@ -121,6 +127,18 @@ fn apply(hub: &Hub, core: &mut AgentCore, id: &str, op: &Value) -> bool {
         publish(hub, id, event);
     }
     quit
+}
+
+/// Everything a client needs to show a session it starts watching: the
+/// startup batch, the conversation so far and the current model status.
+/// Sent to that client only; the others already have it.
+fn send_snapshot(hub: &Hub, core: &AgentCore, id: &str, client: u64) {
+    let mut events = core.state_events();
+    events.push(core.transcript_event());
+    events.push(AgentEvent::Attended(core.attended()));
+    for event in events {
+        hub.send_to(client, &session_event_json(id, event));
+    }
 }
 
 /// Commands that would switch the engine to another session. A hosted

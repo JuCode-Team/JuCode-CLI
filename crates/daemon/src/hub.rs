@@ -161,6 +161,11 @@ impl Hub {
             hosted.watchers.remove(&client);
         }
         let after = !hosted.watchers.is_empty();
+        if watch {
+            let _ = hosted
+                .ops
+                .send(json!({ "op": "snapshot", "client": client }));
+        }
         if before != after {
             let _ = hosted
                 .ops

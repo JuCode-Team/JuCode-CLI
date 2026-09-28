@@ -54,7 +54,7 @@ every connected client.
 | `session_create` | `cwd` | `session_created` with `session`; the session's startup events follow |
 | `session_open` | `session` | `session_opened`; reopens a closed session (or one from before a restart), resuming its transcript and its undecided deferred actions |
 | `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped |
-| `watch` / `unwatch` | `session` | `watching` with `watching: true/false` |
+| `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
 | `actions_list` | — | `actions`: undecided deferred actions across all sessions |
 
 ## Session ops
