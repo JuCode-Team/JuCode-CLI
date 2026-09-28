@@ -4,6 +4,7 @@
 //! reads the brief into every turn of the agent's sessions; the agent keeps
 //! it current with the `brief` tool.
 
+use jucode_agent_core::sandbox::{CommandRule, RuleAction, SandboxMode, SandboxPolicy};
 use serde_json::{json, Value};
 use std::{
     fs, io,
@@ -26,6 +27,20 @@ pub struct Agent {
     /// Approval mode for its sessions (`manual`, `auto-edit`, `auto`,
     /// `full-access`); unattended agents default to `auto`.
     pub approval_mode: String,
+    /// Sandbox for its shell commands: `read-only`, `workspace-write`
+    /// (default) or `full-access`.
+    pub sandbox: String,
+    pub network: bool,
+    /// Directories outside `cwd` it may use, each `ro` or `rw`.
+    pub directories: Vec<Directory>,
+    pub command_rules: Vec<CommandRule>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Directory {
+    pub path: PathBuf,
+    /// `ro` or `rw`.
+    pub mode: String,
 }
 
 impl Agent {
@@ -36,8 +51,96 @@ impl Agent {
             "cwd": self.cwd.display().to_string(),
             "enabled": self.enabled,
             "approval_mode": self.approval_mode,
+            "sandbox": self.sandbox,
+            "network": self.network,
+            "directories": self.directories.iter().map(|dir| json!({
+                "path": dir.path.display().to_string(),
+                "mode": dir.mode,
+            })).collect::<Vec<_>>(),
+            "command_rules": self.command_rules.iter().map(|rule| json!({
+                "prefix": rule.prefix,
+                "action": match rule.action {
+                    RuleAction::Allow => "allow",
+                    RuleAction::Ask => "ask",
+                    RuleAction::Forbid => "forbid",
+                },
+            })).collect::<Vec<_>>(),
         })
     }
+
+    /// The sandbox its sessions run in.
+    pub fn policy(&self) -> Result<SandboxPolicy, String> {
+        let dirs = |mode: &str| {
+            self.directories
+                .iter()
+                .filter(|dir| dir.mode == mode)
+                .map(|dir| dir.path.clone())
+                .collect()
+        };
+        Ok(SandboxPolicy {
+            mode: SandboxMode::parse(&self.sandbox)?,
+            writable_dirs: dirs("rw"),
+            readable_dirs: dirs("ro"),
+            network: self.network,
+            rules: self.command_rules.clone(),
+        })
+    }
+}
+
+/// New agents may commit on their own but ask before pushing: `.git` is
+/// read-only in the sandbox, so committing needs an escalation.
+fn default_rules() -> Value {
+    json!([
+        { "prefix": "git add", "action": "allow" },
+        { "prefix": "git commit", "action": "allow" },
+        { "prefix": "git push", "action": "ask" },
+    ])
+}
+
+fn parse_directories(value: &Value) -> Result<Vec<Directory>, String> {
+    let Some(items) = value.as_array() else {
+        return Ok(Vec::new());
+    };
+    items
+        .iter()
+        .map(|item| {
+            let path = item["path"].as_str().unwrap_or_default();
+            let mode = item["mode"].as_str().unwrap_or("ro");
+            if !matches!(mode, "ro" | "rw") {
+                return Err(format!("directory mode must be ro or rw, not '{mode}'"));
+            }
+            let path = PathBuf::from(path);
+            if !path.is_absolute() || !path.is_dir() {
+                return Err(format!(
+                    "not an existing absolute directory: {}",
+                    path.display()
+                ));
+            }
+            Ok(Directory {
+                path,
+                mode: mode.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn parse_rules(value: &Value) -> Result<Vec<CommandRule>, String> {
+    let Some(items) = value.as_array() else {
+        return Ok(Vec::new());
+    };
+    items
+        .iter()
+        .map(|item| {
+            let prefix = item["prefix"].as_str().unwrap_or_default().trim();
+            if prefix.is_empty() {
+                return Err("a command rule needs a prefix".to_string());
+            }
+            Ok(CommandRule {
+                prefix: prefix.to_string(),
+                action: RuleAction::parse(item["action"].as_str().unwrap_or_default())?,
+            })
+        })
+        .collect()
 }
 
 impl Agents {
@@ -72,6 +175,20 @@ impl Agents {
                 .as_str()
                 .unwrap_or("auto")
                 .to_string(),
+            sandbox: value["sandbox"]
+                .as_str()
+                .unwrap_or(default_sandbox())
+                .to_string(),
+            network: value["network"].as_bool().unwrap_or(true),
+            // A directory that has gone away is dropped, not an error.
+            directories: value["directories"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|item| parse_directories(&json!([item])).ok())
+                .flatten()
+                .collect(),
+            command_rules: parse_rules(&value["command_rules"]).unwrap_or_default(),
         })
     }
 
@@ -100,6 +217,10 @@ impl Agents {
             cwd: cwd.to_path_buf(),
             enabled: true,
             approval_mode: "auto".to_string(),
+            sandbox: default_sandbox().to_string(),
+            network: true,
+            directories: Vec::new(),
+            command_rules: parse_rules(&default_rules()).expect("default rules parse"),
         };
         let write = || -> io::Result<()> {
             fs::create_dir_all(dir.join("memory"))?;
@@ -119,35 +240,48 @@ impl Agents {
         Ok(agent)
     }
 
-    /// Changes the given settings in `agent.json`, keeping the rest.
-    pub fn update(
-        &self,
-        id: &str,
-        name: Option<&str>,
-        enabled: Option<bool>,
-        approval_mode: Option<&str>,
-    ) -> Result<Agent, String> {
-        if let Some(mode) = approval_mode {
-            if !matches!(mode, "manual" | "auto-edit" | "auto" | "full-access") {
-                return Err(format!(
-                    "unknown approval mode '{mode}': use manual, auto-edit, auto or full-access"
-                ));
-            }
-        }
+    /// Changes the settings present in `changes` (`name`, `enabled`,
+    /// `approval_mode`, `sandbox`, `network`, `directories`,
+    /// `command_rules`), keeping the rest of `agent.json`.
+    pub fn update(&self, id: &str, changes: &Value) -> Result<Agent, String> {
         if !valid_id(id) {
             return Err(format!("unknown agent {id}"));
         }
         let path = self.dir.join(id).join("agent.json");
         let text = fs::read_to_string(&path).map_err(|_| format!("unknown agent {id}"))?;
         let mut settings: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
-        if let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) {
+        if let Some(name) = changes["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
             settings["name"] = json!(name);
         }
-        if let Some(enabled) = enabled {
+        if let Some(enabled) = changes["enabled"].as_bool() {
             settings["enabled"] = json!(enabled);
         }
-        if let Some(mode) = approval_mode {
+        if let Some(mode) = changes["approval_mode"].as_str() {
+            if !matches!(mode, "manual" | "auto-edit" | "auto" | "full-access") {
+                return Err(format!(
+                    "unknown approval mode '{mode}': use manual, auto-edit, auto or full-access"
+                ));
+            }
             settings["approval_mode"] = json!(mode);
+        }
+        if let Some(sandbox) = changes["sandbox"].as_str() {
+            SandboxMode::parse(sandbox)?;
+            settings["sandbox"] = json!(sandbox);
+        }
+        if let Some(network) = changes["network"].as_bool() {
+            settings["network"] = json!(network);
+        }
+        if !changes["directories"].is_null() {
+            parse_directories(&changes["directories"])?;
+            settings["directories"] = changes["directories"].clone();
+        }
+        if !changes["command_rules"].is_null() {
+            parse_rules(&changes["command_rules"])?;
+            settings["command_rules"] = changes["command_rules"].clone();
         }
         let text = serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())?;
         fs::write(&path, text + "\n").map_err(|error| error.to_string())?;
@@ -264,6 +398,15 @@ impl Agents {
     }
 }
 
+/// Windows has no sandbox yet: its agents start without one.
+fn default_sandbox() -> &'static str {
+    if cfg!(windows) {
+        "full-access"
+    } else {
+        "workspace-write"
+    }
+}
+
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 40
@@ -319,13 +462,44 @@ mod tests {
         let (agents, work) = agents("update");
         agents.create("ops", "Ops", &work, "role").unwrap();
         let updated = agents
-            .update("ops", None, Some(false), Some("manual"))
+            .update(
+                "ops",
+                &json!({ "enabled": false, "approval_mode": "manual" }),
+            )
             .unwrap();
         assert_eq!(updated.name, "Ops");
         assert!(!updated.enabled);
         assert_eq!(updated.approval_mode, "manual");
-        assert!(agents.update("ops", None, None, Some("yolo")).is_err());
-        assert!(agents.update("missing", Some("x"), None, None).is_err());
+        assert!(agents
+            .update("ops", &json!({ "approval_mode": "yolo" }))
+            .is_err());
+        assert!(agents.update("missing", &json!({ "name": "x" })).is_err());
+        assert!(agents.update("ops", &json!({ "sandbox": "open" })).is_err());
+        assert!(agents
+            .update(
+                "ops",
+                &json!({ "directories": [{ "path": "relative", "mode": "rw" }] })
+            )
+            .is_err());
+        let logs = work.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let updated = agents
+            .update(
+                "ops",
+                &json!({
+                    "sandbox": "read-only",
+                    "network": false,
+                    "directories": [{ "path": logs, "mode": "ro" }],
+                }),
+            )
+            .unwrap();
+        let policy = updated.policy().unwrap();
+        assert_eq!(policy.mode, SandboxMode::ReadOnly);
+        assert!(!policy.network);
+        assert_eq!(policy.readable_dirs, vec![logs]);
+        // New agents may commit on their own and ask before pushing.
+        assert_eq!(policy.rule_for("git commit -m x"), Some(RuleAction::Allow));
+        assert_eq!(policy.rule_for("git push"), Some(RuleAction::Ask));
     }
 
     #[test]

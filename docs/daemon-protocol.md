@@ -136,8 +136,42 @@ the agent's directory as that agent.
 
 A long-lived agent is a directory `~/.jucode/agents/<id>/`: its brief
 (`role.md`, `capabilities.md`, `policy.md`, `state.md`), `memory/<topic>.md`
-notes and `agent.json` (`name`, `cwd`, `enabled`, `approval_mode`, default
-`auto`). Every turn of an agent session gets the brief, the memory index and
+notes and `agent.json`:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `name`, `cwd`, `enabled` | | Display name, working directory, whether it takes messages. |
+| `approval_mode` | `auto` | `manual`, `auto-edit`, `auto` or `full-access`. |
+| `sandbox` | `workspace-write` (`full-access` on Windows) | Where its shell commands run; see below. |
+| `network` | `true` | Whether sandboxed commands may connect out. |
+| `directories` | `[]` | `[{"path": "/abs/dir", "mode": "ro" \| "rw"}]`: directories outside `cwd` it may read, or read and write. |
+| `command_rules` | `git add`/`git commit` allow, `git push` ask | `[{"prefix": "git push", "action": "allow" \| "ask" \| "forbid"}]`. |
+
+`agent_update` changes any of these fields.
+
+### Sandbox
+
+An agent's shell commands run in an OS sandbox (Seatbelt on macOS,
+`bwrap` on Linux; a session does not start when the sandbox is missing):
+
+- `read-only`: nothing is writable.
+- `workspace-write`: `cwd`, the `rw` directories, temp and package-cache
+  directories are writable; `.git` (and a worktree's real git directory),
+  `.jucode`, `.agents` inside them and the `ro` directories stay read-only.
+- `full-access`: no sandbox.
+
+`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.jucode/auth.json` and
+`~/.jucode/daemon` are unreadable in every sandboxed mode. File tools check
+writes against the same rules and can also read and write the agent's
+directories.
+
+A command inside the sandbox needs no approval (except under `manual`). A
+command that must leave it (commit to git, write elsewhere) is called with
+`escalate: true` and a `justification` and goes through the approval mode:
+`auto` asks the safety model, the others ask a person, and an unattended
+session defers it. Command rules come first: `forbid` never runs, `ask`
+always asks a person, `allow` lets an escalation run without asking;
+`forbid` wins over other matches, otherwise the longest prefix. Every turn of an agent session gets the brief, the memory index and
 the other agents in its system prompt, and three tools:
 
 | Tool | Does |

@@ -794,3 +794,42 @@ fn a_device_pairs_with_a_code_from_the_desktop_until_revoked() {
     }
     assert!(tungstenite::connect(format!("ws://{}/?token={token}", daemon.address)).is_err());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_agent_writes_its_rw_directories_and_not_its_ro_ones() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    let dir = create_agent(&mut client, "deployer", "Deploys");
+    fs::create_dir_all(dir.join(".git")).unwrap();
+    let deploy = temp_dir("deploy-scripts");
+    let logs = temp_dir("prod-logs");
+    fs::write(logs.join("app.log"), "boot ok").unwrap();
+    client.send(json!({
+        "op": "agent_update", "agent": "deployer", "id": 1,
+        "directories": [{ "path": deploy, "mode": "rw" }, { "path": logs, "mode": "ro" }],
+    }));
+    let frames = client.until(|frame| frame["id"] == 1);
+    assert_eq!(
+        frames.last().unwrap()["agent"]["sandbox"],
+        "workspace-write"
+    );
+
+    let script = format!(
+        "RUN: printf a > src.txt; printf b > {}/run.sh; printf c > {}/app.log; printf d > .git/config; cat {}/app.log > seen.txt",
+        deploy.display(),
+        logs.display(),
+        logs.display()
+    );
+    let (_, frames) = run_agent(&mut client, "deployer", &script);
+    // auto mode, inside the sandbox: nothing asked, nothing deferred.
+    assert!(!frames
+        .iter()
+        .any(|frame| frame["type"] == "approval_request" || frame["type"] == "action_deferred"));
+    assert_eq!(fs::read_to_string(dir.join("src.txt")).unwrap(), "a");
+    assert_eq!(fs::read_to_string(deploy.join("run.sh")).unwrap(), "b");
+    assert_eq!(fs::read_to_string(logs.join("app.log")).unwrap(), "boot ok");
+    assert!(!dir.join(".git/config").exists());
+    assert_eq!(fs::read_to_string(dir.join("seen.txt")).unwrap(), "boot ok");
+}

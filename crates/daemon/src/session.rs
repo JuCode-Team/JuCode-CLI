@@ -69,6 +69,10 @@ fn open(
         if let Ok(mode) = ApprovalMode::parse(&agent.approval_mode) {
             core.set_approval_mode(mode);
         }
+        // Refuse to start rather than run an agent's commands unsandboxed.
+        let policy = agent.policy()?;
+        policy.check_available()?;
+        core.set_sandbox(Some(policy));
         let session = core.session_id().to_string();
         core.set_host_extensions(crate::agent_tools::extensions(
             Arc::clone(hub),

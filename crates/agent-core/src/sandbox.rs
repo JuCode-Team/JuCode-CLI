@@ -131,7 +131,8 @@ impl SandboxPolicy {
     }
 
     /// `.git` (and a worktree's real git directory), `.jucode` and `.agents`
-    /// under the working directory and the read-write directories. A path
+    /// under the working directory and the read-write directories, and the
+    /// read-only directories. A path
     /// that contains `cwd` itself is left writable, so a subagent working
     /// inside `.jucode/agents/…` can still write its own worktree.
     pub fn protected_paths(&self, cwd: &Path) -> Vec<PathBuf> {
@@ -153,6 +154,9 @@ impl SandboxPolicy {
                 }
             }
         }
+        // Read-only directories stay read-only even when they sit under a
+        // writable root such as the temp directory.
+        protected.extend(self.readable_dirs.iter().map(|dir| real(dir)));
         protected.retain(|path| !cwd.starts_with(path));
         protected.sort();
         protected.dedup();

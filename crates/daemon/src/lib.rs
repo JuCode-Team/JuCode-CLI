@@ -315,18 +315,10 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             None => Err("agent_get requires a known agent".to_string()),
         },
         ("agent_update", _) => match op["agent"].as_str() {
-            Some(id) => hub
-                .agents
-                .update(
-                    id,
-                    op["name"].as_str(),
-                    op["enabled"].as_bool(),
-                    op["approval_mode"].as_str(),
-                )
-                .map(|agent| {
-                    hub.broadcast(&hub.agents_json());
-                    json!({ "type": "agent_updated", "agent": agent.to_json() })
-                }),
+            Some(id) => hub.agents.update(id, &op).map(|agent| {
+                hub.broadcast(&hub.agents_json());
+                json!({ "type": "agent_updated", "agent": agent.to_json() })
+            }),
             None => Err("agent_update requires agent".to_string()),
         },
         // An action can be decided after its session closed or the daemon
