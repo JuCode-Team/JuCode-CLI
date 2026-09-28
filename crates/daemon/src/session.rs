@@ -51,26 +51,30 @@ fn open(hub: &Hub, cwd: PathBuf, resume: Option<&str>) -> Result<AgentCore, Stri
         .with_version(hub.version);
     // Nobody watches a session until a client asks to.
     core.set_attended(false);
-    if let Some(id) = resume {
-        let (_, events) = core.handle_command(&format!("/resume {id}"));
-        if core.session_id() != id {
-            let reason = events
-                .into_iter()
-                .find_map(|event| match event {
-                    AgentEvent::Error(message) => Some(message),
-                    _ => None,
-                })
-                .unwrap_or_else(|| format!("could not resume {id}"));
-            return Err(reason);
-        }
-        let open = hub
-            .store
-            .open_actions()
+    let Some(id) = resume else {
+        // Persist the new session right away: a session closed before its
+        // first message must still reopen by id.
+        core.save_session().map_err(|error| error.to_string())?;
+        return Ok(core);
+    };
+    let (_, events) = core.handle_command(&format!("/resume {id}"));
+    if core.session_id() != id {
+        let reason = events
             .into_iter()
-            .filter(|action| action.session_id == id)
-            .collect();
-        core.restore_deferred_actions(open);
+            .find_map(|event| match event {
+                AgentEvent::Error(message) => Some(message),
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("could not resume {id}"));
+        return Err(reason);
     }
+    let open = hub
+        .store
+        .open_actions()
+        .into_iter()
+        .filter(|action| action.session_id == id)
+        .collect();
+    core.restore_deferred_actions(open);
     Ok(core)
 }
 

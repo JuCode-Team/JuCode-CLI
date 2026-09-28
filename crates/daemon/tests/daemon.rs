@@ -266,6 +266,20 @@ fn watching_sends_that_client_a_snapshot_of_the_session() {
 }
 
 #[test]
+fn a_session_closed_before_its_first_message_reopens() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-empty");
+    let mut client = Client::connect(&daemon);
+    let session = client.create_session(&dir);
+    client.send(json!({ "op": "session_close", "session": session }));
+    client.until(|frame| frame["type"] == "session_closed");
+    client.send(json!({ "op": "session_open", "session": session, "id": 7 }));
+    let frames = client.until(|frame| frame["id"] == 7);
+    assert_eq!(frames.last().unwrap()["type"], "session_opened");
+}
+
+#[test]
 fn session_switching_commands_are_refused() {
     let _guard = setup();
     let daemon = start_daemon();

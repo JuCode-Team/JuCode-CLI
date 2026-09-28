@@ -286,6 +286,12 @@ impl AgentCore {
         &self.cwd
     }
 
+    /// Writes the session to disk now, even before its first message, so a
+    /// host can reopen it by id at any time.
+    pub fn save_session(&mut self) -> io::Result<()> {
+        self.session.save_for_cwd(&self.profile_dir, &self.cwd)
+    }
+
     /// The current branch as a transcript, for a client that attaches to a
     /// running session and needs the conversation so far.
     pub fn transcript_event(&self) -> AgentEvent {
