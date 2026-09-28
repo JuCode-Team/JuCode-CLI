@@ -249,7 +249,7 @@ AgentOS 中不迁移的部分：自研 runtime 与工具集、WebUI（由 Deskto
   - 同一端口区分 WebSocket 与普通 HTTP。普通请求提供远程网页的构建产物（`--web <dir>`，未指定时用二进制旁边的 `web/`），`/` 跳转到 `/remote`，没有扩展名的路径返回 `index.html`，路径不能越出目录。
   - 配对：本机客户端发 `pair_start` 拿到 8 位一次性配对码（5 分钟有效）。手机把配对码 `POST /api/pair`，换取设备 token。`devices.jsonl` 只存 token 的哈希。设备 token 可以使用除设备管理以外的所有操作；`pair_start`、`device_list`、`device_revoke` 只允许本机 token。吊销后，该设备已打开的连接立即断开。
 - Desktop：
-  - daemon 地址改为可替换的来源（`setDaemonEndpoint`），外链打开改为 `openExternal`（Tauri 内用系统浏览器，普通浏览器开新标签页）。这是网页目标需要的全部传输接口：聊天渲染这条链路原本就不依赖 Tauri。
+  - daemon 地址改为可替换的来源（`setDaemonEndpoint`），外链打开改为 `openExternal`（Tauri 内用系统浏览器，普通浏览器开新标签页）。网页目标只需要替换这两处：聊天的状态和渲染组件原本就不依赖 Tauri。
   - 新增 `/remote` 路由，与桌面端同一次构建产出。页面按手机设计：配对页（支持扫码链接里的配对码）、工作台（与桌面端共用 `DeskContent`）、Agent 列表、会话页（消息流、审批卡片、输入框、停止）。查看会话即为有人在看，离开只取消查看，不结束会话。
   - 设置 → 后端 → 后台服务：填写手机访问地址（推荐 `tailscale serve` 的 HTTPS 地址），"添加设备"显示配对码和二维码（新增依赖 `uqr`，无传递依赖），已配对设备列表可吊销。
 - 验证：
