@@ -148,7 +148,7 @@ fn apply(hub: &Hub, core: &mut AgentCore, id: &str, op: &Value) -> bool {
     // Recorded before the engine runs an approved action: if the daemon
     // stops mid-run, the action is not offered again and run twice.
     if op["op"] == "decide_action" {
-        if let (Some(action), Some(decision)) = (op["id"].as_str(), op["decision"].as_str()) {
+        if let (Some(action), Some(decision)) = (op["action"].as_str(), op["decision"].as_str()) {
             let _ = hub.store.record_decided(action, decision == "allow");
         }
     }

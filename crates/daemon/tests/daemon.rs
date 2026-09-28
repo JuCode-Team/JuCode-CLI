@@ -169,7 +169,7 @@ fn an_unwatched_session_defers_and_keeps_running_after_the_client_leaves() {
     client.send(json!({
         "op": "decide_action",
         "session": session,
-        "id": deferred["id"],
+        "action": deferred["id"],
         "decision": "allow",
     }));
     client.until(|frame| frame["type"] == "action_decided" && frame["id"] == deferred["id"]);
@@ -242,7 +242,7 @@ fn a_closed_session_reopens_with_its_open_actions() {
     client.send(json!({
         "op": "decide_action",
         "session": session,
-        "id": deferred["id"],
+        "action": deferred["id"],
         "decision": "allow",
     }));
     client.until(|frame| frame["type"] == "action_decided");
@@ -653,7 +653,7 @@ fn an_action_can_be_decided_after_its_session_closed() {
     client.until(|frame| frame["type"] == "session_closed");
 
     client.send(json!({
-        "op": "decide_action", "session": session, "id": action["id"], "decision": "allow",
+        "op": "decide_action", "session": session, "action": action["id"], "decision": "allow",
     }));
     client.until(|frame| frame["type"] == "action_decided");
     client.until(ready(&session));

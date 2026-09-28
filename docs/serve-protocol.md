@@ -158,10 +158,10 @@ open deferred action, or the decision already made for it in this engine.
 ### `decide_action`
 
 ```json
-{"op":"decide_action","id":"act-1727500000000-3f9a1c2b","decision":"allow"}
+{"op":"decide_action","action":"act-1727500000000-3f9a1c2b","decision":"allow"}
 ```
 
-Decides a deferred action. `allow` runs the call with its original arguments
+Decides the deferred action whose id is `action`. `allow` runs the call with its original arguments
 in the background; `deny` does not run it. Either way the engine emits
 `action_decided` and sends the outcome to the session as a user message,
 which starts a turn (or queues behind the running one). Unknown ids emit

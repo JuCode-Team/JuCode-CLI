@@ -77,14 +77,15 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
                 "set_attended requires attended: true or false".to_string(),
             )],
         },
+        // The action id travels as `action`: `id` is a client's request id.
         "decide_action" => match (
-            value.get("id").and_then(Value::as_str),
+            value.get("action").and_then(Value::as_str),
             value.get("decision").and_then(Value::as_str),
         ) {
             (Some(id), Some("allow")) => core.decide_action(id, true),
             (Some(id), Some("deny")) => core.decide_action(id, false),
             _ => vec![AgentEvent::Error(
-                "decide_action requires id and decision: allow or deny".to_string(),
+                "decide_action requires action and decision: allow or deny".to_string(),
             )],
         },
         "mcp_list" => vec![core.mcp_servers_event()],
