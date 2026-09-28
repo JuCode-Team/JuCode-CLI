@@ -178,8 +178,8 @@ pub struct AgentCore {
     trust: TrustStore,
     project_trusted: bool,
     hooks: Hooks,
-    /// Files this engine has read; editing requires a prior read.
-    reads: crate::tools::ReadTracker,
+    /// Files read and shells started by this engine (see `tools::ToolState`).
+    tool_state: crate::tools::ToolState,
     plan: Vec<PlanItem>,
     mcp: McpManager,
     /// Version reported in the startup event and used by the update check.
@@ -258,7 +258,7 @@ impl AgentCore {
             trust,
             project_trusted,
             hooks,
-            reads: crate::tools::ReadTracker::default(),
+            tool_state: crate::tools::ToolState::default(),
             plan: Vec::new(),
             approval_receiver: None,
             pending_approvals: HashMap::new(),
@@ -1806,7 +1806,7 @@ impl AgentCore {
             safety_reasoning_effort: self.config.safety_reasoning_effort.clone(),
             edit_tools: self.config.edit_tools.clone(),
             extra_read_roots,
-            reads: self.reads.clone(),
+            tool_state: self.tool_state.clone(),
             subagent_manager: Some(self.subagent_manager.clone()),
             hooks: self.hooks.clone(),
         }) else {
@@ -2044,7 +2044,7 @@ impl AgentCore {
             // Summarization clients never expose or execute tools.
             edit_tools: Vec::new(),
             extra_read_roots: Vec::new(),
-            reads: crate::tools::ReadTracker::default(),
+            tool_state: crate::tools::ToolState::default(),
             subagent_manager: None,
             hooks: Hooks::default(),
         })
@@ -2089,7 +2089,7 @@ impl AgentCore {
             // Summarization clients never expose or execute tools.
             edit_tools: Vec::new(),
             extra_read_roots: Vec::new(),
-            reads: crate::tools::ReadTracker::default(),
+            tool_state: crate::tools::ToolState::default(),
             subagent_manager: None,
             hooks: Hooks::default(),
         })
@@ -2328,7 +2328,7 @@ impl AgentCore {
         let tx = self.action_tx.clone();
         let mcp = self.mcp.clone();
         let hooks = self.hooks.clone();
-        let reads = self.reads.clone();
+        let tool_state = self.tool_state.clone();
         thread::spawn(move || {
             let result = if action.name.starts_with("mcp__") {
                 match mcp.run_tool(&action.name, &action.arguments) {
@@ -2358,7 +2358,7 @@ impl AgentCore {
                     &action.arguments,
                     &action.cwd,
                     &[],
-                    &reads,
+                    &tool_state,
                     |_| Ok(()),
                 )
             };
@@ -3155,7 +3155,7 @@ impl AgentCore {
             ))];
         }
         let (restored, removed) =
-            match crate::tools::restore_to_timestamp(&self.cwd, t, &self.reads) {
+            match crate::tools::restore_to_timestamp(&self.cwd, t, &self.tool_state) {
                 Ok(result) => (
                     result
                         .get("restored")

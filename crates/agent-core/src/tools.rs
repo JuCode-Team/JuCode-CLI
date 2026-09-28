@@ -311,17 +311,17 @@ fn with_function_tool_defaults(mut definitions: Vec<Value>) -> Vec<Value> {
 #[cfg(test)]
 thread_local! {
     /// One tracker per test thread, standing in for an engine's.
-    static TEST_READS: ReadTracker = ReadTracker::default();
+    static TEST_STATE: ToolState = ToolState::default();
 }
 
 #[cfg(test)]
-fn test_reads() -> ReadTracker {
-    TEST_READS.with(ReadTracker::clone)
+fn test_state() -> ToolState {
+    TEST_STATE.with(ToolState::clone)
 }
 
 #[cfg(test)]
 fn run_tool(name: &str, arguments: &str, cwd: &Path) -> String {
-    run_tool_with_events(name, arguments, cwd, &[], &test_reads(), |_| Ok(())).output
+    run_tool_with_events(name, arguments, cwd, &[], &test_state(), |_| Ok(())).output
 }
 
 /// `extra_read_roots` lists directories outside the workspace that read-only
@@ -332,7 +332,7 @@ pub fn run_tool_with_events(
     arguments: &str,
     cwd: &Path,
     extra_read_roots: &[PathBuf],
-    reads: &ReadTracker,
+    state: &ToolState,
     mut emit: impl FnMut(ToolExecutionEvent) -> Result<(), String>,
 ) -> ToolExecutionResult {
     let parsed = serde_json::from_str::<Value>(arguments);
@@ -348,17 +348,28 @@ pub fn run_tool_with_events(
     };
 
     let result = match name {
-        "read" => read_file(&args, cwd, extra_read_roots, reads),
-        "str_replace" | "edit" => str_replace_file(&args, cwd, reads),
-        "hashline_edit" => hashline_edit_file(&args, cwd, reads),
-        "write" => write_file(&args, cwd, reads),
-        "bash" | "execute" | "exec_command" | "shell_command" => bash(&args, cwd, &mut emit),
-        "write_stdin" => write_stdin(&args),
+        "read" => read_file(&args, cwd, extra_read_roots, state),
+        "str_replace" | "edit" => str_replace_file(&args, cwd, state),
+        "hashline_edit" => hashline_edit_file(&args, cwd, state),
+        "write" => write_file(&args, cwd, state),
+        "bash" | "execute" | "exec_command" | "shell_command" => {
+            let value = bash(&args, cwd, &mut emit);
+            if let Some(session_id) = value.get("session_id").and_then(Value::as_u64) {
+                state.own_shell(session_id);
+            }
+            value
+        }
+        "write_stdin" => match optional_u64(&args, "session_id") {
+            Ok(Some(session_id)) if !state.owns_shell(session_id) => {
+                json!({ "session_id": session_id, "error": format!("unknown shell session {session_id}") })
+            }
+            _ => write_stdin(&args),
+        },
         "apply_patch" => apply_patch(&args, cwd, &mut emit),
         "ls" => list_dir(&args, cwd, extra_read_roots),
         "ripgrep" => ripgrep(&args, cwd, extra_read_roots),
         "outline" => outline_file(&args, cwd, extra_read_roots),
-        "checkpoint" => checkpoint_tool(&args, cwd, reads),
+        "checkpoint" => checkpoint_tool(&args, cwd, state),
         "web_fetch" => crate::web_fetch::run(&args),
         _ => json!({ "error": format!("unknown tool: {name}") }),
     };
@@ -398,7 +409,7 @@ fn add_soft_hint(value: &mut Value, warning: &str, suggestion: &str) {
     }
 }
 
-fn read_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf], reads: &ReadTracker) -> Value {
+fn read_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf], state: &ToolState) -> Value {
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return json!({ "error": "missing path" });
     };
@@ -439,7 +450,7 @@ fn read_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf], reads: &Rea
                 return json!({ "path": path.display().to_string(), "error": error.to_string() })
             }
         };
-        reads.mark(&path);
+        state.mark_read(&path);
         return json!({
             "path": path.display().to_string(),
             "kind": "image",
@@ -488,7 +499,7 @@ fn read_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf], reads: &Rea
         }
         lines_read += 1;
     }
-    reads.mark(&path);
+    state.mark_read(&path);
 
     let mut value = json!({
         "path": path.display().to_string(),
@@ -510,7 +521,7 @@ fn read_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf], reads: &Rea
     value
 }
 
-fn str_replace_file(args: &Value, cwd: &Path, reads: &ReadTracker) -> Value {
+fn str_replace_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return json!({ "error": "missing path" });
     };
@@ -525,7 +536,7 @@ fn str_replace_file(args: &Value, cwd: &Path, reads: &ReadTracker) -> Value {
         Ok(path) => path,
         Err(error) => return json!({ "error": error }),
     };
-    if !reads.contains(&path) {
+    if !state.has_read(&path) {
         return json!({
             "path": path.display().to_string(),
             "error": "edit requires reading this file first so oldText matches bytes on disk"
@@ -581,7 +592,7 @@ fn str_replace_file(args: &Value, cwd: &Path, reads: &ReadTracker) -> Value {
     let _ = create_checkpoint(cwd, "auto-edit", std::slice::from_ref(&path));
     match fs::write(&path, &output) {
         Ok(()) => {
-            reads.mark(&path);
+            state.mark_read(&path);
             let diff = unified_diff_for_file(cwd, &path, &original, &output);
             json!({
                 "path": path.display().to_string(),
@@ -613,7 +624,7 @@ struct HashlineSpan {
     replacement: String,
 }
 
-fn hashline_edit_file(args: &Value, cwd: &Path, reads: &ReadTracker) -> Value {
+fn hashline_edit_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return json!({ "error": "missing path" });
     };
@@ -628,7 +639,7 @@ fn hashline_edit_file(args: &Value, cwd: &Path, reads: &ReadTracker) -> Value {
         Ok(path) => path,
         Err(error) => return json!({ "error": error }),
     };
-    if !reads.contains(&path) {
+    if !state.has_read(&path) {
         return json!({
             "path": path.display().to_string(),
             "error": "hashline_edit requires reading this file first and copying LINE#HASH anchors from read().hashlines"
@@ -650,7 +661,7 @@ fn hashline_edit_file(args: &Value, cwd: &Path, reads: &ReadTracker) -> Value {
     let _ = create_checkpoint(cwd, "auto-hashline-edit", std::slice::from_ref(&path));
     match fs::write(&path, &output) {
         Ok(()) => {
-            reads.mark(&path);
+            state.mark_read(&path);
             let diff = unified_diff_for_file(cwd, &path, &original, &output);
             let changed = changed_line_range(&original, &output);
             let anchors =
@@ -667,7 +678,7 @@ fn hashline_edit_file(args: &Value, cwd: &Path, reads: &ReadTracker) -> Value {
     }
 }
 
-fn write_file(args: &Value, cwd: &Path, reads: &ReadTracker) -> Value {
+fn write_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return json!({ "error": "missing path" });
     };
@@ -680,7 +691,7 @@ fn write_file(args: &Value, cwd: &Path, reads: &ReadTracker) -> Value {
         Err(error) => return json!({ "error": error }),
     };
     let exists = path.exists();
-    if exists && !reads.contains(&path) {
+    if exists && !state.has_read(&path) {
         return json!({
             "path": path.display().to_string(),
             "error": "write requires reading an existing file first before overwriting it; new files can be written without a prior read"
@@ -700,7 +711,7 @@ fn write_file(args: &Value, cwd: &Path, reads: &ReadTracker) -> Value {
     let _ = create_checkpoint(cwd, "auto-write", std::slice::from_ref(&path));
     match fs::write(&path, content) {
         Ok(()) => {
-            reads.mark(&path);
+            state.mark_read(&path);
             let diff = unified_diff_for_file(cwd, &path, &original, content);
             json!({
                 "path": path.display().to_string(),
@@ -2198,7 +2209,7 @@ fn outline_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value
     })
 }
 
-fn checkpoint_tool(args: &Value, cwd: &Path, reads: &ReadTracker) -> Value {
+fn checkpoint_tool(args: &Value, cwd: &Path, state: &ToolState) -> Value {
     let action = args
         .get("action")
         .and_then(Value::as_str)
@@ -2235,7 +2246,7 @@ fn checkpoint_tool(args: &Value, cwd: &Path, reads: &ReadTracker) -> Value {
             let Some(id) = args.get("id").and_then(Value::as_str) else {
                 return json!({ "error": "checkpoint restore requires id" });
             };
-            match restore_checkpoint(cwd, id, reads) {
+            match restore_checkpoint(cwd, id, state) {
                 Ok(value) => value,
                 Err(error) => json!({ "error": error.to_string() }),
             }
@@ -2329,23 +2340,45 @@ fn normalize_path_key(path: &Path) -> String {
     }
 }
 
-/// Files an engine has read (or written) since it started. Editing an
-/// existing file requires having read it first; each engine keeps its own
-/// set, so a read in one session never licenses an edit in another.
+/// Per-engine tool state. One per engine (shared with its subagents), so
+/// several engines in one process never see each other's:
+/// - files read (or written) since the engine started: editing an existing
+///   file requires having read it first;
+/// - background shell sessions started by `bash`: `write_stdin` may only
+///   reach the engine's own.
 #[derive(Clone, Default)]
-pub struct ReadTracker(Arc<Mutex<HashSet<String>>>);
+pub struct ToolState(Arc<Mutex<ToolStateInner>>);
 
-impl ReadTracker {
-    fn mark(&self, path: &Path) {
-        if let Ok(mut paths) = self.0.lock() {
-            paths.insert(normalize_path_key(path));
+#[derive(Default)]
+struct ToolStateInner {
+    reads: HashSet<String>,
+    shells: HashSet<u64>,
+}
+
+impl ToolState {
+    fn mark_read(&self, path: &Path) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.reads.insert(normalize_path_key(path));
         }
     }
 
-    fn contains(&self, path: &Path) -> bool {
+    fn has_read(&self, path: &Path) -> bool {
         self.0
             .lock()
-            .map(|paths| paths.contains(&normalize_path_key(path)))
+            .map(|inner| inner.reads.contains(&normalize_path_key(path)))
+            .unwrap_or(false)
+    }
+
+    fn own_shell(&self, session_id: u64) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.shells.insert(session_id);
+        }
+    }
+
+    fn owns_shell(&self, session_id: u64) -> bool {
+        self.0
+            .lock()
+            .map(|inner| inner.shells.contains(&session_id))
             .unwrap_or(false)
     }
 }
@@ -2496,7 +2529,7 @@ pub(crate) fn list_checkpoints(cwd: &Path) -> io::Result<Vec<Value>> {
     Ok(items)
 }
 
-pub(crate) fn restore_checkpoint(cwd: &Path, id: &str, reads: &ReadTracker) -> io::Result<Value> {
+pub(crate) fn restore_checkpoint(cwd: &Path, id: &str, state: &ToolState) -> io::Result<Value> {
     let path = checkpoint_dir(cwd).join(format!("{id}.json"));
     let value =
         serde_json::from_str::<Value>(&fs::read_to_string(path)?).map_err(io::Error::other)?;
@@ -2522,7 +2555,7 @@ pub(crate) fn restore_checkpoint(cwd: &Path, id: &str, reads: &ReadTracker) -> i
                 fs::create_dir_all(parent)?;
             }
             fs::write(&abs, content)?;
-            reads.mark(&abs);
+            state.mark_read(&abs);
             restored.push(rel.to_string());
         } else if content.is_null() {
             if abs.exists() {
@@ -2547,7 +2580,7 @@ pub(crate) fn restore_checkpoint(cwd: &Path, id: &str, reads: &ReadTracker) -> i
 /// file touched at or after `t`, restore the content captured by the earliest
 /// such checkpoint (its pre-edit state), and delete files that did not yet
 /// exist then. Checkpoints are ordered by their nanosecond id for precision.
-pub(crate) fn restore_to_timestamp(cwd: &Path, t: u64, reads: &ReadTracker) -> io::Result<Value> {
+pub(crate) fn restore_to_timestamp(cwd: &Path, t: u64, state: &ToolState) -> io::Result<Value> {
     let dir = checkpoint_dir(cwd);
     if !dir.exists() {
         return Ok(json!({ "restored": [], "removed": [] }));
@@ -2605,7 +2638,7 @@ pub(crate) fn restore_to_timestamp(cwd: &Path, t: u64, reads: &ReadTracker) -> i
                 fs::create_dir_all(parent)?;
             }
             fs::write(&abs, text)?;
-            reads.mark(&abs);
+            state.mark_read(&abs);
             restored.push(rel);
         } else if content.is_null() {
             if abs.exists() {
@@ -4161,7 +4194,7 @@ mod tests {
             &json!({ "command": "echo hello", "timeout": 5 }).to_string(),
             &dir,
             &[],
-            &test_reads(),
+            &test_state(),
             |event| {
                 let ToolExecutionEvent::Update(output) = event;
                 updates.push(output);
@@ -4560,7 +4593,7 @@ mod tests {
 
         let created = create_checkpoint(&dir, "manual", std::slice::from_ref(&path)).unwrap();
         let id = created["id"].as_str().unwrap();
-        let restored = restore_checkpoint(&dir, id, &test_reads()).unwrap();
+        let restored = restore_checkpoint(&dir, id, &test_state()).unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), vec![0xff, 0x00, 0x9f]);
         assert_eq!(restored["skipped"][0], "binary.bin");
@@ -4577,7 +4610,7 @@ mod tests {
         fs::write(&path, [0xff, 0x00]).unwrap();
 
         create_checkpoint(&dir, "manual", std::slice::from_ref(&path)).unwrap();
-        let restored = restore_to_timestamp(&dir, 0, &test_reads()).unwrap();
+        let restored = restore_to_timestamp(&dir, 0, &test_state()).unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), vec![0xff, 0x00]);
         assert_eq!(restored["skipped"][0], "binary.bin");
@@ -4616,7 +4649,7 @@ mod tests {
             &json!({ "pattern": "definitely_not_present_xyz", "path": path }).to_string(),
             &dir,
             &[],
-            &test_reads(),
+            &test_state(),
             |_| Ok(()),
         );
         let value = serde_json::from_str::<Value>(&result.output).unwrap();
@@ -4642,7 +4675,7 @@ mod tests {
             &json!({ "command": "sleep 0.4; echo done > marker.txt", "timeout": 10 }).to_string(),
             &dir,
             &[],
-            &test_reads(),
+            &test_state(),
             |_| Err("interrupted".to_string()),
         );
 
@@ -4703,7 +4736,7 @@ mod tests {
                 .to_string(),
             &dir,
             &[],
-            &test_reads(),
+            &test_state(),
             |_| {
                 emits.set(emits.get() + 1);
                 if emits.get() == 1 {
@@ -4802,7 +4835,7 @@ mod tests {
             &json!({ "command": "kill -9 $$", "timeout": 10 }).to_string(),
             &dir,
             &[],
-            &test_reads(),
+            &test_state(),
             |_| Ok(()),
         );
         let value = serde_json::from_str::<Value>(&result.output).unwrap();
@@ -4854,7 +4887,7 @@ mod tests {
                 &args.to_string(),
                 &workspace,
                 &roots,
-                &test_reads(),
+                &test_state(),
                 |_| Ok(()),
             )
         };
@@ -5107,10 +5140,10 @@ mod tests {
         let dir = test_dir("read-tracker-scope");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("notes.txt"), "old").unwrap();
-        let reader = ReadTracker::default();
-        let other = ReadTracker::default();
-        let call = |name: &str, args: Value, reads: &ReadTracker| {
-            run_tool_with_events(name, &args.to_string(), &dir, &[], reads, |_| Ok(())).output
+        let reader = ToolState::default();
+        let other = ToolState::default();
+        let call = |name: &str, args: Value, state: &ToolState| {
+            run_tool_with_events(name, &args.to_string(), &dir, &[], state, |_| Ok(())).output
         };
         call("read", json!({ "path": "notes.txt" }), &reader);
 
@@ -5129,6 +5162,44 @@ mod tests {
         );
         assert!(!informed.contains("error"), "{informed}");
         assert_eq!(fs::read_to_string(dir.join("notes.txt")).unwrap(), "new");
+    }
+
+    #[test]
+    fn write_stdin_reaches_only_the_engines_own_shells() {
+        let dir = test_dir("shell-owner");
+        fs::create_dir_all(&dir).unwrap();
+        let owner = ToolState::default();
+        let other = ToolState::default();
+        let call = |name: &str, args: Value, state: &ToolState| -> Value {
+            let output =
+                run_tool_with_events(name, &args.to_string(), &dir, &[], state, |_| Ok(())).output;
+            serde_json::from_str(&output).unwrap()
+        };
+        let started = call(
+            "bash",
+            json!({ "command": "sleep 5", "timeout": 10, "yield_time_ms": 100 }),
+            &owner,
+        );
+        let session_id = started["session_id"].as_u64().expect("still running");
+
+        let foreign = call(
+            "write_stdin",
+            json!({ "session_id": session_id, "text": "" }),
+            &other,
+        );
+        assert!(
+            foreign["error"]
+                .as_str()
+                .unwrap()
+                .contains("unknown shell session"),
+            "{foreign}"
+        );
+        let own = call(
+            "write_stdin",
+            json!({ "session_id": session_id, "text": "", "yield_time_ms": 10 }),
+            &owner,
+        );
+        assert!(own.get("error").is_none(), "{own}");
     }
 
     fn test_dir(name: &str) -> PathBuf {

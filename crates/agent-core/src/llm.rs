@@ -95,8 +95,8 @@ pub struct OpenAiClient {
     /// Directories outside the workspace read-only file tools may also read
     /// (discovered skill directories); inherited by subagents.
     extra_read_roots: Vec<PathBuf>,
-    /// The engine's record of files read, shared with its subagents.
-    reads: tools::ReadTracker,
+    /// The engine's tool state (see `tools::ToolState`), shared with its subagents.
+    tool_state: tools::ToolState,
     hooks: Hooks,
     /// Independent one-shot model used by `auto` mode to classify shell
     /// commands. None disables classification (shell calls then always ask).
@@ -143,8 +143,8 @@ pub struct OpenAiClientConfig<'a> {
     /// Directories outside the workspace that read-only file tools may also
     /// read — the directories of the discovered skills.
     pub extra_read_roots: Vec<PathBuf>,
-    /// The engine's record of files read (see `tools::ReadTracker`).
-    pub reads: tools::ReadTracker,
+    /// The engine's tool state (see `tools::ToolState`).
+    pub tool_state: tools::ToolState,
     pub subagent_manager: Option<SubagentManager>,
     pub hooks: Hooks,
 }
@@ -406,7 +406,7 @@ impl OpenAiClient {
             agent_depth: 0,
             write_root: None,
             extra_read_roots: config.extra_read_roots,
-            reads: config.reads,
+            tool_state: config.tool_state,
             hooks: config.hooks,
             safety,
         })
@@ -603,7 +603,7 @@ impl OpenAiClient {
                     &allowed_requests,
                     cwd,
                     &self.extra_read_roots,
-                    &self.reads,
+                    &self.tool_state,
                     &mut emit,
                 )?
             } else {
@@ -935,7 +935,7 @@ impl OpenAiClient {
                 &request.arguments,
                 cwd,
                 &self.extra_read_roots,
-                &self.reads,
+                &self.tool_state,
                 |event| {
                     let tools::ToolExecutionEvent::Update(output) = event;
                     emit(StreamEvent::ToolUpdate {
@@ -1081,7 +1081,7 @@ impl OpenAiClient {
             agent_depth: child_depth,
             write_root: Some(workspace.root.clone()),
             extra_read_roots: self.extra_read_roots.clone(),
-            reads: self.reads.clone(),
+            tool_state: self.tool_state.clone(),
             hooks: self.hooks.clone(),
             safety: self.safety.clone(),
         };
@@ -1611,7 +1611,7 @@ fn run_parallel_builtin_tools(
     requests: &[ToolCallRequest],
     cwd: &Path,
     extra_read_roots: &[PathBuf],
-    reads: &tools::ReadTracker,
+    tool_state: &tools::ToolState,
     emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
 ) -> Result<Vec<ToolCallResult>, String> {
     let (tx, rx) = mpsc::channel();
@@ -1621,14 +1621,14 @@ fn run_parallel_builtin_tools(
         let tx = tx.clone();
         let cwd = cwd.to_path_buf();
         let extra_read_roots = extra_read_roots.to_vec();
-        let reads = reads.clone();
+        let tool_state = tool_state.clone();
         handles.push(thread::spawn(move || {
             let result = tools::run_tool_with_events(
                 &request.name,
                 &request.arguments,
                 &cwd,
                 &extra_read_roots,
-                &reads,
+                &tool_state,
                 {
                     let tx = tx.clone();
                     let call_id = request.call_id.clone();
@@ -2174,8 +2174,8 @@ mod tests {
         ];
         let mut events = Vec::new();
 
-        let reads = tools::ReadTracker::default();
-        let results = run_parallel_builtin_tools(&requests, &dir, &[], &reads, &mut |event| {
+        let tool_state = tools::ToolState::default();
+        let results = run_parallel_builtin_tools(&requests, &dir, &[], &tool_state, &mut |event| {
             events.push(event);
             Ok(())
         })
@@ -2260,7 +2260,7 @@ mod tests {
             safety_reasoning_effort: String::new(),
             edit_tools: crate::config::default_edit_tools(),
             extra_read_roots: Vec::new(),
-            reads: tools::ReadTracker::default(),
+            tool_state: tools::ToolState::default(),
             subagent_manager: None,
             hooks: Hooks::default(),
         })
