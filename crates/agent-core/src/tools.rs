@@ -3229,10 +3229,14 @@ fn shell_command(command: &str) -> (&'static str, Vec<&str>) {
 }
 
 fn temp_output_path(label: &str) -> PathBuf {
+    // The counter keeps names unique across threads: the clock alone repeats
+    // when two tool calls (or two hosted sessions) ask in the same tick.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     env::temp_dir().join(format!(
-        "jucode-tool-{label}-{}-{}.log",
+        "jucode-tool-{label}-{}-{}-{}.log",
         std::process::id(),
-        now_nanos()
+        now_nanos(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
     ))
 }
 
