@@ -19,9 +19,23 @@ standardized subset for ACP clients; see `docs/serve-vs-acp.md` for the split.
   `{"type":"error","message":"unknown op: ..."}`. Malformed input never exits
   the process.
 
+## Protocol version
+
+This document describes protocol version 2. The first line on stdout is
+
+```json
+{"type":"hello","protocol":2,"version":"0.3.0"}
+```
+
+A client that does not support `protocol` must stop instead of guessing.
+Every later event carries a `session` field with the engine's current
+session id, the same shape the daemon uses to multiplex several sessions on
+one connection (`docs/agent-daemon-plan.md`). Ops may carry a `session`
+field; `jucode serve` hosts exactly one session and ignores it.
+
 ## Lifecycle
 
-On spawn, before any command, the engine emits its startup batch:
+After `hello`, before any command, the engine emits its startup batch:
 
 ```jsonl
 {"type":"startup","version":"0.2.0","session_id":"...","profile_dir":"...","config_path":"...","cwd":"...","model":"...","context_window":200000}

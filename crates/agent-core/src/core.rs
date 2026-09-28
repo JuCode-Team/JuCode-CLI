@@ -278,6 +278,14 @@ impl AgentCore {
         self
     }
 
+    pub fn session_id(&self) -> &str {
+        self.session.session_id()
+    }
+
+    pub fn cwd(&self) -> &std::path::Path {
+        &self.cwd
+    }
+
     pub fn startup_events(&self) -> Vec<AgentEvent> {
         let model_config = self.config.current_model_config();
         let mut events = vec![
