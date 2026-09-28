@@ -15,6 +15,17 @@ jucode daemon                      # ws://127.0.0.1:7788
 jucode daemon --listen 127.0.0.1:9000
 ```
 
+To start it at login and restart it if it exits:
+
+```sh
+jucode daemon install              # launchd on macOS, systemd user unit on Linux
+jucode daemon uninstall
+```
+
+`install` writes the PATH of the shell that ran it into the service, so the
+agent finds the same commands as in that shell; rerun it after changing PATH.
+The service logs to `~/.jucode/daemon/daemon.log`.
+
 State lives in `~/.jucode/daemon/`:
 
 | File | Contents |

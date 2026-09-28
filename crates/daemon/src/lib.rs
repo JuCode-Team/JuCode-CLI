@@ -5,6 +5,7 @@
 //! `docs/agent-daemon-plan.md` and `docs/daemon-protocol.md`.
 
 mod hub;
+pub mod install;
 mod session;
 mod store;
 

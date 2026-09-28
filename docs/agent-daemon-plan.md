@@ -183,15 +183,34 @@ AgentOS 中不迁移的部分：自研 runtime 与工具集、WebUI（由 Deskto
 - 待确认动作目前只保存在引擎内存里，持久化由阶段 1 的 daemon 根据 `action_deferred` 事件写日志完成。
 - 验证：`crates/agent-core/tests/hosted_engines.rs` 使用临时 HOME 和本地假模型服务，覆盖同进程两个引擎各自在自己的目录执行命令、无人值守时推迟后批准执行、拒绝后同一调用被直接拒绝、等待审批中切为无人值守后回合继续。
 
-梳理出的进程级状态，在阶段 1 按 daemon 的需要处理：
+梳理出的进程级状态及阶段 1 的处理结果：
 
-| 状态 | 位置 | 多引擎下的问题 | 阶段 1 处理 |
+| 状态 | 位置 | 多引擎下的问题 | 处理 |
 | --- | --- | --- | --- |
-| 已读文件记录 `READ_TRACKER` | `tools.rs` | 编辑前必须先读的检查在引擎之间共享，一个会话读过的文件，另一个会话可以直接编辑 | 改为每个引擎一份 |
-| shell 会话表 `SHELL_SESSIONS` | `tools.rs` | id 全局唯一，不冲突；但任一引擎可以按 id 向其他引擎的 shell 写入 | 记录所属引擎，跨引擎访问报错 |
-| 配置与凭据 | `Config`、`AuthStore` | 每个引擎各自加载一份并整文件保存，一个会话改模型后，另一个会话保存时会覆盖回去 | daemon 内所有引擎共享同一份 |
-| MCP 连接 | `McpManager` | 每个引擎各自启动 MCP 服务进程 | 先测量占用，再决定是否共享 |
+| 已读文件记录 | `tools.rs` | 一个会话读过的文件，另一个会话可以直接编辑 | 已改为每个引擎一份 `ToolState` |
+| shell 会话表 | `tools.rs` | 任一引擎可以按编号向其他引擎的 shell 写入 | `ToolState` 记录引擎启动的 shell，`write_stdin` 只能访问自己的 |
+| 配置 | `Config` | 每个引擎整文件保存，会覆盖其他会话的修改 | 模型、推理强度、MCP 的修改改为读取磁盘上的当前配置、只改对应字段再保存；登录与切换 provider 属于全局操作，仍整文件保存 |
+| MCP 连接 | `McpManager` | 每个引擎各自启动 MCP 服务进程 | 未处理，真实使用中测量占用后再定 |
 | 日志、环境变量 | `logging.rs` 等 | 只读或本来就全局，无问题 | 不处理 |
+
+### 阶段 1 结果
+
+- `crates/daemon`：`jucode daemon [--listen]` 用 WebSocket 托管多个会话，协议见 `docs/daemon-protocol.md`。
+  - 鉴权：首次启动生成 `~/.jucode/daemon/token`（0600），连接必须带 token。
+  - 会话：`session_create`、`session_open`、`session_close`；会话创建时立即落盘，关闭或 daemon 重启后都能按 id 重开，未决定的待确认动作随之恢复。
+  - 有人在看：客户端 `watch` 一个会话即为有人在看，最后一个客户端 `unwatch` 或断开后转为无人在看，正在等审批的调用转成待确认动作。`watch` 同时向该客户端发送会话快照（状态事件与对话记录）。
+  - 追加日志：`sessions.jsonl`、`actions.jsonl`。`decide_action` 在引擎执行前记录，daemon 中途停止也不会重复执行。
+  - 托管的会话拒绝 `/new` 与 `/resume <id>`，由 daemon 的会话操作代替。
+  - `jucode daemon install|uninstall` 写入 launchd 或 systemd 用户服务，并带上安装时的 PATH。
+- 协议 v2：`serve` 首行发 `hello`（带协议版本），每个事件带 `session`。事件序列化与指令处理移到 `agent-core/src/protocol.rs`，`serve` 与 daemon 共用。
+- Desktop：
+  - 设置 → 后端 → 后台服务：打开后新的 JuCode 会话由 daemon 托管。`src/lib/daemon.ts` 用一个 WebSocket 连接 daemon，托管会话在 Desktop 里的表现与子进程相同，适配器、`ChatState` 和各视图不变。
+  - 关闭 Desktop 只断开连接，会话继续运行；关闭标签页会结束对应的 daemon 会话；恢复、重启、切换 provider 都按 id 重开 daemon 会话。
+  - 修正：jucode 会话的指令改为经过适配器编码，审批模式名称（`read-only`、`full-auto`）在发送前映射为引擎的 `manual`、`full-access`。适配器检查 `hello` 的协议版本。
+- 验证：
+  - `crates/daemon/tests/daemon.rs` 用真实 WebSocket 客户端和假模型覆盖错误 token、无人在看时推迟、客户端离开后会话继续、有人在看时提示且观察者离开后转为推迟、关闭后重开并恢复待确认动作、新会话关闭后重开、快照、拒绝切换会话的命令。
+  - Desktop 的 `DaemonClient` 与 SessionStore 托管流程有单元测试，另用真实 `jucode daemon` 跑通创建、快照、关闭、按 id 重开。
+  - 尚未在 Tauri 界面中手动走一遍完整流程。
 
 AgentOS 现有数据不做迁移，只有少量会话。需要保留的 brief 可以直接复制到 `~/.jucode/agents/`。
 

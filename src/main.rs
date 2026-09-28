@@ -152,6 +152,8 @@ USAGE:
                                          front-ends (jucode's native schema)
     jucode daemon [--listen <addr>]      host many sessions for Desktop and
                                          remote clients over a WebSocket
+    jucode daemon install|uninstall      run the daemon at login (launchd /
+                                         systemd user service)
     jucode acp                           Agent Client Protocol (ACP v1)
                                          JSON-RPC adapter over stdio, for
                                          ACP-capable editors like Zed
@@ -328,16 +330,37 @@ fn run_update() -> i32 {
 /// `jucode daemon [--listen <addr>]`: host sessions for Desktop and remote
 /// clients until killed. Listens on loopback unless told otherwise.
 fn run_daemon(args: &[String]) -> io::Result<i32> {
+    let (action, args) = match args.first().map(String::as_str) {
+        Some(action @ ("install" | "uninstall")) => (action, &args[1..]),
+        _ => ("run", args),
+    };
     let mut listen = jucode_daemon::DEFAULT_LISTEN.to_string();
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match (arg.as_str(), rest.next()) {
             ("--listen", Some(address)) => listen = address.clone(),
             _ => {
-                eprintln!("usage: jucode daemon [--listen <host:port>]");
+                eprintln!("usage: jucode daemon [install|uninstall] [--listen <host:port>]");
                 return Ok(2);
             }
         }
+    }
+    let outcome = match action {
+        "install" => Some(jucode_daemon::install::install(&listen)),
+        "uninstall" => Some(jucode_daemon::install::uninstall()),
+        _ => None,
+    };
+    if let Some(outcome) = outcome {
+        return Ok(match outcome {
+            Ok(message) => {
+                println!("{message}");
+                0
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                1
+            }
+        });
     }
     let listener = std::net::TcpListener::bind(&listen)?;
     let store = jucode_daemon::Store::open(jucode_daemon::state_dir()?)?;
