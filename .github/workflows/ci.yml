@@ -21,7 +21,12 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install test dependencies
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep bubblewrap
+
+      # The sandbox tests run commands under bwrap, which needs unprivileged
+      # user namespaces; Ubuntu 24.04 restricts them through AppArmor.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Check formatting
         run: cargo fmt --check

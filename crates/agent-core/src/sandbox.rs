@@ -595,9 +595,9 @@ mod tests {
         assert!(args.contains("--unshare-net"));
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn seatbelt_enforces_the_policy() {
+    fn the_os_sandbox_enforces_the_policy() {
         use std::process::Command;
         let dir = work("seatbelt");
         let outside = real(&env::temp_dir())

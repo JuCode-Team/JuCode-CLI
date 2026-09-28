@@ -239,7 +239,7 @@ fn host_tools_run_in_the_host_and_host_prompt_reaches_the_model() {
     assert!(assistant_text(&events).contains("<host-marker>brief goes here</host-marker>"));
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_sandboxed_engine_runs_commands_inside_and_asks_to_leave() {
     use jucode_agent_core::sandbox::{CommandRule, RuleAction, SandboxMode, SandboxPolicy};

@@ -795,7 +795,7 @@ fn a_device_pairs_with_a_code_from_the_desktop_until_revoked() {
     assert!(tungstenite::connect(format!("ws://{}/?token={token}", daemon.address)).is_err());
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn an_agent_writes_its_rw_directories_and_not_its_ro_ones() {
     let _guard = setup();
@@ -834,7 +834,7 @@ fn an_agent_writes_its_rw_directories_and_not_its_ro_ones() {
     assert_eq!(fs::read_to_string(dir.join("seen.txt")).unwrap(), "boot ok");
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn an_unattended_escalation_becomes_a_pending_action() {
     let _guard = setup();

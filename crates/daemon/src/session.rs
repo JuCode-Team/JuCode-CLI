@@ -157,6 +157,9 @@ fn apply(hub: &Hub, core: &mut AgentCore, id: &str, op: &Value) -> bool {
         }
     }
     let (quit, events) = protocol::apply_op(core, op);
+    if op["claimed"] == true {
+        hub.release_claim(id);
+    }
     for event in events {
         publish(hub, id, event);
     }

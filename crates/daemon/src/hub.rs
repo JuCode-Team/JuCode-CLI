@@ -34,6 +34,10 @@ pub struct Hub {
     sessions: Mutex<HashMap<String, Hosted>>,
     /// Sessions whose engine is running a turn or has queued messages.
     busy: Mutex<HashSet<String>>,
+    /// Delivered messages a session thread has not processed yet. They hold
+    /// a running slot: the engine still reports "ready" until it has read
+    /// the message, and that must not free the slot early.
+    claims: Mutex<HashMap<String, usize>>,
     /// When each session last received a message (ms), for routing.
     last_active: Mutex<HashMap<String, u64>>,
     /// Serializes message delivery (scheduler ticks, sends, tool calls).
@@ -70,6 +74,7 @@ impl Hub {
             version,
             sessions: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashSet::new()),
+            claims: Mutex::new(HashMap::new()),
             last_active: Mutex::new(HashMap::new()),
             delivering: Mutex::new(()),
             next_id: AtomicU64::new(0),
@@ -277,6 +282,7 @@ impl Hub {
             let _ = self.store.record_session_closed(id);
         }
         lock(&self.busy).remove(id);
+        lock(&self.claims).remove(id);
         self.broadcast(&json!({ "type": "session_closed", "session": id }));
     }
 
@@ -315,8 +321,13 @@ impl Hub {
         }
     }
 
-    /// Called by a session thread when its engine starts or finishes work.
+    /// Called by a session thread with its engine's state every tick. A
+    /// session with an unprocessed delivery stays busy.
     pub fn set_busy(&self, session: &str, busy: bool) {
+        let busy = busy
+            || lock(&self.claims)
+                .get(session)
+                .is_some_and(|count| *count > 0);
         let changed = if busy {
             lock(&self.busy).insert(session.to_string())
         } else {
@@ -324,6 +335,17 @@ impl Hub {
         };
         if changed {
             self.broadcast(&self.agents_json());
+        }
+    }
+
+    /// The session thread has handed a delivered message to its engine.
+    pub fn release_claim(&self, session: &str) {
+        let mut claims = lock(&self.claims);
+        if let Some(count) = claims.get_mut(session) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                claims.remove(session);
+            }
         }
     }
 
@@ -610,13 +632,17 @@ impl Hub {
             }
             None => self.create_session(None, Some(&message.to))?,
         };
-        self.forward(
-            &session,
-            json!({ "op": "user_message", "content": delivery_text(message) }),
-        )?;
-        // A delivered message starts (or queues) a run; count it before the
-        // engine reports its status so the next message sees the slot taken.
+        // A delivered message starts (or queues) a run: claim the slot before
+        // forwarding, so the next message sees it taken.
+        *lock(&self.claims).entry(session.clone()).or_default() += 1;
         lock(&self.busy).insert(session.clone());
+        if let Err(error) = self.forward(
+            &session,
+            json!({ "op": "user_message", "content": delivery_text(message), "claimed": true }),
+        ) {
+            self.release_claim(&session);
+            return Err(error);
+        }
         lock(&self.last_active).insert(session.clone(), now());
         self.store
             .record_delivered(&message.id, &session)
