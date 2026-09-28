@@ -228,6 +228,21 @@ AgentOS 中不迁移的部分：自研 runtime 与工具集、WebUI（由 Deskto
 - 验证：`crates/daemon/tests/daemon.rs` 新增用户消息开新会话、后续消息接同一会话、brief 进入系统提示词、定时器在无客户端连接时触发并完成一次运行、Agent 之间互发消息、去重、停机期间到期的定时器在启动后触发、第 5 个运行等待空位。Desktop 的 Agent 目录与打开 Agent 会话有单元测试，另用真实 daemon 跑通创建 Agent 和以 Agent 身份开会话。
 - 未做：brief 修改记录（阶段 6）；Agent 页（会话列表、档案、设置），放到阶段 3 与首页一起做。
 
+### 阶段 3 结果
+
+- daemon：
+  - `question` 工具记录标题、正文、期间假设、默认处理、截止时间和重要程度，写入后立即返回。用户答复或到期后，结果作为消息送回提问的会话；到期时消息写明按默认处理。同一问题只能答复一次，答复与到期不会同时生效。
+  - `report` 工具记录汇报，不唤醒任何会话，可标记已读。
+  - 新增 `questions.jsonl`、`reports.jsonl`；新增 op：`question_list`、`question_answer`、`report_list`、`report_read`、`agent_get`、`agent_update`。问题列表、待确认动作列表变化时广播，新汇报广播 `report_posted`，客户端连接时先收到问题与待确认动作列表。
+  - `decide_action` 可以处理已关闭或 daemon 重启前的会话里的动作，daemon 会先重开会话。
+  - 协议修正：`decide_action` 的动作编号字段由 `id` 改为 `action`，与请求编号分开。
+- Desktop：
+  - 工作台（侧栏 Agent 分区顶部，显示待处理数量）：待你处理（问题可直接答复，待确认动作可批准或拒绝，均可打开对应会话）、正在工作的 Agent、汇报（展开即标记已读）。
+  - Agent 页（Agent 行上的档案按钮）：启用开关、审批模式、会话列表（打开或新建）、brief 四个文件和记忆文件列表。brief 只读，编辑与修改记录放到阶段 6。
+  - 托管会话的聊天里显示待确认动作的记录与处理结果。
+- 验证：`crates/daemon/tests/daemon.rs` 新增答复唤醒提问的会话、到期按默认处理、汇报不唤醒会话且可标记已读、会话关闭后仍可处理待确认动作、Agent 页读取与修改设置、停用的 Agent 不再接收消息。Desktop 的工作台状态与聊天提示有单元测试，另用真实 daemon 跑通 Agent 页和工作台的请求。
+- 未在 Tauri 界面中手动走查；夜间场景（提问后继续工作、早上答复后唤醒）由 daemon 集成测试覆盖，界面部分待真实使用确认。
+
 AgentOS 现有数据不做迁移，只有少量会话。需要保留的 brief 可以直接复制到 `~/.jucode/agents/`。
 
 ## 6. 风险
