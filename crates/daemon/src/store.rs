@@ -19,6 +19,7 @@ const MESSAGES: &str = "messages.jsonl";
 const TIMERS: &str = "timers.jsonl";
 const QUESTIONS: &str = "questions.jsonl";
 const REPORTS: &str = "reports.jsonl";
+const DEVICES: &str = "devices.jsonl";
 const TOKEN: &str = "token";
 
 pub struct Store {
@@ -84,6 +85,17 @@ pub struct Report {
     pub read: bool,
 }
 
+/// A paired remote device (a phone's browser). Only a hash of its token is
+/// kept, so the state directory never holds a usable device token.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Device {
+    pub id: String,
+    pub name: String,
+    pub token_hash: String,
+    pub paired_at: u64,
+    pub revoked: bool,
+}
+
 /// A one-shot timer that wakes an agent with `body` at `fire_at` (ms).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Timer {
@@ -114,9 +126,7 @@ impl Store {
                 return Ok(token);
             }
         }
-        let mut bytes = [0u8; 32];
-        getrandom::getrandom(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
-        let token = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let token = random_hex(32)?;
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -430,6 +440,51 @@ impl Store {
             .collect()
     }
 
+    pub fn record_device(&self, device: &Device) -> io::Result<()> {
+        self.append(
+            DEVICES,
+            json!({
+                "kind": "paired", "id": device.id, "name": device.name,
+                "token_hash": device.token_hash, "at": device.paired_at,
+            }),
+        )
+    }
+
+    pub fn record_device_revoked(&self, id: &str) -> io::Result<()> {
+        self.append(DEVICES, json!({ "kind": "revoked", "id": id, "at": now() }))
+    }
+
+    pub fn devices(&self) -> Vec<Device> {
+        let entries = self.read(DEVICES);
+        let revoked: HashSet<&str> = entries
+            .iter()
+            .filter(|entry| entry["kind"] == "revoked")
+            .filter_map(|entry| entry["id"].as_str())
+            .collect();
+        entries
+            .iter()
+            .filter(|entry| entry["kind"] == "paired")
+            .filter_map(|entry| {
+                let id = entry["id"].as_str()?.to_string();
+                Some(Device {
+                    revoked: revoked.contains(id.as_str()),
+                    id,
+                    name: entry["name"].as_str().unwrap_or_default().to_string(),
+                    token_hash: entry["token_hash"].as_str()?.to_string(),
+                    paired_at: entry["at"].as_u64().unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
+    /// The active device a token belongs to.
+    pub fn device_for_token(&self, token: &str) -> Option<Device> {
+        let hash = token_hash(token);
+        self.devices()
+            .into_iter()
+            .find(|device| !device.revoked && device.token_hash == hash)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
         self.write
             .lock()
@@ -487,6 +542,21 @@ fn message_from_json(entry: &Value) -> Option<Message> {
         dedupe_key: text("dedupe_key"),
         at: entry["at"].as_u64().unwrap_or_default(),
     })
+}
+
+pub fn token_hash(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// `bytes` random bytes as lowercase hex.
+pub fn random_hex(bytes: usize) -> io::Result<String> {
+    let mut buffer = vec![0u8; bytes];
+    getrandom::getrandom(&mut buffer).map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(buffer.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 pub fn now() -> u64 {
@@ -667,5 +737,27 @@ mod tests {
             vec!["r3", "r2"]
         );
         assert!(reports[1].read && !reports[0].read);
+    }
+
+    #[test]
+    fn a_device_token_works_until_revoked() {
+        let store = store("devices");
+        store
+            .record_device(&Device {
+                id: "d1".to_string(),
+                name: "phone".to_string(),
+                token_hash: token_hash("secret"),
+                paired_at: 1,
+                revoked: false,
+            })
+            .unwrap();
+        assert_eq!(store.device_for_token("secret").unwrap().id, "d1");
+        assert!(store.device_for_token("guess").is_none());
+        store.record_device_revoked("d1").unwrap();
+        assert!(store.device_for_token("secret").is_none());
+        assert!(store.devices()[0].revoked);
+        // Only the hash is on disk.
+        let log = fs::read_to_string(store.dir.join(DEVICES)).unwrap();
+        assert!(!log.contains("\"secret\""));
     }
 }

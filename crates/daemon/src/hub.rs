@@ -5,7 +5,7 @@
 use crate::{
     agents::Agents,
     session,
-    store::{now, Message, Question, Report, Store, Timer},
+    store::{now, random_hex, token_hash, Device, Message, Question, Report, Store, Timer},
 };
 use serde_json::{json, Value};
 use std::{
@@ -17,6 +17,11 @@ use std::{
         Arc, Mutex, MutexGuard,
     },
 };
+
+/// How long a pairing code shown on the desktop stays valid.
+const PAIRING_TTL_MS: u64 = 5 * 60 * 1000;
+/// Pairing codes avoid characters that are easy to misread (0/O, 1/I).
+const PAIRING_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 /// Runs that may be in progress at once across all sessions; messages that
 /// would start another run wait for a free slot.
@@ -34,8 +39,17 @@ pub struct Hub {
     /// Serializes message delivery (scheduler ticks, sends, tool calls).
     delivering: Mutex<()>,
     next_id: AtomicU64,
-    clients: Mutex<HashMap<u64, Sender<String>>>,
+    clients: Mutex<HashMap<u64, Client>>,
+    /// Pairing code → expiry (ms). Single use.
+    pairings: Mutex<HashMap<String, u64>>,
     next_client: AtomicU64,
+}
+
+struct Client {
+    outbox: Sender<String>,
+    /// The paired device this connection authenticated as; None for a local
+    /// client holding the daemon token.
+    device: Option<String>,
 }
 
 struct Hosted {
@@ -60,14 +74,94 @@ impl Hub {
             delivering: Mutex::new(()),
             next_id: AtomicU64::new(0),
             clients: Mutex::new(HashMap::new()),
+            pairings: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
         })
     }
 
-    pub fn add_client(&self, outbox: Sender<String>) -> u64 {
+    pub fn add_client(&self, outbox: Sender<String>, device: Option<String>) -> u64 {
         let id = self.next_client.fetch_add(1, Ordering::SeqCst);
-        lock(&self.clients).insert(id, outbox);
+        lock(&self.clients).insert(id, Client { outbox, device });
         id
+    }
+
+    /// Whether the connection is a local client (not a paired device).
+    pub fn is_local(&self, client: u64) -> bool {
+        lock(&self.clients)
+            .get(&client)
+            .is_some_and(|client| client.device.is_none())
+    }
+
+    /// A new single-use pairing code and its expiry (ms).
+    pub fn start_pairing(&self) -> Result<(String, u64), String> {
+        let mut bytes = [0u8; 8];
+        getrandom::getrandom(&mut bytes).map_err(|error| error.to_string())?;
+        let code: String = bytes
+            .iter()
+            .map(|byte| PAIRING_ALPHABET[*byte as usize % PAIRING_ALPHABET.len()] as char)
+            .collect();
+        let expires_at = now() + PAIRING_TTL_MS;
+        let mut pairings = lock(&self.pairings);
+        pairings.retain(|_, expiry| *expiry > now());
+        pairings.insert(code.clone(), expires_at);
+        Ok((code, expires_at))
+    }
+
+    /// Trades a pairing code for a new device and its token. The token is
+    /// returned once and only its hash is stored.
+    pub fn pair(&self, code: &str, name: &str) -> Result<(Device, String), String> {
+        let code = code.trim().to_ascii_uppercase();
+        let valid = lock(&self.pairings)
+            .remove(&code)
+            .is_some_and(|expiry| expiry > now());
+        if !valid {
+            return Err("pairing code is wrong or expired".to_string());
+        }
+        let token = random_hex(32).map_err(|error| error.to_string())?;
+        let name = name.trim();
+        let device = Device {
+            id: self.new_id("dev"),
+            name: if name.is_empty() { "device" } else { name }
+                .chars()
+                .take(60)
+                .collect(),
+            token_hash: token_hash(&token),
+            paired_at: now(),
+            revoked: false,
+        };
+        self.store
+            .record_device(&device)
+            .map_err(|error| error.to_string())?;
+        Ok((device, token))
+    }
+
+    /// Revokes a device and drops its open connections.
+    pub fn revoke_device(&self, id: &str) -> Result<(), String> {
+        if !self
+            .store
+            .devices()
+            .iter()
+            .any(|device| device.id == id && !device.revoked)
+        {
+            return Err(format!("unknown device {id}"));
+        }
+        self.store
+            .record_device_revoked(id)
+            .map_err(|error| error.to_string())?;
+        // Dropping the outbox ends that connection's loop.
+        lock(&self.clients).retain(|_, client| client.device.as_deref() != Some(id));
+        Ok(())
+    }
+
+    pub fn devices_json(&self) -> Value {
+        let list: Vec<Value> = self
+            .store
+            .devices()
+            .iter()
+            .filter(|device| !device.revoked)
+            .map(|device| json!({ "id": device.id, "name": device.name, "paired_at": device.paired_at }))
+            .collect();
+        json!({ "type": "devices", "devices": list })
     }
 
     /// Drops the client and its watches; sessions it was the last watcher of
@@ -86,12 +180,12 @@ impl Hub {
 
     pub fn broadcast(&self, frame: &Value) {
         let text = frame.to_string();
-        lock(&self.clients).retain(|_, outbox| outbox.send(text.clone()).is_ok());
+        lock(&self.clients).retain(|_, client| client.outbox.send(text.clone()).is_ok());
     }
 
     pub fn send_to(&self, client: u64, frame: &Value) {
-        if let Some(outbox) = lock(&self.clients).get(&client) {
-            let _ = outbox.send(frame.to_string());
+        if let Some(client) = lock(&self.clients).get(&client) {
+            let _ = client.outbox.send(frame.to_string());
         }
     }
 

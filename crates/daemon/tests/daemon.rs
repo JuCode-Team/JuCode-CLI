@@ -38,7 +38,8 @@ fn start_daemon_on(state: PathBuf, agents: PathBuf) -> Daemon {
     let store = Store::open(state.clone()).unwrap();
     let token = store.token().unwrap();
     let agent_store = jucode_daemon::Agents::open(agents.clone()).unwrap();
-    thread::spawn(move || jucode_daemon::serve(listener, store, agent_store, "test"));
+    let web = state.parent().map(|root| root.join("web"));
+    thread::spawn(move || jucode_daemon::serve(listener, store, agent_store, web, "test"));
     Daemon {
         address,
         token,
@@ -53,9 +54,12 @@ struct Client {
 
 impl Client {
     fn connect(daemon: &Daemon) -> Self {
+        Self::connect_with(daemon, &daemon.token)
+    }
+
+    fn connect_with(daemon: &Daemon, token: &str) -> Self {
         let (socket, _) =
-            tungstenite::connect(format!("ws://{}/?token={}", daemon.address, daemon.token))
-                .unwrap();
+            tungstenite::connect(format!("ws://{}/?token={token}", daemon.address)).unwrap();
         if let MaybeTlsStream::Plain(stream) = socket.get_ref() {
             stream
                 .set_read_timeout(Some(Duration::from_millis(50)))
@@ -680,4 +684,113 @@ fn the_agent_page_reads_the_brief_and_changes_settings() {
     thread::sleep(Duration::from_millis(1500));
     let log = fs::read_to_string(daemon.state.join("messages.jsonl")).unwrap();
     assert!(log.contains("undeliverable"), "{log}");
+}
+
+/// One plain HTTP request; returns (status, headers and body as text).
+fn http(daemon: &Daemon, request: &str) -> (u16, String) {
+    use std::io::{Read, Write};
+    let mut stream = TcpStream::connect(&daemon.address).unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    (status, response)
+}
+
+fn pair_request(code: &str) -> String {
+    let body = json!({ "code": code, "name": "phone" }).to_string();
+    format!(
+        "POST /api/pair HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+#[test]
+fn the_remote_page_is_served_over_plain_http() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let web = daemon.state.parent().unwrap().join("web");
+    fs::create_dir_all(web.join("_app/immutable")).unwrap();
+    fs::write(web.join("index.html"), "<html>remote</html>").unwrap();
+    fs::write(web.join("_app/immutable/app.js"), "console.log(1)").unwrap();
+
+    let (status, response) = http(&daemon, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_eq!(status, 302);
+    assert!(response.contains("Location: /remote"));
+    // A page route of the single-page app gets index.html.
+    let (status, response) = http(&daemon, "GET /remote HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_eq!(status, 200);
+    assert!(response.contains("text/html") && response.ends_with("<html>remote</html>"));
+    let (status, response) = http(
+        &daemon,
+        "GET /_app/immutable/app.js HTTP/1.1\r\nHost: x\r\n\r\n",
+    );
+    assert_eq!(status, 200);
+    assert!(response.contains("text/javascript") && response.contains("immutable"));
+    let (status, _) = http(&daemon, "GET /../daemon/token HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_eq!(status, 404);
+    let (status, _) = http(&daemon, "GET /missing.js HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_eq!(status, 404);
+}
+
+#[test]
+fn a_device_pairs_with_a_code_from_the_desktop_until_revoked() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut desktop = Client::connect(&daemon);
+    desktop.send(json!({ "op": "pair_start", "id": 1 }));
+    let frames = desktop.until(|frame| frame["id"] == 1);
+    let code = frames.last().unwrap()["code"].as_str().unwrap().to_string();
+    assert_eq!(code.len(), 8);
+
+    let (status, _) = http(&daemon, &pair_request("WRONG123"));
+    assert_eq!(status, 403);
+    let (status, response) = http(&daemon, &pair_request(&code.to_lowercase()));
+    assert_eq!(status, 200, "{response}");
+    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let token = body["token"].as_str().unwrap().to_string();
+    let device = body["device"].as_str().unwrap().to_string();
+    // The code works once.
+    let (status, _) = http(&daemon, &pair_request(&code));
+    assert_eq!(status, 403);
+
+    // The phone reaches sessions and agents, but cannot pair more devices.
+    let mut phone = Client::connect_with(&daemon, &token);
+    phone.send(json!({ "op": "agent_list", "id": 2 }));
+    assert_eq!(
+        phone.until(|frame| frame["id"] == 2).last().unwrap()["type"],
+        "agents"
+    );
+    phone.send(json!({ "op": "pair_start", "id": 3 }));
+    assert_eq!(
+        phone.until(|frame| frame["id"] == 3).last().unwrap()["type"],
+        "error"
+    );
+
+    desktop.send(json!({ "op": "device_list", "id": 4 }));
+    let frames = desktop.until(|frame| frame["id"] == 4);
+    assert_eq!(frames.last().unwrap()["devices"][0]["name"], "phone");
+    desktop.send(json!({ "op": "device_revoke", "device": device, "id": 5 }));
+    desktop.until(|frame| frame["id"] == 5);
+
+    // The open connection is dropped and the token no longer connects.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match phone.socket.read() {
+            Ok(Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) => break,
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+            Ok(_) => {}
+        }
+        assert!(Instant::now() < deadline, "revoked device still connected");
+    }
+    assert!(tungstenite::connect(format!("ws://{}/?token={token}", daemon.address)).is_err());
 }

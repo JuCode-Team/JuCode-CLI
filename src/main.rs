@@ -335,16 +335,27 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
         _ => ("run", args),
     };
     let mut listen = jucode_daemon::DEFAULT_LISTEN.to_string();
+    let mut web = None;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match (arg.as_str(), rest.next()) {
             ("--listen", Some(address)) => listen = address.clone(),
+            ("--web", Some(dir)) => web = Some(std::path::PathBuf::from(dir)),
             _ => {
-                eprintln!("usage: jucode daemon [install|uninstall] [--listen <host:port>]");
+                eprintln!(
+                    "usage: jucode daemon [install|uninstall] [--listen <host:port>] [--web <dir>]"
+                );
                 return Ok(2);
             }
         }
     }
+    // A release ships the remote page next to the binary.
+    let web = web.or_else(|| {
+        env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("web")))
+            .filter(|dir| dir.join("index.html").is_file())
+    });
     let outcome = match action {
         "install" => Some(jucode_daemon::install::install(&listen)),
         "uninstall" => Some(jucode_daemon::install::uninstall()),
@@ -370,7 +381,14 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
         jucode_daemon::state_dir()?.join("token").display()
     );
     let agents = jucode_daemon::Agents::open(jucode_daemon::agents_dir()?)?;
-    jucode_daemon::serve(listener, store, agents, env!("CARGO_PKG_VERSION"))?;
+    if let Some(dir) = &web {
+        eprintln!(
+            "remote page: http://{}/remote (from {})",
+            listener.local_addr()?,
+            dir.display()
+        );
+    }
+    jucode_daemon::serve(listener, store, agents, web, env!("CARGO_PKG_VERSION"))?;
     Ok(0)
 }
 

@@ -6,6 +6,7 @@
 
 mod agent_tools;
 mod agents;
+mod http;
 mod hub;
 pub mod install;
 mod session;
@@ -34,11 +35,14 @@ use tungstenite::{
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7788";
 
 /// Serves clients on `listener` until the process exits. The token guards
-/// every connection; local clients read it from `<state dir>/token`.
+/// every WebSocket connection: local clients read it from
+/// `<state dir>/token`, paired devices hold their own. `web` is the remote
+/// page's build directory, served over plain HTTP on the same port.
 pub fn serve(
     listener: TcpListener,
     store: Store,
     agents: Agents,
+    web: Option<PathBuf>,
     version: &'static str,
 ) -> io::Result<()> {
     let token = store.token()?;
@@ -54,8 +58,9 @@ pub fn serve(
         let Ok(stream) = stream else { continue };
         let hub = Arc::clone(&hub);
         let token = token.clone();
+        let web = web.clone();
         thread::spawn(move || {
-            if let Err(error) = connection(&hub, stream, &token) {
+            if let Err(error) = connection(&hub, stream, &token, web.as_deref()) {
                 jucode_agent_core::log_warn!("daemon", "connection ended", error = error);
             }
         });
@@ -80,11 +85,31 @@ fn jucode_dir() -> io::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".jucode"))
 }
 
-fn connection(hub: &Arc<Hub>, stream: TcpStream, token: &str) -> Result<(), String> {
+fn connection(
+    hub: &Arc<Hub>,
+    stream: TcpStream,
+    token: &str,
+    web: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let head = http::peek_head(&stream)?;
+    if !http::is_websocket(&head) {
+        return http::serve(hub, stream, &head, web);
+    }
+    // Some(None): the local token; Some(Some(id)): a paired device.
+    let mut authorized: Option<Option<String>> = None;
     // The error type is fixed by tungstenite's handshake callback.
     #[allow(clippy::result_large_err)]
     let authorize = |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
-        if request_token(request).as_deref() == Some(token) {
+        let presented = request_token(request);
+        authorized = match presented.as_deref() {
+            Some(presented) if presented == token => Some(None),
+            Some(presented) => hub
+                .store
+                .device_for_token(presented)
+                .map(|device| Some(device.id)),
+            None => None,
+        };
+        if authorized.is_some() {
             Ok(response)
         } else {
             let mut denied = ErrorResponse::new(Some("missing or wrong token".to_string()));
@@ -101,7 +126,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream, token: &str) -> Result<(), Stri
         .map_err(|error| error.to_string())?;
 
     let (outbox, inbox) = mpsc::channel();
-    let client = hub.add_client(outbox);
+    let client = hub.add_client(outbox, authorized.flatten());
     let result = pump(hub, client, &mut socket, &inbox);
     hub.remove_client(client);
     result
@@ -130,10 +155,19 @@ fn pump(
             }
             Err(error) => return Err(error.to_string()),
         }
-        while let Ok(frame) = inbox.try_recv() {
-            socket
-                .send(Message::text(frame))
-                .map_err(|error| error.to_string())?;
+        loop {
+            match inbox.try_recv() {
+                Ok(frame) => socket
+                    .send(Message::text(frame))
+                    .map_err(|error| error.to_string())?,
+                Err(mpsc::TryRecvError::Empty) => break,
+                // The hub dropped this client (its device was revoked).
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    let _ = socket.close(None);
+                    let _ = socket.flush();
+                    return Ok(());
+                }
+            }
         }
     }
 }
@@ -183,7 +217,22 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         hub.send_to(client, &frame);
     };
     let session = op["session"].as_str().map(str::to_string);
-    let result = match (op["op"].as_str().unwrap_or_default(), session) {
+    let name = op["op"].as_str().unwrap_or_default();
+    if matches!(name, "pair_start" | "device_list" | "device_revoke") && !hub.is_local(client) {
+        reply(json!({ "type": "error", "message": "only the desktop can manage devices" }));
+        return;
+    }
+    let result = match (name, session) {
+        ("pair_start", _) => hub
+            .start_pairing()
+            .map(|(code, expires_at)| json!({ "type": "pairing", "code": code, "expires_at": expires_at })),
+        ("device_list", _) => Ok(hub.devices_json()),
+        ("device_revoke", _) => match op["device"].as_str() {
+            Some(device) => hub
+                .revoke_device(device)
+                .map(|()| json!({ "type": "device_revoked", "device": device })),
+            None => Err("device_revoke requires device".to_string()),
+        },
         ("session_list", _) => Ok(hub.sessions_json()),
         ("session_create", _) => hub
             .create_session(op["cwd"].as_str().map(PathBuf::from), op["agent"].as_str())

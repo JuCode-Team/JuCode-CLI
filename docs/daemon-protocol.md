@@ -13,7 +13,11 @@ Background and roadmap: `docs/agent-daemon-plan.md`.
 ```sh
 jucode daemon                      # ws://127.0.0.1:7788
 jucode daemon --listen 127.0.0.1:9000
+jucode daemon --web path/to/JuCode-Desktop/build   # serve the remote page
 ```
+
+Without `--web`, the daemon serves a `web/` directory next to its binary
+when one exists (release packages ship it there).
 
 To start it at login and restart it if it exits:
 
@@ -37,13 +41,48 @@ State lives in `~/.jucode/daemon/`:
 | `timers.jsonl` | Append log of agent timers set, fired and cancelled. |
 | `questions.jsonl` | Append log of questions asked and answered. |
 | `reports.jsonl` | Append log of reports posted and read. |
+| `devices.jsonl` | Paired devices (a hash of each token, never the token) and revocations. |
+
+## Plain HTTP
+
+The same port answers plain HTTP requests (anything that is not a
+WebSocket upgrade):
+
+- `GET /` redirects to `/remote`.
+- `GET <path>` serves the remote page's files from the `--web` directory.
+  A path without a file extension gets `index.html` (the page is a
+  single-page app). Paths cannot leave the directory.
+- `POST /api/pair` with `{"code": "...", "name": "..."}` trades a pairing
+  code for a device: `200 {"device", "name", "token"}`, or `403` when the
+  code is wrong, expired or already used.
+
+The files hold nothing private; every daemon op still needs a token over
+the WebSocket.
+
+## Remote devices
+
+A phone pairs once and then connects with its own token:
+
+1. A local client sends `pair_start` and shows the returned 8-character
+   `code` (valid 5 minutes, single use), for example as a QR code of
+   `<address>/remote?pair=<code>`.
+2. The phone's page posts the code to `/api/pair` and keeps the token.
+3. The phone connects to the WebSocket with that token.
+
+Device tokens reach every op except `pair_start`, `device_list` and
+`device_revoke`, which only local clients (holding the daemon token) may
+send. `device_revoke` drops the device's open connections at once.
+
+To reach the daemon from a phone, keep it on `127.0.0.1` and expose the
+port over HTTPS with `tailscale serve` or a reverse proxy; the daemon has no
+TLS of its own.
 
 ## Connecting
 
 Connect to `ws://<listen>/?token=<token>` (or send
 `Authorization: Bearer <token>`). A missing or wrong token fails the
-handshake with HTTP 401. Local clients read the token from
-`~/.jucode/daemon/token`.
+handshake with HTTP 401. Local clients read the daemon token from
+`~/.jucode/daemon/token`; paired devices use their own token.
 
 Each WebSocket text message is one JSON frame. The daemon first sends:
 
@@ -73,6 +112,9 @@ every connected client.
 | `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped |
 | `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
 | `actions_list` | — | `actions`: undecided deferred actions across all sessions |
+| `pair_start` | — | `pairing` with `code` and `expires_at` (local clients only) |
+| `device_list` | — | `devices`: paired, unrevoked devices (local clients only) |
+| `device_revoke` | `device` | `device_revoked` (local clients only) |
 | `agent_list` | — | `agents` |
 | `agent_create` | `agent` (the new agent's id), `name`, `cwd`, `role` | `agent_created`; every client also receives the new `agents` list |
 | `message_send` | `agent`, `body`, optional `session`, `reply_to`, `dedupe_key` | `message_accepted` with `message` and `duplicate` |

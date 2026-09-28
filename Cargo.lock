@@ -697,6 +697,7 @@ dependencies = [
  "getrandom 0.2.17",
  "jucode-agent-core",
  "serde_json",
+ "sha2",
  "tungstenite",
 ]
 
