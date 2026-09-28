@@ -180,6 +180,8 @@ pub struct AgentCore {
     hooks: Hooks,
     /// Files read and shells started by this engine (see `tools::ToolState`).
     tool_state: crate::tools::ToolState,
+    /// Tools and prompt text added by a host process (the daemon).
+    host: Option<crate::host::HostExtensions>,
     plan: Vec<PlanItem>,
     mcp: McpManager,
     /// Version reported in the startup event and used by the update check.
@@ -259,6 +261,7 @@ impl AgentCore {
             project_trusted,
             hooks,
             tool_state: crate::tools::ToolState::default(),
+            host: None,
             plan: Vec::new(),
             approval_receiver: None,
             pending_approvals: HashMap::new(),
@@ -287,6 +290,11 @@ impl AgentCore {
 
     pub fn cwd(&self) -> &std::path::Path {
         &self.cwd
+    }
+
+    /// Adds host tools and prompt text; they apply from the next turn.
+    pub fn set_host_extensions(&mut self, host: crate::host::HostExtensions) {
+        self.host = Some(host);
     }
 
     /// Writes the session to disk now, even before its first message, so a
@@ -1760,7 +1768,7 @@ impl AgentCore {
             Vec::new()
         };
         let prompt_tools = crate::tools::prompt_tool_names(&self.config.edit_tools, true);
-        let system_prompt = build_system_prompt(
+        let mut system_prompt = build_system_prompt(
             &base_prompt,
             &PromptContext {
                 date: current_utc_date(),
@@ -1771,6 +1779,13 @@ impl AgentCore {
                 skills,
             },
         );
+        if let Some(host) = &self.host {
+            let extra = (host.prompt)();
+            if !extra.trim().is_empty() {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(extra.trim_end());
+            }
+        }
 
         let (goal_tool_tx, goal_tool_rx) = mpsc::channel();
         self.goal_tool_receiver = Some(goal_tool_rx);
@@ -1807,6 +1822,7 @@ impl AgentCore {
             edit_tools: self.config.edit_tools.clone(),
             extra_read_roots,
             tool_state: self.tool_state.clone(),
+            host: self.host.clone(),
             subagent_manager: Some(self.subagent_manager.clone()),
             hooks: self.hooks.clone(),
         }) else {
@@ -2045,6 +2061,7 @@ impl AgentCore {
             edit_tools: Vec::new(),
             extra_read_roots: Vec::new(),
             tool_state: crate::tools::ToolState::default(),
+            host: None,
             subagent_manager: None,
             hooks: Hooks::default(),
         })
@@ -2090,6 +2107,7 @@ impl AgentCore {
             edit_tools: Vec::new(),
             extra_read_roots: Vec::new(),
             tool_state: crate::tools::ToolState::default(),
+            host: None,
             subagent_manager: None,
             hooks: Hooks::default(),
         })

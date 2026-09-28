@@ -113,6 +113,35 @@ fn script(request: &Value) -> String {
         _ => String::new(),
     };
     if last["role"] == "user" {
+        if let Some(call) = text.strip_prefix("CALL ") {
+            let (name, arguments) = call.split_once(' ').unwrap_or((call, "{}"));
+            return sse(&[
+                json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [{
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": { "name": name, "arguments": arguments }
+                }] }, "finish_reason": null }] }),
+                json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }] }),
+            ]);
+        }
+        if text == "SYSTEM" {
+            let system = messages
+                .iter()
+                .find(|message| message["role"] == "system")
+                .and_then(|message| message["content"].as_str())
+                .unwrap_or_default();
+            let tail: String = system
+                .chars()
+                .rev()
+                .take(2000)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            return sse(&[
+                json!({ "choices": [{ "index": 0, "delta": { "content": tail }, "finish_reason": null }] }),
+                json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
+            ]);
+        }
         if let Some(command) = text.strip_prefix("RUN: ") {
             let arguments = json!({ "command": command }).to_string();
             return sse(&[

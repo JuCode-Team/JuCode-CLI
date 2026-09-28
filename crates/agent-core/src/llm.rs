@@ -97,6 +97,8 @@ pub struct OpenAiClient {
     extra_read_roots: Vec<PathBuf>,
     /// The engine's tool state (see `tools::ToolState`), shared with its subagents.
     tool_state: tools::ToolState,
+    /// Tools and prompt text added by the host process (main agent only).
+    host: Option<crate::host::HostExtensions>,
     hooks: Hooks,
     /// Independent one-shot model used by `auto` mode to classify shell
     /// commands. None disables classification (shell calls then always ask).
@@ -145,6 +147,7 @@ pub struct OpenAiClientConfig<'a> {
     pub extra_read_roots: Vec<PathBuf>,
     /// The engine's tool state (see `tools::ToolState`).
     pub tool_state: tools::ToolState,
+    pub host: Option<crate::host::HostExtensions>,
     pub subagent_manager: Option<SubagentManager>,
     pub hooks: Hooks,
 }
@@ -407,6 +410,7 @@ impl OpenAiClient {
             write_root: None,
             extra_read_roots: config.extra_read_roots,
             tool_state: config.tool_state,
+            host: config.host,
             hooks: config.hooks,
             safety,
         })
@@ -846,6 +850,9 @@ impl OpenAiClient {
             definitions.extend(subagent_definitions());
         }
         definitions.extend(self.mcp.definitions());
+        if let Some(host) = &self.host {
+            definitions.extend(host.tools.iter().cloned());
+        }
         if self.goal_tool_tx.is_some() {
             definitions.extend(goal_tool_definitions());
             definitions.push(plan_tool_definition());
@@ -917,6 +924,17 @@ impl OpenAiClient {
             pending_call_ids,
         ) {
             result
+        } else if let Some(host) = self
+            .host
+            .as_ref()
+            .filter(|host| host.has_tool(&request.name))
+        {
+            let (output, is_error) = (host.run_tool)(&request.name, &request.arguments);
+            tools::ToolExecutionResult {
+                model_output: tools::project_model_output(&request.name, &output, cwd),
+                output,
+                is_error,
+            }
         } else if request.name.starts_with("mcp__") {
             match self.mcp.run_tool(&request.name, &request.arguments) {
                 Some((output, is_error)) => tools::ToolExecutionResult {
@@ -1082,6 +1100,7 @@ impl OpenAiClient {
             write_root: Some(workspace.root.clone()),
             extra_read_roots: self.extra_read_roots.clone(),
             tool_state: self.tool_state.clone(),
+            host: None,
             hooks: self.hooks.clone(),
             safety: self.safety.clone(),
         };
@@ -2261,6 +2280,7 @@ mod tests {
             edit_tools: crate::config::default_edit_tools(),
             extra_read_roots: Vec::new(),
             tool_state: tools::ToolState::default(),
+            host: None,
             subagent_manager: None,
             hooks: Hooks::default(),
         })

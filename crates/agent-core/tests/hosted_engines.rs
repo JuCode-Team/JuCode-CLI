@@ -199,3 +199,42 @@ fn config_changes_from_two_engines_both_land() {
     second.mcp_remove("from_first");
     second.mcp_remove("from_second");
 }
+
+#[test]
+fn host_tools_run_in_the_host_and_host_prompt_reaches_the_model() {
+    use jucode_agent_core::host::HostExtensions;
+    use std::sync::{Arc, Mutex};
+    let _guard = setup();
+    let mut core = open(&temp_dir("host"), ApprovalMode::Manual);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&calls);
+    core.set_host_extensions(HostExtensions {
+        tools: vec![serde_json::json!({
+            "type": "function",
+            "name": "note_down",
+            "description": "Record a note.",
+            "parameters": { "type": "object", "properties": { "text": { "type": "string" } } }
+        })],
+        run_tool: Arc::new(move |name, arguments| {
+            seen.lock().unwrap().push(format!("{name} {arguments}"));
+            ("noted".to_string(), false)
+        }),
+        prompt: Arc::new(|| "<host-marker>brief goes here</host-marker>".to_string()),
+    });
+
+    core.submit_user_message(r#"CALL note_down {"text":"hi"}"#.to_string());
+    let events = pump(&mut core, is_ready);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![r#"note_down {"text":"hi"}"#.to_string()]
+    );
+    // No approval is asked for a host tool, and its output reaches the model.
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ApprovalRequest { .. })));
+    assert!(assistant_text(&events).contains("noted"));
+
+    core.submit_user_message("SYSTEM".to_string());
+    let events = pump(&mut core, is_ready);
+    assert!(assistant_text(&events).contains("<host-marker>brief goes here</host-marker>"));
+}

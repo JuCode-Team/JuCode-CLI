@@ -5,6 +5,7 @@ mod core;
 pub mod custom_commands;
 pub mod event;
 mod hooks;
+pub mod host;
 mod hunks;
 mod llm;
 pub mod logging;

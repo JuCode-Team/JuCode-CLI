@@ -222,4 +222,3 @@ mod tests {
         assert_eq!(xml_escape("a&b<c>"), "a&amp;b&lt;c&gt;");
     }
 }
-
