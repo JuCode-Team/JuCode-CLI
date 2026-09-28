@@ -13,6 +13,7 @@
 //! (`sandbox-exec`), Linux `bwrap`; Windows supports `full-access` only.
 //! File tools run in-process and check writes against the same rules.
 
+use serde_json::{json, Value};
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -373,6 +374,110 @@ impl SandboxPolicy {
             cwd.display()
         )
     }
+}
+
+impl SandboxPolicy {
+    /// The default: the working directory writable, network on, commits
+    /// allowed to leave the sandbox and pushes always asked. Windows has no
+    /// sandbox yet and starts at `full-access`.
+    pub fn default_for_platform() -> Self {
+        Self {
+            mode: if cfg!(windows) {
+                SandboxMode::FullAccess
+            } else {
+                SandboxMode::WorkspaceWrite
+            },
+            writable_dirs: Vec::new(),
+            readable_dirs: Vec::new(),
+            network: true,
+            rules: rules_from_json(&default_rules_json()).expect("default rules parse"),
+        }
+    }
+}
+
+pub fn default_rules_json() -> Value {
+    json!([
+        { "prefix": "git add", "action": "allow" },
+        { "prefix": "git commit", "action": "allow" },
+        { "prefix": "git push", "action": "ask" },
+    ])
+}
+
+/// `[{"prefix": "git push", "action": "allow" | "ask" | "forbid"}]`.
+pub fn rules_from_json(value: &Value) -> Result<Vec<CommandRule>, String> {
+    let Some(items) = value.as_array() else {
+        return Ok(Vec::new());
+    };
+    items
+        .iter()
+        .map(|item| {
+            let prefix = item["prefix"].as_str().unwrap_or_default().trim();
+            if prefix.is_empty() {
+                return Err("a command rule needs a prefix".to_string());
+            }
+            Ok(CommandRule {
+                prefix: prefix.to_string(),
+                action: RuleAction::parse(item["action"].as_str().unwrap_or_default())?,
+            })
+        })
+        .collect()
+}
+
+pub fn rules_to_json(rules: &[CommandRule]) -> Value {
+    json!(rules
+        .iter()
+        .map(|rule| json!({
+            "prefix": rule.prefix,
+            "action": match rule.action {
+                RuleAction::Allow => "allow",
+                RuleAction::Ask => "ask",
+                RuleAction::Forbid => "forbid",
+            },
+        }))
+        .collect::<Vec<_>>())
+}
+
+/// `[{"path": "/abs/dir", "mode": "ro" | "rw"}]` → (read-write, read-only).
+/// A directory that no longer exists is dropped when `strict` is false (a
+/// saved setting), and is an error when true (a change being made).
+pub fn directories_from_json(
+    value: &Value,
+    strict: bool,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    let mut writable = Vec::new();
+    let mut readable = Vec::new();
+    for item in value.as_array().into_iter().flatten() {
+        let mode = item["mode"].as_str().unwrap_or("ro");
+        if !matches!(mode, "ro" | "rw") {
+            return Err(format!("directory mode must be ro or rw, not '{mode}'"));
+        }
+        let path = PathBuf::from(item["path"].as_str().unwrap_or_default());
+        if !path.is_absolute() || !path.is_dir() {
+            if strict {
+                return Err(format!(
+                    "not an existing absolute directory: {}",
+                    path.display()
+                ));
+            }
+            continue;
+        }
+        if mode == "rw" {
+            writable.push(path);
+        } else {
+            readable.push(path);
+        }
+    }
+    Ok((writable, readable))
+}
+
+pub fn directories_to_json(writable: &[PathBuf], readable: &[PathBuf]) -> Value {
+    let entry =
+        |path: &PathBuf, mode: &str| json!({ "path": path.display().to_string(), "mode": mode });
+    json!(writable
+        .iter()
+        .map(|path| entry(path, "rw"))
+        .chain(readable.iter().map(|path| entry(path, "ro")))
+        .collect::<Vec<_>>())
 }
 
 fn gitdir_target(git_file: &Path) -> Option<PathBuf> {

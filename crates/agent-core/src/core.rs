@@ -226,6 +226,8 @@ impl AgentCore {
         let auth = AuthStore::load_or_create(config.encrypt_secrets).inspect_err(|error| {
             crate::log_error!("auth", "failed to load auth", error = error.to_string());
         })?;
+        let tool_state = crate::tools::ToolState::default();
+        tool_state.set_sandbox(Some(config.sandbox.clone()));
         let session = SessionStore::new();
         // A fresh session id is unique, so this only fails on IO problems.
         let session_lock = SessionLock::acquire(&profile_dir()?, &cwd, session.session_id()).ok();
@@ -260,7 +262,7 @@ impl AgentCore {
             trust,
             project_trusted,
             hooks,
-            tool_state: crate::tools::ToolState::default(),
+            tool_state,
             host: None,
             plan: Vec::new(),
             approval_receiver: None,
@@ -319,6 +321,15 @@ impl AgentCore {
     /// output of session_start hooks, which run here.
     pub fn startup_events(&self) -> Vec<AgentEvent> {
         let mut events = self.state_events();
+        if let Some(Err(error)) = self
+            .tool_state
+            .sandbox()
+            .map(|sandbox| sandbox.check_available())
+        {
+            events.push(AgentEvent::Error(format!(
+                "sandbox unavailable, shell commands will fail: {error}"
+            )));
+        }
         for message in self.hooks.session_start(&self.cwd) {
             events.push(AgentEvent::Info(message));
         }
@@ -727,6 +738,7 @@ impl AgentCore {
                 Err(error) => vec![AgentEvent::Error(error)],
             },
             "/permissions" => self.permissions_command_events(args.trim()),
+            "/sandbox" => self.sandbox_command_events(args.trim()),
             "/effort" => self.effort_command_events(args.trim()),
             "/mcp" => self.mcp_command_events(args.trim()),
             "/context" => self.context_events(),
@@ -2435,6 +2447,67 @@ impl AgentCore {
             AgentEvent::Status(format!("approval mode: {}", mode.as_str())),
             self.approval_mode_event(),
         ]
+    }
+
+    /// `/sandbox [mode]` — show the sandbox, or switch its mode for this
+    /// session (config.json `sandbox` sets the default).
+    fn sandbox_command_events(&mut self, arg: &str) -> Vec<AgentEvent> {
+        let mut policy = self
+            .tool_state
+            .sandbox()
+            .unwrap_or_else(|| self.config.sandbox.clone());
+        if !arg.is_empty() {
+            match crate::sandbox::SandboxMode::parse(arg) {
+                Ok(mode) => {
+                    policy.mode = mode;
+                    if let Err(error) = policy.check_available() {
+                        return vec![AgentEvent::Error(format!("sandbox unavailable: {error}"))];
+                    }
+                    self.tool_state.set_sandbox(Some(policy.clone()));
+                }
+                Err(error) => {
+                    return vec![AgentEvent::Error(format!(
+                        "usage: /sandbox [read-only|workspace-write|full-access] ({error})"
+                    ))]
+                }
+            }
+        }
+        let list = |dirs: &[PathBuf]| {
+            if dirs.is_empty() {
+                "none".to_string()
+            } else {
+                dirs.iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        };
+        let rules = policy
+            .rules
+            .iter()
+            .map(|rule| {
+                format!(
+                    "{} → {}",
+                    rule.prefix,
+                    format!("{:?}", rule.action).to_lowercase()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        vec![AgentEvent::Info(format!(
+            "sandbox: {}\n\
+             read-only       - commands cannot write anything\n\
+             workspace-write - the working directory, temp and package caches are writable; .git, .jucode and .agents stay read-only\n\
+             full-access     - no sandbox\n\
+             network: {} · read-write dirs: {} · read-only dirs: {}\n\
+             command rules: {}\n\
+             Inside the sandbox commands need no approval (except in manual mode); a command that must leave it asks per the approval mode. Set defaults in config.json (sandbox, sandbox_network, sandbox_directories, command_rules).",
+            policy.mode.as_str(),
+            if policy.network { "on" } else { "off" },
+            list(&policy.writable_dirs),
+            list(&policy.readable_dirs),
+            if rules.is_empty() { "none".to_string() } else { rules }
+        ))]
     }
 
     /// `/permissions [mode]` — show the current mode, or switch it for this session.

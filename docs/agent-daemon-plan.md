@@ -275,7 +275,9 @@ AgentOS 中不迁移的部分：自研 runtime 与工具集、WebUI（由 Deskto
   - 引擎：Seatbelt 实际执行测试，覆盖工作区可写、`.git` 和目录外不可写；bwrap 参数顺序的单元测试；文件工具写入规则；集成测试覆盖沙箱内命令免审批、越界需审批、`allow` 规则免审批、`forbid` 规则不执行、系统提示词。
   - daemon（macOS）：源码目录可写、读写目录可写、只读目录不可写但可读、`.git` 不可写，全程无审批；无人值守时的越界转为待确认动作。
 - 与方案的差异：钩子命令由使用者自己配置，不放进沙箱。
-- 未验证：Linux 上的 bwrap 只有参数构造的单元测试，还没有在 Linux 实机上跑过。
+- 之后扩展到所有引擎：TUI、`serve`、headless、Desktop 会话和 daemon 的普通会话都默认启用沙箱（`config.json` 的 `sandbox`、`sandbox_network`、`sandbox_directories`、`command_rules`，见 `docs/sandbox.md`），`/sandbox` 查看或切换本会话的档位；daemon 的 Agent 会话仍用 `agent.json` 的设置。沙箱不可用时启动即报错，命令失败，不退回到不加沙箱执行。
+- Linux 验证：CI 安装 bubblewrap 并放开 Ubuntu 的非特权用户命名空间限制，沙箱执行测试在 GitHub 的 Linux 机器上以普通用户通过。
+- 同时修正：daemon 投递消息后、会话线程读到它之前，运行计数可能被提前释放，导致同时运行超过 4 个（CI 上偶发失败）；现在投递的消息在被会话读取前一直占用运行位。
 
 AgentOS 现有数据不做迁移，只有少量会话。需要保留的 brief 可以直接复制到 `~/.jucode/agents/`。
 

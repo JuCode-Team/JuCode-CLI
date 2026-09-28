@@ -218,6 +218,9 @@ pub struct Config {
     /// pinned built-in index for https://github.com/anthropics/skills.
     pub extra_skills_source: Option<String>,
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Sandbox for shell commands (`sandbox`, `sandbox_network`,
+    /// `sandbox_directories`, `command_rules` in config.json).
+    pub sandbox: crate::sandbox::SandboxPolicy,
     path: PathBuf,
 }
 
@@ -351,6 +354,7 @@ impl Config {
                 edit_tools: default_edit_tools(),
                 extra_skills_source: None,
                 mcp_servers: Vec::new(),
+                sandbox: crate::sandbox::SandboxPolicy::default_for_platform(),
                 path,
             };
             config.save()?;
@@ -465,6 +469,7 @@ impl Config {
             edit_tools: read_edit_tools(&value)?,
             extra_skills_source: read_optional_string(&value, "extra_skills_source"),
             mcp_servers: read_mcp_servers(&value),
+            sandbox: read_sandbox(&value)?,
             path,
         };
         Ok(config)
@@ -498,7 +503,14 @@ impl Config {
             "approval_mode": self.approval_mode.as_str(),
             "edit_tools": self.edit_tools,
             "extra_skills_source": self.extra_skills_source,
-            "mcp_servers": self.mcp_servers.iter().map(mcp_server_config_value).collect::<Vec<_>>()
+            "mcp_servers": self.mcp_servers.iter().map(mcp_server_config_value).collect::<Vec<_>>(),
+            "sandbox": self.sandbox.mode.as_str(),
+            "sandbox_network": self.sandbox.network,
+            "sandbox_directories": crate::sandbox::directories_to_json(
+                &self.sandbox.writable_dirs,
+                &self.sandbox.readable_dirs,
+            ),
+            "command_rules": crate::sandbox::rules_to_json(&self.sandbox.rules),
         });
         write_atomically(
             &self.path,
@@ -758,6 +770,38 @@ fn read_u64(value: &Value, key: &str, default: u64) -> u64 {
 
 /// Optional `approval_mode` in config.json; absent/empty defaults to manual,
 /// an unknown value is a hard load error rather than a silent fallback.
+/// The sandbox settings; absent keys take the platform defaults, and a
+/// configured directory that no longer exists is dropped.
+fn read_sandbox(value: &Value) -> io::Result<crate::sandbox::SandboxPolicy> {
+    use crate::sandbox::{directories_from_json, rules_from_json, SandboxMode, SandboxPolicy};
+    let invalid = |error: String| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid sandbox settings in config.json: {error}"),
+        )
+    };
+    let mut policy = SandboxPolicy::default_for_platform();
+    if let Some(mode) = value
+        .get("sandbox")
+        .and_then(Value::as_str)
+        .filter(|mode| !mode.trim().is_empty())
+    {
+        policy.mode = SandboxMode::parse(mode.trim()).map_err(invalid)?;
+    }
+    if let Some(network) = value.get("sandbox_network").and_then(Value::as_bool) {
+        policy.network = network;
+    }
+    if let Some(directories) = value.get("sandbox_directories") {
+        let (writable, readable) = directories_from_json(directories, false).map_err(invalid)?;
+        policy.writable_dirs = writable;
+        policy.readable_dirs = readable;
+    }
+    if let Some(rules) = value.get("command_rules") {
+        policy.rules = rules_from_json(rules).map_err(invalid)?;
+    }
+    Ok(policy)
+}
+
 fn read_approval_mode(value: &Value) -> io::Result<ApprovalMode> {
     let raw = value
         .get("approval_mode")
@@ -1567,6 +1611,7 @@ mod tests {
             edit_tools: default_edit_tools(),
             extra_skills_source: None,
             mcp_servers: Vec::new(),
+            sandbox: crate::sandbox::SandboxPolicy::default_for_platform(),
             path: PathBuf::from("config.json"),
         };
 
@@ -1838,6 +1883,46 @@ mod tests {
         assert_eq!(canonical_edit_tool_name("apply_patch"), Some("apply_patch"));
         assert_eq!(canonical_edit_tool_name("read"), None);
         assert_eq!(canonical_edit_tool_name("bash"), None);
+    }
+
+    #[test]
+    fn sandbox_settings_default_parse_and_validate() {
+        use crate::sandbox::{RuleAction, SandboxMode};
+        let default = read_sandbox(&json!({})).unwrap();
+        assert_eq!(
+            default.mode,
+            if cfg!(windows) {
+                SandboxMode::FullAccess
+            } else {
+                SandboxMode::WorkspaceWrite
+            }
+        );
+        assert!(default.network);
+        assert_eq!(default.rule_for("git push"), Some(RuleAction::Ask));
+
+        let dir = std::env::temp_dir();
+        let custom = read_sandbox(&json!({
+            "sandbox": "read-only",
+            "sandbox_network": false,
+            "sandbox_directories": [
+                { "path": dir, "mode": "rw" },
+                { "path": "/definitely/not/here", "mode": "ro" }
+            ],
+            "command_rules": []
+        }))
+        .unwrap();
+        assert_eq!(custom.mode, SandboxMode::ReadOnly);
+        assert!(!custom.network);
+        assert_eq!(custom.writable_dirs, vec![dir]);
+        // A directory that went away is dropped; an explicit empty rule list stays empty.
+        assert!(custom.readable_dirs.is_empty());
+        assert!(custom.rules.is_empty());
+
+        assert!(read_sandbox(&json!({ "sandbox": "wide-open" })).is_err());
+        assert!(
+            read_sandbox(&json!({ "command_rules": [{ "prefix": "", "action": "allow" }] }))
+                .is_err()
+        );
     }
 
     #[test]

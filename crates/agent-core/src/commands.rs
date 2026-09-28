@@ -109,6 +109,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         advanced: false,
     },
     CommandSpec {
+        name: "/sandbox",
+        aliases: &[],
+        args: "[read-only|workspace-write|full-access]",
+        description: "Show or switch the shell command sandbox",
+        advanced: false,
+    },
+    CommandSpec {
         name: "/context",
         aliases: &[],
         args: "",

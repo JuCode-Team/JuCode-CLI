@@ -4,7 +4,10 @@
 //! reads the brief into every turn of the agent's sessions; the agent keeps
 //! it current with the `brief` tool.
 
-use jucode_agent_core::sandbox::{CommandRule, RuleAction, SandboxMode, SandboxPolicy};
+use jucode_agent_core::sandbox::{
+    default_rules_json, directories_from_json, rules_from_json, rules_to_json, CommandRule,
+    SandboxMode, SandboxPolicy,
+};
 use serde_json::{json, Value};
 use std::{
     fs, io,
@@ -57,14 +60,7 @@ impl Agent {
                 "path": dir.path.display().to_string(),
                 "mode": dir.mode,
             })).collect::<Vec<_>>(),
-            "command_rules": self.command_rules.iter().map(|rule| json!({
-                "prefix": rule.prefix,
-                "action": match rule.action {
-                    RuleAction::Allow => "allow",
-                    RuleAction::Ask => "ask",
-                    RuleAction::Forbid => "forbid",
-                },
-            })).collect::<Vec<_>>(),
+            "command_rules": rules_to_json(&self.command_rules),
         })
     }
 
@@ -87,60 +83,18 @@ impl Agent {
     }
 }
 
-/// New agents may commit on their own but ask before pushing: `.git` is
-/// read-only in the sandbox, so committing needs an escalation.
-fn default_rules() -> Value {
-    json!([
-        { "prefix": "git add", "action": "allow" },
-        { "prefix": "git commit", "action": "allow" },
-        { "prefix": "git push", "action": "ask" },
-    ])
-}
-
-fn parse_directories(value: &Value) -> Result<Vec<Directory>, String> {
-    let Some(items) = value.as_array() else {
-        return Ok(Vec::new());
+/// `sandbox_directories`-shaped JSON as the agent's directory list.
+fn directories(value: &Value, strict: bool) -> Result<Vec<Directory>, String> {
+    let (writable, readable) = directories_from_json(value, strict)?;
+    let entry = |path: PathBuf, mode: &str| Directory {
+        path,
+        mode: mode.to_string(),
     };
-    items
-        .iter()
-        .map(|item| {
-            let path = item["path"].as_str().unwrap_or_default();
-            let mode = item["mode"].as_str().unwrap_or("ro");
-            if !matches!(mode, "ro" | "rw") {
-                return Err(format!("directory mode must be ro or rw, not '{mode}'"));
-            }
-            let path = PathBuf::from(path);
-            if !path.is_absolute() || !path.is_dir() {
-                return Err(format!(
-                    "not an existing absolute directory: {}",
-                    path.display()
-                ));
-            }
-            Ok(Directory {
-                path,
-                mode: mode.to_string(),
-            })
-        })
-        .collect()
-}
-
-fn parse_rules(value: &Value) -> Result<Vec<CommandRule>, String> {
-    let Some(items) = value.as_array() else {
-        return Ok(Vec::new());
-    };
-    items
-        .iter()
-        .map(|item| {
-            let prefix = item["prefix"].as_str().unwrap_or_default().trim();
-            if prefix.is_empty() {
-                return Err("a command rule needs a prefix".to_string());
-            }
-            Ok(CommandRule {
-                prefix: prefix.to_string(),
-                action: RuleAction::parse(item["action"].as_str().unwrap_or_default())?,
-            })
-        })
-        .collect()
+    Ok(writable
+        .into_iter()
+        .map(|path| entry(path, "rw"))
+        .chain(readable.into_iter().map(|path| entry(path, "ro")))
+        .collect())
 }
 
 impl Agents {
@@ -181,14 +135,8 @@ impl Agents {
                 .to_string(),
             network: value["network"].as_bool().unwrap_or(true),
             // A directory that has gone away is dropped, not an error.
-            directories: value["directories"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|item| parse_directories(&json!([item])).ok())
-                .flatten()
-                .collect(),
-            command_rules: parse_rules(&value["command_rules"]).unwrap_or_default(),
+            directories: directories(&value["directories"], false).unwrap_or_default(),
+            command_rules: rules_from_json(&value["command_rules"]).unwrap_or_default(),
         })
     }
 
@@ -220,7 +168,7 @@ impl Agents {
             sandbox: default_sandbox().to_string(),
             network: true,
             directories: Vec::new(),
-            command_rules: parse_rules(&default_rules()).expect("default rules parse"),
+            command_rules: rules_from_json(&default_rules_json()).expect("default rules parse"),
         };
         let write = || -> io::Result<()> {
             fs::create_dir_all(dir.join("memory"))?;
@@ -276,11 +224,11 @@ impl Agents {
             settings["network"] = json!(network);
         }
         if !changes["directories"].is_null() {
-            parse_directories(&changes["directories"])?;
+            directories(&changes["directories"], true)?;
             settings["directories"] = changes["directories"].clone();
         }
         if !changes["command_rules"].is_null() {
-            parse_rules(&changes["command_rules"])?;
+            rules_from_json(&changes["command_rules"])?;
             settings["command_rules"] = changes["command_rules"].clone();
         }
         let text = serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())?;
@@ -456,6 +404,8 @@ mod tests {
             .create("nowhere", "x", &work.join("missing"), "")
             .is_err());
     }
+
+    use jucode_agent_core::sandbox::RuleAction;
 
     #[test]
     fn update_changes_only_the_given_settings() {

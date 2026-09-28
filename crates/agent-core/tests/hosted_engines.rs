@@ -316,3 +316,33 @@ fn a_sandboxed_engine_runs_commands_inside_and_asks_to_leave() {
     let events = pump(&mut core, is_ready);
     assert!(assistant_text(&events).contains("<sandbox mode=\"workspace-write\">"));
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_plain_engine_is_sandboxed_by_default_and_sandbox_switches_it() {
+    let _guard = setup();
+    let dir = temp_dir("plain-sandbox");
+    fs::create_dir_all(dir.join(".git")).unwrap();
+    // No agent, no set_sandbox: the config default applies.
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.submit_user_message("RUN: printf a > file.txt; printf b > .git/config".to_string());
+    pump(&mut core, is_ready);
+    assert_eq!(fs::read_to_string(dir.join("file.txt")).unwrap(), "a");
+    assert!(!dir.join(".git/config").exists());
+
+    let (_, events) = core.handle_command("/sandbox");
+    let shown = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::Info(text) => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(shown.starts_with("sandbox: workspace-write"), "{shown}");
+    assert!(shown.contains("git push → ask"), "{shown}");
+
+    core.handle_command("/sandbox full-access");
+    core.submit_user_message("RUN: printf b > .git/config".to_string());
+    pump(&mut core, is_ready);
+    assert_eq!(fs::read_to_string(dir.join(".git/config")).unwrap(), "b");
+}
