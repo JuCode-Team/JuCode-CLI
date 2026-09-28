@@ -72,7 +72,7 @@ impl Client {
     }
 
     /// Reads frames until `done` matches one; returns all frames read.
-    fn until(&mut self, done: impl Fn(&Value) -> bool) -> Vec<Value> {
+    fn until(&mut self, mut done: impl FnMut(&Value) -> bool) -> Vec<Value> {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut seen = Vec::new();
         while Instant::now() < deadline {
@@ -466,4 +466,44 @@ fn a_timer_due_while_the_daemon_was_down_fires_on_start() {
     let mut client = Client::connect(&daemon);
     let frames = client.until(delivered_to("sleeper"));
     assert_eq!(frames.last().unwrap()["from"], "timer:t-overdue");
+}
+
+#[test]
+fn at_most_four_runs_are_in_progress_at_once() {
+    let _guard = setup();
+    let root = temp_dir("daemon-slots");
+    let agents = jucode_daemon::Agents::open(root.join("agents")).unwrap();
+    let ids = ["slot-a", "slot-b", "slot-c", "slot-d", "slot-e"];
+    for id in ids {
+        agents.create(id, id, &temp_dir(id), "Waits").unwrap();
+        // Run shell commands without asking, so each run takes real time.
+        let settings = root.join("agents").join(id).join("agent.json");
+        let text = fs::read_to_string(&settings).unwrap();
+        fs::write(&settings, text.replace("\"auto\"", "\"full-access\"")).unwrap();
+    }
+    let daemon = start_daemon_on(root.join("daemon"), root.join("agents"));
+    let mut client = Client::connect(&daemon);
+    for id in ids {
+        client.send(json!({ "op": "message_send", "agent": id, "body": "RUN: sleep 2" }));
+    }
+    let mut delivered = Vec::new();
+    let mut finished = 0;
+    let mut finished_before_fifth = 0;
+    client.until(|frame| {
+        if frame["type"] == "message_delivered" {
+            delivered.push(frame["session"].as_str().unwrap().to_string());
+            if delivered.len() == 5 {
+                finished_before_fifth = finished;
+            }
+        }
+        if frame["type"] == "status" && frame["message"] == "ready" {
+            finished += 1;
+        }
+        delivered.len() == 5
+    });
+    // The fifth message waited for one of the first four runs to end.
+    assert!(
+        finished_before_fifth >= 1,
+        "fifth delivered with {finished_before_fifth} runs finished"
+    );
 }

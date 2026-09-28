@@ -212,6 +212,22 @@ AgentOS 中不迁移的部分：自研 runtime 与工具集、WebUI（由 Deskto
   - Desktop 的 `DaemonClient` 与 SessionStore 托管流程有单元测试，另用真实 `jucode daemon` 跑通创建、快照、关闭、按 id 重开。
   - 尚未在 Tauri 界面中手动走一遍完整流程。
 
+### 阶段 2 结果
+
+- 引擎：新增宿主扩展接口（`host.rs`）。宿主可以给引擎加工具（由宿主执行，不走审批），并在每轮系统提示词末尾附加文字。Agent 的概念只存在于 daemon 中，agent-core 不知道 Agent。
+- daemon：
+  - Agent 存在 `~/.jucode/agents/<id>/`：brief 四个文件、`memory/` 和 `agent.json`（名称、工作目录、启用状态、审批模式，默认 `auto`）。Agent 的会话在它的工作目录里运行，每轮都带上 brief、记忆索引和其他 Agent 的清单。
+  - Agent 会话有三个工具：`message_agent`（给其他 Agent 发消息）、`timer`（设置、列出、取消定时器）、`brief`（改写自己的 brief 与记忆）。
+  - 消息先写入 `messages.jsonl` 再投递。路由顺序：消息指定的会话 → 所回复消息所在的会话 → 用户消息接该 Agent 最近活跃的会话 → 新会话。带 `dedupe_key` 的消息只投递一次。每秒重试未投递的消息（包括重启前留下的），同时最多 4 个运行。
+  - 定时器写入 `timers.jsonl`，默认回到设置它的会话。触发时以定时器 id 作为消息的去重键，daemon 停机期间到期的定时器在启动后只触发一次。
+  - 新增 op：`agent_list`、`agent_create`、`message_send`、`timer_list`；`session_create` 可以指定 `agent`；新增广播：`agents`、`message_delivered`。
+- Desktop：打开后台服务后，侧栏顶部显示 Agent 分区（名称、职责第一行、是否在工作）。点击 Agent 打开它最近的会话，没有会话时新建一个；"+"打开新建 Agent 对话框（名称、标识、工作目录、职责）。daemon 连不上时显示提示并每 5 秒重试。
+- 顺带修正：
+  - 临时文件名只用了进程号和时间戳，两个线程同时生成 diff 时会互相覆盖，已加计数器。
+  - `agent_create` 原先用 `id` 表示 Agent 标识，与请求编号冲突，改为 `agent`。
+- 验证：`crates/daemon/tests/daemon.rs` 新增用户消息开新会话、后续消息接同一会话、brief 进入系统提示词、定时器在无客户端连接时触发并完成一次运行、Agent 之间互发消息、去重、停机期间到期的定时器在启动后触发、第 5 个运行等待空位。Desktop 的 Agent 目录与打开 Agent 会话有单元测试，另用真实 daemon 跑通创建 Agent 和以 Agent 身份开会话。
+- 未做：brief 修改记录（阶段 6）；Agent 页（会话列表、档案、设置），放到阶段 3 与首页一起做。
+
 AgentOS 现有数据不做迁移，只有少量会话。需要保留的 brief 可以直接复制到 `~/.jucode/agents/`。
 
 ## 6. 风险
