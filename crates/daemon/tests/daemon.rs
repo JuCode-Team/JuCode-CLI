@@ -833,3 +833,27 @@ fn an_agent_writes_its_rw_directories_and_not_its_ro_ones() {
     assert!(!dir.join(".git/config").exists());
     assert_eq!(fs::read_to_string(dir.join("seen.txt")).unwrap(), "boot ok");
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_unattended_escalation_becomes_a_pending_action() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    let dir = create_agent(&mut client, "escalator", "Needs git");
+    fs::create_dir_all(dir.join(".git")).unwrap();
+    // auto-edit: an escalation asks a person (no safety model involved).
+    client.send(json!({ "op": "agent_update", "agent": "escalator", "approval_mode": "auto-edit", "id": 1 }));
+    client.until(|frame| frame["id"] == 1);
+    let (_, frames) = run_agent(
+        &mut client,
+        "escalator",
+        r#"CALL bash {"command":"printf x > .git/config","escalate":true,"justification":"set up the repo"}"#,
+    );
+    let deferred = frames
+        .iter()
+        .find(|frame| frame["type"] == "action_deferred")
+        .expect("nobody watches, so the escalation waits on the desk");
+    assert!(deferred["arguments"].as_str().unwrap().contains("escalate"));
+    assert!(!dir.join(".git/config").exists());
+}

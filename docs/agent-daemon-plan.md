@@ -258,6 +258,25 @@ AgentOS 中不迁移的部分：自研 runtime 与工具集、WebUI（由 Deskto
   - 用无头浏览器（手机尺寸）加本地假模型，对真实 daemon 与构建产物跑通：扫码链接配对 → Agent 列表 → 打开会话 → 发消息 → 收到回复。过程中发现并修正：会话打开完成前就能发送消息，消息会被随后到达的快照清掉且没有提示；现在打开完成前输入框不可发送。
 - 未做：发布包和 Docker 镜像带上 `web/` 目录，放到阶段 7。
 
+### 阶段 5 结果
+
+- 引擎（`sandbox.rs`）：
+  - 三档沙箱。macOS 用 Seatbelt，策略是默认放行，只拒绝三类：写可写目录以外的位置或保护路径、读取凭据、关闭网络时的出站连接。Linux 用 `bwrap`：整个文件系统只读，可写目录读写绑定，保护路径再只读绑定，凭据目录用空 tmpfs 遮住，关闭网络时新建网络命名空间。Windows 只支持 `full-access`。
+  - 可写目录：工作目录、Agent 的读写目录、临时目录和常见包管理缓存（`~/.cache`、`~/.npm`、`~/.cargo/registry` 等），保证安装依赖和构建能在沙箱里完成。
+  - 保护路径：可写目录里的 `.git`（worktree 同时保护它指向的真实 git 目录）、`.jucode`、`.agents`，以及 Agent 的只读目录（即使它位于临时目录这类可写位置之下）。子 Agent 在 `.jucode/agents/…` 下的工作区仍可写。
+  - 凭据：`~/.ssh`、`~/.gnupg`、`~/.aws`、`~/.jucode/auth.json`、`~/.jucode/daemon` 在任何沙箱档位下都不可读。
+  - 沙箱挂在每个引擎的 `ToolState` 上，TUI 与 `serve` 默认不启用，行为不变。
+  - 审批：沙箱内的命令不需要审批（`manual` 除外）。命令带 `escalate: true` 和理由时越出沙箱执行，按审批模式处理（`auto` 走安全模型，其余问人，无人在看时转为待确认动作）。命令规则优先：`forbid` 不执行，`ask` 总是问人，`allow` 让越界直接执行；`forbid` 优先，其余取最长匹配。
+  - 文件工具在进程内按同一套规则检查写入，并能读写 Agent 的其他目录。
+  - 启用沙箱时，系统提示词说明沙箱范围，shell 工具多出 `escalate` 与 `justification` 参数。
+- daemon：`agent.json` 新增 `sandbox`（默认 `workspace-write`）、`network`（默认开启）、`directories`（ro/rw）、`command_rules`（新 Agent 默认 `git add`、`git commit` 允许，`git push` 询问）。沙箱不可用时会话拒绝启动，不会不加沙箱就执行命令。
+- Desktop：Agent 页可以修改沙箱档位、网络、其他目录（添加、切换只读或读写、移除）和命令规则。
+- 验证：
+  - 引擎：Seatbelt 实际执行测试，覆盖工作区可写、`.git` 和目录外不可写；bwrap 参数顺序的单元测试；文件工具写入规则；集成测试覆盖沙箱内命令免审批、越界需审批、`allow` 规则免审批、`forbid` 规则不执行、系统提示词。
+  - daemon（macOS）：源码目录可写、读写目录可写、只读目录不可写但可读、`.git` 不可写，全程无审批；无人值守时的越界转为待确认动作。
+- 与方案的差异：钩子命令由使用者自己配置，不放进沙箱。
+- 未验证：Linux 上的 bwrap 只有参数构造的单元测试，还没有在 Linux 实机上跑过。
+
 AgentOS 现有数据不做迁移，只有少量会话。需要保留的 brief 可以直接复制到 `~/.jucode/agents/`。
 
 ## 6. 风险
