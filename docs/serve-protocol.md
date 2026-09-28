@@ -125,6 +125,34 @@ can retry with a corrected op.
 `status:"approval mode: ..."` and an `approval_mode` event. The change
 applies to new turns; an in-flight turn's gating can only loosen.
 
+### `set_attended`
+
+```json
+{"op":"set_attended","attended":false}
+```
+
+Marks whether a client is watching the session (default `true`). While
+unattended, a tool call that would emit `approval_request` is recorded as a
+deferred action instead: the engine emits `action_deferred`, the model gets a
+"submitted for confirmation" result, and the turn continues without waiting.
+Switching to `false` also converts calls already waiting on an
+`approval_request` into deferred actions. Emits `attended`.
+
+An identical call (same tool, arguments and working directory) reuses the
+open deferred action, or the decision already made for it in this engine.
+
+### `decide_action`
+
+```json
+{"op":"decide_action","id":"act-1727500000000-3f9a1c2b","decision":"allow"}
+```
+
+Decides a deferred action. `allow` runs the call with its original arguments
+in the background; `deny` does not run it. Either way the engine emits
+`action_decided` and sends the outcome to the session as a user message,
+which starts a turn (or queues behind the running one). Unknown ids emit
+`error`.
+
 ### MCP ops
 
 `mcp_list`, `mcp_set`, `mcp_remove`, `mcp_toggle` manage configured MCP
@@ -164,6 +192,9 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `tool_update` | `call_id`, `name`, `output` | Intermediate tool progress (e.g. long-running bash). |
 | `tool_output` | `call_id`, `name`, `output`, `is_error` | Tool call finished. |
 | `approval_request` | `call_id`, `name`, `summary`, `subagent_id`, `hunks` | A gated tool call waits for an `approve` op. `hunks` is a list of `{id, file, header, lines}` for partial approval, `null` otherwise. `subagent_id` is set when a subagent issued the call. |
+| `action_deferred` | `id`, `session_id`, `cwd`, `call_id`, `name`, `arguments`, `summary`, `subagent_id`, `digest`, `created_at` | An unattended session recorded a gated call instead of prompting; decide it with `decide_action`. |
+| `action_decided` | `id`, `decision`, `output`, `is_error` | A deferred action was decided; `output` is the tool result when it ran, `null` when declined. |
+| `attended` | `attended` | Current attended state, after `set_attended`. |
 | `subagent_lifecycle` | `path`, `status`, `message` | Subagent spawn/progress/finish notices. |
 | `usage` | `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_tokens` | Real API usage for the completed turn. |
 | `context_usage` | `tokens`, `tokenizer`, `cost` | Tokenizer-counted context size; `cost` is cumulative USD (0 when unpriced). |

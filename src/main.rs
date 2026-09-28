@@ -451,6 +451,22 @@ fn handle_serve_line(
                 Err(error) => vec![AgentEvent::Error(error)],
             }
         }
+        "set_attended" => match value.get("attended").and_then(Value::as_bool) {
+            Some(attended) => core.set_attended(attended),
+            None => vec![AgentEvent::Error(
+                "set_attended requires attended: true or false".to_string(),
+            )],
+        },
+        "decide_action" => match (
+            value.get("id").and_then(Value::as_str),
+            value.get("decision").and_then(Value::as_str),
+        ) {
+            (Some(id), Some("allow")) => core.decide_action(id, true),
+            (Some(id), Some("deny")) => core.decide_action(id, false),
+            _ => vec![AgentEvent::Error(
+                "decide_action requires id and decision: allow or deny".to_string(),
+            )],
+        },
         "mcp_list" => vec![core.mcp_servers_event()],
         "mcp_set" => match value.get("server") {
             Some(server) => core.mcp_set(server),
@@ -593,6 +609,9 @@ fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
         AgentEvent::CheckpointView(_) => "checkpoint_view",
         AgentEvent::McpServers { .. } => "mcp_servers",
         AgentEvent::ApprovalRequest { .. } => "approval_request",
+        AgentEvent::ActionDeferred(_) => "action_deferred",
+        AgentEvent::ActionDecided { .. } => "action_decided",
+        AgentEvent::Attended(_) => "attended",
         AgentEvent::ApprovalMode { .. } => "approval_mode",
         AgentEvent::TrustPrompt { .. } => "trust_prompt",
         AgentEvent::ModelView { .. } => "model_view",
@@ -884,6 +903,24 @@ fn event_json(event: AgentEvent) -> Value {
         AgentEvent::Info(message) => json!({ "type": "info", "message": message }),
         AgentEvent::Error(message) => json!({ "type": "error", "message": message }),
         AgentEvent::Status(message) => json!({ "type": "status", "message": message }),
+        AgentEvent::ActionDeferred(action) => {
+            let mut value = action.to_json();
+            value["type"] = json!("action_deferred");
+            value
+        }
+        AgentEvent::ActionDecided {
+            id,
+            allow,
+            output,
+            is_error,
+        } => json!({
+            "type": "action_decided",
+            "id": id,
+            "decision": if allow { "allow" } else { "deny" },
+            "output": output,
+            "is_error": is_error,
+        }),
+        AgentEvent::Attended(attended) => json!({ "type": "attended", "attended": attended }),
     }
 }
 

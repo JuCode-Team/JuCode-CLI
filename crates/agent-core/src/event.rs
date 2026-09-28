@@ -191,6 +191,18 @@ pub enum AgentEvent {
         /// for non-edit tools (or when planning failed): whole-call only.
         hunks: Option<Vec<HunkView>>,
     },
+    /// A gated call made while no client was watching: recorded instead of
+    /// blocking the turn. Decide it later with `AgentCore::decide_action`.
+    ActionDeferred(crate::actions::DeferredAction),
+    /// A deferred action was decided. `output` is set when it ran.
+    ActionDecided {
+        id: String,
+        allow: bool,
+        output: Option<String>,
+        is_error: bool,
+    },
+    /// Whether a client is watching; unattended sessions defer gated calls.
+    Attended(bool),
     /// The session's current tool approval mode (emitted on startup and on change).
     ApprovalMode {
         mode: String,

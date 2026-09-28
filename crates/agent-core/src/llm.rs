@@ -159,6 +159,10 @@ pub struct ApprovalRequest {
     pub call_id: String,
     pub name: String,
     pub summary: String,
+    /// Raw JSON arguments and working directory, kept so an unattended
+    /// session can record the call and run it later exactly as requested.
+    pub arguments: String,
+    pub cwd: PathBuf,
     /// Path of the subagent that issued the call; None for the main agent.
     pub subagent_id: Option<String>,
     /// Hunk breakdown for edit tools, computed before anything is applied so
@@ -174,6 +178,9 @@ pub struct ApprovalDecision {
     /// With `allow`, Some(ids) applies only the listed hunks of an edit tool
     /// call; None approves the whole call.
     pub approved_hunks: Option<Vec<String>>,
+    /// Set when no client was watching: the call was recorded as this
+    /// deferred action id and must not run now.
+    pub deferred: Option<String>,
 }
 
 impl ApprovalDecision {
@@ -181,6 +188,7 @@ impl ApprovalDecision {
         Self {
             allow: true,
             approved_hunks: None,
+            deferred: None,
         }
     }
 
@@ -188,6 +196,15 @@ impl ApprovalDecision {
         Self {
             allow: false,
             approved_hunks: None,
+            deferred: None,
+        }
+    }
+
+    pub fn deferred(id: String) -> Self {
+        Self {
+            allow: false,
+            approved_hunks: None,
+            deferred: Some(id),
         }
     }
 }
@@ -534,7 +551,10 @@ impl OpenAiClient {
                         call_id: request.call_id.clone(),
                         name: request.name.clone(),
                     })?;
-                    let result = approval_denied_result();
+                    let result = match &decision.deferred {
+                        Some(id) => approval_deferred_result(id),
+                        None => approval_denied_result(),
+                    };
                     emit_tool_output(&request, &result, &mut emit)?;
                     blocked_results.push(ToolCallResult { request, result });
                     continue;
@@ -1382,6 +1402,8 @@ impl OpenAiClient {
                 call_id: request.call_id.clone(),
                 name: request.name.clone(),
                 summary: approval_summary(&request.name, &request.arguments),
+                arguments: request.arguments.clone(),
+                cwd: cwd.to_path_buf(),
                 subagent_id: (self.agent_depth > 0).then(|| self.agent_path.clone()),
                 hunks: hunks::plan_edit_hunks(&request.name, &request.arguments, cwd),
                 response_tx,
@@ -1686,6 +1708,20 @@ fn hunk_selection_failed_result(error: &str) -> tools::ToolExecutionResult {
         model_output: output.clone(),
         output,
         is_error: true,
+    }
+}
+
+fn approval_deferred_result(id: &str) -> tools::ToolExecutionResult {
+    let output = json!({
+        "status": "submitted for confirmation",
+        "action_id": id,
+        "note": "No one is watching this session, so the call was recorded instead of run. It has not executed. Continue with work that does not depend on it; once the user decides, the outcome arrives as a message. Do not submit the same call again."
+    })
+    .to_string();
+    tools::ToolExecutionResult {
+        model_output: output.clone(),
+        output,
+        is_error: false,
     }
 }
 
@@ -2486,6 +2522,7 @@ mod tests {
                 .send(ApprovalDecision {
                     allow: true,
                     approved_hunks: Some(vec!["f0h1".to_string()]),
+                    deferred: None,
                 })
                 .unwrap();
         });

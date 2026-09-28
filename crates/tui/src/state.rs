@@ -532,6 +532,23 @@ impl TuiState {
                     true
                 }
                 AgentEvent::Status(status) => self.apply_status(status),
+                AgentEvent::ActionDeferred(action) => {
+                    self.chat.push(ChatLine::System(format!(
+                        "deferred {} for confirmation: {} ({})",
+                        action.id, action.name, action.summary
+                    )));
+                    self.mark_history_dirty();
+                    true
+                }
+                AgentEvent::ActionDecided { id, allow, .. } => {
+                    self.chat.push(ChatLine::System(format!(
+                        "deferred action {id} {}",
+                        if allow { "approved" } else { "declined" }
+                    )));
+                    self.mark_history_dirty();
+                    true
+                }
+                AgentEvent::Attended(_) => false,
             };
         }
         changed

@@ -1,3 +1,4 @@
+pub mod actions;
 mod commands;
 mod config;
 mod core;

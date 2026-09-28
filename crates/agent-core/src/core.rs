@@ -1,5 +1,6 @@
 use crate::providers::CLIENT_NAME;
 use crate::{
+    actions::{action_digest, decision_message, DeferredAction},
     config::{
         models_for_provider, profile_dir, ApprovalMode, AuthStore, Config, JucodeTokens,
         ModelConfig,
@@ -57,6 +58,17 @@ struct PendingApproval {
     response_tx: mpsc::Sender<ApprovalDecision>,
     name: String,
     hunk_ids: Vec<String>,
+    summary: String,
+    arguments: String,
+    cwd: PathBuf,
+    subagent_id: Option<String>,
+}
+
+/// Outcome of a deferred action approved and run on a background thread.
+struct ActionOutcome {
+    action: DeferredAction,
+    output: String,
+    is_error: bool,
 }
 
 #[derive(Debug)]
@@ -139,6 +151,15 @@ pub struct AgentCore {
     /// Session approval mode; starts from config and is switched by /permissions
     /// or the serve `set_approval_mode` op (session-only, not persisted).
     approval_mode: ApprovalMode,
+    /// False when no client is watching: gated calls become deferred actions
+    /// instead of blocking the turn on a prompt.
+    attended: bool,
+    /// Deferred actions awaiting a decision, by id.
+    deferred_actions: HashMap<String, DeferredAction>,
+    /// Decisions by action digest, reused for identical calls in this session.
+    action_decisions: HashMap<String, bool>,
+    action_tx: Sender<ActionOutcome>,
+    action_rx: Receiver<ActionOutcome>,
     update_receiver: Option<Receiver<UpdateNotice>>,
     login_receiver: Option<Receiver<Result<OAuthLoginResult, String>>>,
     omp_login_receiver: Option<Receiver<OmpLoginEvent>>,
@@ -177,7 +198,12 @@ enum OmpLoginEvent {
 
 impl AgentCore {
     pub fn new() -> io::Result<Self> {
-        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::open(env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+
+    /// Opens an engine rooted at `cwd` without touching the process working
+    /// directory, so one process can host engines for several projects.
+    pub fn open(cwd: PathBuf) -> io::Result<Self> {
         let trust = TrustStore::load_or_create()?;
         let project_trusted = if trust::project_has_local_resources(&cwd) {
             trust.decision_for(&cwd).unwrap_or(false)
@@ -199,6 +225,7 @@ impl AgentCore {
         let session = SessionStore::new();
         // A fresh session id is unique, so this only fails on IO problems.
         let session_lock = SessionLock::acquire(&profile_dir()?, &cwd, session.session_id()).ok();
+        let (action_tx, action_rx) = mpsc::channel();
         Ok(Self {
             config,
             auth,
@@ -234,6 +261,11 @@ impl AgentCore {
             pending_approvals: HashMap::new(),
             approved_tools: HashSet::new(),
             approval_mode,
+            attended: true,
+            deferred_actions: HashMap::new(),
+            action_decisions: HashMap::new(),
+            action_tx,
+            action_rx,
             mcp,
             version: env!("CARGO_PKG_VERSION"),
         })
@@ -1526,6 +1558,7 @@ impl AgentCore {
         }
         events.extend(self.poll_goal_tool_requests());
         events.extend(self.poll_approval_requests());
+        events.extend(self.poll_action_outcomes());
         self.mcp.refresh_changed();
         for message in self.mcp.drain_messages() {
             events.push(AgentEvent::Info(message));
@@ -2095,6 +2128,19 @@ impl AgentCore {
                 let _ = request.response_tx.send(ApprovalDecision::allow_all());
                 continue;
             }
+            if !self.attended {
+                let (decision, event) = self.defer_call(
+                    request.call_id,
+                    request.name,
+                    request.summary,
+                    request.arguments,
+                    request.cwd,
+                    request.subagent_id,
+                );
+                let _ = request.response_tx.send(decision);
+                events.extend(event);
+                continue;
+            }
             let hunk_ids = request
                 .hunks
                 .as_ref()
@@ -2113,10 +2159,186 @@ impl AgentCore {
                     response_tx: request.response_tx,
                     name: request.name,
                     hunk_ids,
+                    summary: request.summary,
+                    arguments: request.arguments,
+                    cwd: request.cwd,
+                    subagent_id: request.subagent_id,
                 },
             );
         }
         self.approval_receiver = Some(rx);
+        events
+    }
+
+    /// Records a gated call as a deferred action, or reuses the decision (or
+    /// the still-open action) of an identical call made earlier.
+    fn defer_call(
+        &mut self,
+        call_id: String,
+        name: String,
+        summary: String,
+        arguments: String,
+        cwd: PathBuf,
+        subagent_id: Option<String>,
+    ) -> (ApprovalDecision, Option<AgentEvent>) {
+        let digest = action_digest(&name, &arguments, &cwd);
+        match self.action_decisions.get(&digest) {
+            Some(true) => return (ApprovalDecision::allow_all(), None),
+            Some(false) => return (ApprovalDecision::deny(), None),
+            None => {}
+        }
+        if let Some(open) = self
+            .deferred_actions
+            .values()
+            .find(|action| action.digest == digest)
+        {
+            return (ApprovalDecision::deferred(open.id.clone()), None);
+        }
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or_default();
+        let action = DeferredAction {
+            id: format!("act-{created_at}-{}", &digest[..8]),
+            session_id: self.session.session_id().to_string(),
+            cwd,
+            call_id,
+            name,
+            arguments,
+            summary,
+            subagent_id,
+            digest,
+            created_at,
+        };
+        self.deferred_actions
+            .insert(action.id.clone(), action.clone());
+        (
+            ApprovalDecision::deferred(action.id.clone()),
+            Some(AgentEvent::ActionDeferred(action)),
+        )
+    }
+
+    pub fn attended(&self) -> bool {
+        self.attended
+    }
+
+    /// Marks whether a client is watching. Going unattended also converts
+    /// calls already waiting on a prompt into deferred actions, so a client
+    /// that disconnects mid-prompt never leaves the turn blocked.
+    pub fn set_attended(&mut self, attended: bool) -> Vec<AgentEvent> {
+        self.attended = attended;
+        let mut events = Vec::new();
+        if !attended {
+            let parked = std::mem::take(&mut self.pending_approvals);
+            for (call_id, pending) in parked {
+                let (decision, event) = self.defer_call(
+                    call_id,
+                    pending.name,
+                    pending.summary,
+                    pending.arguments,
+                    pending.cwd,
+                    pending.subagent_id,
+                );
+                let _ = pending.response_tx.send(decision);
+                events.extend(event);
+            }
+        }
+        events.push(AgentEvent::Attended(attended));
+        events
+    }
+
+    /// Decides a deferred action. An approved action runs with its original
+    /// arguments on a background thread; either way the outcome is sent back
+    /// to the session as a message, which starts (or queues) a turn.
+    pub fn decide_action(&mut self, id: &str, allow: bool) -> Vec<AgentEvent> {
+        match self.deferred_actions.get(id) {
+            None => return vec![AgentEvent::Error(format!("no deferred action {id}"))],
+            // The outcome is delivered as a message to the current session,
+            // so an action from a session this engine has switched away from
+            // must not land here.
+            Some(action) if action.session_id != self.session.session_id() => {
+                return vec![AgentEvent::Error(format!(
+                    "deferred action {id} belongs to session {}",
+                    action.session_id
+                ))]
+            }
+            Some(_) => {}
+        }
+        let action = self
+            .deferred_actions
+            .remove(id)
+            .expect("deferred action checked above");
+        self.action_decisions.insert(action.digest.clone(), allow);
+        if !allow {
+            let mut events = vec![AgentEvent::ActionDecided {
+                id: action.id.clone(),
+                allow: false,
+                output: None,
+                is_error: false,
+            }];
+            events.extend(self.submit_user_message(decision_message(&action, None)));
+            return events;
+        }
+        let tx = self.action_tx.clone();
+        let mcp = self.mcp.clone();
+        let hooks = self.hooks.clone();
+        thread::spawn(move || {
+            let result = if action.name.starts_with("mcp__") {
+                match mcp.run_tool(&action.name, &action.arguments) {
+                    Some((output, is_error)) => crate::tools::ToolExecutionResult {
+                        model_output: crate::tools::project_model_output(
+                            &action.name,
+                            &output,
+                            &action.cwd,
+                        ),
+                        output,
+                        is_error,
+                    },
+                    None => {
+                        let output =
+                            json!({ "error": format!("unknown MCP tool: {}", action.name) })
+                                .to_string();
+                        crate::tools::ToolExecutionResult {
+                            model_output: output.clone(),
+                            output,
+                            is_error: true,
+                        }
+                    }
+                }
+            } else {
+                crate::tools::run_tool_with_events(
+                    &action.name,
+                    &action.arguments,
+                    &action.cwd,
+                    &[],
+                    |_| Ok(()),
+                )
+            };
+            hooks.post_tool(&action.name, &result.output, &action.cwd);
+            let _ = tx.send(ActionOutcome {
+                action,
+                output: result.model_output,
+                is_error: result.is_error,
+            });
+        });
+        Vec::new()
+    }
+
+    fn poll_action_outcomes(&mut self) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        while let Ok(outcome) = self.action_rx.try_recv() {
+            let action = outcome.action;
+            events.push(AgentEvent::ActionDecided {
+                id: action.id.clone(),
+                allow: true,
+                output: Some(outcome.output.clone()),
+                is_error: outcome.is_error,
+            });
+            events.extend(self.submit_user_message(decision_message(
+                &action,
+                Some((&outcome.output, outcome.is_error)),
+            )));
+        }
         events
     }
 
@@ -3693,6 +3915,7 @@ fn resolve_approval_decision(
     let _ = pending.response_tx.send(ApprovalDecision {
         allow,
         approved_hunks,
+        deferred: None,
     });
     Ok(())
 }
@@ -3727,6 +3950,10 @@ mod approval_decision_tests {
                 response_tx,
                 name: "apply_patch".to_string(),
                 hunk_ids: hunk_ids.iter().map(|id| id.to_string()).collect(),
+                summary: String::new(),
+                arguments: String::new(),
+                cwd: PathBuf::new(),
+                subagent_id: None,
             },
         );
         (map, response_rx)
