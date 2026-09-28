@@ -191,7 +191,7 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             let text = |key: &str| op[key].as_str().unwrap_or_default();
             hub.agents
                 .create(
-                    text("id"),
+                    text("agent"),
                     text("name"),
                     &PathBuf::from(text("cwd")),
                     text("role"),

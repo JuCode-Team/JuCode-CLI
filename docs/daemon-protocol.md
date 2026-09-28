@@ -70,7 +70,7 @@ every connected client.
 | `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
 | `actions_list` | — | `actions`: undecided deferred actions across all sessions |
 | `agent_list` | — | `agents` |
-| `agent_create` | `id`, `name`, `cwd`, `role` | `agent_created`; every client also receives the new `agents` list |
+| `agent_create` | `agent` (the new agent's id), `name`, `cwd`, `role` | `agent_created`; every client also receives the new `agents` list |
 | `message_send` | `agent`, `body`, optional `session`, `reply_to`, `dedupe_key` | `message_accepted` with `message` and `duplicate` |
 | `timer_list` | — | `timers`: active timers of all agents |
 

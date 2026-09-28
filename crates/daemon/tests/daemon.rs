@@ -313,7 +313,7 @@ fn session_switching_commands_are_refused() {
 fn create_agent(client: &mut Client, id: &str, role: &str) -> PathBuf {
     let dir = temp_dir(&format!("agent-{id}"));
     client.send(json!({
-        "op": "agent_create", "id": id, "name": id, "cwd": dir, "role": role,
+        "op": "agent_create", "agent": id, "name": id, "cwd": dir, "role": role,
     }));
     client.until(|frame| frame["type"] == "agent_created" && frame["agent"]["id"] == id);
     dir
