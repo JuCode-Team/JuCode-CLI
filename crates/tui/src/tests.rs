@@ -411,6 +411,49 @@ fn progress_renders_above_input() {
     assert!(progress_index < input_index);
 }
 
+fn user_line_color(app: &mut TuiApp<TestRuntime>, text: &str) -> Option<Color> {
+    let document = app.build_document(80, Instant::now());
+    document
+        .rendered_history_lines
+        .expect("state renders history")
+        .iter()
+        .filter(|line| line.kind == UiKind::User)
+        .flat_map(|line| line.line.spans.iter())
+        .find(|span| span.content.contains(text))
+        .map(|span| span.style.fg)
+        .expect("user message renders")
+}
+
+#[test]
+fn sent_message_is_dim_until_the_request_connects() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.apply_events(vec![
+        AgentEvent::UserMessage("hello".to_string()),
+        AgentEvent::Connecting,
+    ]);
+    assert_eq!(user_line_color(&mut app, "hello"), Some(Color::DarkGray));
+    // The dim message stands in for the connecting indicator.
+    let document = app.build_document(80, Instant::now());
+    assert!(!document
+        .controls
+        .iter()
+        .any(|line| line.plain().contains("connecting")));
+
+    app.apply_events(vec![AgentEvent::ThinkingStart]);
+    assert_eq!(user_line_color(&mut app, "hello"), None);
+}
+
+#[test]
+fn a_failed_request_still_shows_the_sent_message_normally() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.apply_events(vec![
+        AgentEvent::UserMessage("hello".to_string()),
+        AgentEvent::Connecting,
+        AgentEvent::Error("connection refused".to_string()),
+    ]);
+    assert_eq!(user_line_color(&mut app, "hello"), None);
+}
+
 #[test]
 fn colored_status_line_does_not_wrap_at_visible_width() {
     let document = UiBuilder::new()

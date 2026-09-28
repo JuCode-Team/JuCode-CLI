@@ -164,7 +164,10 @@ impl UiBuilder {
                     model,
                     *context_window,
                 ),
-                ChatLine::User(text) => self.push_user_message(text),
+                ChatLine::User(text) => self.push_user_message(text, Style::new()),
+                ChatLine::PendingUser(text) => {
+                    self.push_user_message(text, Style::new().fg(Color::DarkGray))
+                }
                 ChatLine::Assistant(text) => {
                     for line in render_markdown(text, width) {
                         self.history_line(UiKind::Assistant, line);
@@ -426,9 +429,13 @@ impl UiBuilder {
         mut self,
         activity: &ActivityState,
         thinking_tokens: u64,
+        awaiting_connection: bool,
         now: Instant,
         width: usize,
     ) -> Self {
+        if awaiting_connection && matches!(activity.kind, crate::ActivityKind::Connecting) {
+            return self;
+        }
         let Some(progress) = activity.progress(now, thinking_tokens) else {
             return self;
         };
@@ -506,7 +513,7 @@ impl UiBuilder {
 
     /// User turns echo with a dim `›` marker — same glyph as the composer
     /// prompt — so their own messages read as quoted input, not output.
-    fn push_user_message(&mut self, text: &str) {
+    fn push_user_message(&mut self, text: &str, style: Style) {
         if text.is_empty() {
             self.history_line(
                 UiKind::User,
@@ -520,7 +527,7 @@ impl UiBuilder {
                 UiKind::User,
                 Line::from(vec![
                     Span::styled(marker, Style::new().fg(Color::DarkGray)),
-                    Span::raw(line.to_string()),
+                    Span::styled(line.to_string(), style),
                 ]),
             );
         }

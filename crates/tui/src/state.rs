@@ -102,7 +102,13 @@ impl TuiState {
             .rendered_history_lines(rendered_history_lines)
             .picker(self.picker_view.as_ref(), control_width)
             .pending_messages(&self.pending_messages)
-            .progress(&self.activity, self.thinking_tokens, now, control_width)
+            .progress(
+                &self.activity,
+                self.thinking_tokens,
+                self.awaiting_connection(),
+                now,
+                control_width,
+            )
             .input(&input_display, &completion_rows, self.completion_index)
             .bottom_status(
                 BottomStatus {
@@ -300,7 +306,7 @@ impl TuiState {
                     changed
                 }
                 AgentEvent::UserMessage(message) => {
-                    self.chat.push(ChatLine::User(message));
+                    self.chat.push(ChatLine::PendingUser(message));
                     self.mark_history_dirty();
                     true
                 }
@@ -348,6 +354,7 @@ impl TuiState {
                     changed
                 }
                 AgentEvent::ThinkingStart => {
+                    self.confirm_pending_user();
                     self.begin_reasoning_turn_if_idle();
                     self.activity.start_thinking();
                     true
@@ -524,6 +531,7 @@ impl TuiState {
                     true
                 }
                 AgentEvent::Error(error) => {
+                    self.confirm_pending_user();
                     self.collapse_live_thinking();
                     self.commit_live_assistant();
                     self.activity.finish();
@@ -563,8 +571,35 @@ impl TuiState {
         self.picker_view = Some(PickerState::approval(call_id, name, summary));
     }
 
+    /// The request connected (or the turn ended without connecting): show
+    /// the sent message at full brightness.
+    pub(super) fn confirm_pending_user(&mut self) -> bool {
+        let mut changed = false;
+        for line in &mut self.chat {
+            if let ChatLine::PendingUser(text) = line {
+                *line = ChatLine::User(std::mem::take(text));
+                changed = true;
+            }
+        }
+        if changed {
+            self.mark_history_dirty();
+        }
+        changed
+    }
+
+    /// True while a sent message waits for its request to connect; the dim
+    /// message itself shows that, so no separate connecting line is drawn.
+    pub(super) fn awaiting_connection(&self) -> bool {
+        self.chat
+            .iter()
+            .any(|line| matches!(line, ChatLine::PendingUser(_)))
+    }
+
     pub(super) fn apply_status(&mut self, status: String) -> bool {
         let mut changed = self.status != status;
+        if status == "ready" || status == "interrupted" {
+            changed |= self.confirm_pending_user();
+        }
         if status == "ready" || status == "interrupted" || status.starts_with("queued:") {
             // The reasoning message (collapsed) stays in the transcript, but the
             // above-input status indicator is reset once the reply is done.

@@ -79,6 +79,9 @@ pub(crate) enum ChatLine {
         context_window: u64,
     },
     User(String),
+    /// A sent message whose model request has not connected yet; drawn dim
+    /// until the connection is up, then turned into `User`.
+    PendingUser(String),
     Assistant(String),
     Reasoning {
         text: String,
