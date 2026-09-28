@@ -1,9 +1,10 @@
 //! Tools a long-lived agent's sessions get from the daemon, added to the
-//! engine through `HostExtensions`: `message_agent`, `timer` and `brief`.
+//! engine through `HostExtensions`: `message_agent`, `timer`, `brief`,
+//! `question` and `report`.
 
 use crate::{
     hub::Hub,
-    store::{now, Message, Timer},
+    store::{now, Message, Question, Report, Timer},
 };
 use jucode_agent_core::host::HostExtensions;
 use serde_json::{json, Value};
@@ -115,12 +116,83 @@ fn run(
             Some("list") => Ok(json!({ "memory": hub.agents.memory_files(agent) })),
             _ => Err("brief action must be read, write or list".to_string()),
         },
+        "question" => {
+            let title = text("title").ok_or("question requires title")?;
+            let importance = text("importance").unwrap_or_else(|| "normal".to_string());
+            if !matches!(importance.as_str(), "low" | "normal" | "high") {
+                return Err("importance must be low, normal or high".to_string());
+            }
+            let question = Question {
+                id: hub.new_id("q"),
+                agent: agent.to_string(),
+                session: session.to_string(),
+                title,
+                body: text("body").unwrap_or_default(),
+                assumption: text("assumption").unwrap_or_default(),
+                default_action: text("default").unwrap_or_default(),
+                importance,
+                due_at: args["due_in_seconds"]
+                    .as_u64()
+                    .map(|seconds| now() + seconds * 1000),
+                asked_at: now(),
+            };
+            hub.ask(&question)?;
+            Ok(json!({
+                "question": question.id,
+                "note": "Recorded for the user. Carry on with work that does not depend on the answer, under your stated assumption; the answer (or the deadline passing) arrives in this conversation as a message."
+            }))
+        }
+        "report" => {
+            let report = Report {
+                id: hub.new_id("r"),
+                agent: agent.to_string(),
+                session: session.to_string(),
+                title: text("title").ok_or("report requires title")?,
+                body: text("body").unwrap_or_default(),
+                at: now(),
+                read: false,
+            };
+            hub.post_report(&report)?;
+            Ok(json!({ "report": report.id }))
+        }
         other => Err(format!("unknown tool {other}")),
     }
 }
 
 fn definitions() -> Vec<Value> {
     vec![
+        json!({
+            "type": "function",
+            "name": "question",
+            "description": "Ask the user something only they can decide, without stopping: the question waits for them while you continue under `assumption`. Their answer, or the deadline passing (then you go with `default`), arrives here as a message. Use it for real decisions, not for confirmations you can reason out yourself.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "The question in one line." },
+                    "body": { "type": "string", "description": "Context and the options you see." },
+                    "assumption": { "type": "string", "description": "What you assume while waiting." },
+                    "default": { "type": "string", "description": "What you will do if nobody answers in time." },
+                    "due_in_seconds": { "type": "integer", "minimum": 0, "description": "Deadline; omit to wait indefinitely." },
+                    "importance": { "type": "string", "enum": ["low", "normal", "high"] }
+                },
+                "required": ["title"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "report",
+            "description": "Tell the user what you finished or found, for them to read later on their desk. It wakes nobody. Report outcomes worth their attention (done, blocked, something they should know), not every step.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "The outcome in one line." },
+                    "body": { "type": "string", "description": "Details: what changed, how it was checked, what is left." }
+                },
+                "required": ["title"],
+                "additionalProperties": false
+            }
+        }),
         json!({
             "type": "function",
             "name": "message_agent",

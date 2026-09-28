@@ -507,3 +507,177 @@ fn at_most_four_runs_are_in_progress_at_once() {
         "fifth delivered with {finished_before_fifth} runs finished"
     );
 }
+
+/// Sends `body` to a fresh agent and returns the session it landed in once
+/// that run has finished.
+fn run_agent(client: &mut Client, agent: &str, body: &str) -> (String, Vec<Value>) {
+    client.send(json!({ "op": "message_send", "agent": agent, "body": body }));
+    let frames = client.until(delivered_to(agent));
+    let session = frames.last().unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut all = frames;
+    all.extend(client.until(ready(&session)));
+    (session, all)
+}
+
+#[test]
+fn an_answered_question_wakes_the_session_that_asked() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "asks", "Needs decisions");
+    let (session, frames) = run_agent(
+        &mut client,
+        "asks",
+        r#"CALL question {"title":"Ship to prod?","assumption":"not yet","default":"wait","importance":"high"}"#,
+    );
+    let listed = frames
+        .iter()
+        .rev()
+        .find(|frame| frame["type"] == "questions")
+        .expect("the new question is broadcast");
+    let question = listed["questions"][0].clone();
+    assert_eq!(question["title"], "Ship to prod?");
+    assert_eq!(question["session"], session.as_str());
+    assert_eq!(question["importance"], "high");
+
+    client.send(json!({
+        "op": "question_answer", "question": question["id"], "answer": "yes, ship it", "id": 3,
+    }));
+    let mut frames = client.until(|frame| frame["id"] == 3 && frame["type"] == "question_answered");
+    frames.extend(client.until(ready(&session)));
+    let delivery = frames
+        .iter()
+        .find(|frame| frame["type"] == "message_delivered")
+        .expect("the answer is delivered");
+    assert_eq!(delivery["session"], session.as_str());
+    let reply = reply_text(&frames, &session);
+    assert!(reply.contains("A: yes, ship it"), "{reply}");
+
+    client.send(
+        json!({ "op": "question_answer", "question": question["id"], "answer": "no", "id": 4 }),
+    );
+    let frames = client.until(|frame| frame["id"] == 4);
+    assert_eq!(frames.last().unwrap()["type"], "error");
+}
+
+#[test]
+fn an_unanswered_question_falls_back_to_its_default_at_the_deadline() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "waits", "Waits politely");
+    let (session, _) = run_agent(
+        &mut client,
+        "waits",
+        r#"CALL question {"title":"Which region?","default":"use eu","due_in_seconds":1}"#,
+    );
+    let frames = client.until(delivered_to("waits"));
+    assert_eq!(
+        frames.last().unwrap()["from"]
+            .as_str()
+            .unwrap()
+            .split(':')
+            .next(),
+        Some("question")
+    );
+    let frames = client.until(ready(&session));
+    let reply = reply_text(&frames, &session);
+    assert!(reply.contains("No answer by the deadline"), "{reply}");
+    assert!(reply.contains("use eu"), "{reply}");
+    client.send(json!({ "op": "question_list", "id": 5 }));
+    let frames = client.until(|frame| frame["id"] == 5);
+    assert_eq!(frames.last().unwrap()["questions"], json!([]));
+}
+
+#[test]
+fn a_report_is_listed_until_read_and_wakes_nobody() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "reporter", "Reports");
+    let (_, frames) = run_agent(
+        &mut client,
+        "reporter",
+        r#"CALL report {"title":"Login fixed","body":"tests: 12 pass"}"#,
+    );
+    let posted = frames
+        .iter()
+        .find(|frame| frame["type"] == "report_posted")
+        .expect("the report is broadcast")["report"]
+        .clone();
+    assert_eq!(posted["title"], "Login fixed");
+    assert_eq!(posted["read"], false);
+    // Posting a report started no further delivery.
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["type"] == "message_delivered")
+            .count(),
+        1
+    );
+
+    client.send(json!({ "op": "report_read", "report": posted["id"], "id": 6 }));
+    client.until(|frame| frame["id"] == 6);
+    client.send(json!({ "op": "report_list", "id": 7 }));
+    let frames = client.until(|frame| frame["id"] == 7);
+    let reports = frames.last().unwrap()["reports"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0]["read"], true);
+}
+
+#[test]
+fn an_action_can_be_decided_after_its_session_closed() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    let dir = create_agent(&mut client, "careful", "Asks before shell commands");
+    client.send(
+        json!({ "op": "agent_update", "agent": "careful", "approval_mode": "manual", "id": 8 }),
+    );
+    client.until(|frame| frame["id"] == 8);
+    let (session, frames) = run_agent(&mut client, "careful", "RUN: printf later > marker.txt");
+    let actions = frames
+        .iter()
+        .rev()
+        .find(|frame| frame["type"] == "actions")
+        .expect("the deferred action is broadcast");
+    let action = actions["actions"][0].clone();
+    assert_eq!(action["session_id"], session.as_str());
+    client.send(json!({ "op": "session_close", "session": session }));
+    client.until(|frame| frame["type"] == "session_closed");
+
+    client.send(json!({
+        "op": "decide_action", "session": session, "id": action["id"], "decision": "allow",
+    }));
+    client.until(|frame| frame["type"] == "action_decided");
+    client.until(ready(&session));
+    assert_eq!(fs::read_to_string(dir.join("marker.txt")).unwrap(), "later");
+}
+
+#[test]
+fn the_agent_page_reads_the_brief_and_changes_settings() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "paged", "Has a page");
+    client.send(json!({ "op": "agent_update", "agent": "paged", "name": "Paged", "enabled": false, "id": 1 }));
+    let frames = client.until(|frame| frame["id"] == 1);
+    assert_eq!(frames.last().unwrap()["agent"]["enabled"], false);
+    client.send(json!({ "op": "agent_get", "agent": "paged", "id": 2 }));
+    let frames = client.until(|frame| frame["id"] == 2);
+    let page = frames.last().unwrap();
+    assert_eq!(page["agent"]["name"], "Paged");
+    assert_eq!(page["brief"]["role.md"], "Has a page\n");
+    // A disabled agent takes no new messages.
+    client.send(json!({ "op": "message_send", "agent": "paged", "body": "hi", "id": 3 }));
+    client.until(|frame| frame["id"] == 3);
+    thread::sleep(Duration::from_millis(1500));
+    let log = fs::read_to_string(daemon.state.join("messages.jsonl")).unwrap();
+    assert!(log.contains("undeliverable"), "{log}");
+}

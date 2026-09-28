@@ -17,6 +17,8 @@ const SESSIONS: &str = "sessions.jsonl";
 const ACTIONS: &str = "actions.jsonl";
 const MESSAGES: &str = "messages.jsonl";
 const TIMERS: &str = "timers.jsonl";
+const QUESTIONS: &str = "questions.jsonl";
+const REPORTS: &str = "reports.jsonl";
 const TOKEN: &str = "token";
 
 pub struct Store {
@@ -49,6 +51,37 @@ pub struct Message {
     /// A second message with the same key is dropped.
     pub dedupe_key: Option<String>,
     pub at: u64,
+}
+
+/// A question an agent asked while it kept working. Answered by the user,
+/// or by the deadline passing (the agent then goes with its default).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Question {
+    pub id: String,
+    pub agent: String,
+    pub session: String,
+    pub title: String,
+    pub body: String,
+    /// What the agent assumes meanwhile.
+    pub assumption: String,
+    /// What the agent will do if nobody answers in time.
+    pub default_action: String,
+    /// `low`, `normal` or `high`.
+    pub importance: String,
+    pub due_at: Option<u64>,
+    pub asked_at: u64,
+}
+
+/// Something an agent reports for the user to read; wakes nobody.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Report {
+    pub id: String,
+    pub agent: String,
+    pub session: String,
+    pub title: String,
+    pub body: String,
+    pub at: u64,
+    pub read: bool,
 }
 
 /// A one-shot timer that wakes an agent with `body` at `fire_at` (ms).
@@ -296,6 +329,107 @@ impl Store {
         timers
     }
 
+    pub fn record_question(&self, question: &Question) -> io::Result<()> {
+        self.append(
+            QUESTIONS,
+            json!({
+                "kind": "asked", "id": question.id, "agent": question.agent,
+                "session": question.session, "title": question.title, "body": question.body,
+                "assumption": question.assumption, "default": question.default_action,
+                "importance": question.importance, "due_at": question.due_at,
+                "at": question.asked_at,
+            }),
+        )
+    }
+
+    /// Records the answer; false when the question was already answered or
+    /// does not exist, so a user answer and a deadline never both land.
+    pub fn record_answer(&self, id: &str, answer: &str, by: &str) -> io::Result<bool> {
+        let _guard = self.lock();
+        let entries = self.read(QUESTIONS);
+        let asked = entries
+            .iter()
+            .any(|entry| entry["kind"] == "asked" && entry["id"] == id);
+        let answered = entries
+            .iter()
+            .any(|entry| entry["kind"] == "answered" && entry["id"] == id);
+        if !asked || answered {
+            return Ok(false);
+        }
+        self.append_locked(
+            QUESTIONS,
+            json!({ "kind": "answered", "id": id, "answer": answer, "by": by, "at": now() }),
+        )?;
+        Ok(true)
+    }
+
+    pub fn question(&self, id: &str) -> Option<Question> {
+        self.read(QUESTIONS)
+            .iter()
+            .find(|entry| entry["kind"] == "asked" && entry["id"] == id)
+            .and_then(question_from_json)
+    }
+
+    /// Unanswered questions, oldest first.
+    pub fn open_questions(&self) -> Vec<Question> {
+        let entries = self.read(QUESTIONS);
+        let answered: HashSet<&str> = entries
+            .iter()
+            .filter(|entry| entry["kind"] == "answered")
+            .filter_map(|entry| entry["id"].as_str())
+            .collect();
+        entries
+            .iter()
+            .filter(|entry| entry["kind"] == "asked")
+            .filter(|entry| !entry["id"].as_str().is_some_and(|id| answered.contains(id)))
+            .filter_map(question_from_json)
+            .collect()
+    }
+
+    pub fn record_report(&self, report: &Report) -> io::Result<()> {
+        self.append(
+            REPORTS,
+            json!({
+                "kind": "posted", "id": report.id, "agent": report.agent,
+                "session": report.session, "title": report.title, "body": report.body,
+                "at": report.at,
+            }),
+        )
+    }
+
+    pub fn record_report_read(&self, id: &str) -> io::Result<()> {
+        self.append(REPORTS, json!({ "kind": "read", "id": id, "at": now() }))
+    }
+
+    /// The newest `limit` reports, newest first.
+    pub fn reports(&self, limit: usize) -> Vec<Report> {
+        let entries = self.read(REPORTS);
+        let read: HashSet<&str> = entries
+            .iter()
+            .filter(|entry| entry["kind"] == "read")
+            .filter_map(|entry| entry["id"].as_str())
+            .collect();
+        entries
+            .iter()
+            .rev()
+            .filter(|entry| entry["kind"] == "posted")
+            .filter_map(|entry| {
+                let text = |key: &str| entry[key].as_str().map(str::to_string);
+                let id = text("id")?;
+                Some(Report {
+                    read: read.contains(id.as_str()),
+                    id,
+                    agent: text("agent")?,
+                    session: text("session")?,
+                    title: text("title")?,
+                    body: text("body").unwrap_or_default(),
+                    at: entry["at"].as_u64().unwrap_or_default(),
+                })
+            })
+            .take(limit)
+            .collect()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
         self.write
             .lock()
@@ -323,6 +457,22 @@ impl Store {
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect()
     }
+}
+
+fn question_from_json(entry: &Value) -> Option<Question> {
+    let text = |key: &str| entry[key].as_str().map(str::to_string);
+    Some(Question {
+        id: text("id")?,
+        agent: text("agent")?,
+        session: text("session")?,
+        title: text("title")?,
+        body: text("body").unwrap_or_default(),
+        assumption: text("assumption").unwrap_or_default(),
+        default_action: text("default").unwrap_or_default(),
+        importance: text("importance").unwrap_or_else(|| "normal".to_string()),
+        due_at: entry["due_at"].as_u64(),
+        asked_at: entry["at"].as_u64().unwrap_or_default(),
+    })
 }
 
 fn message_from_json(entry: &Value) -> Option<Message> {
@@ -464,5 +614,58 @@ mod tests {
         store.record_timer_done("gone", "cancelled").unwrap();
         let ids: Vec<String> = store.active_timers().into_iter().map(|t| t.id).collect();
         assert_eq!(ids, vec!["soon", "late"]);
+    }
+
+    fn question(id: &str) -> Question {
+        Question {
+            id: id.to_string(),
+            agent: "ops".to_string(),
+            session: "s1".to_string(),
+            title: "Which region?".to_string(),
+            body: String::new(),
+            assumption: "eu".to_string(),
+            default_action: "deploy to eu".to_string(),
+            importance: "normal".to_string(),
+            due_at: Some(5),
+            asked_at: 1,
+        }
+    }
+
+    #[test]
+    fn a_question_is_answered_once() {
+        let store = store("questions");
+        store.record_question(&question("q1")).unwrap();
+        store.record_question(&question("q2")).unwrap();
+        assert!(store.record_answer("q1", "us", "user").unwrap());
+        assert!(!store.record_answer("q1", "eu", "deadline").unwrap());
+        assert!(!store.record_answer("missing", "x", "user").unwrap());
+        let open: Vec<String> = store.open_questions().into_iter().map(|q| q.id).collect();
+        assert_eq!(open, vec!["q2"]);
+        assert_eq!(store.question("q1").unwrap().default_action, "deploy to eu");
+    }
+
+    #[test]
+    fn reports_list_newest_first_with_read_state() {
+        let store = store("reports");
+        for (id, at) in [("r1", 1), ("r2", 2), ("r3", 3)] {
+            store
+                .record_report(&Report {
+                    id: id.to_string(),
+                    agent: "ops".to_string(),
+                    session: "s1".to_string(),
+                    title: id.to_string(),
+                    body: String::new(),
+                    at,
+                    read: false,
+                })
+                .unwrap();
+        }
+        store.record_report_read("r2").unwrap();
+        let reports = store.reports(2);
+        assert_eq!(
+            reports.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["r3", "r2"]
+        );
+        assert!(reports[1].read && !reports[0].read);
     }
 }

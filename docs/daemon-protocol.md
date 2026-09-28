@@ -35,6 +35,8 @@ State lives in `~/.jucode/daemon/`:
 | `actions.jsonl` | Append log of deferred actions and their decisions. |
 | `messages.jsonl` | Append log of messages to agents and their delivery. |
 | `timers.jsonl` | Append log of agent timers set, fired and cancelled. |
+| `questions.jsonl` | Append log of questions asked and answered. |
+| `reports.jsonl` | Append log of reports posted and read. |
 
 ## Connecting
 
@@ -49,6 +51,8 @@ Each WebSocket text message is one JSON frame. The daemon first sends:
 {"type":"hello","protocol":2,"version":"0.3.0"}
 {"type":"sessions","sessions":[{"session":"...","cwd":"...","created_at":0,"open":true,"watchers":0}]}
 ```
+
+followed by the current `agents`, `questions` and `actions` lists.
 
 A client that does not speak `protocol` 2 must disconnect.
 
@@ -73,6 +77,15 @@ every connected client.
 | `agent_create` | `agent` (the new agent's id), `name`, `cwd`, `role` | `agent_created`; every client also receives the new `agents` list |
 | `message_send` | `agent`, `body`, optional `session`, `reply_to`, `dedupe_key` | `message_accepted` with `message` and `duplicate` |
 | `timer_list` | — | `timers`: active timers of all agents |
+| `agent_get` | `agent` | `agent`: settings, `brief` (the four files), `memory` file names and the agent's `sessions` |
+| `agent_update` | `agent`, optional `name`, `enabled`, `approval_mode` | `agent_updated`; every client also receives the new `agents` list |
+| `question_list` | — | `questions`: unanswered questions |
+| `question_answer` | `question`, `answer` | `question_answered`; the answer is delivered to the session that asked |
+| `report_list` | optional `limit` (50) | `reports`, newest first, with `read` |
+| `report_read` | `report` | `report_read` |
+
+`decide_action` (a session op) also works for a session that is closed or
+was hosted before a restart: the daemon reopens it first.
 
 `session_create` also accepts `agent` instead of `cwd`: the session runs in
 the agent's directory as that agent.
@@ -90,6 +103,8 @@ the other agents in its system prompt, and three tools:
 | `message_agent` | Sends a message to another agent. |
 | `timer` | `set` (after `in_seconds` or at unix `at`), `list`, `cancel`. A timer wakes the session that set it unless `new_session` is true, whether or not a client is connected. |
 | `brief` | Reads or rewrites the agent's own brief and memory files. |
+| `question` | Records a question for the user (`title`, `body`, `assumption`, `default`, `due_in_seconds`, `importance`) and returns at once. The answer, or the deadline passing (the agent then goes with `default`), is delivered to the session that asked. |
+| `report` | Records a report (`title`, `body`) for the user to read; wakes nobody. |
 
 Messages (from `message_send`, `message_agent` or a fired timer) are
 recorded in `messages.jsonl` before delivery and routed to a session:
@@ -105,7 +120,9 @@ message that would start a fifth waits. Messages are retried every second,
 including ones left over from before a restart, and a fired timer is
 delivered once (its id is the message's dedupe key). Every client receives
 `message_delivered` (`id`, `agent`, `from`, `session`) and an updated
-`agents` list when an agent starts or stops working.
+`agents` list when an agent starts or stops working, an updated `questions`
+list when a question is asked or answered, `report_posted` for a new report,
+and an updated `actions` list when an action is deferred or decided.
 
 ## Session ops
 

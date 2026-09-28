@@ -47,7 +47,7 @@ pub fn serve(
     // including ones left over from before a restart.
     let scheduler = Arc::clone(&hub);
     thread::spawn(move || loop {
-        scheduler.fire_due_timers();
+        scheduler.tick();
         thread::sleep(Duration::from_secs(1));
     });
     for stream in listener.incoming() {
@@ -116,6 +116,8 @@ fn pump(
     send(socket, &protocol::hello_json(hub.version))?;
     send(socket, &hub.sessions_json())?;
     send(socket, &hub.agents_json())?;
+    send(socket, &hub.questions_json())?;
+    send(socket, &hub.actions_json())?;
     loop {
         match socket.read() {
             Ok(Message::Text(text)) => handle(hub, client, text.as_str()),
@@ -221,6 +223,69 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 _ => Err("message_send requires agent and body".to_string()),
             }
         }
+        ("question_list", _) => Ok(hub.questions_json()),
+        ("question_answer", _) => match (op["question"].as_str(), op["answer"].as_str()) {
+            (Some(question), Some(answer)) if !answer.trim().is_empty() => hub
+                .answer_question(question, answer.trim(), "user")
+                .map(|()| json!({ "type": "question_answered", "question": question })),
+            _ => Err("question_answer requires question and a non-empty answer".to_string()),
+        },
+        ("report_list", _) => Ok(hub.reports_json(op["limit"].as_u64().unwrap_or(50) as usize)),
+        ("report_read", _) => match op["report"].as_str() {
+            Some(report) => hub
+                .store
+                .record_report_read(report)
+                .map(|()| json!({ "type": "report_read", "report": report }))
+                .map_err(|error| error.to_string()),
+            None => Err("report_read requires report".to_string()),
+        },
+        ("agent_get", _) => match op["agent"].as_str().and_then(|id| hub.agents.get(id)) {
+            Some(agent) => {
+                let brief: serde_json::Map<String, Value> = agents::BRIEF_FILES
+                    .iter()
+                    .map(|file| {
+                        let text = hub.agents.read_brief(&agent.id, file).unwrap_or_default();
+                        (file.to_string(), json!(text))
+                    })
+                    .collect();
+                let sessions: Vec<Value> = hub.sessions_json()["sessions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|session| session["agent"] == agent.id.as_str())
+                    .cloned()
+                    .collect();
+                Ok(json!({
+                    "type": "agent",
+                    "agent": agent.to_json(),
+                    "brief": brief,
+                    "memory": hub.agents.memory_files(&agent.id),
+                    "sessions": sessions,
+                }))
+            }
+            None => Err("agent_get requires a known agent".to_string()),
+        },
+        ("agent_update", _) => match op["agent"].as_str() {
+            Some(id) => hub
+                .agents
+                .update(
+                    id,
+                    op["name"].as_str(),
+                    op["enabled"].as_bool(),
+                    op["approval_mode"].as_str(),
+                )
+                .map(|agent| {
+                    hub.broadcast(&hub.agents_json());
+                    json!({ "type": "agent_updated", "agent": agent.to_json() })
+                }),
+            None => Err("agent_update requires agent".to_string()),
+        },
+        // An action can be decided after its session closed or the daemon
+        // restarted: reopen the session so its engine can run the action.
+        ("decide_action", Some(session)) => hub
+            .open_session(&session)
+            .and_then(|()| hub.forward(&session, op.clone()))
+            .map(|()| Value::Null),
         ("timer_list", _) => Ok(json!({
             "type": "timers",
             "timers": hub.store.active_timers().iter().map(|timer| json!({

@@ -119,6 +119,41 @@ impl Agents {
         Ok(agent)
     }
 
+    /// Changes the given settings in `agent.json`, keeping the rest.
+    pub fn update(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        enabled: Option<bool>,
+        approval_mode: Option<&str>,
+    ) -> Result<Agent, String> {
+        if let Some(mode) = approval_mode {
+            if !matches!(mode, "manual" | "auto-edit" | "auto" | "full-access") {
+                return Err(format!(
+                    "unknown approval mode '{mode}': use manual, auto-edit, auto or full-access"
+                ));
+            }
+        }
+        if !valid_id(id) {
+            return Err(format!("unknown agent {id}"));
+        }
+        let path = self.dir.join(id).join("agent.json");
+        let text = fs::read_to_string(&path).map_err(|_| format!("unknown agent {id}"))?;
+        let mut settings: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+        if let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) {
+            settings["name"] = json!(name);
+        }
+        if let Some(enabled) = enabled {
+            settings["enabled"] = json!(enabled);
+        }
+        if let Some(mode) = approval_mode {
+            settings["approval_mode"] = json!(mode);
+        }
+        let text = serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())?;
+        fs::write(&path, text + "\n").map_err(|error| error.to_string())?;
+        self.get(id).ok_or_else(|| format!("unknown agent {id}"))
+    }
+
     /// Reads a brief file (`role.md` … `state.md`) or `memory/<name>.md`.
     pub fn read_brief(&self, id: &str, file: &str) -> Result<String, String> {
         let path = self.brief_path(id, file)?;
@@ -172,8 +207,9 @@ impl Agents {
              You are a long-lived agent: your sessions come and go, but your brief below persists and is \
              yours to keep current with the `brief` tool. Record what the next session needs in state.md \
              (progress, open threads) and durable knowledge in memory/<topic>.md. Nobody may be watching: \
-             work on without waiting, use `timer` to come back to something later and `message_agent` to \
-             hand work to another agent.\n",
+             work on without waiting. When only the user can decide, `question` them and continue under \
+             your assumption; when something is done or blocked, `report` it. Use `timer` to come back to \
+             something later and `message_agent` to hand work to another agent.\n",
             agent.id, agent.name
         );
         for file in BRIEF_FILES {
@@ -276,6 +312,20 @@ mod tests {
         assert!(agents
             .create("nowhere", "x", &work.join("missing"), "")
             .is_err());
+    }
+
+    #[test]
+    fn update_changes_only_the_given_settings() {
+        let (agents, work) = agents("update");
+        agents.create("ops", "Ops", &work, "role").unwrap();
+        let updated = agents
+            .update("ops", None, Some(false), Some("manual"))
+            .unwrap();
+        assert_eq!(updated.name, "Ops");
+        assert!(!updated.enabled);
+        assert_eq!(updated.approval_mode, "manual");
+        assert!(agents.update("ops", None, None, Some("yolo")).is_err());
+        assert!(agents.update("missing", Some("x"), None, None).is_err());
     }
 
     #[test]

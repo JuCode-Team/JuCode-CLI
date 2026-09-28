@@ -203,5 +203,12 @@ fn publish(hub: &Hub, id: &str, event: AgentEvent) {
             }));
         }
     }
+    let actions_changed = matches!(
+        event,
+        AgentEvent::ActionDeferred(_) | AgentEvent::ActionDecided { .. }
+    );
     hub.broadcast(&session_event_json(id, event));
+    if actions_changed {
+        hub.broadcast(&hub.actions_json());
+    }
 }

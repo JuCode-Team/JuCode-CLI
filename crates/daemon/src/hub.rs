@@ -5,7 +5,7 @@
 use crate::{
     agents::Agents,
     session,
-    store::{now, Message, Store, Timer},
+    store::{now, Message, Question, Report, Store, Timer},
 };
 use serde_json::{json, Value};
 use std::{
@@ -287,9 +287,124 @@ impl Hub {
             .map_err(|error| error.to_string())
     }
 
+    /// One scheduler pass: due timers and overdue questions become messages,
+    /// then everything pending is delivered.
+    pub fn tick(self: &Arc<Self>) {
+        self.fire_due_timers();
+        self.expire_questions();
+        self.deliver_pending();
+    }
+
+    pub fn ask(&self, question: &Question) -> Result<(), String> {
+        self.store
+            .record_question(question)
+            .map_err(|error| error.to_string())?;
+        self.broadcast(&self.questions_json());
+        Ok(())
+    }
+
+    /// Answers a question: the answer goes back to the session that asked,
+    /// waking it. `by` is `user` or `deadline`. Errors when the question is
+    /// unknown or already answered.
+    pub fn answer_question(
+        self: &Arc<Self>,
+        id: &str,
+        answer: &str,
+        by: &str,
+    ) -> Result<(), String> {
+        let question = self
+            .store
+            .question(id)
+            .ok_or_else(|| format!("unknown question {id}"))?;
+        if !self
+            .store
+            .record_answer(id, answer, by)
+            .map_err(|error| error.to_string())?
+        {
+            return Err(format!("question {id} is already answered"));
+        }
+        self.broadcast(&self.questions_json());
+        let body = if by == "deadline" {
+            format!(
+                "Q: {}\nNo answer by the deadline. Go ahead with your default: {}",
+                question.title, question.default_action
+            )
+        } else {
+            format!("Q: {}\nA: {answer}", question.title)
+        };
+        self.store
+            .record_message(&Message {
+                id: self.new_id("m"),
+                to: question.agent,
+                from: format!("question:{id}"),
+                body,
+                session: Some(question.session),
+                reply_to: None,
+                dedupe_key: Some(format!("question:{id}")),
+                at: now(),
+            })
+            .map_err(|error| error.to_string())?;
+        self.deliver_pending();
+        Ok(())
+    }
+
+    fn expire_questions(self: &Arc<Self>) {
+        for question in self.store.open_questions() {
+            if question.due_at.is_some_and(|due| due <= now()) {
+                let _ = self.answer_question(&question.id, "", "deadline");
+            }
+        }
+    }
+
+    pub fn post_report(&self, report: &Report) -> Result<(), String> {
+        self.store
+            .record_report(report)
+            .map_err(|error| error.to_string())?;
+        self.broadcast(&json!({ "type": "report_posted", "report": report_json(report) }));
+        Ok(())
+    }
+
+    pub fn questions_json(&self) -> Value {
+        let list: Vec<Value> = self
+            .store
+            .open_questions()
+            .iter()
+            .map(|question| {
+                json!({
+                    "id": question.id,
+                    "agent": question.agent,
+                    "session": question.session,
+                    "title": question.title,
+                    "body": question.body,
+                    "assumption": question.assumption,
+                    "default": question.default_action,
+                    "importance": question.importance,
+                    "due_at": question.due_at,
+                    "asked_at": question.asked_at,
+                })
+            })
+            .collect();
+        json!({ "type": "questions", "questions": list })
+    }
+
+    pub fn reports_json(&self, limit: usize) -> Value {
+        let list: Vec<Value> = self.store.reports(limit).iter().map(report_json).collect();
+        json!({ "type": "reports", "reports": list })
+    }
+
+    pub fn actions_json(&self) -> Value {
+        let list: Vec<Value> = self
+            .store
+            .open_actions()
+            .iter()
+            .map(|action| action.to_json())
+            .collect();
+        json!({ "type": "actions", "actions": list })
+    }
+
     /// Turns due timers into messages. The timer id is the message's dedupe
     /// key, so a timer that fired just before a crash fires only once.
-    pub fn fire_due_timers(self: &Arc<Self>) {
+    fn fire_due_timers(self: &Arc<Self>) {
         let due: Vec<Timer> = self
             .store
             .active_timers()
@@ -320,7 +435,6 @@ impl Hub {
                 }
             }
         }
-        self.deliver_pending();
     }
 
     /// Delivers every pending message that can go now, oldest first. A
@@ -448,6 +562,18 @@ impl Hub {
 
 /// How a message reads in the receiving session: the user's own words
 /// as-is, anything else with a line saying where it came from.
+fn report_json(report: &Report) -> Value {
+    json!({
+        "id": report.id,
+        "agent": report.agent,
+        "session": report.session,
+        "title": report.title,
+        "body": report.body,
+        "at": report.at,
+        "read": report.read,
+    })
+}
+
 fn delivery_text(message: &Message) -> String {
     if message.from == "user" {
         return message.body.clone();
@@ -455,6 +581,7 @@ fn delivery_text(message: &Message) -> String {
     let origin = match message.from.split_once(':') {
         Some(("agent", id)) => format!("message from agent {id}"),
         Some(("timer", id)) => format!("timer {id} fired"),
+        Some(("question", id)) => format!("answer to your question {id}"),
         _ => format!("message from {}", message.from),
     };
     format!("[{origin} · {}]\n{}", message.id, message.body)
