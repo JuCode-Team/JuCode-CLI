@@ -95,6 +95,10 @@ fn main() -> io::Result<()> {
         let code = run_serve(approval_mode)?;
         std::process::exit(code);
     }
+    if args.first().map(String::as_str) == Some("daemon") {
+        let code = run_daemon(&args[1..])?;
+        std::process::exit(code);
+    }
     if args.first().map(String::as_str) == Some("acp") {
         let code = acp::run_acp(approval_mode)?;
         std::process::exit(code);
@@ -146,6 +150,8 @@ USAGE:
                                          full-access for unattended writes)
     jucode serve                         newline-JSON protocol for GUI/IDE
                                          front-ends (jucode's native schema)
+    jucode daemon [--listen <addr>]      host many sessions for Desktop and
+                                         remote clients over a WebSocket
     jucode acp                           Agent Client Protocol (ACP v1)
                                          JSON-RPC adapter over stdio, for
                                          ACP-capable editors like Zed
@@ -317,6 +323,31 @@ fn run_update() -> i32 {
             1
         }
     }
+}
+
+/// `jucode daemon [--listen <addr>]`: host sessions for Desktop and remote
+/// clients until killed. Listens on loopback unless told otherwise.
+fn run_daemon(args: &[String]) -> io::Result<i32> {
+    let mut listen = jucode_daemon::DEFAULT_LISTEN.to_string();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match (arg.as_str(), rest.next()) {
+            ("--listen", Some(address)) => listen = address.clone(),
+            _ => {
+                eprintln!("usage: jucode daemon [--listen <host:port>]");
+                return Ok(2);
+            }
+        }
+    }
+    let listener = std::net::TcpListener::bind(&listen)?;
+    let store = jucode_daemon::Store::open(jucode_daemon::state_dir()?)?;
+    eprintln!(
+        "jucode daemon listening on ws://{} (token in {})",
+        listener.local_addr()?,
+        jucode_daemon::state_dir()?.join("token").display()
+    );
+    jucode_daemon::serve(listener, store, env!("CARGO_PKG_VERSION"))?;
+    Ok(0)
 }
 
 /// Persistent bidirectional protocol mode for GUI/IDE front-ends.

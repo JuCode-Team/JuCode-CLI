@@ -39,6 +39,23 @@ impl DeferredAction {
             "created_at": self.created_at,
         })
     }
+
+    /// Reads back a record written by `to_json`; None when a field is missing.
+    pub fn from_json(value: &Value) -> Option<Self> {
+        let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
+        Some(Self {
+            id: text("id")?,
+            session_id: text("session_id")?,
+            cwd: PathBuf::from(text("cwd")?),
+            call_id: text("call_id")?,
+            name: text("name")?,
+            arguments: text("arguments")?,
+            summary: text("summary")?,
+            subagent_id: text("subagent_id"),
+            digest: text("digest")?,
+            created_at: value.get("created_at").and_then(Value::as_u64)?,
+        })
+    }
 }
 
 pub fn action_digest(name: &str, arguments: &str, cwd: &std::path::Path) -> String {
@@ -79,6 +96,24 @@ pub fn decision_message(action: &DeferredAction, outcome: Option<(&str, bool)>) 
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn record_round_trips_through_json() {
+        let action = DeferredAction {
+            id: "act-1".to_string(),
+            session_id: "s1".to_string(),
+            cwd: PathBuf::from("/work"),
+            call_id: "call_1".to_string(),
+            name: "bash".to_string(),
+            arguments: r#"{"command":"make"}"#.to_string(),
+            summary: "make".to_string(),
+            subagent_id: None,
+            digest: action_digest("bash", r#"{"command":"make"}"#, Path::new("/work")),
+            created_at: 42,
+        };
+        assert_eq!(DeferredAction::from_json(&action.to_json()), Some(action));
+        assert_eq!(DeferredAction::from_json(&json!({ "id": "x" })), None);
+    }
 
     #[test]
     fn digest_depends_on_tool_arguments_and_cwd() {

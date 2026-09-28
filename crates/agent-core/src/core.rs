@@ -2226,6 +2226,16 @@ impl AgentCore {
         )
     }
 
+    /// Puts back deferred actions recorded by a host before a restart, so
+    /// they can still be decided. Actions of other sessions are ignored.
+    pub fn restore_deferred_actions(&mut self, actions: Vec<DeferredAction>) {
+        for action in actions {
+            if action.session_id == self.session.session_id() {
+                self.deferred_actions.insert(action.id.clone(), action);
+            }
+        }
+    }
+
     pub fn attended(&self) -> bool {
         self.attended
     }
