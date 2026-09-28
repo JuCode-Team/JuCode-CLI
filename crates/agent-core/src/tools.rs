@@ -10,7 +10,7 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -309,8 +309,19 @@ fn with_function_tool_defaults(mut definitions: Vec<Value>) -> Vec<Value> {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// One tracker per test thread, standing in for an engine's.
+    static TEST_READS: ReadTracker = ReadTracker::default();
+}
+
+#[cfg(test)]
+fn test_reads() -> ReadTracker {
+    TEST_READS.with(ReadTracker::clone)
+}
+
+#[cfg(test)]
 fn run_tool(name: &str, arguments: &str, cwd: &Path) -> String {
-    run_tool_with_events(name, arguments, cwd, &[], |_| Ok(())).output
+    run_tool_with_events(name, arguments, cwd, &[], &test_reads(), |_| Ok(())).output
 }
 
 /// `extra_read_roots` lists directories outside the workspace that read-only
@@ -321,6 +332,7 @@ pub fn run_tool_with_events(
     arguments: &str,
     cwd: &Path,
     extra_read_roots: &[PathBuf],
+    reads: &ReadTracker,
     mut emit: impl FnMut(ToolExecutionEvent) -> Result<(), String>,
 ) -> ToolExecutionResult {
     let parsed = serde_json::from_str::<Value>(arguments);
@@ -336,17 +348,17 @@ pub fn run_tool_with_events(
     };
 
     let result = match name {
-        "read" => read_file(&args, cwd, extra_read_roots),
-        "str_replace" | "edit" => str_replace_file(&args, cwd),
-        "hashline_edit" => hashline_edit_file(&args, cwd),
-        "write" => write_file(&args, cwd),
+        "read" => read_file(&args, cwd, extra_read_roots, reads),
+        "str_replace" | "edit" => str_replace_file(&args, cwd, reads),
+        "hashline_edit" => hashline_edit_file(&args, cwd, reads),
+        "write" => write_file(&args, cwd, reads),
         "bash" | "execute" | "exec_command" | "shell_command" => bash(&args, cwd, &mut emit),
         "write_stdin" => write_stdin(&args),
         "apply_patch" => apply_patch(&args, cwd, &mut emit),
         "ls" => list_dir(&args, cwd, extra_read_roots),
         "ripgrep" => ripgrep(&args, cwd, extra_read_roots),
         "outline" => outline_file(&args, cwd, extra_read_roots),
-        "checkpoint" => checkpoint_tool(&args, cwd),
+        "checkpoint" => checkpoint_tool(&args, cwd, reads),
         "web_fetch" => crate::web_fetch::run(&args),
         _ => json!({ "error": format!("unknown tool: {name}") }),
     };
@@ -386,7 +398,7 @@ fn add_soft_hint(value: &mut Value, warning: &str, suggestion: &str) {
     }
 }
 
-fn read_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value {
+fn read_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf], reads: &ReadTracker) -> Value {
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return json!({ "error": "missing path" });
     };
@@ -427,7 +439,7 @@ fn read_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value {
                 return json!({ "path": path.display().to_string(), "error": error.to_string() })
             }
         };
-        mark_read(&path);
+        reads.mark(&path);
         return json!({
             "path": path.display().to_string(),
             "kind": "image",
@@ -476,7 +488,7 @@ fn read_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value {
         }
         lines_read += 1;
     }
-    mark_read(&path);
+    reads.mark(&path);
 
     let mut value = json!({
         "path": path.display().to_string(),
@@ -498,7 +510,7 @@ fn read_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value {
     value
 }
 
-fn str_replace_file(args: &Value, cwd: &Path) -> Value {
+fn str_replace_file(args: &Value, cwd: &Path, reads: &ReadTracker) -> Value {
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return json!({ "error": "missing path" });
     };
@@ -513,7 +525,7 @@ fn str_replace_file(args: &Value, cwd: &Path) -> Value {
         Ok(path) => path,
         Err(error) => return json!({ "error": error }),
     };
-    if !has_read(&path) {
+    if !reads.contains(&path) {
         return json!({
             "path": path.display().to_string(),
             "error": "edit requires reading this file first so oldText matches bytes on disk"
@@ -569,7 +581,7 @@ fn str_replace_file(args: &Value, cwd: &Path) -> Value {
     let _ = create_checkpoint(cwd, "auto-edit", std::slice::from_ref(&path));
     match fs::write(&path, &output) {
         Ok(()) => {
-            mark_read(&path);
+            reads.mark(&path);
             let diff = unified_diff_for_file(cwd, &path, &original, &output);
             json!({
                 "path": path.display().to_string(),
@@ -601,7 +613,7 @@ struct HashlineSpan {
     replacement: String,
 }
 
-fn hashline_edit_file(args: &Value, cwd: &Path) -> Value {
+fn hashline_edit_file(args: &Value, cwd: &Path, reads: &ReadTracker) -> Value {
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return json!({ "error": "missing path" });
     };
@@ -616,7 +628,7 @@ fn hashline_edit_file(args: &Value, cwd: &Path) -> Value {
         Ok(path) => path,
         Err(error) => return json!({ "error": error }),
     };
-    if !has_read(&path) {
+    if !reads.contains(&path) {
         return json!({
             "path": path.display().to_string(),
             "error": "hashline_edit requires reading this file first and copying LINE#HASH anchors from read().hashlines"
@@ -638,7 +650,7 @@ fn hashline_edit_file(args: &Value, cwd: &Path) -> Value {
     let _ = create_checkpoint(cwd, "auto-hashline-edit", std::slice::from_ref(&path));
     match fs::write(&path, &output) {
         Ok(()) => {
-            mark_read(&path);
+            reads.mark(&path);
             let diff = unified_diff_for_file(cwd, &path, &original, &output);
             let changed = changed_line_range(&original, &output);
             let anchors =
@@ -655,7 +667,7 @@ fn hashline_edit_file(args: &Value, cwd: &Path) -> Value {
     }
 }
 
-fn write_file(args: &Value, cwd: &Path) -> Value {
+fn write_file(args: &Value, cwd: &Path, reads: &ReadTracker) -> Value {
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return json!({ "error": "missing path" });
     };
@@ -668,7 +680,7 @@ fn write_file(args: &Value, cwd: &Path) -> Value {
         Err(error) => return json!({ "error": error }),
     };
     let exists = path.exists();
-    if exists && !has_read(&path) {
+    if exists && !reads.contains(&path) {
         return json!({
             "path": path.display().to_string(),
             "error": "write requires reading an existing file first before overwriting it; new files can be written without a prior read"
@@ -688,7 +700,7 @@ fn write_file(args: &Value, cwd: &Path) -> Value {
     let _ = create_checkpoint(cwd, "auto-write", std::slice::from_ref(&path));
     match fs::write(&path, content) {
         Ok(()) => {
-            mark_read(&path);
+            reads.mark(&path);
             let diff = unified_diff_for_file(cwd, &path, &original, content);
             json!({
                 "path": path.display().to_string(),
@@ -2186,7 +2198,7 @@ fn outline_file(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value
     })
 }
 
-fn checkpoint_tool(args: &Value, cwd: &Path) -> Value {
+fn checkpoint_tool(args: &Value, cwd: &Path, reads: &ReadTracker) -> Value {
     let action = args
         .get("action")
         .and_then(Value::as_str)
@@ -2223,7 +2235,7 @@ fn checkpoint_tool(args: &Value, cwd: &Path) -> Value {
             let Some(id) = args.get("id").and_then(Value::as_str) else {
                 return json!({ "error": "checkpoint restore requires id" });
             };
-            match restore_checkpoint(cwd, id) {
+            match restore_checkpoint(cwd, id, reads) {
                 Ok(value) => value,
                 Err(error) => json!({ "error": error.to_string() }),
             }
@@ -2304,19 +2316,6 @@ fn symbol_from_line(line: &str) -> Option<String> {
         .map(|_| trimmed.trim_end().to_string())
 }
 
-fn mark_read(path: &Path) {
-    if let Ok(mut paths) = read_tracker().lock() {
-        paths.insert(normalize_path_key(path));
-    }
-}
-
-fn has_read(path: &Path) -> bool {
-    read_tracker()
-        .lock()
-        .map(|paths| paths.contains(&normalize_path_key(path)))
-        .unwrap_or(false)
-}
-
 fn normalize_path_key(path: &Path) -> String {
     let value = path
         .canonicalize()
@@ -2330,10 +2329,25 @@ fn normalize_path_key(path: &Path) -> String {
     }
 }
 
-static READ_TRACKER: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// Files an engine has read (or written) since it started. Editing an
+/// existing file requires having read it first; each engine keeps its own
+/// set, so a read in one session never licenses an edit in another.
+#[derive(Clone, Default)]
+pub struct ReadTracker(Arc<Mutex<HashSet<String>>>);
 
-fn read_tracker() -> &'static Mutex<HashSet<String>> {
-    READ_TRACKER.get_or_init(|| Mutex::new(HashSet::new()))
+impl ReadTracker {
+    fn mark(&self, path: &Path) {
+        if let Ok(mut paths) = self.0.lock() {
+            paths.insert(normalize_path_key(path));
+        }
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        self.0
+            .lock()
+            .map(|paths| paths.contains(&normalize_path_key(path)))
+            .unwrap_or(false)
+    }
 }
 
 /// Files referenced by a unified diff's `---`/`+++` headers, for pre-apply
@@ -2482,7 +2496,7 @@ pub(crate) fn list_checkpoints(cwd: &Path) -> io::Result<Vec<Value>> {
     Ok(items)
 }
 
-pub(crate) fn restore_checkpoint(cwd: &Path, id: &str) -> io::Result<Value> {
+pub(crate) fn restore_checkpoint(cwd: &Path, id: &str, reads: &ReadTracker) -> io::Result<Value> {
     let path = checkpoint_dir(cwd).join(format!("{id}.json"));
     let value =
         serde_json::from_str::<Value>(&fs::read_to_string(path)?).map_err(io::Error::other)?;
@@ -2508,7 +2522,7 @@ pub(crate) fn restore_checkpoint(cwd: &Path, id: &str) -> io::Result<Value> {
                 fs::create_dir_all(parent)?;
             }
             fs::write(&abs, content)?;
-            mark_read(&abs);
+            reads.mark(&abs);
             restored.push(rel.to_string());
         } else if content.is_null() {
             if abs.exists() {
@@ -2533,7 +2547,7 @@ pub(crate) fn restore_checkpoint(cwd: &Path, id: &str) -> io::Result<Value> {
 /// file touched at or after `t`, restore the content captured by the earliest
 /// such checkpoint (its pre-edit state), and delete files that did not yet
 /// exist then. Checkpoints are ordered by their nanosecond id for precision.
-pub(crate) fn restore_to_timestamp(cwd: &Path, t: u64) -> io::Result<Value> {
+pub(crate) fn restore_to_timestamp(cwd: &Path, t: u64, reads: &ReadTracker) -> io::Result<Value> {
     let dir = checkpoint_dir(cwd);
     if !dir.exists() {
         return Ok(json!({ "restored": [], "removed": [] }));
@@ -2591,7 +2605,7 @@ pub(crate) fn restore_to_timestamp(cwd: &Path, t: u64) -> io::Result<Value> {
                 fs::create_dir_all(parent)?;
             }
             fs::write(&abs, text)?;
-            mark_read(&abs);
+            reads.mark(&abs);
             restored.push(rel);
         } else if content.is_null() {
             if abs.exists() {
@@ -4147,6 +4161,7 @@ mod tests {
             &json!({ "command": "echo hello", "timeout": 5 }).to_string(),
             &dir,
             &[],
+            &test_reads(),
             |event| {
                 let ToolExecutionEvent::Update(output) = event;
                 updates.push(output);
@@ -4545,7 +4560,7 @@ mod tests {
 
         let created = create_checkpoint(&dir, "manual", std::slice::from_ref(&path)).unwrap();
         let id = created["id"].as_str().unwrap();
-        let restored = restore_checkpoint(&dir, id).unwrap();
+        let restored = restore_checkpoint(&dir, id, &test_reads()).unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), vec![0xff, 0x00, 0x9f]);
         assert_eq!(restored["skipped"][0], "binary.bin");
@@ -4562,7 +4577,7 @@ mod tests {
         fs::write(&path, [0xff, 0x00]).unwrap();
 
         create_checkpoint(&dir, "manual", std::slice::from_ref(&path)).unwrap();
-        let restored = restore_to_timestamp(&dir, 0).unwrap();
+        let restored = restore_to_timestamp(&dir, 0, &test_reads()).unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), vec![0xff, 0x00]);
         assert_eq!(restored["skipped"][0], "binary.bin");
@@ -4601,6 +4616,7 @@ mod tests {
             &json!({ "pattern": "definitely_not_present_xyz", "path": path }).to_string(),
             &dir,
             &[],
+            &test_reads(),
             |_| Ok(()),
         );
         let value = serde_json::from_str::<Value>(&result.output).unwrap();
@@ -4626,6 +4642,7 @@ mod tests {
             &json!({ "command": "sleep 0.4; echo done > marker.txt", "timeout": 10 }).to_string(),
             &dir,
             &[],
+            &test_reads(),
             |_| Err("interrupted".to_string()),
         );
 
@@ -4686,6 +4703,7 @@ mod tests {
                 .to_string(),
             &dir,
             &[],
+            &test_reads(),
             |_| {
                 emits.set(emits.get() + 1);
                 if emits.get() == 1 {
@@ -4784,6 +4802,7 @@ mod tests {
             &json!({ "command": "kill -9 $$", "timeout": 10 }).to_string(),
             &dir,
             &[],
+            &test_reads(),
             |_| Ok(()),
         );
         let value = serde_json::from_str::<Value>(&result.output).unwrap();
@@ -4830,7 +4849,14 @@ mod tests {
         fs::write(outside.join("secret.txt"), "secret").unwrap();
         let roots = vec![skill.clone()];
         let run = |name: &str, args: Value| {
-            run_tool_with_events(name, &args.to_string(), &workspace, &roots, |_| Ok(()))
+            run_tool_with_events(
+                name,
+                &args.to_string(),
+                &workspace,
+                &roots,
+                &test_reads(),
+                |_| Ok(()),
+            )
         };
 
         // The skill file and files it references resolve under the root.
@@ -5074,6 +5100,35 @@ mod tests {
         assert_eq!(value["exit_code"], 0, "{value}");
         assert!(value["stdout"].as_str().unwrap().contains("hello"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_read_licenses_edits_only_for_the_engine_that_read() {
+        let dir = test_dir("read-tracker-scope");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("notes.txt"), "old").unwrap();
+        let reader = ReadTracker::default();
+        let other = ReadTracker::default();
+        let call = |name: &str, args: Value, reads: &ReadTracker| {
+            run_tool_with_events(name, &args.to_string(), &dir, &[], reads, |_| Ok(())).output
+        };
+        call("read", json!({ "path": "notes.txt" }), &reader);
+
+        let blind = call(
+            "write",
+            json!({ "path": "notes.txt", "content": "x" }),
+            &other,
+        );
+        assert!(blind.contains("requires reading"), "{blind}");
+        assert_eq!(fs::read_to_string(dir.join("notes.txt")).unwrap(), "old");
+
+        let informed = call(
+            "write",
+            json!({ "path": "notes.txt", "content": "new" }),
+            &reader,
+        );
+        assert!(!informed.contains("error"), "{informed}");
+        assert_eq!(fs::read_to_string(dir.join("notes.txt")).unwrap(), "new");
     }
 
     fn test_dir(name: &str) -> PathBuf {

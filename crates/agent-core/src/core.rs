@@ -178,6 +178,8 @@ pub struct AgentCore {
     trust: TrustStore,
     project_trusted: bool,
     hooks: Hooks,
+    /// Files this engine has read; editing requires a prior read.
+    reads: crate::tools::ReadTracker,
     plan: Vec<PlanItem>,
     mcp: McpManager,
     /// Version reported in the startup event and used by the update check.
@@ -256,6 +258,7 @@ impl AgentCore {
             trust,
             project_trusted,
             hooks,
+            reads: crate::tools::ReadTracker::default(),
             plan: Vec::new(),
             approval_receiver: None,
             pending_approvals: HashMap::new(),
@@ -1803,6 +1806,7 @@ impl AgentCore {
             safety_reasoning_effort: self.config.safety_reasoning_effort.clone(),
             edit_tools: self.config.edit_tools.clone(),
             extra_read_roots,
+            reads: self.reads.clone(),
             subagent_manager: Some(self.subagent_manager.clone()),
             hooks: self.hooks.clone(),
         }) else {
@@ -2040,6 +2044,7 @@ impl AgentCore {
             // Summarization clients never expose or execute tools.
             edit_tools: Vec::new(),
             extra_read_roots: Vec::new(),
+            reads: crate::tools::ReadTracker::default(),
             subagent_manager: None,
             hooks: Hooks::default(),
         })
@@ -2084,6 +2089,7 @@ impl AgentCore {
             // Summarization clients never expose or execute tools.
             edit_tools: Vec::new(),
             extra_read_roots: Vec::new(),
+            reads: crate::tools::ReadTracker::default(),
             subagent_manager: None,
             hooks: Hooks::default(),
         })
@@ -2322,6 +2328,7 @@ impl AgentCore {
         let tx = self.action_tx.clone();
         let mcp = self.mcp.clone();
         let hooks = self.hooks.clone();
+        let reads = self.reads.clone();
         thread::spawn(move || {
             let result = if action.name.starts_with("mcp__") {
                 match mcp.run_tool(&action.name, &action.arguments) {
@@ -2351,6 +2358,7 @@ impl AgentCore {
                     &action.arguments,
                     &action.cwd,
                     &[],
+                    &reads,
                     |_| Ok(()),
                 )
             };
@@ -3146,28 +3154,29 @@ impl AgentCore {
                 "failed to rewind conversation: {error}"
             ))];
         }
-        let (restored, removed) = match crate::tools::restore_to_timestamp(&self.cwd, t) {
-            Ok(result) => (
-                result
-                    .get("restored")
-                    .and_then(Value::as_array)
-                    .map(Vec::len)
-                    .unwrap_or(0),
-                result
-                    .get("removed")
-                    .and_then(Value::as_array)
-                    .map(Vec::len)
-                    .unwrap_or(0),
-            ),
-            Err(error) => {
-                return vec![
-                    AgentEvent::Transcript(self.session.transcript_items()),
-                    AgentEvent::Error(format!(
-                        "conversation rewound, but file restore failed: {error}"
-                    )),
-                ];
-            }
-        };
+        let (restored, removed) =
+            match crate::tools::restore_to_timestamp(&self.cwd, t, &self.reads) {
+                Ok(result) => (
+                    result
+                        .get("restored")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0),
+                    result
+                        .get("removed")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0),
+                ),
+                Err(error) => {
+                    return vec![
+                        AgentEvent::Transcript(self.session.transcript_items()),
+                        AgentEvent::Error(format!(
+                            "conversation rewound, but file restore failed: {error}"
+                        )),
+                    ];
+                }
+            };
         let save_event = self.save_session_event();
         vec![
             AgentEvent::Transcript(self.session.transcript_items()),
