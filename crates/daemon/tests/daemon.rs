@@ -19,16 +19,32 @@ use tungstenite::{stream::MaybeTlsStream, Message, WebSocket};
 struct Daemon {
     address: String,
     token: String,
+    state: PathBuf,
+    agents: PathBuf,
 }
 
-/// A daemon on a free loopback port, with its state under the test HOME.
+/// A daemon on a free loopback port with its own state and agents
+/// directories. Daemons from earlier tests keep running in this process, so
+/// sharing directories would let their schedulers act on this test's data.
 fn start_daemon() -> Daemon {
+    let root = temp_dir("daemon-state");
+    start_daemon_on(root.join("daemon"), root.join("agents"))
+}
+
+/// A daemon on existing directories, standing in for a restart.
+fn start_daemon_on(state: PathBuf, agents: PathBuf) -> Daemon {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
-    let store = Store::open(jucode_daemon::state_dir().unwrap()).unwrap();
+    let store = Store::open(state.clone()).unwrap();
     let token = store.token().unwrap();
-    thread::spawn(move || jucode_daemon::serve(listener, store, "test"));
-    Daemon { address, token }
+    let agent_store = jucode_daemon::Agents::open(agents.clone()).unwrap();
+    thread::spawn(move || jucode_daemon::serve(listener, store, agent_store, "test"));
+    Daemon {
+        address,
+        token,
+        state,
+        agents,
+    }
 }
 
 struct Client {
@@ -219,7 +235,7 @@ fn a_closed_session_reopens_with_its_open_actions() {
     client.until(|frame| frame["type"] == "session_closed");
 
     // A second daemon on the same state stands in for a restart.
-    let restarted = start_daemon();
+    let restarted = start_daemon_on(daemon.state.clone(), daemon.agents.clone());
     let mut client = Client::connect(&restarted);
     client.send(json!({ "op": "session_open", "session": session }));
     client.until(|frame| frame["type"] == "session_opened");
@@ -292,4 +308,162 @@ fn session_switching_commands_are_refused() {
         .as_str()
         .unwrap()
         .contains("session_create"));
+}
+
+fn create_agent(client: &mut Client, id: &str, role: &str) -> PathBuf {
+    let dir = temp_dir(&format!("agent-{id}"));
+    client.send(json!({
+        "op": "agent_create", "id": id, "name": id, "cwd": dir, "role": role,
+    }));
+    client.until(|frame| frame["type"] == "agent_created" && frame["agent"]["id"] == id);
+    dir
+}
+
+fn delivered_to(agent: &str) -> impl Fn(&Value) -> bool + '_ {
+    move |frame| frame["type"] == "message_delivered" && frame["agent"] == agent
+}
+
+/// Text the model streamed in `frames` for `session`.
+fn reply_text(frames: &[Value], session: &str) -> String {
+    frames
+        .iter()
+        .filter(|frame| frame["session"] == session && frame["type"] == "assistant_delta")
+        .filter_map(|frame| frame["delta"].as_str())
+        .collect()
+}
+
+#[test]
+fn a_user_message_to_an_agent_opens_a_session_and_follow_ups_continue_it() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "route", "Keeps the build green");
+
+    client.send(json!({ "op": "message_send", "agent": "route", "body": "SYSTEM" }));
+    let frames = client.until(delivered_to("route"));
+    let session = frames.last().unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let frames = client.until(ready(&session));
+    // The agent's brief is part of every turn's system prompt.
+    let reply = reply_text(&frames, &session);
+    assert!(reply.contains("<agent id=\"route\""), "{reply}");
+    assert!(reply.contains("Keeps the build green"), "{reply}");
+
+    client.send(json!({ "op": "message_send", "agent": "route", "body": "and another thing" }));
+    let frames = client.until(delivered_to("route"));
+    assert_eq!(frames.last().unwrap()["session"], session.as_str());
+}
+
+#[test]
+fn a_timer_set_by_an_agent_wakes_it_with_nobody_connected() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "waker", "Checks back later");
+    client.send(json!({
+        "op": "message_send",
+        "agent": "waker",
+        "body": r#"CALL timer {"action":"set","in_seconds":1,"body":"check the deploy"}"#,
+    }));
+    let frames = client.until(delivered_to("waker"));
+    let session = frames.last().unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client.until(ready(&session));
+    drop(client);
+
+    // Nobody is connected when the timer fires; a client that attaches
+    // afterwards finds the timer's message answered in the same session.
+    thread::sleep(Duration::from_millis(3500));
+    let mut late = Client::connect(&daemon);
+    late.send(json!({ "op": "watch", "session": session }));
+    let frames =
+        late.until(|frame| frame["type"] == "transcript" && frame["session"] == session.as_str());
+    let transcript = frames.last().unwrap()["items"].to_string();
+    assert!(transcript.contains("fired"), "{transcript}");
+    assert!(transcript.contains("check the deploy"), "{transcript}");
+    late.send(json!({ "op": "timer_list" }));
+    let timers = late.until(|frame| frame["type"] == "timers");
+    assert!(!timers.last().unwrap()["timers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|timer| timer["agent"] == "waker"));
+}
+
+#[test]
+fn agents_message_each_other_into_a_new_session() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "asker", "Asks for help");
+    create_agent(&mut client, "helper", "Helps");
+    client.send(json!({
+        "op": "message_send",
+        "agent": "asker",
+        "body": r#"CALL message_agent {"to":"helper","body":"please look at the logs"}"#,
+    }));
+    let frames = client.until(delivered_to("helper"));
+    let delivery = frames.last().unwrap().clone();
+    assert_eq!(delivery["from"], "agent:asker");
+    let session = delivery["session"].as_str().unwrap().to_string();
+    let frames = client.until(ready(&session));
+    let reply = reply_text(&frames, &session);
+    assert!(reply.contains("message from agent asker"), "{reply}");
+    assert!(reply.contains("please look at the logs"), "{reply}");
+}
+
+#[test]
+fn a_message_with_a_seen_dedupe_key_is_delivered_once() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "once", "Does things once");
+    for expected in [false, true] {
+        client.send(json!({
+            "op": "message_send", "agent": "once", "body": "hi", "dedupe_key": "im-42", "id": 9,
+        }));
+        let frames = client.until(|frame| frame["id"] == 9);
+        assert_eq!(frames.last().unwrap()["duplicate"], expected);
+    }
+    let sessions = fs::read_to_string(daemon.state.join("messages.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("\"delivered\"") || line.contains("im-42"))
+        .count();
+    // One message line and one delivery line.
+    assert_eq!(sessions, 2);
+}
+
+#[test]
+fn a_timer_due_while_the_daemon_was_down_fires_on_start() {
+    let _guard = setup();
+    // An agent and a timer written before this daemon starts, already due.
+    let root = temp_dir("daemon-down");
+    let agents = jucode_daemon::Agents::open(root.join("agents")).unwrap();
+    agents
+        .create(
+            "sleeper",
+            "sleeper",
+            &temp_dir("agent-sleeper"),
+            "Was asleep",
+        )
+        .unwrap();
+    let timers = root.join("daemon").join("timers.jsonl");
+    fs::create_dir_all(timers.parent().unwrap()).unwrap();
+    let line = json!({
+        "kind": "set", "id": "t-overdue", "agent": "sleeper", "session": null,
+        "fire_at": 1, "body": "catch up", "at": 1,
+    });
+    let mut existing = fs::read_to_string(&timers).unwrap_or_default();
+    existing.push_str(&format!("{line}\n"));
+    fs::write(&timers, existing).unwrap();
+
+    let daemon = start_daemon_on(root.join("daemon"), root.join("agents"));
+    let mut client = Client::connect(&daemon);
+    let frames = client.until(delivered_to("sleeper"));
+    assert_eq!(frames.last().unwrap()["from"], "timer:t-overdue");
 }

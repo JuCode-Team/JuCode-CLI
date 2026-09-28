@@ -4,11 +4,14 @@
 //! `session` field on every session op and event. See
 //! `docs/agent-daemon-plan.md` and `docs/daemon-protocol.md`.
 
+mod agent_tools;
+mod agents;
 mod hub;
 pub mod install;
 mod session;
 mod store;
 
+pub use agents::Agents;
 pub use store::Store;
 
 use hub::Hub;
@@ -22,6 +25,7 @@ use std::{
     thread,
     time::Duration,
 };
+use store::now;
 use tungstenite::{
     handshake::server::{ErrorResponse, Request, Response},
     Message, WebSocket,
@@ -31,9 +35,21 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:7788";
 
 /// Serves clients on `listener` until the process exits. The token guards
 /// every connection; local clients read it from `<state dir>/token`.
-pub fn serve(listener: TcpListener, store: Store, version: &'static str) -> io::Result<()> {
+pub fn serve(
+    listener: TcpListener,
+    store: Store,
+    agents: Agents,
+    version: &'static str,
+) -> io::Result<()> {
     let token = store.token()?;
-    let hub = Hub::new(store, version);
+    let hub = Hub::new(store, agents, version);
+    // Fires due timers and retries messages waiting for a free run slot,
+    // including ones left over from before a restart.
+    let scheduler = Arc::clone(&hub);
+    thread::spawn(move || loop {
+        scheduler.fire_due_timers();
+        thread::sleep(Duration::from_secs(1));
+    });
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let hub = Arc::clone(&hub);
@@ -49,10 +65,19 @@ pub fn serve(listener: TcpListener, store: Store, version: &'static str) -> io::
 
 /// State directory: `~/.jucode/daemon`.
 pub fn state_dir() -> io::Result<PathBuf> {
+    Ok(jucode_dir()?.join("daemon"))
+}
+
+/// Agents directory: `~/.jucode/agents`.
+pub fn agents_dir() -> io::Result<PathBuf> {
+    Ok(jucode_dir()?.join("agents"))
+}
+
+fn jucode_dir() -> io::Result<PathBuf> {
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "home directory not found"))?;
-    Ok(PathBuf::from(home).join(".jucode").join("daemon"))
+    Ok(PathBuf::from(home).join(".jucode"))
 }
 
 fn connection(hub: &Arc<Hub>, stream: TcpStream, token: &str) -> Result<(), String> {
@@ -90,6 +115,7 @@ fn pump(
 ) -> Result<(), String> {
     send(socket, &protocol::hello_json(hub.version))?;
     send(socket, &hub.sessions_json())?;
+    send(socket, &hub.agents_json())?;
     loop {
         match socket.read() {
             Ok(Message::Text(text)) => handle(hub, client, text.as_str()),
@@ -157,12 +183,54 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     let session = op["session"].as_str().map(str::to_string);
     let result = match (op["op"].as_str().unwrap_or_default(), session) {
         ("session_list", _) => Ok(hub.sessions_json()),
-        ("session_create", _) => match op["cwd"].as_str() {
-            Some(cwd) => hub
-                .create_session(PathBuf::from(cwd))
-                .map(|session| json!({ "type": "session_created", "session": session })),
-            None => Err("session_create requires cwd".to_string()),
-        },
+        ("session_create", _) => hub
+            .create_session(op["cwd"].as_str().map(PathBuf::from), op["agent"].as_str())
+            .map(|session| json!({ "type": "session_created", "session": session })),
+        ("agent_list", _) => Ok(hub.agents_json()),
+        ("agent_create", _) => {
+            let text = |key: &str| op[key].as_str().unwrap_or_default();
+            hub.agents
+                .create(
+                    text("id"),
+                    text("name"),
+                    &PathBuf::from(text("cwd")),
+                    text("role"),
+                )
+                .map(|agent| {
+                    hub.broadcast(&hub.agents_json());
+                    json!({ "type": "agent_created", "agent": agent.to_json() })
+                })
+        }
+        ("message_send", _) => {
+            let text = |key: &str| op[key].as_str().map(str::to_string);
+            match (text("agent"), text("body")) {
+                (Some(to), Some(body)) => {
+                    let id = hub.new_id("m");
+                    hub.send_message(store::Message {
+                        id: id.clone(),
+                        to,
+                        from: "user".to_string(),
+                        body,
+                        session: text("session"),
+                        reply_to: text("reply_to"),
+                        dedupe_key: text("dedupe_key"),
+                        at: now(),
+                    })
+                    .map(|fresh| json!({ "type": "message_accepted", "message": id, "duplicate": !fresh }))
+                }
+                _ => Err("message_send requires agent and body".to_string()),
+            }
+        }
+        ("timer_list", _) => Ok(json!({
+            "type": "timers",
+            "timers": hub.store.active_timers().iter().map(|timer| json!({
+                "timer": timer.id,
+                "agent": timer.agent,
+                "session": timer.session,
+                "fire_at": timer.fire_at,
+                "body": timer.body,
+            })).collect::<Vec<_>>(),
+        })),
         ("session_open", Some(session)) => hub
             .open_session(&session)
             .map(|()| json!({ "type": "session_opened", "session": session })),

@@ -15,6 +15,8 @@ use std::{
 
 const SESSIONS: &str = "sessions.jsonl";
 const ACTIONS: &str = "actions.jsonl";
+const MESSAGES: &str = "messages.jsonl";
+const TIMERS: &str = "timers.jsonl";
 const TOKEN: &str = "token";
 
 pub struct Store {
@@ -26,8 +28,38 @@ pub struct Store {
 pub struct SessionRecord {
     pub id: String,
     pub cwd: PathBuf,
+    /// The long-lived agent the session belongs to, if any.
+    pub agent: Option<String>,
     pub created_at: u64,
     pub closed: bool,
+}
+
+/// A message for an agent: from the user, another agent or a timer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Message {
+    pub id: String,
+    pub to: String,
+    /// `user`, `agent:<id>` or `timer:<id>`.
+    pub from: String,
+    pub body: String,
+    /// Deliver into this session instead of routing.
+    pub session: Option<String>,
+    /// Deliver into the session that received this earlier message.
+    pub reply_to: Option<String>,
+    /// A second message with the same key is dropped.
+    pub dedupe_key: Option<String>,
+    pub at: u64,
+}
+
+/// A one-shot timer that wakes an agent with `body` at `fire_at` (ms).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Timer {
+    pub id: String,
+    pub agent: String,
+    /// Wake this session; None opens a new one.
+    pub session: Option<String>,
+    pub fire_at: u64,
+    pub body: String,
 }
 
 impl Store {
@@ -65,10 +97,18 @@ impl Store {
         Ok(token)
     }
 
-    pub fn record_session(&self, id: &str, cwd: &std::path::Path) -> io::Result<()> {
+    pub fn record_session(
+        &self,
+        id: &str,
+        cwd: &std::path::Path,
+        agent: Option<&str>,
+    ) -> io::Result<()> {
         self.append(
             SESSIONS,
-            json!({ "kind": "open", "session": id, "cwd": cwd.display().to_string(), "at": now() }),
+            json!({
+                "kind": "open", "session": id, "cwd": cwd.display().to_string(),
+                "agent": agent, "at": now(),
+            }),
         )
     }
 
@@ -98,6 +138,7 @@ impl Store {
                         SessionRecord {
                             id: id.to_string(),
                             cwd: PathBuf::from(cwd),
+                            agent: entry["agent"].as_str().map(str::to_string),
                             created_at: entry["at"].as_u64().unwrap_or_default(),
                             closed: false,
                         }
@@ -148,11 +189,125 @@ impl Store {
             .collect()
     }
 
-    fn append(&self, file: &str, value: Value) -> io::Result<()> {
-        let _guard = self
-            .write
+    /// Records a message; returns false (and records nothing) when a message
+    /// with the same dedupe key already exists.
+    pub fn record_message(&self, message: &Message) -> io::Result<bool> {
+        let _guard = self.lock();
+        if let Some(key) = &message.dedupe_key {
+            let taken = self.read(MESSAGES).iter().any(|entry| {
+                entry["kind"] == "message" && entry["dedupe_key"].as_str() == Some(key)
+            });
+            if taken {
+                return Ok(false);
+            }
+        }
+        self.append_locked(
+            MESSAGES,
+            json!({
+                "kind": "message", "id": message.id, "to": message.to, "from": message.from,
+                "body": message.body, "session": message.session, "reply_to": message.reply_to,
+                "dedupe_key": message.dedupe_key, "at": message.at,
+            }),
+        )?;
+        Ok(true)
+    }
+
+    pub fn record_delivered(&self, id: &str, session: &str) -> io::Result<()> {
+        self.append(
+            MESSAGES,
+            json!({ "kind": "delivered", "id": id, "session": session, "at": now() }),
+        )
+    }
+
+    /// A message that can never be delivered (its agent is gone); it stops
+    /// being retried.
+    pub fn record_undeliverable(&self, id: &str, reason: &str) -> io::Result<()> {
+        self.append(
+            MESSAGES,
+            json!({ "kind": "undeliverable", "id": id, "reason": reason, "at": now() }),
+        )
+    }
+
+    /// Messages neither delivered nor undeliverable, oldest first.
+    pub fn pending_messages(&self) -> Vec<Message> {
+        let entries = self.read(MESSAGES);
+        let settled: HashSet<&str> = entries
+            .iter()
+            .filter(|entry| entry["kind"] == "delivered" || entry["kind"] == "undeliverable")
+            .filter_map(|entry| entry["id"].as_str())
+            .collect();
+        entries
+            .iter()
+            .filter(|entry| entry["kind"] == "message")
+            .filter(|entry| !entry["id"].as_str().is_some_and(|id| settled.contains(id)))
+            .filter_map(message_from_json)
+            .collect()
+    }
+
+    /// The session a delivered message went to.
+    pub fn delivered_session(&self, id: &str) -> Option<String> {
+        self.read(MESSAGES)
+            .into_iter()
+            .find(|entry| entry["kind"] == "delivered" && entry["id"] == id)
+            .and_then(|entry| entry["session"].as_str().map(str::to_string))
+    }
+
+    pub fn record_timer(&self, timer: &Timer) -> io::Result<()> {
+        self.append(
+            TIMERS,
+            json!({
+                "kind": "set", "id": timer.id, "agent": timer.agent, "session": timer.session,
+                "fire_at": timer.fire_at, "body": timer.body, "at": now(),
+            }),
+        )
+    }
+
+    /// Ends a timer: `fired` or `cancelled`.
+    pub fn record_timer_done(&self, id: &str, reason: &str) -> io::Result<()> {
+        self.append(
+            TIMERS,
+            json!({ "kind": "done", "id": id, "reason": reason, "at": now() }),
+        )
+    }
+
+    /// Timers that have neither fired nor been cancelled, soonest first.
+    pub fn active_timers(&self) -> Vec<Timer> {
+        let entries = self.read(TIMERS);
+        let done: HashSet<&str> = entries
+            .iter()
+            .filter(|entry| entry["kind"] == "done")
+            .filter_map(|entry| entry["id"].as_str())
+            .collect();
+        let mut timers: Vec<Timer> = entries
+            .iter()
+            .filter(|entry| entry["kind"] == "set")
+            .filter(|entry| !entry["id"].as_str().is_some_and(|id| done.contains(id)))
+            .filter_map(|entry| {
+                Some(Timer {
+                    id: entry["id"].as_str()?.to_string(),
+                    agent: entry["agent"].as_str()?.to_string(),
+                    session: entry["session"].as_str().map(str::to_string),
+                    fire_at: entry["fire_at"].as_u64()?,
+                    body: entry["body"].as_str()?.to_string(),
+                })
+            })
+            .collect();
+        timers.sort_by_key(|timer| timer.fire_at);
+        timers
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.write
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn append(&self, file: &str, value: Value) -> io::Result<()> {
+        let _guard = self.lock();
+        self.append_locked(file, value)
+    }
+
+    fn append_locked(&self, file: &str, value: Value) -> io::Result<()> {
         let mut out = OpenOptions::new()
             .create(true)
             .append(true)
@@ -170,7 +325,21 @@ impl Store {
     }
 }
 
-fn now() -> u64 {
+fn message_from_json(entry: &Value) -> Option<Message> {
+    let text = |key: &str| entry[key].as_str().map(str::to_string);
+    Some(Message {
+        id: text("id")?,
+        to: text("to")?,
+        from: text("from")?,
+        body: text("body")?,
+        session: text("session"),
+        reply_to: text("reply_to"),
+        dedupe_key: text("dedupe_key"),
+        at: entry["at"].as_u64().unwrap_or_default(),
+    })
+}
+
+pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
@@ -211,10 +380,10 @@ mod tests {
     fn sessions_fold_open_and_close() {
         let store = store("sessions");
         store
-            .record_session("a", std::path::Path::new("/p/a"))
+            .record_session("a", std::path::Path::new("/p/a"), None)
             .unwrap();
         store
-            .record_session("b", std::path::Path::new("/p/b"))
+            .record_session("b", std::path::Path::new("/p/b"), Some("ops"))
             .unwrap();
         store.record_session_closed("a").unwrap();
         let sessions = store.sessions();
@@ -222,8 +391,9 @@ mod tests {
         assert_eq!(sessions[0].id, "a");
         assert!(sessions[0].closed);
         assert!(!sessions[1].closed);
+        assert_eq!(sessions[1].agent.as_deref(), Some("ops"));
         store
-            .record_session("a", std::path::Path::new("/p/a"))
+            .record_session("a", std::path::Path::new("/p/a"), None)
             .unwrap();
         assert!(!store.sessions()[0].closed);
     }
@@ -249,5 +419,50 @@ mod tests {
         let open = store.open_actions();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].id, "two");
+    }
+
+    fn message(id: &str, key: Option<&str>) -> Message {
+        Message {
+            id: id.to_string(),
+            to: "ops".to_string(),
+            from: "user".to_string(),
+            body: "hi".to_string(),
+            session: None,
+            reply_to: None,
+            dedupe_key: key.map(str::to_string),
+            at: 1,
+        }
+    }
+
+    #[test]
+    fn messages_are_pending_until_settled_and_deduplicated() {
+        let store = store("messages");
+        assert!(store.record_message(&message("m1", Some("k"))).unwrap());
+        assert!(!store.record_message(&message("m2", Some("k"))).unwrap());
+        assert!(store.record_message(&message("m3", None)).unwrap());
+        assert!(store.record_message(&message("m4", None)).unwrap());
+        store.record_delivered("m1", "s1").unwrap();
+        store.record_undeliverable("m3", "agent gone").unwrap();
+        let pending: Vec<String> = store.pending_messages().into_iter().map(|m| m.id).collect();
+        assert_eq!(pending, vec!["m4"]);
+        assert_eq!(store.delivered_session("m1").as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn timers_are_active_until_done() {
+        let store = store("timers");
+        let timer = |id: &str, fire_at: u64| Timer {
+            id: id.to_string(),
+            agent: "ops".to_string(),
+            session: None,
+            fire_at,
+            body: "check".to_string(),
+        };
+        store.record_timer(&timer("late", 20)).unwrap();
+        store.record_timer(&timer("soon", 10)).unwrap();
+        store.record_timer(&timer("gone", 5)).unwrap();
+        store.record_timer_done("gone", "cancelled").unwrap();
+        let ids: Vec<String> = store.active_timers().into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec!["soon", "late"]);
     }
 }

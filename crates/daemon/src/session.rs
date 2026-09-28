@@ -4,7 +4,7 @@
 use crate::hub::Hub;
 use jucode_agent_core::{
     protocol::{self, session_event_json},
-    AgentCore, AgentEvent,
+    AgentCore, AgentEvent, ApprovalMode,
 };
 use serde_json::{json, Value};
 use std::{
@@ -17,17 +17,19 @@ use std::{
     time::Duration,
 };
 
-/// Opens an engine in `cwd` (resuming `resume` when given) on a new thread.
-/// Returns the session id once the engine is ready, or the open error.
+/// Opens an engine in `cwd` (resuming `resume` when given) on a new thread,
+/// set up for `agent` when the session belongs to one. Returns the session
+/// id once the engine is ready, or the open error.
 pub fn spawn(
     hub: Arc<Hub>,
     cwd: PathBuf,
     resume: Option<String>,
+    agent: Option<String>,
 ) -> Result<(String, Sender<Value>), String> {
     let (ops_tx, ops_rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     thread::spawn(move || {
-        let core = match open(&hub, cwd, resume.as_deref()) {
+        let core = match open(&hub, cwd, resume.as_deref(), agent.as_deref()) {
             Ok(core) => core,
             Err(error) => {
                 let _ = ready_tx.send(Err(error));
@@ -45,18 +47,39 @@ pub fn spawn(
     Ok((id, ops_tx))
 }
 
-fn open(hub: &Hub, cwd: PathBuf, resume: Option<&str>) -> Result<AgentCore, String> {
+fn open(
+    hub: &Arc<Hub>,
+    cwd: PathBuf,
+    resume: Option<&str>,
+    agent: Option<&str>,
+) -> Result<AgentCore, String> {
     let mut core = AgentCore::open(cwd)
         .map_err(|error| error.to_string())?
         .with_version(hub.version);
     // Nobody watches a session until a client asks to.
     core.set_attended(false);
-    let Some(id) = resume else {
+    let result = match resume {
         // Persist the new session right away: a session closed before its
         // first message must still reopen by id.
-        core.save_session().map_err(|error| error.to_string())?;
-        return Ok(core);
+        None => core.save_session().map_err(|error| error.to_string()),
+        Some(id) => resume_session(hub, &mut core, id),
     };
+    result?;
+    if let Some(agent) = agent.and_then(|id| hub.agents.get(id)) {
+        if let Ok(mode) = ApprovalMode::parse(&agent.approval_mode) {
+            core.set_approval_mode(mode);
+        }
+        let session = core.session_id().to_string();
+        core.set_host_extensions(crate::agent_tools::extensions(
+            Arc::clone(hub),
+            agent.id,
+            session,
+        ));
+    }
+    Ok(core)
+}
+
+fn resume_session(hub: &Hub, core: &mut AgentCore, id: &str) -> Result<(), String> {
     let (_, events) = core.handle_command(&format!("/resume {id}"));
     if core.session_id() != id {
         let reason = events
@@ -75,7 +98,7 @@ fn open(hub: &Hub, cwd: PathBuf, resume: Option<&str>) -> Result<AgentCore, Stri
         .filter(|action| action.session_id == id)
         .collect();
     core.restore_deferred_actions(open);
-    Ok(core)
+    Ok(())
 }
 
 fn run(hub: &Hub, mut core: AgentCore, id: &str, ops: Receiver<Value>) {
@@ -99,6 +122,9 @@ fn run(hub: &Hub, mut core: AgentCore, id: &str, ops: Receiver<Value>) {
             publish(hub, id, event);
         }
         let status = session_event_json(id, core.model_status_event());
+        // Reconciled every tick, so a message that never started a run (an
+        // engine error) does not hold a running slot.
+        hub.set_busy(id, status["state"] != "ready");
         if last_status.as_ref() != Some(&status) {
             hub.broadcast(&status);
             last_status = Some(status);

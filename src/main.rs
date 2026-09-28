@@ -369,7 +369,8 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
         listener.local_addr()?,
         jucode_daemon::state_dir()?.join("token").display()
     );
-    jucode_daemon::serve(listener, store, env!("CARGO_PKG_VERSION"))?;
+    let agents = jucode_daemon::Agents::open(jucode_daemon::agents_dir()?)?;
+    jucode_daemon::serve(listener, store, agents, env!("CARGO_PKG_VERSION"))?;
     Ok(0)
 }
 
