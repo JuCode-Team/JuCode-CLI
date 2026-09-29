@@ -1817,9 +1817,8 @@ impl AgentCore {
             goal_tool_tx: Some(goal_tool_tx),
             approval_tx: Some(approval_tx),
             approval_mode: self.approval_mode,
-            safety_model: Some(self.config.safety_model.clone())
-                .filter(|model| !model.trim().is_empty()),
-            safety_reasoning_effort: self.config.safety_reasoning_effort.clone(),
+            safety_model: Some(self.config.safety().0).filter(|model| !model.trim().is_empty()),
+            safety_reasoning_effort: self.config.safety().1,
             edit_tools: self.config.edit_tools.clone(),
             extra_read_roots,
             tool_state: self.tool_state.clone(),
@@ -2029,11 +2028,12 @@ impl AgentCore {
     }
 
     fn compaction_client(&self) -> Result<OpenAiClient, String> {
+        let (model, reasoning_effort) = self.config.compact();
         OpenAiClient::from_config(OpenAiClientConfig {
-            model: self.config.compact_model.clone(),
+            model,
             provider: self.config.provider.clone(),
             protocol: self.config.protocol.clone(),
-            reasoning_effort: self.config.compact_reasoning_effort.clone(),
+            reasoning_effort,
             model_reasoning_efforts: Vec::new(),
             system_prompt: String::new(),
             prompt_cache_key: self.session.session_id().to_string(),
@@ -2067,7 +2067,8 @@ impl AgentCore {
             .iter()
             .find(|entry| entry.name == RESUME_SUMMARY_MODEL)
             .map(|entry| entry.name.clone())
-            .unwrap_or_else(|| self.config.compact_model.clone());
+            .unwrap_or_else(|| self.config.compact().0);
+        let summary_model = model == RESUME_SUMMARY_MODEL;
         let max_output_tokens = self
             .config
             .models
@@ -2079,7 +2080,11 @@ impl AgentCore {
             model,
             provider: self.config.provider.clone(),
             protocol: self.config.protocol.clone(),
-            reasoning_effort: self.config.compact_reasoning_effort.clone(),
+            reasoning_effort: if summary_model {
+                self.config.compact_reasoning_effort.clone()
+            } else {
+                self.config.compact().1
+            },
             model_reasoning_efforts: Vec::new(),
             system_prompt: String::new(),
             prompt_cache_key: self.session.session_id().to_string(),

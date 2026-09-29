@@ -563,7 +563,27 @@ impl Config {
     }
 
     pub fn compact_model_config(&self) -> ModelConfig {
-        self.model_config(&self.compact_model)
+        self.model_config(&self.compact().0)
+    }
+
+    /// Compaction model and effort. A provider switch rewrites `model` and
+    /// `models` but leaves `compact_model` naming the previous provider's
+    /// model, which the new endpoint rejects; fall back to the chat model.
+    pub fn compact(&self) -> (String, String) {
+        self.helper_model(&self.compact_model, &self.compact_reasoning_effort)
+    }
+
+    /// Safety-classifier model and effort, with the same fallback as `compact`.
+    pub fn safety(&self) -> (String, String) {
+        self.helper_model(&self.safety_model, &self.safety_reasoning_effort)
+    }
+
+    fn helper_model(&self, model: &str, effort: &str) -> (String, String) {
+        if self.models.iter().any(|m| m.name == model) {
+            (model.to_string(), effort.to_string())
+        } else {
+            (self.model.clone(), self.reasoning_effort.clone())
+        }
     }
 
     pub fn model_config(&self, model: &str) -> ModelConfig {
