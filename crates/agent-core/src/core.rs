@@ -1698,15 +1698,6 @@ impl AgentCore {
         self.turn_goal_tokens = 0;
         let save_event = self.save_session_event();
 
-        if self.config.provider == "jucode" && !is_jucode_supported_model(&self.config.model) {
-            let mut events = save_event;
-            events.push(AgentEvent::Error(format!(
-                "{} is not supported by JuCode CLI. Run /model and choose a GPT or Claude model.",
-                self.config.model
-            )));
-            return events;
-        }
-
         self.spawn_current_context_turn(save_event)
     }
 
@@ -1986,14 +1977,6 @@ impl AgentCore {
                 "cannot compact while a response is running".to_string(),
             )];
         }
-        if self.config.provider == "jucode"
-            && !is_jucode_supported_model(&self.config.compact_model)
-        {
-            return vec![AgentEvent::Error(format!(
-                "{} is not supported by JuCode CLI. Configure compact_model to a GPT or Claude model.",
-                self.config.compact_model
-            ))];
-        }
 
         let Some(plan) = self
             .session
@@ -2145,15 +2128,6 @@ impl AgentCore {
         self.turn_started_at = Some(SystemTime::now());
         self.turn_goal_tokens = 0;
         let save_event = self.save_session_event();
-
-        if self.config.provider == "jucode" && !is_jucode_supported_model(&self.config.model) {
-            let mut events = save_event;
-            events.push(AgentEvent::Error(format!(
-                "{} is not supported by JuCode CLI. Run /model and choose a GPT or Claude model.",
-                self.config.model
-            )));
-            return events;
-        }
 
         self.spawn_current_context_turn(save_event)
     }
@@ -3136,37 +3110,37 @@ impl AgentCore {
     }
 
     fn apply_login_result(&mut self, result: OAuthLoginResult) -> Vec<AgentEvent> {
-        let models = result
-            .models
+        // The gateway lists every model the account can reach (across all its
+        // groups); the user picks which to show. Keep an earlier pick, else
+        // start from the recommended set.
+        let available: Vec<ModelConfig> = result.models.iter().map(jucode_model_config).collect();
+        let kept: Vec<ModelConfig> = self
+            .config
+            .jucode_models
             .iter()
-            .filter(|model| is_jucode_supported_model(&model.id))
-            .cloned()
-            .collect::<Vec<_>>();
+            .filter_map(|m| available.iter().find(|a| a.name == m.name).cloned())
+            .collect();
+        let visible = if kept.is_empty() {
+            default_jucode_models(&available)
+        } else {
+            kept
+        };
         self.config.provider = "jucode".to_string();
         self.config.jucode_web_url = result.web_url.clone();
         self.config.jucode_api_url = result.api_url.clone();
         self.config.base_url = format!("{}/v1", result.api_url);
-        for model in &models {
-            let model_config = jucode_model_config(model);
-            if let Some(existing) = self
-                .config
-                .models
-                .iter_mut()
-                .find(|entry| entry.name == model.id)
-            {
-                *existing = model_config;
-            } else {
-                self.config.models.push(model_config);
-            }
-        }
-        if let Some(model) = models.first() {
-            self.config.model = model.id.clone();
-            let supported = self.reasoning_efforts_for_model(&model.id);
-            if !supported
-                .iter()
-                .any(|effort| effort == &self.config.reasoning_effort)
-            {
-                self.config.reasoning_effort = self.default_reasoning_effort_for_model(&model.id);
+        self.config.jucode_models = visible.clone();
+        self.config.models = visible;
+        if !self.config.models.iter().any(|m| m.name == self.config.model) {
+            if let Some(model) = self.config.models.first().map(|m| m.name.clone()) {
+                self.config.model = model.clone();
+                let supported = self.reasoning_efforts_for_model(&model);
+                if !supported
+                    .iter()
+                    .any(|effort| effort == &self.config.reasoning_effort)
+                {
+                    self.config.reasoning_effort = self.default_reasoning_effort_for_model(&model);
+                }
             }
         }
         self.auth.set_jucode_tokens(JucodeTokens {
@@ -3602,10 +3576,13 @@ impl AgentCore {
 
     fn model_command_events(&mut self, args: Vec<&str>) -> Vec<AgentEvent> {
         match args.as_slice() {
-            [] => vec![AgentEvent::ModelView {
-                models: self.model_options(),
-                active_effort: self.config.reasoning_effort.clone(),
-            }],
+            [] => {
+                self.reload_model_list();
+                vec![AgentEvent::ModelView {
+                    models: self.model_options(),
+                    active_effort: self.config.reasoning_effort.clone(),
+                }]
+            }
             [model] if self.is_reasoning_effort_for_current_model(model) => {
                 self.set_model_config(self.config.model.clone(), (*model).to_string())
             }
@@ -3635,6 +3612,17 @@ impl AgentCore {
     /// engine's copy. Other engines (in this process or another) may have
     /// saved since this one loaded the file; saving the whole in-memory copy
     /// would silently undo their changes.
+    /// Desktop edits the visible JuCode models in config.json; pick them up
+    /// when the model list opens instead of waiting for a restart.
+    fn reload_model_list(&mut self) {
+        if let Ok(disk) = Config::load_or_create() {
+            if disk.provider == self.config.provider {
+                self.config.models = disk.models;
+                self.config.jucode_models = disk.jucode_models;
+            }
+        }
+    }
+
     fn change_config(&mut self, change: impl Fn(&mut Config)) -> io::Result<()> {
         let mut current = Config::load_or_create()?;
         change(&mut current);
@@ -3646,11 +3634,6 @@ impl AgentCore {
     fn set_model_config(&mut self, model: String, reasoning_effort: String) -> Vec<AgentEvent> {
         if model.trim().is_empty() {
             return vec![AgentEvent::Error("model cannot be empty".to_string())];
-        }
-        if self.config.provider == "jucode" && !is_jucode_supported_model(&model) {
-            return vec![AgentEvent::Error(format!(
-                "{model} is not supported by JuCode CLI"
-            ))];
         }
         if !self.is_reasoning_effort_for_model(&model, &reasoning_effort) {
             return vec![AgentEvent::Error(format!(
@@ -3671,9 +3654,6 @@ impl AgentCore {
         self.config
             .models
             .iter()
-            .filter(|model_config| {
-                self.config.provider != "jucode" || is_jucode_supported_model(&model_config.name)
-            })
             .map(|model_config| {
                 let active = model_config.name == self.config.model;
                 ModelOptionView {
@@ -3746,11 +3726,21 @@ fn current_utc_date() -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-fn is_jucode_supported_model(model: &str) -> bool {
-    matches!(
-        model,
-        "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.3-codex" | "gpt-5.2"
-    ) || model.starts_with("claude-")
+/// Models shown after the first login, before the user picks their own:
+/// the coding models JuCode is tuned for, in the gateway's order. An account
+/// that can reach none of them sees its first few models instead.
+fn default_jucode_models(available: &[ModelConfig]) -> Vec<ModelConfig> {
+    const RECOMMENDED: &[&str] = &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"];
+    let picked: Vec<ModelConfig> = available
+        .iter()
+        .filter(|m| RECOMMENDED.contains(&m.name.as_str()) || m.name.starts_with("claude-"))
+        .cloned()
+        .collect();
+    if picked.is_empty() {
+        available.iter().take(6).cloned().collect()
+    } else {
+        picked
+    }
 }
 
 fn jucode_model_config(model: &OAuthModel) -> ModelConfig {

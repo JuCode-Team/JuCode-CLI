@@ -108,10 +108,17 @@ fn main() -> io::Result<()> {
         std::process::exit(run_update());
     }
     if args.first().map(String::as_str) == Some("providers") {
+        // JuCode lists the models the user chose to show, once they have.
+        let jucode_models = jucode_agent_core::jucode_visible_models();
         let list = jucode_agent_core::builtin_providers()
             .into_iter()
             .map(|(id, base_url, protocol)| {
-                let models = jucode_agent_core::models_for_provider(&id)
+                let models = if id == "jucode" && !jucode_models.is_empty() {
+                    jucode_models.clone()
+                } else {
+                    jucode_agent_core::models_for_provider(&id)
+                };
+                let models = models
                     .into_iter()
                     .map(|m| {
                         json!({

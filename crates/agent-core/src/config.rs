@@ -197,6 +197,10 @@ pub struct Config {
     pub safety_model: String,
     pub safety_reasoning_effort: String,
     pub models: Vec<ModelConfig>,
+    /// The JuCode gateway models the user chose to show (`jucode_models`),
+    /// out of everything their account can reach. Becomes `models` whenever
+    /// the provider is jucode; empty until the first login.
+    pub jucode_models: Vec<ModelConfig>,
     pub base_url: String,
     pub jucode_web_url: String,
     pub jucode_api_url: String,
@@ -346,6 +350,7 @@ impl Config {
                 safety_model: "gpt-5.5".to_string(),
                 safety_reasoning_effort: DEFAULT_COMPACT_REASONING_EFFORT.to_string(),
                 models: models_for_provider("jucode"),
+                jucode_models: Vec::new(),
                 base_url: "https://api.jucode.cn/v1".to_string(),
                 jucode_web_url: "https://api.jucode.cn".to_string(),
                 jucode_api_url: "https://api.jucode.cn".to_string(),
@@ -441,6 +446,10 @@ impl Config {
             safety_model,
             safety_reasoning_effort,
             models,
+            jucode_models: value
+                .get("jucode_models")
+                .map(|list| read_model_configs(&json!({ "models": list }), "jucode"))
+                .unwrap_or_default(),
             base_url: normalize_base_url(&read_string(&value, "base_url", &default_base_url)),
             provider,
             jucode_web_url: normalize_base_url(&read_string(
@@ -510,6 +519,7 @@ impl Config {
             "safety_model": self.safety_model,
             "safety_reasoning_effort": self.safety_reasoning_effort,
             "models": self.models.iter().map(model_config_value).collect::<Vec<_>>(),
+            "jucode_models": self.jucode_models.iter().map(model_config_value).collect::<Vec<_>>(),
             "base_url": normalize_base_url(&self.base_url),
             "jucode_web_url": normalize_base_url(&self.jucode_web_url),
             "jucode_api_url": normalize_base_url(&self.jucode_api_url),
@@ -1256,6 +1266,13 @@ fn model_config_from_template(model: &llm_provider_kit::ModelTemplate) -> ModelC
     }
 }
 
+/// The JuCode models the user chose to show (empty before the first login).
+pub fn jucode_visible_models() -> Vec<ModelConfig> {
+    Config::load_or_create()
+        .map(|c| c.jucode_models)
+        .unwrap_or_default()
+}
+
 /// Built-in providers as (id, default base_url, protocol) — for UIs to offer a
 /// picker. The jucode gateway comes first; the rest follows the vendored omp
 /// catalog's login order, listing providers with at least one servable model
@@ -1662,6 +1679,7 @@ mod tests {
             sandbox: crate::sandbox::SandboxPolicy::default_for_platform(),
             web_search_engine: crate::web::DEFAULT_SEARCH_ENGINE.to_string(),
             web_fetch_engine: crate::web::DEFAULT_FETCH_ENGINE.to_string(),
+            jucode_models: Vec::new(),
             path: PathBuf::from("config.json"),
         };
 

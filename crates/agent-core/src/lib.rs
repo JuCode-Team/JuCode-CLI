@@ -27,7 +27,9 @@ pub mod update;
 mod web;
 mod web_fetch;
 
-pub use config::{builtin_providers, models_for_provider, ApprovalMode, ModelConfig};
+pub use config::{
+    builtin_providers, jucode_visible_models, models_for_provider, ApprovalMode, ModelConfig,
+};
 pub use core::AgentCore;
 pub use event::{
     AgentEvent, CommandView, GoalView, LoginProviderView, McpServerView, McpToolView,
