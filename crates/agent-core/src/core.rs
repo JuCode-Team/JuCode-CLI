@@ -3131,7 +3131,12 @@ impl AgentCore {
         self.config.base_url = format!("{}/v1", result.api_url);
         self.config.jucode_models = visible.clone();
         self.config.models = visible;
-        if !self.config.models.iter().any(|m| m.name == self.config.model) {
+        if !self
+            .config
+            .models
+            .iter()
+            .any(|m| m.name == self.config.model)
+        {
             if let Some(model) = self.config.models.first().map(|m| m.name.clone()) {
                 self.config.model = model.clone();
                 let supported = self.reasoning_efforts_for_model(&model);
