@@ -351,9 +351,9 @@ impl Config {
                 safety_reasoning_effort: DEFAULT_COMPACT_REASONING_EFFORT.to_string(),
                 models: models_for_provider("jucode"),
                 jucode_models: Vec::new(),
-                base_url: "https://api.jucode.cn/v1".to_string(),
-                jucode_web_url: "https://api.jucode.cn".to_string(),
-                jucode_api_url: "https://api.jucode.cn".to_string(),
+                base_url: "https://api.jucode.net/v1".to_string(),
+                jucode_web_url: "https://api.jucode.net".to_string(),
+                jucode_api_url: "https://api.jucode.net".to_string(),
                 api_key_env: "OPENAI_API_KEY".to_string(),
                 retry_attempts: DEFAULT_RETRY_ATTEMPTS,
                 connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,
@@ -426,12 +426,12 @@ impl Config {
         let legacy_jucode_url = read_string(&value, "jucode_base_url", "");
         let default_jucode_web_url =
             if legacy_jucode_url.is_empty() || legacy_jucode_url == "http://localhost:8090" {
-                "https://api.jucode.cn"
+                "https://api.jucode.net"
             } else {
                 &legacy_jucode_url
             };
         let default_jucode_api_url = if legacy_jucode_url.is_empty() {
-            "https://api.jucode.cn"
+            "https://api.jucode.net"
         } else {
             &legacy_jucode_url
         };
@@ -787,7 +787,18 @@ pub fn profile_dir() -> io::Result<PathBuf> {
 }
 
 pub fn normalize_base_url(value: &str) -> String {
-    value.trim().trim_end_matches('/').to_string()
+    migrate_jucode_host(value.trim().trim_end_matches('/'))
+}
+
+/// The JuCode gateway moved from api.jucode.cn to api.jucode.net; configs
+/// saved with the old host follow it.
+fn migrate_jucode_host(url: &str) -> String {
+    match url.strip_prefix("https://api.jucode.cn") {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            format!("https://api.jucode.net{rest}")
+        }
+        _ => url.to_string(),
+    }
 }
 
 fn read_string(value: &Value, key: &str, default: &str) -> String {
@@ -1575,6 +1586,26 @@ mod tests {
     }
 
     #[test]
+    fn configs_on_the_old_jucode_host_move_to_the_new_one() {
+        assert_eq!(
+            normalize_base_url("https://api.jucode.cn/v1/"),
+            "https://api.jucode.net/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.jucode.cn"),
+            "https://api.jucode.net"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.jucode.cnx"),
+            "https://api.jucode.cnx"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.openai.com/v1"),
+            "https://api.openai.com/v1"
+        );
+    }
+
+    #[test]
     fn builtin_providers_expose_vendor_templates_with_models() {
         // `jucode providers` prints this list: JuCode's own gateway first,
         // then the vendored omp catalog's usable providers.
@@ -1683,8 +1714,8 @@ mod tests {
                 },
             ],
             base_url: "https://api.openai.com/v1".to_string(),
-            jucode_web_url: "https://api.jucode.cn".to_string(),
-            jucode_api_url: "https://api.jucode.cn".to_string(),
+            jucode_web_url: "https://api.jucode.net".to_string(),
+            jucode_api_url: "https://api.jucode.net".to_string(),
             api_key_env: "OPENAI_API_KEY".to_string(),
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
             connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,

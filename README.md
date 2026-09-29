@@ -57,7 +57,7 @@ On first run, JuCode creates its configuration under the user profile directory.
 
 - default provider: `jucode`
 - default model: `gpt-5.5`
-- default API base URL: `https://api.jucode.cn/v1`
+- default API base URL: `https://api.jucode.net/v1`
 - default API key environment variable: `OPENAI_API_KEY`
 
 Sign in with `/login` to use the JuCode gateway, or set an API key and point the config at any compatible endpoint. Built-in provider templates: `jucode` and `openai` (Responses), `deepseek` (Anthropic Messages), and `ollama` and `openrouter` (Chat Completions). List them with `jucode providers`, or override the `protocol` setting for custom endpoints:

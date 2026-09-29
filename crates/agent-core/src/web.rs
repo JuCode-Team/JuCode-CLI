@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn local_engine_and_missing_config_fetch_locally() {
         let local = WebTools {
-            api_url: "https://api.jucode.cn".to_string(),
+            api_url: "https://api.jucode.net".to_string(),
             encrypt_secrets: false,
             search_engine: "auto".to_string(),
             fetch_engine: "local".to_string(),

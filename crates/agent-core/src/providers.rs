@@ -14,7 +14,7 @@ pub const CLIENT_NAME: &str = "jucode";
 /// claude-* models, which users configure by name).
 pub const JUCODE_TEMPLATE: ProviderTemplate = ProviderTemplate {
     id: "jucode",
-    base_url: "https://api.jucode.cn/v1",
+    base_url: "https://api.jucode.net/v1",
     protocol: Protocol::OpenAiResponses,
     models: GPT_MODELS,
 };

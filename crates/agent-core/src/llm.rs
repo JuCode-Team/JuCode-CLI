@@ -2364,7 +2364,7 @@ mod tests {
             system_prompt: "system".to_string(),
             prompt_cache_key: "cache-key".to_string(),
             mcp: McpManager::default(),
-            base_url: "https://api.jucode.cn/v1".to_string(),
+            base_url: "https://api.jucode.net/v1".to_string(),
             max_output_tokens: 2048,
             api_key: Some("test-key"),
             api_key_env: "JUCODE_TEST_API_KEY",
