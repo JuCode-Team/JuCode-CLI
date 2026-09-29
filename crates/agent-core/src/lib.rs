@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod chat;
 mod commands;
 mod config;
 mod core;

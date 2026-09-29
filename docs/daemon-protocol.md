@@ -106,7 +106,7 @@ every connected client.
 
 | Op | Fields | Reply |
 | --- | --- | --- |
-| `session_list` | — | `sessions` |
+| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers` |
 | `session_create` | `cwd` | `session_created` with `session`; the session's startup events follow |
 | `session_open` | `session` | `session_opened`; reopens a closed session (or one from before a restart), resuming its transcript and its undecided deferred actions |
 | `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped |
@@ -130,7 +130,11 @@ every connected client.
 was hosted before a restart: the daemon reopens it first.
 
 `session_create` also accepts `agent` instead of `cwd`: the session runs in
-the agent's directory as that agent.
+the agent's directory as that agent. With `chat: true` instead, the session is
+a chat: it runs in `~/.jucode/chats` with the chat prompt (conversation and
+web research) and without project instructions or project skills. Any session
+whose directory is `~/.jucode/chats` or lies inside it is a chat session, so
+reopening one keeps it a chat.
 
 ## Agents
 

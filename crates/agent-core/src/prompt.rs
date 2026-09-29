@@ -44,6 +44,8 @@ pub struct PromptContext {
     pub edit_tools: Vec<String>,
     pub project_instructions: Vec<ProjectInstruction>,
     pub skills: Vec<SkillPromptItem>,
+    /// A chat session gets research guidance instead of coding guidance.
+    pub chat: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,10 +76,12 @@ pub fn build_system_prompt(base: &str, context: &PromptContext) -> String {
         context.cwd.display()
     ));
     prompt.push_str(&format!("Available tools: {}\n", context.tools.join(", ")));
-    prompt.push_str(&format!(
-        "Tool guidance: {}\n",
+    let guidance = if context.chat {
+        crate::chat::CHAT_TOOL_GUIDANCE.to_string()
+    } else {
         tool_guidance(&context.edit_tools)
-    ));
+    };
+    prompt.push_str(&format!("Tool guidance: {guidance}\n"));
     prompt.push_str("</runtime_context>");
 
     if !context.project_instructions.is_empty() {
@@ -384,6 +388,24 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn chat_prompt_uses_research_guidance() {
+        let prompt = build_system_prompt(
+            "Chat prompt",
+            &PromptContext {
+                date: "2026-09-29".to_string(),
+                cwd: PathBuf::from("/home/u/.jucode/chats/c1"),
+                tools: vec!["web_search", "web_fetch"],
+                edit_tools: crate::config::default_edit_tools(),
+                project_instructions: Vec::new(),
+                skills: Vec::new(),
+                chat: true,
+            },
+        );
+        assert!(prompt.contains(crate::chat::CHAT_TOOL_GUIDANCE));
+        assert!(!prompt.contains(TOOL_GUIDANCE_PREFIX));
+    }
+
+    #[test]
     fn prompt_includes_runtime_context_and_skills() {
         let prompt = build_system_prompt(
             "Base prompt",
@@ -401,6 +423,7 @@ mod tests {
                     description: "Review <code> & tests".to_string(),
                     path: PathBuf::from("C:/skills/review/SKILL.md"),
                 }],
+                chat: false,
             },
         );
 
@@ -425,6 +448,7 @@ mod tests {
                 edit_tools,
                 project_instructions: Vec::new(),
                 skills: Vec::new(),
+                chat: false,
             },
         );
         let tools_line = prompt
@@ -468,6 +492,7 @@ mod tests {
                 edit_tools,
                 project_instructions: Vec::new(),
                 skills: Vec::new(),
+                chat: false,
             },
         );
         assert!(prompt.contains("Available tools: read, hashline_edit, write, apply_patch"));

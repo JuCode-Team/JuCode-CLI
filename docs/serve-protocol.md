@@ -6,6 +6,11 @@ emits the engine's `AgentEvent` stream as newline-delimited JSON on stdout —
 the same schema `--headless` uses. It runs until stdin closes, an `op:"shutdown"`
 arrives, or a `command` op carries `/quit` or `/exit`.
 
+`jucode serve --chat` starts a chat session instead: it runs in `~/.jucode/chats`
+with the chat prompt (conversation and web research) and without project
+instructions or project skills. Any engine started in that directory, or
+inside it, is a chat session as well.
+
 This is the richer of JuCode's two embedding protocols. `jucode acp` is the
 standardized subset for ACP clients; see `docs/serve-vs-acp.md` for the split.
 

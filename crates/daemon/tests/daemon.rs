@@ -857,3 +857,42 @@ fn an_unattended_escalation_becomes_a_pending_action() {
     assert!(deferred["arguments"].as_str().unwrap().contains("escalate"));
     assert!(!dir.join(".git/config").exists());
 }
+
+#[test]
+fn a_chat_session_runs_in_the_chats_directory_with_the_chat_prompt() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    client.send(json!({ "op": "session_create", "chat": true, "id": 1 }));
+    let frames = client.until(|frame| frame["type"] == "session_created");
+    let session = frames.last().unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    client.send(json!({ "op": "session_list" }));
+    let listed = client.until(|frame| frame["type"] == "sessions");
+    let entry = listed.last().unwrap()["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["session"] == session.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(entry["chat"], true);
+    let cwd = PathBuf::from(entry["cwd"].as_str().unwrap());
+    assert!(cwd.is_dir() && cwd.ends_with(".jucode/chats"));
+
+    client.send(json!({ "op": "watch", "session": session }));
+    client.send(json!({ "op": "user_message", "session": session, "content": "SYSTEM" }));
+    let frames = client.until(ready(&session));
+    let reply: String = frames
+        .iter()
+        .filter(|frame| frame["session"] == session.as_str())
+        .filter_map(|frame| frame["delta"].as_str().or(frame["text"].as_str()))
+        .collect();
+    assert!(
+        reply.contains(jucode_agent_core::chat::CHAT_TOOL_GUIDANCE),
+        "{reply}"
+    );
+}

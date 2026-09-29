@@ -194,14 +194,18 @@ impl Hub {
         }
     }
 
-    /// Starts a new session in `cwd`, or in the agent's directory for an
-    /// agent session.
+    /// Starts a new session in `cwd`, in the agent's directory for an agent
+    /// session, or in the chats directory for a chat.
     pub fn create_session(
         self: &Arc<Self>,
         cwd: Option<PathBuf>,
         agent: Option<&str>,
+        chat: bool,
     ) -> Result<String, String> {
         let cwd = match agent {
+            None if chat => {
+                jucode_agent_core::chat::ensure_chats_dir().map_err(|error| error.to_string())?
+            }
             Some(id) => {
                 let agent = self
                     .agents
@@ -630,7 +634,7 @@ impl Hub {
                 self.open_session(&session)?;
                 session
             }
-            None => self.create_session(None, Some(&message.to))?,
+            None => self.create_session(None, Some(&message.to), false)?,
         };
         // A delivered message starts (or queues) a run: claim the slot before
         // forwarding, so the next message sees it taken.
@@ -666,9 +670,11 @@ impl Hub {
             .into_iter()
             .map(|record| {
                 let hosted = sessions.get(&record.id);
+                let cwd = hosted.map(|h| h.cwd.clone()).unwrap_or(record.cwd);
                 json!({
                     "session": record.id,
-                    "cwd": hosted.map(|h| h.cwd.clone()).unwrap_or(record.cwd).display().to_string(),
+                    "chat": jucode_agent_core::chat::is_chat_dir(&cwd),
+                    "cwd": cwd.display().to_string(),
                     "created_at": record.created_at,
                     "agent": record.agent,
                     "open": hosted.is_some(),

@@ -92,7 +92,8 @@ fn main() -> io::Result<()> {
         std::process::exit(code);
     }
     if args.first().map(String::as_str) == Some("serve") {
-        let code = run_serve(approval_mode)?;
+        let chat = args.iter().skip(1).any(|arg| arg == "--chat");
+        let code = run_serve(approval_mode, chat)?;
         std::process::exit(code);
     }
     if args.first().map(String::as_str) == Some("daemon") {
@@ -397,8 +398,15 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
 /// Reads newline-delimited JSON commands on stdin and emits the engine's
 /// `AgentEvent` stream as newline-delimited JSON on stdout (same schema as
 /// `--headless`). Runs until stdin closes or a `shutdown`/`/quit` command.
-fn run_serve(approval_mode: Option<ApprovalMode>) -> io::Result<i32> {
-    let mut core = AgentCore::new()?.with_version(env!("CARGO_PKG_VERSION"));
+///
+/// `--chat` starts a chat session in `~/.jucode/chats`.
+fn run_serve(approval_mode: Option<ApprovalMode>, chat: bool) -> io::Result<i32> {
+    let core = if chat {
+        AgentCore::open(jucode_agent_core::chat::ensure_chats_dir()?)?
+    } else {
+        AgentCore::new()?
+    };
+    let mut core = core.with_version(env!("CARGO_PKG_VERSION"));
     if let Some(mode) = approval_mode {
         // Set before startup_events so the startup approval_mode event reflects it.
         let _ = core.set_approval_mode(mode);

@@ -235,7 +235,11 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         },
         ("session_list", _) => Ok(hub.sessions_json()),
         ("session_create", _) => hub
-            .create_session(op["cwd"].as_str().map(PathBuf::from), op["agent"].as_str())
+            .create_session(
+                op["cwd"].as_str().map(PathBuf::from),
+                op["agent"].as_str(),
+                op["chat"].as_bool().unwrap_or(false),
+            )
             .map(|session| json!({ "type": "session_created", "session": session })),
         ("agent_list", _) => Ok(hub.agents_json()),
         ("agent_create", _) => {

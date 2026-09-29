@@ -182,6 +182,9 @@ pub struct AgentCore {
     tool_state: crate::tools::ToolState,
     /// Tools and prompt text added by a host process (the daemon).
     host: Option<crate::host::HostExtensions>,
+    /// Chat session (cwd under `~/.jucode/chats/`): chat prompt, no project
+    /// instructions or project skills.
+    chat: bool,
     plan: Vec<PlanItem>,
     mcp: McpManager,
     /// Version reported in the startup event and used by the update check.
@@ -215,6 +218,7 @@ impl AgentCore {
             true
         };
         let hooks = Hooks::load(&profile_dir()?, &cwd, project_trusted);
+        let chat = crate::chat::is_chat_dir(&cwd);
         let config = Config::load_or_create().inspect_err(|error| {
             crate::log_error!("config", "failed to load config", error = error.to_string());
         })?;
@@ -264,6 +268,7 @@ impl AgentCore {
             hooks,
             tool_state,
             host: None,
+            chat,
             plan: Vec::new(),
             approval_receiver: None,
             pending_approvals: HashMap::new(),
@@ -292,6 +297,10 @@ impl AgentCore {
 
     pub fn cwd(&self) -> &std::path::Path {
         &self.cwd
+    }
+
+    pub fn is_chat(&self) -> bool {
+        self.chat
     }
 
     /// Runs this engine's shell commands in `sandbox` and checks file writes
@@ -1709,6 +1718,7 @@ impl AgentCore {
         }
         self.subagent_manager = SubagentManager::default();
         let base_prompt = match self.config.system_prompt() {
+            Ok(_) if self.chat => crate::chat::CHAT_SYSTEM_PROMPT.to_string(),
             Ok(prompt) => prompt,
             Err(error) => {
                 let mut events = save_event;
@@ -1718,19 +1728,22 @@ impl AgentCore {
                 return events;
             }
         };
-        let skills =
-            match discover_skills(self.config.profile_dir(), &self.cwd, self.project_trusted) {
-                Ok(skills) => skills,
-                Err(error) => {
-                    let mut events = save_event;
-                    events.push(AgentEvent::Error(format!(
-                        "failed to discover skills: {error}"
-                    )));
-                    return events;
-                }
-            };
+        // A chat directory holds no project skills; user skills still apply.
+        let project_skills = self.project_trusted && !self.chat;
+        let skills = match discover_skills(self.config.profile_dir(), &self.cwd, project_skills) {
+            Ok(skills) => skills,
+            Err(error) => {
+                let mut events = save_event;
+                events.push(AgentEvent::Error(format!(
+                    "failed to discover skills: {error}"
+                )));
+                return events;
+            }
+        };
         let extra_read_roots = crate::prompt::skill_read_roots(&skills);
-        let project_instructions = if self.config.include_project_instructions {
+        // Chat directories live under the home directory, where discovery
+        // would pick up unrelated AGENTS.md / CLAUDE.md files.
+        let project_instructions = if self.config.include_project_instructions && !self.chat {
             match discover_project_instructions(&self.cwd) {
                 Ok(instructions) => instructions,
                 Err(error) => {
@@ -1766,6 +1779,7 @@ impl AgentCore {
                 edit_tools: self.config.edit_tools.clone(),
                 project_instructions,
                 skills,
+                chat: self.chat,
             },
         );
         if let Some(sandbox) = self.tool_state.sandbox() {
