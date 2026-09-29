@@ -1046,6 +1046,8 @@ impl AgentCore {
         }
     }
 
+    /// Runs in the background after login. A failure here does not affect the
+    /// session, so it is reported as a notice, not an error in the transcript.
     fn sync_default_skills_events(&mut self) -> Vec<AgentEvent> {
         match self.fetch_marketplace() {
             Ok(marketplace) => {
@@ -1057,13 +1059,13 @@ impl AgentCore {
                         AgentEvent::Status(format!("synced {count} default skill(s)")),
                         self.command_list_event(),
                     ],
-                    Err(error) => vec![AgentEvent::Error(format!(
-                        "failed to sync default skills: {error}"
+                    Err(error) => vec![AgentEvent::Info(format!(
+                        "could not sync default skills: {error}"
                     ))],
                 }
             }
-            Err(error) => vec![AgentEvent::Error(format!(
-                "failed to fetch skills marketplace: {error}"
+            Err(error) => vec![AgentEvent::Info(format!(
+                "could not fetch the skills marketplace: {error}"
             ))],
         }
     }
@@ -3736,15 +3738,26 @@ fn current_utc_date() -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-/// Models shown after the first login, before the user picks their own:
-/// the coding models JuCode is tuned for, in the gateway's order. An account
-/// that can reach none of them sees its first few models instead.
+/// Models shown after the first login, before the user picks their own
+/// (Desktop's ModelSetup preselects the same list): the GPT-6 and Claude Fable
+/// families, the newest Opus and Sonnet, and the fast DeepSeek and GLM models,
+/// in this order. An account that can reach none of them sees its first few
+/// models instead.
+const DEFAULT_JUCODE_MODELS: &[&str] = &[
+    "gpt-6-sol",
+    "gpt-6-astra",
+    "gpt-6-luna",
+    "claude-fable-5-1",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "deepseek-v4.1-flash",
+    "glm-5.3-flash",
+];
+
 fn default_jucode_models(available: &[ModelConfig]) -> Vec<ModelConfig> {
-    const RECOMMENDED: &[&str] = &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"];
-    let picked: Vec<ModelConfig> = available
+    let picked: Vec<ModelConfig> = DEFAULT_JUCODE_MODELS
         .iter()
-        .filter(|m| RECOMMENDED.contains(&m.name.as_str()) || m.name.starts_with("claude-"))
-        .cloned()
+        .filter_map(|name| available.iter().find(|m| m.name == *name).cloned())
         .collect();
     if picked.is_empty() {
         available.iter().take(6).cloned().collect()
