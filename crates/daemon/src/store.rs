@@ -8,7 +8,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     fs::{self, OpenOptions},
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -21,6 +21,7 @@ const QUESTIONS: &str = "questions.jsonl";
 const REPORTS: &str = "reports.jsonl";
 const DEVICES: &str = "devices.jsonl";
 const TOKEN: &str = "token";
+const SETTINGS: &str = "settings.json";
 
 pub struct Store {
     dir: PathBuf,
@@ -116,6 +117,30 @@ impl Store {
         })
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// A daemon setting from `settings.json`; Null when unset.
+    pub fn setting(&self, key: &str) -> Value {
+        self.settings()[key].clone()
+    }
+
+    pub fn set_setting(&self, key: &str, value: Value) -> io::Result<()> {
+        let _guard = self.lock();
+        let mut settings = self.settings();
+        settings[key] = value;
+        fs::write(self.dir.join(SETTINGS), format!("{settings:#}\n"))
+    }
+
+    fn settings(&self) -> Value {
+        fs::read_to_string(self.dir.join(SETTINGS))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}))
+    }
+
     /// The local client token, created on first use and readable only by
     /// the owner. Local clients read it from this file to connect.
     pub fn token(&self) -> io::Result<String> {
@@ -127,16 +152,7 @@ impl Store {
             }
         }
         let token = random_hex(32)?;
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        options
-            .open(&path)?
-            .write_all(format!("{token}\n").as_bytes())?;
+        write_private(&path, format!("{token}\n").as_bytes())?;
         Ok(token)
     }
 
@@ -479,7 +495,12 @@ impl Store {
 
     /// The active device a token belongs to.
     pub fn device_for_token(&self, token: &str) -> Option<Device> {
-        let hash = token_hash(token);
+        self.device_for_hash(&token_hash(token))
+    }
+
+    /// The active device with this token hash. A relay device's hash is of
+    /// its Noise static key.
+    pub fn device_for_hash(&self, hash: &str) -> Option<Device> {
         self.devices()
             .into_iter()
             .find(|device| !device.revoked && device.token_hash == hash)
@@ -545,11 +566,28 @@ fn message_from_json(entry: &Value) -> Option<Message> {
 }
 
 pub fn token_hash(token: &str) -> String {
+    bytes_hash(token.as_bytes())
+}
+
+/// Lowercase hex SHA-256.
+pub fn bytes_hash(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(token.as_bytes())
+    Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// Writes a file only the owner can read.
+pub fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(contents)
 }
 
 /// `bytes` random bytes as lowercase hex.

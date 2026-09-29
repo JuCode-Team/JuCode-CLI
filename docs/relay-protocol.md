@@ -52,7 +52,7 @@ https://app.jucode.net/remote#pair=<host_id>.<host_static_pub>.<code>
 ## 3. Relay endpoints
 
 Base: `wss://app.jucode.net/relay/v1` (Caddy terminates TLS and proxies to the
-relay on `127.0.0.1:18090`; the relay itself speaks plain WS/HTTP).
+relay on `127.0.0.1:18095`; the relay itself speaks plain WS/HTTP).
 
 ### 3.1 Host connection: `GET /relay/v1/host`
 
@@ -152,7 +152,10 @@ on device clients. Revoking a device closes its relay streams.
 - New local-client ops (not allowed for device clients):
   - `relay_status` → `{type:"relay_status", enabled, connected, host, url}`
   - `pair_link` → like `pair_start` but also returns
-    `{link:"https://app.jucode.net/remote#pair=..."}`.
+    `{link:"https://app.jucode.net/remote#pair=..."}`; an error while the
+    relay is off.
+  - `relay_set {enabled}` → turns the relay on or off (persisted in
+    `settings.json`) and replies `relay_status`. Off by default.
 
 ## 6. Test vectors / interop
 

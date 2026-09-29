@@ -4,6 +4,7 @@
 
 use crate::{
     agents::Agents,
+    relay::Relay,
     session,
     store::{now, random_hex, token_hash, Device, Message, Question, Report, Store, Timer},
 };
@@ -31,6 +32,7 @@ pub struct Hub {
     pub store: Store,
     pub agents: Agents,
     pub version: &'static str,
+    pub relay: Relay,
     sessions: Mutex<HashMap<String, Hosted>>,
     /// Sessions whose engine is running a turn or has queued messages.
     busy: Mutex<HashSet<String>>,
@@ -67,8 +69,16 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Hub {
-    pub fn new(store: Store, agents: Agents, version: &'static str) -> Arc<Self> {
+    /// `relay` is the relay base URL; None turns the relay off whatever the
+    /// setting says (`--no-relay`).
+    pub fn new(
+        store: Store,
+        agents: Agents,
+        version: &'static str,
+        relay: Option<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            relay: Relay::new(relay, &store),
             store,
             agents,
             version,
@@ -115,6 +125,14 @@ impl Hub {
     /// Trades a pairing code for a new device and its token. The token is
     /// returned once and only its hash is stored.
     pub fn pair(&self, code: &str, name: &str) -> Result<(Device, String), String> {
+        let token = random_hex(32).map_err(|error| error.to_string())?;
+        let device = self.pair_hash(code, name, token_hash(&token))?;
+        Ok((device, token))
+    }
+
+    /// Trades a pairing code for a new device identified by `token_hash`
+    /// (a token's hash, or a relay client's static key hash).
+    pub fn pair_hash(&self, code: &str, name: &str, token_hash: String) -> Result<Device, String> {
         let code = code.trim().to_ascii_uppercase();
         let valid = lock(&self.pairings)
             .remove(&code)
@@ -122,7 +140,6 @@ impl Hub {
         if !valid {
             return Err("pairing code is wrong or expired".to_string());
         }
-        let token = random_hex(32).map_err(|error| error.to_string())?;
         let name = name.trim();
         let device = Device {
             id: self.new_id("dev"),
@@ -130,14 +147,14 @@ impl Hub {
                 .chars()
                 .take(60)
                 .collect(),
-            token_hash: token_hash(&token),
+            token_hash,
             paired_at: now(),
             revoked: false,
         };
         self.store
             .record_device(&device)
             .map_err(|error| error.to_string())?;
-        Ok((device, token))
+        Ok(device)
     }
 
     /// Revokes a device and drops its open connections.

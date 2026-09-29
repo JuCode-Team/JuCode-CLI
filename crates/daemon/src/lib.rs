@@ -9,6 +9,8 @@ mod agents;
 mod http;
 mod hub;
 pub mod install;
+pub mod noise;
+mod relay;
 mod session;
 mod store;
 
@@ -33,20 +35,28 @@ use tungstenite::{
 };
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7788";
+pub const DEFAULT_RELAY: &str = "wss://app.jucode.net/relay/v1";
 
 /// Serves clients on `listener` until the process exits. The token guards
 /// every WebSocket connection: local clients read it from
 /// `<state dir>/token`, paired devices hold their own. `web` is the remote
-/// page's build directory, served over plain HTTP on the same port.
+/// page's build directory, served over plain HTTP on the same port. `relay`
+/// is the relay base URL (None: never use the relay); the connection is made
+/// only while the `relay` setting is on (`relay_set`).
 pub fn serve(
     listener: TcpListener,
     store: Store,
     agents: Agents,
     web: Option<PathBuf>,
     version: &'static str,
+    relay: Option<String>,
 ) -> io::Result<()> {
     let token = store.token()?;
-    let hub = Hub::new(store, agents, version);
+    let hub = Hub::new(store, agents, version, relay);
+    if hub.relay.url().is_some() {
+        let relay = Arc::clone(&hub);
+        thread::spawn(move || relay::run(&relay));
+    }
     // Fires due timers and retries messages waiting for a free run slot,
     // including ones left over from before a restart.
     let scheduler = Arc::clone(&hub);
@@ -125,9 +135,60 @@ fn connection(
         .set_read_timeout(Some(Duration::from_millis(20)))
         .map_err(|error| error.to_string())?;
 
+    attach(hub, &mut socket, authorized.flatten())
+}
+
+/// One client connection as the hub sees it: JSON text frames both ways.
+/// A local WebSocket and a relay stream (`relay.rs`) are both links.
+trait Link {
+    fn send(&mut self, frame: &str) -> Result<(), String>;
+    /// The next frame, waiting briefly: None when nothing arrived in time.
+    /// `Closed` ends the connection without an error.
+    fn receive(&mut self) -> Result<Option<String>, Received>;
+    /// Drops the connection from the daemon's side.
+    fn close(&mut self);
+}
+
+enum Received {
+    Closed,
+    Failed(String),
+}
+
+impl Link for WebSocket<TcpStream> {
+    fn send(&mut self, frame: &str) -> Result<(), String> {
+        WebSocket::send(self, Message::text(frame)).map_err(|error| error.to_string())
+    }
+
+    fn receive(&mut self) -> Result<Option<String>, Received> {
+        match self.read() {
+            Ok(Message::Text(text)) => Ok(Some(text.as_str().to_string())),
+            Ok(Message::Close(_)) => Err(Received::Closed),
+            Ok(_) => Ok(None),
+            Err(tungstenite::Error::Io(error))
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+            {
+                Ok(None)
+            }
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                Err(Received::Closed)
+            }
+            Err(error) => Err(Received::Failed(error.to_string())),
+        }
+    }
+
+    fn close(&mut self) {
+        let _ = WebSocket::close(self, None);
+        let _ = self.flush();
+    }
+}
+
+/// Serves one authenticated client over `link` until either side closes.
+/// `device` is the paired device it authenticated as; None for a local
+/// client.
+fn attach(hub: &Arc<Hub>, link: &mut impl Link, device: Option<String>) -> Result<(), String> {
     let (outbox, inbox) = mpsc::channel();
-    let client = hub.add_client(outbox, authorized.flatten());
-    let result = pump(hub, client, &mut socket, &inbox);
+    let client = hub.add_client(outbox, device);
+    let result = pump(hub, client, link, &inbox);
     hub.remove_client(client);
     result
 }
@@ -135,47 +196,37 @@ fn connection(
 fn pump(
     hub: &Arc<Hub>,
     client: u64,
-    socket: &mut WebSocket<TcpStream>,
+    link: &mut impl Link,
     inbox: &mpsc::Receiver<String>,
 ) -> Result<(), String> {
-    send(socket, &protocol::hello_json(hub.version))?;
-    send(socket, &hub.sessions_json())?;
-    send(socket, &hub.agents_json())?;
-    send(socket, &hub.questions_json())?;
-    send(socket, &hub.actions_json())?;
+    for frame in [
+        protocol::hello_json(hub.version),
+        hub.sessions_json(),
+        hub.agents_json(),
+        hub.questions_json(),
+        hub.actions_json(),
+    ] {
+        link.send(&frame.to_string())?;
+    }
     loop {
-        match socket.read() {
-            Ok(Message::Text(text)) => handle(hub, client, text.as_str()),
-            Ok(Message::Close(_)) => return Ok(()),
-            Ok(_) => {}
-            Err(tungstenite::Error::Io(error))
-                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
-                return Ok(())
-            }
-            Err(error) => return Err(error.to_string()),
+        match link.receive() {
+            Ok(Some(text)) => handle(hub, client, &text),
+            Ok(None) => {}
+            Err(Received::Closed) => return Ok(()),
+            Err(Received::Failed(error)) => return Err(error),
         }
         loop {
             match inbox.try_recv() {
-                Ok(frame) => socket
-                    .send(Message::text(frame))
-                    .map_err(|error| error.to_string())?,
+                Ok(frame) => link.send(&frame)?,
                 Err(mpsc::TryRecvError::Empty) => break,
                 // The hub dropped this client (its device was revoked).
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    let _ = socket.close(None);
-                    let _ = socket.flush();
+                    link.close();
                     return Ok(());
                 }
             }
         }
     }
-}
-
-fn send(socket: &mut WebSocket<TcpStream>, frame: &Value) -> Result<(), String> {
-    socket
-        .send(Message::text(frame.to_string()))
-        .map_err(|error| error.to_string())
 }
 
 /// The token from `?token=` (browsers cannot set headers on a WebSocket) or
@@ -218,11 +269,24 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     };
     let session = op["session"].as_str().map(str::to_string);
     let name = op["op"].as_str().unwrap_or_default();
-    if matches!(name, "pair_start" | "device_list" | "device_revoke") && !hub.is_local(client) {
+    if matches!(
+        name,
+        "pair_start" | "pair_link" | "device_list" | "device_revoke" | "relay_status" | "relay_set"
+    ) && !hub.is_local(client)
+    {
         reply(json!({ "type": "error", "message": "only the desktop can manage devices" }));
         return;
     }
     let result = match (name, session) {
+        ("pair_link", _) => hub.relay.pair_link(hub),
+        ("relay_status", _) => Ok(hub.relay.status_json()),
+        ("relay_set", _) => match op["enabled"].as_bool() {
+            Some(enabled) => hub
+                .relay
+                .set_enabled(&hub.store, enabled)
+                .map(|()| hub.relay.status_json()),
+            None => Err("relay_set requires enabled".to_string()),
+        },
         ("pair_start", _) => hub
             .start_pairing()
             .map(|(code, expires_at)| json!({ "type": "pairing", "code": code, "expires_at": expires_at })),

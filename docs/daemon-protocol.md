@@ -14,6 +14,8 @@ Background and roadmap: `docs/agent-daemon-plan.md`.
 jucode daemon                      # ws://127.0.0.1:7788
 jucode daemon --listen 127.0.0.1:9000
 jucode daemon --web path/to/JuCode-Desktop/build   # serve the remote page
+jucode daemon --relay wss://relay.example/relay/v1  # another relay
+jucode daemon --no-relay           # never connect to a relay
 ```
 
 Without `--web`, the daemon serves a `web/` directory next to its binary
@@ -42,6 +44,8 @@ State lives in `~/.jucode/daemon/`:
 | `questions.jsonl` | Append log of questions asked and answered. |
 | `reports.jsonl` | Append log of reports posted and read. |
 | `devices.jsonl` | Paired devices (a hash of each token, never the token) and revocations. |
+| `settings.json` | Daemon settings: `relay` (whether the relay connection is on). |
+| `relay-identity.json` | Relay keys (Ed25519 identity, X25519 Noise static key), mode 0600. |
 
 ## Plain HTTP
 
@@ -69,13 +73,32 @@ A phone pairs once and then connects with its own token:
 2. The phone's page posts the code to `/api/pair` and keeps the token.
 3. The phone connects to the WebSocket with that token.
 
-Device tokens reach every op except `pair_start`, `device_list` and
-`device_revoke`, which only local clients (holding the daemon token) may
-send. `device_revoke` drops the device's open connections at once.
+Device tokens reach every op except `pair_start`, `pair_link`,
+`device_list`, `device_revoke`, `relay_status` and `relay_set`, which only
+local clients (holding the daemon token) may send. `device_revoke` drops the device's open connections at once.
 
 To reach the daemon from a phone, keep it on `127.0.0.1` and expose the
 port over HTTPS with `tailscale serve` or a reverse proxy; the daemon has no
-TLS of its own.
+TLS of its own. Or use the relay (below).
+
+## Relay
+
+With the relay on, the daemon keeps one outbound WebSocket to the JuCode
+relay (`--relay`, default `wss://app.jucode.net/relay/v1`) and phones reach
+it from anywhere through end-to-end encrypted streams
+(`docs/relay-protocol.md`). It is off until a local client sends
+`relay_set` with `enabled: true`; the setting survives restarts.
+`--no-relay` keeps it off whatever the setting says.
+
+1. A local client sends `pair_link` and shows the returned `link`
+   (`https://app.jucode.net/remote#pair=<host>.<key>.<code>`, the origin
+   taken from the relay URL) as a QR code. The code is a `pair_start` code.
+2. The phone's page connects through the relay with the code in its first
+   Noise message and is paired as a device keyed by its Noise static key.
+3. Later connections need no code. Relay devices show up in `device_list`;
+   `device_revoke` closes their streams.
+
+A relay stream then behaves exactly like a device's local WebSocket.
 
 ## Connecting
 
@@ -115,6 +138,9 @@ every connected client.
 | `pair_start` | — | `pairing` with `code` and `expires_at` (local clients only) |
 | `device_list` | — | `devices`: paired, unrevoked devices (local clients only) |
 | `device_revoke` | `device` | `device_revoked` (local clients only) |
+| `relay_status` | — | `relay_status` with `enabled`, `connected`, `host` (the host id), `url` (null with `--no-relay`) (local clients only) |
+| `relay_set` | `enabled` | `relay_status`; turns the relay connection on or off and remembers it (local clients only) |
+| `pair_link` | — | `pair_link` with `link`, `code` and `expires_at`; an error while the relay is off (local clients only) |
 | `agent_list` | — | `agents` |
 | `agent_create` | `agent` (the new agent's id), `name`, `cwd`, `role` | `agent_created`; every client also receives the new `agents` list |
 | `message_send` | `agent`, `body`, optional `session`, `reply_to`, `dedupe_key` | `message_accepted` with `message` and `duplicate` |

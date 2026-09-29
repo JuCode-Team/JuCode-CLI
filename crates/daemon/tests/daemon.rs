@@ -33,13 +33,17 @@ fn start_daemon() -> Daemon {
 
 /// A daemon on existing directories, standing in for a restart.
 fn start_daemon_on(state: PathBuf, agents: PathBuf) -> Daemon {
+    start_daemon_with(state, agents, None)
+}
+
+fn start_daemon_with(state: PathBuf, agents: PathBuf, relay: Option<String>) -> Daemon {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let store = Store::open(state.clone()).unwrap();
     let token = store.token().unwrap();
     let agent_store = jucode_daemon::Agents::open(agents.clone()).unwrap();
     let web = state.parent().map(|root| root.join("web"));
-    thread::spawn(move || jucode_daemon::serve(listener, store, agent_store, web, "test"));
+    thread::spawn(move || jucode_daemon::serve(listener, store, agent_store, web, "test", relay));
     Daemon {
         address,
         token,
@@ -895,4 +899,230 @@ fn a_chat_session_runs_in_the_chats_directory_with_the_chat_prompt() {
         reply.contains(jucode_agent_core::chat::CHAT_TOOL_GUIDANCE),
         "{reply}"
     );
+}
+
+/// The relay's end of the host connection, in-process.
+struct FakeRelay {
+    host: WebSocket<TcpStream>,
+}
+
+impl FakeRelay {
+    fn send(&mut self, kind: u8, stream: u32, payload: &[u8]) {
+        let mut frame = vec![kind];
+        frame.extend_from_slice(&stream.to_be_bytes());
+        frame.extend_from_slice(payload);
+        self.host.send(Message::binary(frame)).unwrap();
+    }
+
+    /// The next binary frame from the host: (kind, stream, payload).
+    fn next(&mut self) -> (u8, u32, Vec<u8>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match self.host.read() {
+                Ok(Message::Binary(bytes)) => {
+                    let stream = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
+                    return (bytes[0], stream, bytes[5..].to_vec());
+                }
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => panic!("host connection failed: {error}"),
+            }
+        }
+        panic!("no frame from the host");
+    }
+
+    /// The next frame on `stream`, skipping other streams' traffic.
+    fn next_on(&mut self, stream: u32) -> (u8, Vec<u8>) {
+        loop {
+            let (kind, from, payload) = self.next();
+            if from == stream {
+                return (kind, payload);
+            }
+        }
+    }
+
+    /// Opens a stream and runs the client's handshake; returns msg 2's
+    /// payload and the client transport.
+    fn connect(
+        &mut self,
+        stream: u32,
+        client_key: &[u8],
+        host_key: &[u8],
+        hello: Value,
+    ) -> (Value, jucode_daemon::noise::Transport) {
+        use jucode_daemon::noise;
+        self.send(1, stream, &[]);
+        let mut initiator = noise::initiator(client_key, host_key).unwrap();
+        let mut buffer = vec![0u8; noise::MAX_MESSAGE];
+        let written = initiator
+            .write_message(hello.to_string().as_bytes(), &mut buffer)
+            .unwrap();
+        self.send(2, stream, &buffer[..written]);
+        let (kind, message) = self.next_on(stream);
+        assert_eq!(kind, 2);
+        let read = initiator.read_message(&message, &mut buffer).unwrap();
+        let reply = serde_json::from_slice(&buffer[..read]).unwrap();
+        (reply, noise::Transport::new(initiator).unwrap())
+    }
+}
+
+#[test]
+fn a_relay_client_pairs_gets_hello_and_is_dropped_on_revoke() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use sha2::{Digest, Sha256};
+
+    let _guard = setup();
+    let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+    let root = temp_dir("relay-state");
+    let daemon = start_daemon_with(
+        root.join("daemon"),
+        root.join("agents"),
+        Some(format!("ws://{}/relay/v1", relay.local_addr().unwrap())),
+    );
+    let mut desktop = Client::connect(&daemon);
+    desktop.send(json!({ "op": "relay_status", "id": 1 }));
+    let status = desktop.until(|frame| frame["id"] == 1).pop().unwrap();
+    assert_eq!(
+        (status["enabled"].clone(), status["connected"].clone()),
+        (json!(false), json!(false))
+    );
+    desktop.send(json!({ "op": "pair_link", "id": 2 }));
+    assert_eq!(
+        desktop.until(|frame| frame["id"] == 2).pop().unwrap()["type"],
+        "error"
+    );
+    desktop.send(json!({ "op": "relay_set", "enabled": true, "id": 3 }));
+    assert_eq!(
+        desktop.until(|frame| frame["id"] == 3).pop().unwrap()["enabled"],
+        true
+    );
+    desktop.send(json!({ "op": "pair_link", "id": 4 }));
+    let reply = desktop.until(|frame| frame["id"] == 4).pop().unwrap();
+    let link = reply["link"].as_str().unwrap();
+    let pair = link.split_once("/remote#pair=").unwrap().1;
+    let parts: Vec<&str> = pair.split('.').collect();
+    let (host_id, host_key, code) = (
+        parts[0],
+        URL_SAFE_NO_PAD.decode(parts[1]).unwrap(),
+        parts[2],
+    );
+    assert_eq!(code, reply["code"].as_str().unwrap());
+
+    // The daemon connects and proves its identity.
+    let (tcp, _) = relay.accept().unwrap();
+    let mut path = String::new();
+    // The error type is fixed by tungstenite's handshake callback.
+    #[allow(clippy::result_large_err)]
+    let record_path = |request: &tungstenite::handshake::server::Request,
+                       response: tungstenite::handshake::server::Response| {
+        path = request.uri().path().to_string();
+        Ok(response)
+    };
+    let mut host = tungstenite::accept_hdr(tcp, record_path).unwrap();
+    assert_eq!(path, "/relay/v1/host");
+    let nonce = [7u8; 32];
+    host.send(Message::text(
+        json!({ "t": "challenge", "nonce": URL_SAFE_NO_PAD.encode(nonce) }).to_string(),
+    ))
+    .unwrap();
+    let auth: Value = serde_json::from_str(host.read().unwrap().to_text().unwrap()).unwrap();
+    let public: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(auth["pub"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let signature: [u8; 64] = URL_SAFE_NO_PAD
+        .decode(auth["sig"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    VerifyingKey::from_bytes(&public)
+        .unwrap()
+        .verify(
+            &[b"jucode-relay-v1:".as_slice(), &nonce].concat(),
+            &Signature::from_bytes(&signature),
+        )
+        .unwrap();
+    assert_eq!(
+        URL_SAFE_NO_PAD.encode(&Sha256::digest(public)[..16]),
+        host_id
+    );
+    host.send(Message::text(
+        json!({ "t": "ready", "host": host_id }).to_string(),
+    ))
+    .unwrap();
+    host.get_ref()
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let mut relay = FakeRelay { host };
+
+    // A new phone pairs with the code and gets the usual greeting.
+    let (phone_key, _) = jucode_daemon::noise::generate_keypair().unwrap();
+    let (reply, mut phone) = relay.connect(
+        1,
+        &phone_key,
+        &host_key,
+        json!({ "name": "phone", "pair": code }),
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["name"], "phone");
+    let device = reply["device"].as_str().unwrap().to_string();
+    let (kind, message) = relay.next_on(1);
+    assert_eq!(kind, 2);
+    let hello: Value = serde_json::from_slice(&phone.open(&message).unwrap().unwrap()).unwrap();
+    assert_eq!(hello["type"], "hello");
+    assert_eq!(hello["protocol"], 2);
+
+    // The same phone reconnects without a code; it may not manage devices.
+    let (reply, mut again) = relay.connect(2, &phone_key, &host_key, json!({ "name": "phone" }));
+    assert_eq!(reply["device"], device.as_str());
+    for message in again
+        .seal(
+            json!({ "op": "device_list", "id": 9 })
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap()
+    {
+        relay.send(2, 2, &message);
+    }
+    loop {
+        let (kind, message) = relay.next_on(2);
+        assert_eq!(kind, 2);
+        let frame: Value = serde_json::from_slice(&again.open(&message).unwrap().unwrap()).unwrap();
+        if frame["id"] == 9 {
+            assert_eq!(frame["type"], "error");
+            break;
+        }
+    }
+
+    // An unknown key without a code is refused and closed.
+    let (stranger_key, _) = jucode_daemon::noise::generate_keypair().unwrap();
+    let (reply, _) = relay.connect(3, &stranger_key, &host_key, json!({ "name": "x" }));
+    assert_eq!(reply["ok"], false);
+    assert_eq!(relay.next_on(3), (3, Vec::new()));
+
+    desktop.send(json!({ "op": "relay_status", "id": 5 }));
+    assert_eq!(
+        desktop.until(|frame| frame["id"] == 5).pop().unwrap()["connected"],
+        true
+    );
+
+    // Revoking the device closes both of its streams.
+    desktop.send(json!({ "op": "device_revoke", "device": device, "id": 6 }));
+    desktop.until(|frame| frame["id"] == 6);
+    let mut closed = Vec::new();
+    while closed.len() < 2 {
+        let (kind, stream, _) = relay.next();
+        if kind == 3 {
+            closed.push(stream);
+        }
+    }
+    closed.sort();
+    assert_eq!(closed, [1, 2]);
 }

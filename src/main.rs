@@ -160,6 +160,9 @@ USAGE:
                                          front-ends (jucode's native schema)
     jucode daemon [--listen <addr>]      host many sessions for Desktop and
                                          remote clients over a WebSocket
+                                         (--relay <url> | --no-relay: reach
+                                         it through the JuCode relay once
+                                         Desktop turns that on)
     jucode daemon install|uninstall      run the daemon at login (launchd /
                                          systemd user service)
     jucode acp                           Agent Client Protocol (ACP v1)
@@ -336,7 +339,9 @@ fn run_update() -> i32 {
 }
 
 /// `jucode daemon [--listen <addr>]`: host sessions for Desktop and remote
-/// clients until killed. Listens on loopback unless told otherwise.
+/// clients until killed. Listens on loopback unless told otherwise. The
+/// relay connection (`--relay`, default `wss://app.jucode.net/relay/v1`) is
+/// made only once a local client turns it on; `--no-relay` rules it out.
 fn run_daemon(args: &[String]) -> io::Result<i32> {
     let (action, args) = match args.first().map(String::as_str) {
         Some(action @ ("install" | "uninstall")) => (action, &args[1..]),
@@ -344,14 +349,20 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
     };
     let mut listen = jucode_daemon::DEFAULT_LISTEN.to_string();
     let mut web = None;
+    let mut relay = Some(jucode_daemon::DEFAULT_RELAY.to_string());
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
+        if arg == "--no-relay" {
+            relay = None;
+            continue;
+        }
         match (arg.as_str(), rest.next()) {
             ("--listen", Some(address)) => listen = address.clone(),
             ("--web", Some(dir)) => web = Some(std::path::PathBuf::from(dir)),
+            ("--relay", Some(url)) => relay = Some(url.clone()),
             _ => {
                 eprintln!(
-                    "usage: jucode daemon [install|uninstall] [--listen <host:port>] [--web <dir>]"
+                    "usage: jucode daemon [install|uninstall] [--listen <host:port>] [--web <dir>] [--relay <wss url> | --no-relay]"
                 );
                 return Ok(2);
             }
@@ -396,7 +407,14 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
             dir.display()
         );
     }
-    jucode_daemon::serve(listener, store, agents, web, env!("CARGO_PKG_VERSION"))?;
+    jucode_daemon::serve(
+        listener,
+        store,
+        agents,
+        web,
+        env!("CARGO_PKG_VERSION"),
+        relay,
+    )?;
     Ok(0)
 }
 
