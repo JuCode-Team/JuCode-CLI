@@ -141,16 +141,18 @@ fn exchange_code(
     device_name: &str,
 ) -> Result<Tokens, String> {
     let url = format!("{}/v1/oauth/token", base_url);
-    let response = ureq::post(&url)
-        .set("Content-Type", "application/json")
-        .send_json(json!({
-            "grant_type": "authorization_code",
-            "client_id": CLIENT_ID,
-            "code": code,
-            "redirect_uri": redirect_uri,
-            "code_verifier": verifier,
-            "device_name": device_name,
-        }));
+    let response = send_with_retry(|| {
+        ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .send_json(json!({
+                "grant_type": "authorization_code",
+                "client_id": CLIENT_ID,
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "code_verifier": verifier,
+                "device_name": device_name,
+            }))
+    });
     parse_tokens(&json_response(response)?)
 }
 
@@ -162,13 +164,15 @@ pub fn refresh(api_url: &str, refresh_token: &str) -> Result<Tokens, String> {
         return Err("JuCode API URL cannot be empty".to_string());
     }
     let url = format!("{}/v1/oauth/token", api_url);
-    let response = ureq::post(&url)
-        .set("Content-Type", "application/json")
-        .send_json(json!({
-            "grant_type": "refresh_token",
-            "client_id": CLIENT_ID,
-            "refresh_token": refresh_token,
-        }));
+    let response = send_with_retry(|| {
+        ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .send_json(json!({
+                "grant_type": "refresh_token",
+                "client_id": CLIENT_ID,
+                "refresh_token": refresh_token,
+            }))
+    });
     parse_tokens(&json_response(response)?)
 }
 
@@ -269,11 +273,11 @@ pub fn get_json(api_url: &str, path: &str, access_token: &str) -> Result<Value, 
 
 fn fetch_models(base_url: &str, access_token: &str) -> Result<Vec<OAuthModel>, String> {
     let url = format!("{}/v1/models", base_url);
-    let value = json_response(
+    let value = json_response(send_with_retry(|| {
         ureq::get(&url)
             .set("Authorization", &format!("Bearer {access_token}"))
-            .call(),
-    )?;
+            .call()
+    }))?;
     Ok(parse_models_response(&value))
 }
 
@@ -349,6 +353,31 @@ fn read_u64_field(value: &Value, keys: &[&str]) -> Option<u64> {
 }
 
 /// Gateway errors name the service; the kit's helper reports the bare status.
+/// Sends a request, retrying failures that happen before the server sees it
+/// (DNS, connect, TLS setup). Proxies on flaky links drop these now and then,
+/// and a one-time authorization code or single-use refresh token must not be
+/// lost to one; a request that reached the server is never repeated.
+fn send_with_retry(
+    send: impl Fn() -> Result<ureq::Response, ureq::Error>,
+) -> Result<ureq::Response, ureq::Error> {
+    let mut delay = Duration::from_millis(500);
+    for _ in 0..3 {
+        match send() {
+            Err(ureq::Error::Transport(t))
+                if matches!(
+                    t.kind(),
+                    ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed
+                ) =>
+            {
+                thread::sleep(delay);
+                delay *= 2;
+            }
+            other => return other,
+        }
+    }
+    send()
+}
+
 fn json_response(response: Result<ureq::Response, ureq::Error>) -> Result<Value, String> {
     llm_provider_kit::oauth::json_response(response)
         .map_err(|error| format!("JuCode OAuth returned {error}"))
