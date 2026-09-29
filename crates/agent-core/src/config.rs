@@ -178,7 +178,7 @@ pub fn default_edit_tools() -> Vec<String> {
 }
 
 fn is_network_tool(name: &str) -> bool {
-    matches!(name, "web_fetch")
+    matches!(name, "web_fetch" | "web_search")
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +221,12 @@ pub struct Config {
     /// Sandbox for shell commands (`sandbox`, `sandbox_network`,
     /// `sandbox_directories`, `command_rules` in config.json).
     pub sandbox: crate::sandbox::SandboxPolicy,
+    /// Engine behind `web_search`, served by the JuCode gateway: one of
+    /// `crate::web::SEARCH_ENGINES`.
+    pub web_search_engine: String,
+    /// Engine behind `web_fetch`: `local` fetches from this machine, the
+    /// others go through the JuCode gateway (`crate::web::FETCH_ENGINES`).
+    pub web_fetch_engine: String,
     path: PathBuf,
 }
 
@@ -355,6 +361,8 @@ impl Config {
                 extra_skills_source: None,
                 mcp_servers: Vec::new(),
                 sandbox: crate::sandbox::SandboxPolicy::default_for_platform(),
+                web_search_engine: crate::web::DEFAULT_SEARCH_ENGINE.to_string(),
+                web_fetch_engine: crate::web::DEFAULT_FETCH_ENGINE.to_string(),
                 path,
             };
             config.save()?;
@@ -470,6 +478,18 @@ impl Config {
             extra_skills_source: read_optional_string(&value, "extra_skills_source"),
             mcp_servers: read_mcp_servers(&value),
             sandbox: read_sandbox(&value)?,
+            web_search_engine: read_web_engine(
+                &value,
+                "web_search_engine",
+                crate::web::DEFAULT_SEARCH_ENGINE,
+                crate::web::SEARCH_ENGINES,
+            )?,
+            web_fetch_engine: read_web_engine(
+                &value,
+                "web_fetch_engine",
+                crate::web::DEFAULT_FETCH_ENGINE,
+                crate::web::FETCH_ENGINES,
+            )?,
             path,
         };
         Ok(config)
@@ -511,6 +531,8 @@ impl Config {
                 &self.sandbox.readable_dirs,
             ),
             "command_rules": crate::sandbox::rules_to_json(&self.sandbox.rules),
+            "web_search_engine": self.web_search_engine,
+            "web_fetch_engine": self.web_fetch_engine,
         });
         write_atomically(
             &self.path,
@@ -800,6 +822,32 @@ fn read_sandbox(value: &Value) -> io::Result<crate::sandbox::SandboxPolicy> {
         policy.rules = rules_from_json(rules).map_err(invalid)?;
     }
     Ok(policy)
+}
+
+/// A web engine name from config.json. Absent or empty takes the default;
+/// an unknown name is a hard load error.
+fn read_web_engine(
+    value: &Value,
+    key: &str,
+    default: &str,
+    engines: &[&str],
+) -> io::Result<String> {
+    let raw = value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|raw| raw.trim().to_ascii_lowercase())
+        .filter(|raw| !raw.is_empty());
+    match raw {
+        None => Ok(default.to_string()),
+        Some(raw) if engines.contains(&raw.as_str()) => Ok(raw),
+        Some(raw) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid {key} in config.json: {raw:?} (want one of {})",
+                engines.join(", ")
+            ),
+        )),
+    }
 }
 
 fn read_approval_mode(value: &Value) -> io::Result<ApprovalMode> {
@@ -1612,6 +1660,8 @@ mod tests {
             extra_skills_source: None,
             mcp_servers: Vec::new(),
             sandbox: crate::sandbox::SandboxPolicy::default_for_platform(),
+            web_search_engine: crate::web::DEFAULT_SEARCH_ENGINE.to_string(),
+            web_fetch_engine: crate::web::DEFAULT_FETCH_ENGINE.to_string(),
             path: PathBuf::from("config.json"),
         };
 
@@ -1656,7 +1706,7 @@ mod tests {
             "hashline_edit",
             "apply_patch",
         ];
-        let network_tools = ["web_fetch"];
+        let network_tools = ["web_fetch", "web_search"];
         let free_tools = ["read", "ls", "ripgrep", "outline", "spawn_agent"];
 
         for tool in shell_tools {
@@ -1923,6 +1973,34 @@ mod tests {
             read_sandbox(&json!({ "command_rules": [{ "prefix": "", "action": "allow" }] }))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn read_web_engine_defaults_and_validates() {
+        let engines = crate::web::FETCH_ENGINES;
+        assert_eq!(
+            read_web_engine(&json!({}), "web_fetch_engine", "local", engines).unwrap(),
+            "local"
+        );
+        assert_eq!(
+            read_web_engine(
+                &json!({ "web_fetch_engine": " Jina " }),
+                "web_fetch_engine",
+                "local",
+                engines
+            )
+            .unwrap(),
+            "jina"
+        );
+        let error = read_web_engine(
+            &json!({ "web_fetch_engine": "brave" }),
+            "web_fetch_engine",
+            "local",
+            engines,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("web_fetch_engine"));
     }
 
     #[test]

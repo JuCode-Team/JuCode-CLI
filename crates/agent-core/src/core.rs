@@ -1744,7 +1744,19 @@ impl AgentCore {
         } else {
             Vec::new()
         };
-        let prompt_tools = crate::tools::prompt_tool_names(&self.config.edit_tools, true);
+        // Read the session from disk: Desktop or another engine may have
+        // logged in or out since this engine last loaded auth.json.
+        let signed_in = AuthStore::load_or_create(self.config.encrypt_secrets)
+            .is_ok_and(|auth| auth.jucode_tokens().is_some());
+        self.tool_state.set_web(Some(crate::web::WebTools {
+            api_url: self.config.jucode_api_url.clone(),
+            encrypt_secrets: self.config.encrypt_secrets,
+            search_engine: self.config.web_search_engine.clone(),
+            fetch_engine: self.config.web_fetch_engine.clone(),
+            signed_in,
+        }));
+        let prompt_tools =
+            crate::tools::prompt_tool_names(&self.config.edit_tools, true, signed_in);
         let mut system_prompt = build_system_prompt(
             &base_prompt,
             &PromptContext {

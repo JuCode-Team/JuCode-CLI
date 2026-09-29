@@ -23,6 +23,7 @@ mod tokens;
 mod tools;
 mod trust;
 pub mod update;
+mod web;
 mod web_fetch;
 
 pub use config::{builtin_providers, models_for_provider, ApprovalMode, ModelConfig};

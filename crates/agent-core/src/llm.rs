@@ -1344,6 +1344,12 @@ impl OpenAiClient {
     /// rejection reason when `name` is an edit tool that is not enabled;
     /// None means the tool may run.
     fn disabled_tool_error(&self, name: &str) -> Option<String> {
+        if name == "web_search" && !self.tool_state.web_search_enabled() {
+            return Some(
+                "web_search runs through the JuCode gateway and needs a JuCode login. Run /login."
+                    .to_string(),
+            );
+        }
         if let Some(canonical) = crate::config::canonical_edit_tool_name(name) {
             if !self.enabled_edit_tools.iter().any(|tool| tool == canonical) {
                 let enabled = if self.enabled_edit_tools.is_empty() {

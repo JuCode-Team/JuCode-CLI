@@ -482,6 +482,7 @@ pub(crate) fn tool_kind(name: &str) -> &'static str {
         "write" | "edit" | "str_replace" | "hashline_edit" | "apply_patch" => "edit",
         "bash" | "write_stdin" => "execute",
         "web_fetch" => "fetch",
+        "web_search" => "search",
         "plan" | "goal" => "think",
         _ => "other",
     }

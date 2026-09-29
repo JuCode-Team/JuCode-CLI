@@ -259,6 +259,7 @@ pub fn definitions() -> Vec<Value> {
             }
         }),
         crate::web_fetch::definition(),
+        crate::web::search_definition(),
     ])
 }
 
@@ -268,7 +269,11 @@ pub fn definitions() -> Vec<Value> {
 /// would actually be offered. Dynamic tools added per turn in
 /// `OpenAiClient::tool_definitions` (MCP, goal/plan) are not part
 /// of this list.
-pub fn prompt_tool_names(edit_tools: &[String], subagents: bool) -> Vec<&'static str> {
+pub fn prompt_tool_names(
+    edit_tools: &[String],
+    subagents: bool,
+    web_search: bool,
+) -> Vec<&'static str> {
     let mut names = vec!["read"];
     for name in crate::config::EDIT_TOOL_NAMES {
         if edit_tools.iter().any(|tool| tool == name) {
@@ -285,6 +290,9 @@ pub fn prompt_tool_names(edit_tools: &[String], subagents: bool) -> Vec<&'static
         "checkpoint",
         "web_fetch",
     ]);
+    if web_search {
+        names.push("web_search");
+    }
     if subagents {
         names.extend([
             "spawn_agent",
@@ -378,7 +386,8 @@ pub fn run_tool_with_events(
         "ripgrep" => ripgrep(&args, cwd, extra_read_roots),
         "outline" => outline_file(&args, cwd, extra_read_roots),
         "checkpoint" => checkpoint_tool(&args, cwd, state),
-        "web_fetch" => crate::web_fetch::run(&args),
+        "web_fetch" => crate::web::run_fetch(&args, state.web().as_ref()),
+        "web_search" => crate::web::run_search(&args, state.web().as_ref()),
         _ => json!({ "error": format!("unknown tool: {name}") }),
     };
     tool_result(name, result, cwd)
@@ -2383,6 +2392,9 @@ struct ToolStateInner {
     /// When set, shell commands run in this OS sandbox and file writes are
     /// checked against it.
     sandbox: Option<crate::sandbox::SandboxPolicy>,
+    /// Gateway settings for the web tools; None fetches locally and leaves
+    /// web_search unavailable.
+    web: Option<crate::web::WebTools>,
 }
 
 impl ToolState {
@@ -2394,6 +2406,21 @@ impl ToolState {
 
     pub fn sandbox(&self) -> Option<crate::sandbox::SandboxPolicy> {
         self.0.lock().ok().and_then(|inner| inner.sandbox.clone())
+    }
+
+    pub fn set_web(&self, web: Option<crate::web::WebTools>) {
+        if let Ok(mut inner) = self.0.lock() {
+            inner.web = web;
+        }
+    }
+
+    pub fn web(&self) -> Option<crate::web::WebTools> {
+        self.0.lock().ok().and_then(|inner| inner.web.clone())
+    }
+
+    /// web_search runs through the gateway, so it needs a JuCode session.
+    pub fn web_search_enabled(&self) -> bool {
+        self.web().is_some_and(|web| web.signed_in)
     }
 
     fn mark_read(&self, path: &Path) {
@@ -4077,7 +4104,8 @@ mod tests {
                 "ripgrep",
                 "outline",
                 "checkpoint",
-                "web_fetch"
+                "web_fetch",
+                "web_search"
             ]
         );
         assert!(tools
@@ -4100,7 +4128,8 @@ mod tests {
                     .is_none_or(|canonical| edit_tools.iter().any(|tool| tool == canonical))
             })
             .collect::<Vec<_>>();
-        assert_eq!(prompt_tool_names(&edit_tools, false), expected);
+        assert_eq!(prompt_tool_names(&edit_tools, false, true), expected);
+        assert!(!prompt_tool_names(&edit_tools, false, false).contains(&"web_search"));
 
         let all = vec![
             "str_replace".to_string(),
@@ -4108,7 +4137,7 @@ mod tests {
             "write".to_string(),
             "apply_patch".to_string(),
         ];
-        let names = prompt_tool_names(&all, true);
+        let names = prompt_tool_names(&all, true, false);
         assert_eq!(
             names,
             [
