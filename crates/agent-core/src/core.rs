@@ -1097,50 +1097,9 @@ impl AgentCore {
         if self.config.provider != "jucode" {
             return self.ensure_omp_credentials();
         }
-        // Reload auth.json from disk first. The Desktop shell shares
-        // ~/.jucode/auth.json and may have rotated the (single-use) refresh
-        // token out-of-band; picking up its tokens avoids refreshing with a
-        // stale token and getting a spurious "session expired".
-        self.auth = AuthStore::load_or_create(self.config.encrypt_secrets)
-            .map_err(|error| format!("failed to reload auth.json: {error}"))?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let (access_ok, refresh_token, refresh_alive) = match self.auth.jucode_tokens() {
-            Some(t) => (
-                t.access_expires_at > now + 120,
-                t.refresh_token.clone(),
-                t.refresh_expires_at > now,
-            ),
-            None => return Err("not logged in to JuCode. Run /login.".to_string()),
-        };
-        if access_ok {
-            return Ok(());
-        }
-        if !refresh_alive {
-            self.auth.clear_jucode();
-            let _ = self.auth.save();
-            return Err("JuCode session expired. Run /login to sign in again.".to_string());
-        }
-        match oauth::refresh(&self.config.jucode_api_url, &refresh_token) {
-            Ok(t) => {
-                crate::log_info!("oauth", "refreshed jucode access token");
-                self.auth.set_jucode_tokens(JucodeTokens {
-                    access_token: t.access_token,
-                    refresh_token: t.refresh_token,
-                    access_expires_at: t.access_expires_at,
-                    refresh_expires_at: t.refresh_expires_at,
-                });
-                self.auth.save().map_err(|error| error.to_string())
-            }
-            Err(error) => {
-                crate::log_error!("oauth", "token refresh failed", error = error.clone());
-                Err(format!(
-                    "failed to refresh JuCode session: {error}. Run /login."
-                ))
-            }
-        }
+        self.auth =
+            oauth::ensure_session(&self.config.jucode_api_url, self.config.encrypt_secrets)?;
+        Ok(())
     }
 
     /// Refresh path for omp OAuth credentials (see

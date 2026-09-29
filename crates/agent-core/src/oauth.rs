@@ -6,6 +6,7 @@
 //! what is JuCode's own: the gateway endpoints, the device label, and the
 //! marketplace model list.
 
+use crate::config::{AuthStore, JucodeTokens};
 use llm_provider_kit::oauth::{
     open_browser, parse_callback_query, pkce_challenge, random_token, unix_now, url_encode,
     write_callback_response,
@@ -15,6 +16,7 @@ use std::{
     io::{BufRead, BufReader},
     net::TcpListener,
     process::Command,
+    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
@@ -168,6 +170,60 @@ pub fn refresh(api_url: &str, refresh_token: &str) -> Result<Tokens, String> {
             "refresh_token": refresh_token,
         }));
     parse_tokens(&json_response(response)?)
+}
+
+/// Serializes session checks within the process. Refresh tokens are single
+/// use, so the turn loop and a tool thread refreshing at once would burn the
+/// session.
+static SESSION_REFRESH: Mutex<()> = Mutex::new(());
+
+/// Reloads auth.json and returns it holding a JuCode access token that is good
+/// for at least two more minutes, refreshing the session first when needed.
+pub fn ensure_session(api_url: &str, encrypt_secrets: bool) -> Result<AuthStore, String> {
+    let _guard = SESSION_REFRESH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Reload from disk first. The Desktop shell shares ~/.jucode/auth.json and
+    // may have rotated the refresh token out-of-band; picking up its tokens
+    // avoids refreshing with a stale one and a spurious "session expired".
+    let mut auth = AuthStore::load_or_create(encrypt_secrets)
+        .map_err(|error| format!("failed to reload auth.json: {error}"))?;
+    let now = unix_now();
+    let (access_ok, refresh_token, refresh_alive) = match auth.jucode_tokens() {
+        Some(t) => (
+            t.access_expires_at > now + 120,
+            t.refresh_token.clone(),
+            t.refresh_expires_at > now,
+        ),
+        None => return Err("not logged in to JuCode. Run /login.".to_string()),
+    };
+    if access_ok {
+        return Ok(auth);
+    }
+    if !refresh_alive {
+        auth.clear_jucode();
+        let _ = auth.save();
+        return Err("JuCode session expired. Run /login to sign in again.".to_string());
+    }
+    match refresh(api_url, &refresh_token) {
+        Ok(t) => {
+            crate::log_info!("oauth", "refreshed jucode access token");
+            auth.set_jucode_tokens(JucodeTokens {
+                access_token: t.access_token,
+                refresh_token: t.refresh_token,
+                access_expires_at: t.access_expires_at,
+                refresh_expires_at: t.refresh_expires_at,
+            });
+            auth.save().map_err(|error| error.to_string())?;
+            Ok(auth)
+        }
+        Err(error) => {
+            crate::log_error!("oauth", "token refresh failed", error = error.clone());
+            Err(format!(
+                "failed to refresh JuCode session: {error}. Run /login."
+            ))
+        }
+    }
 }
 
 fn parse_tokens(value: &Value) -> Result<Tokens, String> {
