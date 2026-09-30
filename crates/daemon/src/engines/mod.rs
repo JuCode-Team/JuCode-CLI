@@ -5,6 +5,7 @@
 //! snapshot of each session (state events, transcript, pending approvals) for
 //! clients that start watching mid-session.
 
+pub mod acp;
 pub mod claude;
 pub mod codex;
 
@@ -33,6 +34,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 pub enum Kind {
     Claude,
     Codex,
+    Acp,
 }
 
 impl Kind {
@@ -41,6 +43,7 @@ impl Kind {
             "" | "jucode" => Ok(None),
             "claude" => Ok(Some(Kind::Claude)),
             "codex" => Ok(Some(Kind::Codex)),
+            "acp" => Ok(Some(Kind::Acp)),
             other => Err(format!("unknown engine {other}")),
         }
     }
@@ -49,6 +52,7 @@ impl Kind {
         match self {
             Kind::Claude => "claude",
             Kind::Codex => "codex",
+            Kind::Acp => "acp",
         }
     }
 }
@@ -62,6 +66,10 @@ pub struct Options {
     pub resume: Option<String>,
     /// Claude: resume the conversation as it was at this message.
     pub resume_at: Option<String>,
+    /// ACP: the agent's command line and extra environment.
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
 }
 
 impl Options {
@@ -78,7 +86,33 @@ impl Options {
             model: text("model"),
             resume: None,
             resume_at: text("resume_at"),
+            command: text("command"),
+            args: value["args"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|arg| arg.as_str().map(str::to_string))
+                .collect(),
+            env: value["env"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
+                .collect(),
         }
+    }
+
+    /// Environment names an agent may be given: plain names, never ones that
+    /// change how programs load.
+    pub fn check_env(&self) -> Result<(), String> {
+        for (name, _) in &self.env {
+            let plain =
+                !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !plain || name.starts_with("DYLD_") || name.starts_with("LD_") {
+                return Err(format!("environment variable {name} is not allowed"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -125,6 +159,7 @@ fn adapter(kind: Kind, cwd: &Path, options: &Options) -> Box<dyn Adapter> {
     match kind {
         Kind::Claude => Box::new(claude::Claude::new(options)),
         Kind::Codex => Box::new(codex::Codex::new(cwd, options)),
+        Kind::Acp => Box::new(acp::Acp::new(cwd)),
     }
 }
 
@@ -132,6 +167,7 @@ fn command(kind: Kind, id: &str, options: &Options) -> Command {
     match kind {
         Kind::Claude => claude::command(id, options),
         Kind::Codex => codex::command(),
+        Kind::Acp => acp::command(options),
     }
 }
 
@@ -611,12 +647,17 @@ pub fn log_level(line: &str) -> Option<&str> {
     (stamped && matches!(level, "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE")).then_some(level)
 }
 
-/// The engine binary: `<NAME>_BIN`, then PATH, then the usual install
-/// directories, else the bare name.
+/// The engine binary: `env_override`, else `find_program`.
 pub fn resolve(name: &str, env_override: &str, extra: &[PathBuf]) -> PathBuf {
-    if let Some(path) = std::env::var_os(env_override).filter(|path| !path.is_empty()) {
-        return PathBuf::from(path);
+    match std::env::var_os(env_override).filter(|path| !path.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => find_program(name, extra),
     }
+}
+
+/// `name` on PATH, then in the usual install directories and `extra`, else
+/// the bare name.
+pub fn find_program(name: &str, extra: &[PathBuf]) -> PathBuf {
     let exe = if cfg!(windows) {
         format!("{name}.exe")
     } else {

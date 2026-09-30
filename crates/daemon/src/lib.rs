@@ -292,6 +292,24 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         });
         return;
     }
+    // An ACP agent is a command line to run: only the desktop names one.
+    if matches!(name, "session_create" | "session_open") && op["engine"] == "acp" {
+        if !hub.is_local(client) {
+            reply(json!({ "type": "error", "message": "only the desktop can start ACP agents" }));
+            return;
+        }
+        let options = engines::Options::from_json(&op["options"]);
+        if let Err(message) = options.check_env().and_then(|()| {
+            options
+                .command
+                .as_ref()
+                .map(|_| ())
+                .ok_or_else(|| "an ACP session needs options.command".to_string())
+        }) {
+            reply(json!({ "type": "error", "message": message }));
+            return;
+        }
+    }
     let result = match (name, session) {
         ("ping", _) => Ok(json!({ "type": "pong" })),
         ("workspaces", _) => Ok(projects::workspaces_json(hub)),

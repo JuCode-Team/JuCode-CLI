@@ -1612,3 +1612,41 @@ fn a_codex_session_is_named_by_its_thread_and_resumes_with_its_history() {
         .iter()
         .any(|i| i["role"] == "tool" && i["name"] == "bash"));
 }
+
+#[test]
+fn only_the_desktop_starts_acp_agents_which_run_like_any_session() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-acp");
+    fs::create_dir_all(&dir).unwrap();
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_acp.py");
+    let options = json!({ "command": script, "args": ["--flag"], "env": { "FAKE_ACP_GREETING": "hey" } });
+
+    // A paired device may not name a command to run.
+    let mut desktop = Client::connect(&daemon);
+    desktop.send(json!({ "op": "pair_start", "id": 1 }));
+    let code = desktop.until(|f| f["id"] == 1).pop().unwrap()["code"].as_str().unwrap().to_string();
+    let (_, response) = http(&daemon, &pair_request(&code));
+    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let mut phone = Client::connect_with(&daemon, body["token"].as_str().unwrap());
+    let refused = request(&mut phone, json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": options }));
+    assert_eq!(refused["type"], "error", "{refused}");
+    let bad_env = request(&mut desktop, json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": { "command": script, "env": { "DYLD_INSERT_LIBRARIES": "x" } } }));
+    assert_eq!(bad_env["type"], "error");
+
+    let created = request(&mut desktop, json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": options }));
+    let session = created["session"].as_str().unwrap_or_else(|| panic!("{created}")).to_string();
+    phone.send(json!({ "op": "watch", "session": session }));
+    phone.until(|f| f["session"] == session.as_str() && f["type"] == "attended");
+    phone.send(json!({ "op": "user_message", "session": session, "content": "hi" }));
+    let frames = phone.until(turn_done(&session));
+    assert_eq!(claude_reply(&frames, &session), "ok: hi --flag hey");
+
+    // The phone answers the agent's permission prompt.
+    phone.send(json!({ "op": "user_message", "session": session, "content": "use a tool" }));
+    let asked = phone.until(|f| f["session"] == session.as_str() && f["type"] == "approval_request");
+    let call = asked.last().unwrap()["call_id"].clone();
+    phone.send(json!({ "op": "approve", "session": session, "call_id": call, "decision": "allow" }));
+    let frames = phone.until(turn_done(&session));
+    assert!(frames.iter().any(|f| f["type"] == "tool_output" && f["is_error"] == false), "{frames:#?}");
+}

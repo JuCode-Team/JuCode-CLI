@@ -1512,6 +1512,7 @@ impl Adapter for Claude {
                 .or(self.requested_model.clone()),
             resume: (!self.conversation.is_empty()).then(|| self.conversation.clone()),
             resume_at: None,
+            ..Options::default()
         })
     }
 

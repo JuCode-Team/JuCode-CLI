@@ -267,7 +267,7 @@ impl Hub {
             Some(kind) => {
                 // Claude Code takes its conversation id from us; others name it.
                 let id = match kind {
-                    engines::Kind::Claude => Some(engines::new_uuid()?),
+                    engines::Kind::Claude | engines::Kind::Acp => Some(engines::new_uuid()?),
                     engines::Kind::Codex => None,
                 };
                 engines::spawn(Arc::clone(self), kind, id, cwd.clone(), options, vec![])?
@@ -321,6 +321,8 @@ impl Hub {
                     Some(engines::Kind::Codex) => engines::codex::saved(&cwd)
                         .iter()
                         .any(|(saved, _, _)| saved == id),
+                    // ACP agents keep no conversations to reopen.
+                    Some(engines::Kind::Acp) => false,
                 };
                 if !saved {
                     return Err(format!("no session {id} in {}", cwd.display()));
@@ -359,10 +361,11 @@ impl Hub {
                         .iter()
                         .any(|(saved, _, _)| saved == id),
                     engines::Kind::Codex => true,
+                    engines::Kind::Acp => false,
                 };
                 let transcript = match kind {
                     engines::Kind::Claude => engines::claude::transcript(&record.cwd, id),
-                    engines::Kind::Codex => Vec::new(),
+                    engines::Kind::Codex | engines::Kind::Acp => Vec::new(),
                 };
                 let options = engines::Options {
                     resume: saved.then(|| id.to_string()),

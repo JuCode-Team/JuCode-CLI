@@ -134,7 +134,7 @@ every connected client.
 | `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers`, `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at` |
 | `session_meta` | `session`, `title` and/or `archived` | none; every client receives the new `sessions` list. An empty title goes back to the engine's label |
 | `session_history` | `cwd` | `session_history`: every session saved in `cwd`, newest first, whoever ran it (daemon, TUI, `jucode serve`), with `title`, `updated_at`, `entries`, `archived`, `agent`, `open` |
-| `session_create` | `cwd`, optional `engine` (`jucode`, default, `claude` or `codex`) and `options` | `session_created` with `session`; the session's startup events follow. See "Other engines" |
+| `session_create` | `cwd`, optional `engine` (`jucode`, default, `claude`, `codex` or `acp`) and `options` | `session_created` with `session`; the session's startup events follow. See "Other engines" |
 | `session_open` | `session`, optional `cwd`, `engine`, `options` | `session_opened`; with `cwd`, also opens a session saved there that the daemon never hosted. Reopens a closed session (or one from before a restart), resuming its transcript and its undecided deferred actions |
 | `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped |
 | `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
@@ -199,7 +199,15 @@ clients need nothing engine-specific. `options`:
 | --- | --- |
 | `approval_mode` | `manual`/`read-only` (Claude's `default`), `plan`, `auto`, `auto-edit`, `full-access`/`full-auto` |
 | `model` | Model to start with |
-| `resume_at` | Resume the conversation as it was at this assistant message uuid |
+| `resume_at` | Claude Code: resume the conversation as it was at this assistant message uuid |
+| `command`, `args`, `env` | ACP: the agent's command line and extra environment variables (plain names; no `DYLD_*`/`LD_*`) |
+
+`engine: "acp"` runs an Agent Client Protocol agent (`jucode acp`,
+`gemini --experimental-acp`, ...) from `options.command`. Only local
+clients may start or reopen one, since that names a program to run; paired
+devices watch and drive it like any session. ACP agents keep no
+conversation the daemon can resume, so reopening an ACP session starts a
+new conversation under the same session id.
 
 The session id is the engine's conversation id (Claude Code's session id,
 Codex's thread id), so reopening a closed session resumes the same
