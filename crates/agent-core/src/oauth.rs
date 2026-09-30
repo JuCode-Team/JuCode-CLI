@@ -141,6 +141,8 @@ fn exchange_code(
     device_name: &str,
 ) -> Result<Tokens, String> {
     let url = format!("{}/v1/oauth/token", base_url);
+    // ureq::Error is large; it is ureq's own type, passed through as is.
+    #[allow(clippy::result_large_err)]
     let response = send_with_retry(|| {
         ureq::post(&url)
             .set("Content-Type", "application/json")
@@ -164,6 +166,8 @@ pub fn refresh(api_url: &str, refresh_token: &str) -> Result<Tokens, String> {
         return Err("JuCode API URL cannot be empty".to_string());
     }
     let url = format!("{}/v1/oauth/token", api_url);
+    // ureq::Error is large; it is ureq's own type, passed through as is.
+    #[allow(clippy::result_large_err)]
     let response = send_with_retry(|| {
         ureq::post(&url)
             .set("Content-Type", "application/json")
@@ -273,6 +277,8 @@ pub fn get_json(api_url: &str, path: &str, access_token: &str) -> Result<Value, 
 
 fn fetch_models(base_url: &str, access_token: &str) -> Result<Vec<OAuthModel>, String> {
     let url = format!("{}/v1/models", base_url);
+    // ureq::Error is large; it is ureq's own type, passed through as is.
+    #[allow(clippy::result_large_err)]
     let value = json_response(send_with_retry(|| {
         ureq::get(&url)
             .set("Authorization", &format!("Bearer {access_token}"))
@@ -357,6 +363,7 @@ fn read_u64_field(value: &Value, keys: &[&str]) -> Option<u64> {
 /// (DNS, connect, TLS setup). Proxies on flaky links drop these now and then,
 /// and a one-time authorization code or single-use refresh token must not be
 /// lost to one; a request that reached the server is never repeated.
+#[allow(clippy::result_large_err)] // ureq::Error, passed through as is
 fn send_with_retry(
     send: impl Fn() -> Result<ureq::Response, ureq::Error>,
 ) -> Result<ureq::Response, ureq::Error> {
