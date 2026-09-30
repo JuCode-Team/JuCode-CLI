@@ -351,11 +351,18 @@ impl Hub {
                 (ops, generation)
             }
             Some(kind) => {
+                // A conversation with no turn yet was never saved: start it
+                // again under the same id instead of resuming it.
+                let saved = match kind {
+                    engines::Kind::Claude => engines::claude::saved(&record.cwd)
+                        .iter()
+                        .any(|(saved, _, _)| saved == id),
+                };
                 let transcript = match kind {
                     engines::Kind::Claude => engines::claude::transcript(&record.cwd, id),
                 };
                 let options = engines::Options {
-                    resume: Some(id.to_string()),
+                    resume: saved.then(|| id.to_string()),
                     ..options
                 };
                 engines::spawn(

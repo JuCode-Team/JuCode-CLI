@@ -1484,6 +1484,23 @@ fn full_access_restarts_claude_on_the_same_conversation_and_reopening_resumes_it
     let session = created["session"].as_str().unwrap().to_string();
     client.send(json!({ "op": "watch", "session": session }));
     client.until(is_ready(&session));
+    // Closed before its first turn: nothing saved, so it starts again.
+    client.send(json!({ "op": "session_close", "session": session }));
+    client.until(|f| f["type"] == "session_closed" && f["session"] == session.as_str());
+    request(
+        &mut client,
+        json!({ "op": "session_open", "session": session }),
+    );
+    let again = starts(&log).pop().unwrap();
+    assert!(
+        again
+            .windows(2)
+            .any(|w| w == ["--session-id", session.as_str()]),
+        "{again:?}"
+    );
+    client.send(json!({ "op": "watch", "session": session }));
+    client.until(is_ready(&session));
+
     client.send(json!({ "op": "user_message", "session": session, "content": "first" }));
     client.until(turn_done(&session));
 
