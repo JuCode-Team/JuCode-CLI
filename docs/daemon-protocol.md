@@ -200,6 +200,7 @@ clients need nothing engine-specific. `options`:
 | `approval_mode` | `manual`/`read-only` (Claude's `default`), `plan`, `auto`, `auto-edit`, `full-access`/`full-auto` |
 | `model` | Model to start with |
 | `resume_at` | Claude Code: resume the conversation as it was at this assistant message uuid |
+| `jucode_gateway` | Claude Code / Codex: `true` runs this session through the JuCode gateway on the user's JuCode login; `false` on the provider in the user's own Claude Code / Codex config. The endpoint and key go to this process only (Claude: `--settings` file; Codex: `-c` overrides and an env var), never to the user's config files. Omitted on `session_open`: as the session last ran |
 | `command`, `args`, `env` | ACP: the agent's command line and extra environment variables (plain names; no `DYLD_*`/`LD_*`) |
 
 `engine: "acp"` runs an Agent Client Protocol agent (`jucode acp`,

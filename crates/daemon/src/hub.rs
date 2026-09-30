@@ -266,6 +266,7 @@ impl Hub {
             return Err(format!("not a directory: {}", cwd.display()));
         }
         let agent = agent.map(str::to_string);
+        let gateway = options.gateway == Some(true);
         let (id, ops, generation) = match engine {
             None => session::spawn(Arc::clone(self), cwd.clone(), None, agent.clone())?,
             Some(kind) => {
@@ -278,7 +279,13 @@ impl Hub {
             }
         };
         self.store
-            .record_engine_session(&id, &cwd, agent.as_deref(), engine.map(engines::Kind::name))
+            .record_engine_session(
+                &id,
+                &cwd,
+                agent.as_deref(),
+                engine.map(engines::Kind::name),
+                gateway,
+            )
             .map_err(|error| error.to_string())?;
         lock(&self.untitled).insert(id.clone());
         self.host(id.clone(), ops, cwd, generation);
@@ -342,11 +349,13 @@ impl Hub {
                     archived: false,
                     hidden: false,
                     engine: engine.map(|kind| kind.name().to_string()),
+                    gateway: false,
                 }
             }
             (None, None) => return Err(format!("unknown session {id}")),
         };
         let kind = engines::Kind::parse(record.engine.as_deref().unwrap_or_default())?;
+        let mut gateway = false;
         let (ops, generation) = match kind {
             None => {
                 let (_, ops, generation) = session::spawn(
@@ -373,10 +382,13 @@ impl Hub {
                     engines::Kind::Claude => engines::claude::transcript(&record.cwd, id),
                     engines::Kind::Codex | engines::Kind::Acp => Vec::new(),
                 };
+                // A client that does not say (a phone) keeps how it last ran.
                 let options = engines::Options {
                     resume: saved.then(|| id.to_string()),
+                    gateway: Some(options.gateway.unwrap_or(record.gateway)),
                     ..options
                 };
+                gateway = options.gateway == Some(true);
                 // A new start keeps the recorded id; a resume opens it.
                 let fresh = options.resume.is_none().then(|| id.to_string());
                 let (_, ops, generation) = engines::spawn(
@@ -397,6 +409,7 @@ impl Hub {
                     &record.cwd,
                     record.agent.as_deref(),
                     record.engine.as_deref(),
+                    gateway,
                 )
                 .map_err(|error| error.to_string())?;
         }

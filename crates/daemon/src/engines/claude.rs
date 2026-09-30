@@ -35,6 +35,26 @@ pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const DEFAULT_EFFORT: &str = "medium";
 const SUMMARY_CAP: usize = 4000;
 
+/// This session talks to the JuCode gateway: a settings file (owner-only)
+/// that overrides the endpoint and token for this process alone. An empty
+/// ANTHROPIC_API_KEY masks one the user's own settings set.
+pub fn use_gateway(command: &mut Command, api: &str, token: &str) -> Result<(), String> {
+    let api = super::gateway_url(api)?;
+    let settings = json!({ "env": {
+        "ANTHROPIC_BASE_URL": api,
+        "ANTHROPIC_AUTH_TOKEN": token,
+        "ANTHROPIC_API_KEY": "",
+    } });
+    let path = home()
+        .join(".jucode")
+        .join("daemon")
+        .join("claude-gateway.json");
+    crate::store::write_private(&path, settings.to_string().as_bytes())
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    command.arg("--settings").arg(path);
+    Ok(())
+}
+
 pub fn command(id: &str, options: &Options) -> Command {
     let program = resolve(
         "claude",

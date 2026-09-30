@@ -29,6 +29,22 @@ pub fn command() -> Command {
     command
 }
 
+/// The env var a gateway session reads its key from.
+const GATEWAY_KEY_ENV: &str = "JUCODE_GATEWAY_TOKEN";
+
+/// This session talks to the JuCode gateway: config overrides for this
+/// process alone, with the key in its environment (never in argv).
+pub fn use_gateway(command: &mut Command, api: &str, token: &str) -> Result<(), String> {
+    let api = super::gateway_url(api)?;
+    command
+        .args(["-c", "model_provider=\"jucode_gateway\"", "-c"])
+        .arg(format!(
+            "model_providers.jucode_gateway={{name=\"JuCode\",base_url=\"{api}/v1\",env_key=\"{GATEWAY_KEY_ENV}\",wire_api=\"responses\"}}"
+        ))
+        .env(GATEWAY_KEY_ENV, token);
+    Ok(())
+}
+
 fn text(value: &Value) -> &str {
     value.as_str().unwrap_or_default()
 }
@@ -1285,6 +1301,34 @@ mod tests {
             ]
         );
         c
+    }
+
+    #[test]
+    fn the_gateway_goes_to_this_process_only() {
+        let mut command = std::process::Command::new("codex");
+        use_gateway(&mut command, "https://api.jucode.net/", "tok").unwrap();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args[1], "model_provider=\"jucode_gateway\"");
+        assert!(args[3].contains("base_url=\"https://api.jucode.net/v1\""));
+        assert!(!args.concat().contains("tok\""));
+        let env: Vec<_> = command.get_envs().collect();
+        assert_eq!(
+            env,
+            [(
+                std::ffi::OsStr::new("JUCODE_GATEWAY_TOKEN"),
+                Some(std::ffi::OsStr::new("tok"))
+            )]
+        );
+        assert!(use_gateway(&mut command, "http://api.jucode.net", "tok").is_err());
+        assert!(use_gateway(&mut command, "https://a\"b", "tok").is_err());
+        assert_eq!(
+            Options::from_json(&json!({ "jucode_gateway": true })).gateway,
+            Some(true)
+        );
+        assert_eq!(Options::from_json(&json!({})).gateway, None);
     }
 
     #[test]

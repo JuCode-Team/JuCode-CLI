@@ -44,6 +44,8 @@ pub struct SessionRecord {
     pub hidden: bool,
     /// The engine running it; None: jucode.
     pub engine: Option<String>,
+    /// Claude / Codex: it last ran through the JuCode gateway.
+    pub gateway: bool,
 }
 
 /// A message for an agent: from the user, another agent or a timer.
@@ -170,7 +172,7 @@ impl Store {
         cwd: &std::path::Path,
         agent: Option<&str>,
     ) -> io::Result<()> {
-        self.record_engine_session(id, cwd, agent, None)
+        self.record_engine_session(id, cwd, agent, None, false)
     }
 
     /// Like `record_session`, for a session run by `engine` (None: jucode).
@@ -180,6 +182,7 @@ impl Store {
         cwd: &std::path::Path,
         agent: Option<&str>,
         engine: Option<&str>,
+        gateway: bool,
     ) -> io::Result<()> {
         let mut entry = json!({
             "kind": "open", "session": id, "cwd": cwd.display().to_string(),
@@ -187,6 +190,9 @@ impl Store {
         });
         if let Some(engine) = engine {
             entry["engine"] = json!(engine);
+        }
+        if gateway {
+            entry["gateway"] = json!(true);
         }
         self.append(SESSIONS, entry)
     }
@@ -276,9 +282,11 @@ impl Store {
                             archived: false,
                             hidden: false,
                             engine: entry["engine"].as_str().map(str::to_string),
+                            gateway: false,
                         }
                     });
                     record.closed = false;
+                    record.gateway = entry["gateway"] == true;
                 }
                 Some("close") => {
                     if let Some(record) = records.get_mut(id) {
@@ -759,6 +767,21 @@ mod tests {
             .record_session("a", std::path::Path::new("/p/a"), None)
             .unwrap();
         assert!(!store.sessions()[0].closed);
+    }
+
+    #[test]
+    fn a_session_remembers_whether_it_last_ran_through_the_gateway() {
+        let store = store("gateway");
+        let cwd = std::path::Path::new("/p");
+        store
+            .record_engine_session("c", cwd, None, Some("claude"), true)
+            .unwrap();
+        assert!(store.sessions()[0].gateway);
+        store.record_session_closed("c").unwrap();
+        store
+            .record_engine_session("c", cwd, None, Some("claude"), false)
+            .unwrap();
+        assert!(!store.sessions()[0].gateway);
     }
 
     #[test]

@@ -70,6 +70,10 @@ pub struct Options {
     pub command: Option<String>,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Claude / Codex: talk to the JuCode gateway on the user's JuCode login
+    /// instead of the provider in their own config (which stays untouched).
+    /// None: as the session last ran.
+    pub gateway: Option<bool>,
 }
 
 impl Options {
@@ -99,6 +103,7 @@ impl Options {
                 .flatten()
                 .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
                 .collect(),
+            gateway: value["jucode_gateway"].as_bool(),
         }
     }
 
@@ -163,12 +168,30 @@ fn adapter(kind: Kind, cwd: &Path, options: &Options) -> Box<dyn Adapter> {
     }
 }
 
-fn command(kind: Kind, id: &str, options: &Options) -> Command {
-    match kind {
+fn command(kind: Kind, id: &str, options: &Options) -> Result<Command, String> {
+    let mut command = match kind {
         Kind::Claude => claude::command(id, options),
         Kind::Codex => codex::command(),
         Kind::Acp => acp::command(options),
+    };
+    if options.gateway == Some(true) {
+        let (api, token) = jucode_agent_core::jucode_gateway_credentials()?;
+        match kind {
+            Kind::Claude => claude::use_gateway(&mut command, &api, &token)?,
+            Kind::Codex => codex::use_gateway(&mut command, &api, &token)?,
+            Kind::Acp => return Err("an ACP agent has no JuCode gateway mode".to_string()),
+        }
     }
+    Ok(command)
+}
+
+/// The gateway URL as it may go into a spawned tool's config.
+fn gateway_url(api: &str) -> Result<&str, String> {
+    let api = api.trim().trim_end_matches('/');
+    if !api.starts_with("https://") || api.contains(['"', '\\', '\n']) {
+        return Err(format!("invalid JuCode API URL: {api}"));
+    }
+    Ok(api)
 }
 
 /// A running engine process: its stdin writer and merged output.
@@ -402,7 +425,7 @@ pub fn spawn(
     transcript: Vec<Value>,
 ) -> Result<(String, Sender<Value>, u64), String> {
     let process = Process::spawn(
-        command(kind, id.as_deref().unwrap_or_default(), &options),
+        command(kind, id.as_deref().unwrap_or_default(), &options)?,
         &cwd,
     )?;
     let (ops_tx, ops) = mpsc::channel();
@@ -521,7 +544,9 @@ impl Session<'_> {
                     next.resume = adapter.conversation().or(next.resume);
                     process.stop();
                     let id = self.id.clone().unwrap_or_default();
-                    match Process::spawn(command(self.kind, &id, &next), &self.cwd) {
+                    match command(self.kind, &id, &next)
+                        .and_then(|command| Process::spawn(command, &self.cwd))
+                    {
                         Ok(started) => {
                             process = started;
                             adapter = self::adapter(self.kind, &self.cwd, &next);
