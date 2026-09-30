@@ -844,6 +844,7 @@ dependencies = [
  "jucode-tui",
  "libc",
  "serde_json",
+ "tungstenite",
 ]
 
 [[package]]

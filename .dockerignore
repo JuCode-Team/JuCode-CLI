@@ -1,0 +1,10 @@
+/target
+/target-*
+/artifacts
+/dist
+/npm/*/bin
+/evals
+/.jucode
+**/node_modules
+.git
+crates/llm-provider-kit/.git

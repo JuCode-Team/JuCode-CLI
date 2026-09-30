@@ -1,4 +1,5 @@
 mod acp;
+mod daemon_admin;
 
 use jucode_agent_core::{
     protocol::{self, event_json},
@@ -379,7 +380,21 @@ fn run_update() -> i32 {
 /// made only once a local client turns it on; `--no-relay` rules it out.
 fn run_daemon(args: &[String]) -> io::Result<i32> {
     let (action, args) = match args.first().map(String::as_str) {
-        Some(action @ ("install" | "uninstall")) => (action, &args[1..]),
+        Some(action @ ("install" | "uninstall" | "pair")) => (action, &args[1..]),
+        // `relay on|off|status`: the state word comes first.
+        Some("relay") => {
+            let state = args.get(1).filter(|arg| !arg.starts_with("--"));
+            let rest = &args[1 + usize::from(state.is_some())..];
+            let listen = match rest {
+                [] => jucode_daemon::DEFAULT_LISTEN.to_string(),
+                [flag, address] if flag == "--listen" => address.clone(),
+                _ => {
+                    eprintln!("usage: jucode daemon relay [on|off|status] [--listen <host:port>]");
+                    return Ok(2);
+                }
+            };
+            return daemon_admin::relay(&listen, state.map(String::as_str));
+        }
         _ => ("run", args),
     };
     let mut listen = jucode_daemon::DEFAULT_LISTEN.to_string();
@@ -397,7 +412,7 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
             ("--relay", Some(url)) => relay = Some(url.clone()),
             _ => {
                 eprintln!(
-                    "usage: jucode daemon [install|uninstall] [--listen <host:port>] [--web <dir>] [--relay <wss url> | --no-relay]"
+                    "usage: jucode daemon [install|uninstall|pair] [--listen <host:port>] [--web <dir>] [--relay <wss url> | --no-relay]\n       jucode daemon relay [on|off|status] [--listen <host:port>]"
                 );
                 return Ok(2);
             }
@@ -423,6 +438,7 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
             },
         )),
         "uninstall" => Some(jucode_daemon::install::uninstall()),
+        "pair" => return daemon_admin::pair(&listen),
         _ => None,
     };
     if let Some(outcome) = outcome {

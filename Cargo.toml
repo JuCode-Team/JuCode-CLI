@@ -19,6 +19,7 @@ jucode-agent-core = { path = "crates/agent-core" }
 jucode-daemon = { path = "crates/daemon" }
 jucode-tui = { path = "crates/tui" }
 serde_json = "1"
+tungstenite = "0.30"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
