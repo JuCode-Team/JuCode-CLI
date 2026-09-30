@@ -641,8 +641,17 @@ pub fn bytes_hash(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Writes a file only the owner can read.
+/// Writes a file only the owner can read, atomically: a reader sees the old
+/// contents or the new ones, never an empty or partial file.
 pub fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("write_private needs a file path"))?;
+    let temp = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -650,7 +659,14 @@ pub fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path)?.write_all(contents)
+    let written = options
+        .open(&temp)
+        .and_then(|mut file| file.write_all(contents).and_then(|_| file.sync_all()))
+        .and_then(|_| fs::rename(&temp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    written
 }
 
 /// `bytes` random bytes as lowercase hex.

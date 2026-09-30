@@ -437,8 +437,11 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
             }
         });
     }
-    let listener = std::net::TcpListener::bind(&listen)?;
     let store = jucode_daemon::Store::open(jucode_daemon::state_dir()?)?;
+    // The token exists before the port answers: a client that connects as
+    // soon as it can (Desktop starting the daemon) reads it right away.
+    store.token()?;
+    let listener = std::net::TcpListener::bind(&listen)?;
     eprintln!(
         "jucode daemon listening on ws://{} (token in {})",
         listener.local_addr()?,
