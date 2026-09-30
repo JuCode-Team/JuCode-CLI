@@ -38,6 +38,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Short reads let one thread both receive and flush, as for local clients.
 const POLL: Duration = Duration::from_millis(20);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// The relay pings the host every 30 s. A connection this long without a
+/// single frame is dead even if the socket never said so: a proxy or a
+/// network change can drop it without the close ever reaching us.
+const SILENCE: Duration = Duration::from_secs(75);
 
 const OPEN: u8 = 1;
 const DATA: u8 = 2;
@@ -304,13 +308,24 @@ fn host_connection(
     // Stream threads send finished frames here; this thread writes them.
     let (out, outgoing) = mpsc::channel::<Vec<u8>>();
     let mut streams: HashMap<u32, Sender<Vec<u8>>> = HashMap::new();
+    let mut heard = Instant::now();
     loop {
         if !hub.relay.enabled() {
             let _ = socket.close(None);
             let _ = socket.flush();
             return Ok(());
         }
-        match socket.read() {
+        if heard.elapsed() > SILENCE {
+            return Err(format!(
+                "no frame from the relay for {} s",
+                SILENCE.as_secs()
+            ));
+        }
+        let read = socket.read();
+        if read.is_ok() {
+            heard = Instant::now();
+        }
+        match read {
             Ok(Message::Binary(bytes)) => match Frame::decode(&bytes) {
                 Some(Frame::Open(id)) => {
                     let (incoming, receiver) = mpsc::channel();
