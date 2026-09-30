@@ -203,6 +203,9 @@ fn rejected(op: &Value) -> Option<String> {
 /// Records deferred-action events before sending any event to clients, so
 /// an action a client sees is always one the daemon can restore.
 fn publish(hub: &Hub, id: &str, event: AgentEvent) {
+    if let AgentEvent::UserMessage(content) = &event {
+        hub.note_user_message(id, content);
+    }
     if let AgentEvent::ActionDeferred(action) = &event {
         if let Err(error) = hub.store.record_deferred(action) {
             hub.broadcast(&json!({

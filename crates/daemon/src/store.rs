@@ -40,6 +40,8 @@ pub struct SessionRecord {
     /// Set by a client; None: the engine's own label for the session.
     pub title: Option<String>,
     pub archived: bool,
+    /// Removed from session lists (its conversation stays on disk).
+    pub hidden: bool,
     /// The engine running it; None: jucode.
     pub engine: Option<String>,
 }
@@ -196,22 +198,27 @@ impl Store {
         )
     }
 
-    /// Renames or (un)archives a session; a field left None is unchanged and
-    /// an empty title goes back to the engine's label.
-    pub fn record_session_meta(
-        &self,
-        id: &str,
-        title: Option<&str>,
-        archived: Option<bool>,
-    ) -> io::Result<()> {
+    /// Renames, (un)archives or hides a session from `changes` (`title`,
+    /// `archived`, `hidden`); fields left out are unchanged and an empty
+    /// title goes back to the engine's label. False when `changes` names
+    /// none of them.
+    pub fn record_session_meta(&self, id: &str, changes: &Value) -> io::Result<bool> {
         let mut entry = json!({ "kind": "meta", "session": id, "at": now() });
-        if let Some(title) = title {
+        let mut changed = false;
+        if let Some(title) = changes["title"].as_str() {
             entry["title"] = json!(title.trim());
+            changed = true;
         }
-        if let Some(archived) = archived {
-            entry["archived"] = json!(archived);
+        for flag in ["archived", "hidden"] {
+            if let Some(value) = changes[flag].as_bool() {
+                entry[flag] = json!(value);
+                changed = true;
+            }
         }
-        self.append(SESSIONS, entry)
+        if changed {
+            self.append(SESSIONS, entry)?;
+        }
+        Ok(changed)
     }
 
     /// Workspaces and their projects: `{rev, workspaces: [...]}`. `rev`
@@ -267,6 +274,7 @@ impl Store {
                             closed: false,
                             title: None,
                             archived: false,
+                            hidden: false,
                             engine: entry["engine"].as_str().map(str::to_string),
                         }
                     });
@@ -284,6 +292,9 @@ impl Store {
                         }
                         if let Some(archived) = entry["archived"].as_bool() {
                             record.archived = archived;
+                        }
+                        if let Some(hidden) = entry["hidden"].as_bool() {
+                            record.hidden = hidden;
                         }
                     }
                 }

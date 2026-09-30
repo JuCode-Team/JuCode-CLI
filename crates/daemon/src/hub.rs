@@ -53,6 +53,9 @@ pub struct Hub {
     /// Pairing code → expiry (ms). Single use.
     pairings: Mutex<HashMap<String, u64>>,
     next_client: AtomicU64,
+    /// Sessions created here that have not had a user message yet: the
+    /// first one becomes their title.
+    untitled: Mutex<HashSet<String>>,
 }
 
 struct Client {
@@ -98,6 +101,7 @@ impl Hub {
             clients: Mutex::new(HashMap::new()),
             pairings: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
+            untitled: Mutex::new(HashSet::new()),
         })
     }
 
@@ -276,6 +280,7 @@ impl Hub {
         self.store
             .record_engine_session(&id, &cwd, agent.as_deref(), engine.map(engines::Kind::name))
             .map_err(|error| error.to_string())?;
+        lock(&self.untitled).insert(id.clone());
         self.host(id.clone(), ops, cwd, generation);
         self.broadcast(&self.agents_json());
         Ok(id)
@@ -335,6 +340,7 @@ impl Hub {
                     closed: true,
                     title: None,
                     archived: false,
+                    hidden: false,
                     engine: engine.map(|kind| kind.name().to_string()),
                 }
             }
@@ -820,12 +826,45 @@ impl Hub {
     }
 
     /// Every recorded session with whether it is hosted right now.
+    /// A session accepted a user message: a new session is titled after
+    /// its first one (first line, 40 characters), as the desktop does.
+    pub fn note_user_message(&self, session: &str, content: &str) {
+        if !lock(&self.untitled).remove(session) {
+            return;
+        }
+        let title: String = content
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(40)
+            .collect();
+        if title.is_empty() {
+            return;
+        }
+        let untouched = self
+            .store
+            .sessions()
+            .iter()
+            .any(|record| record.id == session && record.title.is_none());
+        if untouched
+            && self
+                .store
+                .record_session_meta(session, &json!({ "title": title }))
+                .is_ok()
+        {
+            self.broadcast(&self.sessions_json());
+        }
+    }
+
     pub fn sessions_json(&self) -> Value {
         let records = self.store.sessions();
         let saved = saved_by_id(records.iter().map(|record| record.cwd.as_path()));
         let sessions = lock(&self.sessions);
         let list: Vec<Value> = records
             .into_iter()
+            .filter(|record| !record.hidden)
             .map(|record| {
                 let hosted = sessions.get(&record.id);
                 let cwd = hosted.map(|h| h.cwd.clone()).unwrap_or(record.cwd);
@@ -899,6 +938,11 @@ impl Hub {
                     }),
             )
             .collect();
+        list.retain(|item| {
+            !records
+                .get(item["session"].as_str().unwrap_or_default())
+                .is_some_and(|record| record.hidden)
+        });
         list.sort_by_key(|item| std::cmp::Reverse(item["updated_at"].as_u64().unwrap_or(0)));
         Ok(json!({ "type": "session_history", "cwd": cwd, "sessions": list }))
     }

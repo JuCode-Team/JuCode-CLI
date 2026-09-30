@@ -320,21 +320,14 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             Some(cwd) => hub.session_history(std::path::Path::new(cwd)),
             None => Err("session_history requires cwd".to_string()),
         },
-        ("session_meta", Some(session)) => {
-            let title = op["title"].as_str();
-            let archived = op["archived"].as_bool();
-            if title.is_none() && archived.is_none() {
-                Err("session_meta requires title or archived".to_string())
-            } else {
-                hub.store
-                    .record_session_meta(&session, title, archived)
-                    .map_err(|error| error.to_string())
-                    .map(|()| {
-                        hub.broadcast(&hub.sessions_json());
-                        Value::Null
-                    })
+        ("session_meta", Some(session)) => match hub.store.record_session_meta(&session, &op) {
+            Ok(true) => {
+                hub.broadcast(&hub.sessions_json());
+                Ok(Value::Null)
             }
-        }
+            Ok(false) => Err("session_meta requires title, archived or hidden".to_string()),
+            Err(error) => Err(error.to_string()),
+        },
         ("pair_link", _) => hub.relay.pair_link(hub),
         ("relay_status", _) => Ok(hub.relay.status_json()),
         ("relay_set", _) => match op["enabled"].as_bool() {
