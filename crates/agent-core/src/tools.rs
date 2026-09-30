@@ -1637,12 +1637,18 @@ fn track_tool_group(pid: u32) {
 /// after half a second. Call when the engine process is about to exit, so
 /// nothing it started outlives it.
 pub fn terminate_tool_processes() {
+    let pids = TOOL_GROUPS
+        .get()
+        .and_then(|groups| groups.lock().ok().map(|mut g| std::mem::take(&mut *g)))
+        .unwrap_or_default();
+    terminate_groups(pids);
+}
+
+fn terminate_groups(pids: Vec<u32>) {
+    #[cfg(not(unix))]
+    let _ = pids;
     #[cfg(unix)]
     {
-        let pids = TOOL_GROUPS
-            .get()
-            .and_then(|groups| groups.lock().ok().map(|mut g| std::mem::take(&mut *g)))
-            .unwrap_or_default();
         // Still our unreaped child: its pid (and group id) cannot have been reused.
         let running = |pid: u32| {
             let mut status = 0;
@@ -3631,7 +3637,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn terminate_tool_processes_ends_commands_and_their_children() {
+    fn terminating_a_tool_group_ends_the_command_and_its_children() {
         use std::os::unix::process::CommandExt;
         let mut child = Command::new("sh")
             .args(["-c", "sleep 30 & echo $!; wait"])
@@ -3639,7 +3645,6 @@ mod tests {
             .process_group(0)
             .spawn()
             .unwrap();
-        track_tool_group(child.id());
         let mut line = String::new();
         std::io::BufRead::read_line(
             &mut std::io::BufReader::new(child.stdout.take().unwrap()),
@@ -3648,7 +3653,9 @@ mod tests {
         .unwrap();
         let grandchild: i32 = line.trim().parse().unwrap();
 
-        terminate_tool_processes();
+        // Only this test's group: the suite runs other tool commands in
+        // parallel in this process.
+        terminate_groups(vec![child.id()]);
 
         // SAFETY: signal 0 only probes the pid.
         let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
