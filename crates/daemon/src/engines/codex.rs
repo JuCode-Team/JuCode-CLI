@@ -221,6 +221,8 @@ pub struct Codex {
     override_model: Option<String>,
     override_effort: Option<String>,
     saw_compaction_item: bool,
+    /// Enabled skills from `skills/list`: name → (path, description).
+    skills: Vec<(String, String, String)>,
 }
 
 impl Codex {
@@ -249,6 +251,7 @@ impl Codex {
             override_model: options.model.clone(),
             override_effort: None,
             saw_compaction_item: false,
+            skills: Vec::new(),
         }
     }
 
@@ -305,12 +308,45 @@ impl Codex {
         })
     }
 
-    fn command_list() -> Value {
-        let commands: Vec<Value> = [("/model", ""), ("/resume", ""), ("/compact", ""), ("/goal", "Set or show the thread goal (/goal <objective>, /goal clear)")]
+    /// The commands a Codex session runs through the app-server (its other
+    /// slash commands belong to its TUI), then its skills.
+    fn command_list(&self) -> Value {
+        let builtin = [
+            ("/model", "", "Choose the model and reasoning effort"),
+            ("/resume", "", "Resume an earlier thread"),
+            (
+                "/compact",
+                "",
+                "Summarize the conversation to free up context",
+            ),
+            (
+                "/review",
+                "[instructions]",
+                "Review uncommitted changes, or what the instructions ask for",
+            ),
+            (
+                "/goal",
+                "[objective | clear | pause | resume]",
+                "Set or show the thread goal",
+            ),
+        ];
+        let mut commands: Vec<Value> = builtin
             .iter()
-            .map(|(command, description)| json!({ "command": command, "marker": null, "args": "", "description": description }))
+            .map(|(command, args, description)| json!({ "command": command, "marker": null, "args": args, "description": description }))
             .collect();
+        for (name, _, description) in &self.skills {
+            commands.push(json!({ "command": format!("/{name}"), "marker": "SKILL", "args": "", "description": description }));
+        }
         json!({ "type": "command_list", "commands": commands })
+    }
+
+    /// The skill a `/name` command names: (name, path).
+    fn skill(&self, command: &str) -> Option<(String, String)> {
+        let name = command.strip_prefix('/')?;
+        self.skills
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(n, path, _)| (n.clone(), path.clone()))
     }
 
     fn goal_event(goal: &Value) -> Value {
@@ -370,7 +406,7 @@ impl Codex {
         events.extend([
             json!({ "type": "startup", "model": self.model, "cwd": result["cwd"], "session_id": self.thread, "context_window": self.context_window }),
             self.model_status(),
-            Self::command_list(),
+            self.command_list(),
             json!({ "type": "approval_mode", "mode": self.mode }),
             json!({ "type": "status", "message": "ready" }),
         ]);
@@ -441,6 +477,8 @@ impl Codex {
                     None => self.request("thread/start", open, ""),
                 });
                 frames.push(self.request("model/list", json!({}), ""));
+                let cwd = self.cwd.clone();
+                frames.push(self.request("skills/list", json!({ "cwds": [cwd] }), ""));
                 Output {
                     events: vec![],
                     frames,
@@ -500,6 +538,31 @@ impl Codex {
                 Output::events(vec![json!({ "type": "resume_view", "items": items })])
             }
             "thread/goal/get" => Output::events(vec![Self::goal_event(&result["goal"])]),
+            "skills/list" => {
+                self.skills = result["data"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|entry| entry["skills"].as_array().into_iter().flatten())
+                    .filter(|skill| skill["enabled"] != false && !text(&skill["name"]).is_empty())
+                    .map(|skill| {
+                        let description = [
+                            text(&skill["interface"]["shortDescription"]),
+                            text(&skill["shortDescription"]),
+                            text(&skill["description"]),
+                        ]
+                        .into_iter()
+                        .find(|d| !d.is_empty())
+                        .unwrap_or_default();
+                        (
+                            text(&skill["name"]).to_string(),
+                            text(&skill["path"]).to_string(),
+                            description.to_string(),
+                        )
+                    })
+                    .collect();
+                Output::events(vec![self.command_list()])
+            }
             "turn/start" => {
                 if let Some(turn) = result["turn"]["id"].as_str() {
                     self.active_turn = Some(turn.to_string());
@@ -576,6 +639,23 @@ impl Codex {
     fn item_started(&mut self, item: &Value) -> Vec<Value> {
         let id = text(&item["id"]).to_string();
         match text(&item["type"]) {
+            // Every client sees the turn's input, not only the one that sent it.
+            "userMessage" => {
+                let content = item["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|c| c["type"] == "text")
+                    .map(|c| text(&c["text"]))
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if content.is_empty() {
+                    vec![]
+                } else {
+                    vec![json!({ "type": "user_message", "content": content })]
+                }
+            }
             "agentMessage" => {
                 self.items.insert(id, Item::new("assistant"));
                 vec![json!({ "type": "assistant_start" })]
@@ -711,6 +791,11 @@ impl Codex {
                 json!({ "type": "tool_output", "call_id": id, "name": "web_search", "output": json!({ "query": item["query"] }).to_string(), "is_error": false }),
             ],
             "contextCompaction" => vec![json!({ "type": "compaction_end" })],
+            // A review's findings arrive whole when the review ends.
+            "exitedReviewMode" if !text(&item["review"]).is_empty() => vec![
+                json!({ "type": "assistant_start" }),
+                json!({ "type": "assistant_delta", "delta": text(&item["review"]) }),
+            ],
             _ => vec![],
         }
     }
@@ -995,7 +1080,41 @@ impl Adapter for Codex {
                         )],
                         _ => vec![],
                     },
-                    ("/compact" | "/goal" | "/rewind", None) => vec![],
+                    ("/review", Some(thread)) => {
+                        let target = if arg.is_empty() {
+                            json!({ "type": "uncommittedChanges" })
+                        } else {
+                            json!({ "type": "custom", "instructions": arg })
+                        };
+                        self.busy = true;
+                        let frame = self.request(
+                            "review/start",
+                            json!({ "threadId": thread, "target": target }),
+                            "",
+                        );
+                        return Ok(Output {
+                            events: vec![json!({ "type": "user_message", "content": input })],
+                            frames: vec![frame],
+                        });
+                    }
+                    ("/compact" | "/goal" | "/rewind" | "/review", None) => vec![],
+                    (command, _) if self.skill(command).is_some() => {
+                        let (name, path) = self.skill(command).unwrap_or_default();
+                        let text = if arg.is_empty() {
+                            format!("${name}")
+                        } else {
+                            format!("${name} {arg}")
+                        };
+                        let input = vec![
+                            json!({ "type": "skill", "name": name, "path": path }),
+                            json!({ "type": "text", "text": text, "text_elements": [] }),
+                        ];
+                        if self.thread.is_none() {
+                            self.queued.extend(input);
+                            return Ok(Output::default());
+                        }
+                        vec![self.turn_start(input)]
+                    }
                     (command, _) => {
                         return Err(format!("{command} is not available in a Codex session"))
                     }
@@ -1166,6 +1285,75 @@ mod tests {
             ]
         );
         c
+    }
+
+    #[test]
+    fn skills_list_as_commands_and_review_and_skills_run() {
+        let mut c = opened();
+        let listed = frame(
+            &mut c,
+            json!({ "id": 4, "result": { "data": [{ "cwd": "/p", "errors": [], "skills": [
+                { "name": "lint", "path": "/s/lint/SKILL.md", "description": "Long text", "shortDescription": "Run the linters", "enabled": true },
+                { "name": "off", "path": "/s/off/SKILL.md", "description": "x", "enabled": false }
+            ] }] } }),
+        );
+        let commands = listed.events[0]["commands"].as_array().unwrap();
+        let names: Vec<&str> = commands
+            .iter()
+            .map(|c| c["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["/model", "/resume", "/compact", "/review", "/goal", "/lint"]
+        );
+        assert_eq!(commands[5]["description"], "Run the linters");
+        assert_eq!(commands[5]["marker"], "SKILL");
+
+        let skill = c
+            .encode(&json!({ "op": "command", "input": "/lint src" }))
+            .unwrap();
+        let turn = &sent(&skill.frames)[0];
+        assert_eq!(turn["method"], "turn/start");
+        assert_eq!(
+            turn["params"]["input"][0],
+            json!({ "type": "skill", "name": "lint", "path": "/s/lint/SKILL.md" })
+        );
+        assert_eq!(turn["params"]["input"][1]["text"], "$lint src");
+
+        let review = c
+            .encode(&json!({ "op": "command", "input": "/review" }))
+            .unwrap();
+        assert_eq!(
+            review.events[0],
+            json!({ "type": "user_message", "content": "/review" })
+        );
+        let request = &sent(&review.frames)[0];
+        assert_eq!(request["method"], "review/start");
+        assert_eq!(request["params"]["target"]["type"], "uncommittedChanges");
+        let custom = c
+            .encode(&json!({ "op": "command", "input": "/review check the SQL" }))
+            .unwrap();
+        assert_eq!(
+            sent(&custom.frames)[0]["params"]["target"],
+            json!({ "type": "custom", "instructions": "check the SQL" })
+        );
+        let done = frame(
+            &mut c,
+            json!({ "method": "item/completed", "params": { "item": { "id": "r1", "type": "exitedReviewMode", "review": "No issues" } } }),
+        );
+        assert_eq!(done.events[1]["delta"], "No issues");
+
+        assert!(c
+            .encode(&json!({ "op": "command", "input": "/nope" }))
+            .is_err());
+        let echo = frame(
+            &mut c,
+            json!({ "method": "item/started", "params": { "item": { "id": "u1", "type": "userMessage", "content": [{ "type": "text", "text": "hi" }] } } }),
+        );
+        assert_eq!(
+            echo.events,
+            vec![json!({ "type": "user_message", "content": "hi" })]
+        );
     }
 
     #[test]

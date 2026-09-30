@@ -467,6 +467,9 @@ pub struct Claude {
     last_context: u64,
     active_turn: bool,
     interrupting: bool,
+    /// The composer's slash commands: the CLI's `initialize` reply (with
+    /// descriptions and argument hints), plus names only `system/init` lists.
+    commands: Vec<Value>,
 }
 
 impl Claude {
@@ -494,6 +497,7 @@ impl Claude {
             last_context: 0,
             active_turn: false,
             interrupting: false,
+            commands: Vec::new(),
         }
     }
 
@@ -526,23 +530,46 @@ impl Claude {
         })
     }
 
-    fn command_list(commands: &[Value]) -> Value {
-        let mut names: Vec<String> = Vec::new();
-        for raw in ["model", "resume"]
+    /// `/model` and `/resume` are the desktop's own pickers, so they lead
+    /// even when the CLI does not list them.
+    fn command_list(&self) -> Value {
+        let mut commands: Vec<Value> = ["model", "resume"]
             .into_iter()
-            .map(str::to_string)
-            .chain(commands.iter().map(|c| text(c).to_string()))
-        {
-            let name = raw.trim_start_matches('/').trim().to_string();
-            if !name.is_empty() && !names.contains(&name) {
-                names.push(name);
+            .map(|name| {
+                let command = format!("/{name}");
+                self.commands
+                    .iter()
+                    .find(|c| c["command"] == command.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| command_entry(name, "", ""))
+            })
+            .collect();
+        for entry in &self.commands {
+            if !commands.iter().any(|c| c["command"] == entry["command"]) {
+                commands.push(entry.clone());
             }
         }
-        let commands: Vec<Value> = names
-            .into_iter()
-            .map(|name| json!({ "command": format!("/{name}"), "marker": null, "args": "", "description": "" }))
-            .collect();
         json!({ "type": "command_list", "commands": commands })
+    }
+
+    /// The CLI's own commands from its `initialize` reply: built-ins first,
+    /// then the user's skills and custom commands.
+    fn set_commands(&mut self, reply: &[Value]) {
+        let (builtin, others): (Vec<&Value>, Vec<&Value>) = reply
+            .iter()
+            .filter(|c| !text(&c["name"]).is_empty())
+            .partition(|c| c["builtin"] == true);
+        self.commands = builtin
+            .into_iter()
+            .chain(others)
+            .map(|c| {
+                command_entry(
+                    text(&c["name"]),
+                    text(&c["argumentHint"]),
+                    text(&c["description"]),
+                )
+            })
+            .collect();
     }
 
     fn model_view(&self) -> Value {
@@ -844,10 +871,18 @@ impl Claude {
         self.started = true;
         self.model = model;
         self.engine_mode = engine_mode;
-        let commands = frame["slash_commands"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        for name in frame["slash_commands"].as_array().into_iter().flatten() {
+            let name = text(name).trim_start_matches('/').trim();
+            let command = format!("/{name}");
+            if !name.is_empty()
+                && !self
+                    .commands
+                    .iter()
+                    .any(|c| c["command"] == command.as_str())
+            {
+                self.commands.push(command_entry(name, "", ""));
+            }
+        }
         let mut events = vec![
             json!({
                 "type": "startup",
@@ -857,7 +892,7 @@ impl Claude {
                 "context_window": self.context_window,
             }),
             self.model_status(),
-            Self::command_list(&commands),
+            self.command_list(),
             json!({ "type": "approval_mode", "mode": from_claude_mode(&self.engine_mode) }),
         ];
         if let Some(servers) = frame["mcp_servers"]
@@ -1190,7 +1225,7 @@ impl Claude {
                 };
                 vec![
                     json!({ "type": "approval_mode", "mode": from_claude_mode(&self.engine_mode) }),
-                    Self::command_list(&[]),
+                    self.command_list(),
                     json!({ "type": "status", "message": "ready" }),
                 ]
             }
@@ -1233,10 +1268,18 @@ impl Claude {
                 if tag == "boot" {
                     self.engine_mode = "bypassPermissions".to_string();
                     events.push(json!({ "type": "approval_mode", "mode": "full-auto" }));
-                    events.push(Self::command_list(&[]));
+                    events.push(self.command_list());
                     events.push(json!({ "type": "status", "message": "ready" }));
                 }
                 events
+            }
+            "initialize" => {
+                self.set_commands(
+                    response["response"]["commands"]
+                        .as_array()
+                        .map_or(&[], Vec::as_slice),
+                );
+                vec![self.command_list()]
             }
             "set_model" => {
                 let pick = std::mem::take(&mut self.pending_model);
@@ -1284,9 +1327,13 @@ impl Claude {
     }
 }
 
+fn command_entry(name: &str, args: &str, description: &str) -> Value {
+    json!({ "command": format!("/{name}"), "marker": null, "args": args, "description": description })
+}
+
 impl Adapter for Claude {
     fn start(&mut self) -> Vec<String> {
-        if self.mode == "bypassPermissions" {
+        let mut frames = if self.mode == "bypassPermissions" {
             vec![self.control_request(json!({ "subtype": "list_models" }), "boot")]
         } else {
             let mode = self.mode;
@@ -1297,7 +1344,10 @@ impl Adapter for Claude {
                 ),
                 self.control_request(json!({ "subtype": "list_models" }), ""),
             ]
-        }
+        };
+        // The command list with descriptions, before the first turn.
+        frames.push(self.control_request(json!({ "subtype": "initialize" }), ""));
+        frames
     }
 
     fn translate(&mut self, line: Line) -> Output {
@@ -1737,13 +1787,31 @@ mod tests {
     fn a_turn_streams_text_and_tools_and_ends_ready() {
         let mut c = claude();
         let boot = c.start();
-        assert_eq!(boot.len(), 2);
+        assert_eq!(boot.len(), 3);
         assert!(boot[0].contains("set_permission_mode") && boot[0].contains("\"default\""));
+        assert!(boot[2].contains("initialize"));
         let ready = frame(
             &mut c,
             json!({ "type": "control_response", "response": { "subtype": "success", "request_id": "jucode-1", "response": { "mode": "default" } } }),
         );
         assert_eq!(types(&ready), ["approval_mode", "command_list", "status"]);
+        let listed = frame(
+            &mut c,
+            json!({ "type": "control_response", "response": { "subtype": "success", "request_id": "jucode-3", "response": { "commands": [
+                { "name": "review", "description": "Review a diff (user)", "argumentHint": "" },
+                { "name": "compact", "description": "Free up context", "argumentHint": "<instructions>", "builtin": true },
+                { "name": "model", "description": "Set the AI model", "argumentHint": "<model>", "builtin": true }
+            ] } } }),
+        );
+        let names: Vec<&str> = listed[0]["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["/model", "/resume", "/compact", "/review"]);
+        assert_eq!(listed[0]["commands"][2]["args"], "<instructions>");
+        assert_eq!(listed[0]["commands"][2]["description"], "Free up context");
 
         let init = frame(
             &mut c,
@@ -1760,6 +1828,17 @@ mod tests {
             ]
         );
         assert_eq!(init[1]["model_label"], "Opus 4.8");
+        // Names only the init frame lists join the described ones.
+        let names: Vec<&str> = init[2]["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["/model", "/resume", "/compact", "/review", "/context"]
+        );
         assert_eq!(c.conversation().as_deref(), Some("abc"));
 
         assert_eq!(

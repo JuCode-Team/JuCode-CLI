@@ -42,6 +42,8 @@ while True:
             response = {"mode": mode}
         elif request["subtype"] == "list_models":
             response = {"models": [{"value": "sonnet", "resolvedModel": "claude-sonnet-4-5", "displayName": "Sonnet"}]}
+        elif request["subtype"] == "initialize":
+            response = {"commands": [{"name": "compact", "description": "Free up context", "argumentHint": "", "builtin": True}]}
         out({"type": "control_response", "response": {"subtype": "success", "request_id": frame["request_id"], "response": response}})
         continue
     if frame["type"] != "user":
