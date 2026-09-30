@@ -18,15 +18,19 @@ const SYSTEMD_UNIT: &str = "jucode-daemon.service";
 pub struct ServiceSpec {
     pub program: PathBuf,
     pub listen: String,
+    /// Relay flags to run with (`--relay <url>` / `--no-relay`); empty keeps
+    /// the default relay URL.
+    pub relay_args: Vec<String>,
     pub path_env: String,
     pub log: PathBuf,
 }
 
-pub fn install(listen: &str) -> io::Result<String> {
+pub fn install(listen: &str, relay_args: Vec<String>) -> io::Result<String> {
     let home = home()?;
     let spec = ServiceSpec {
         program: env::current_exe()?,
         listen: listen.to_string(),
+        relay_args,
         path_env: env::var("PATH").unwrap_or_default(),
         log: home.join(".jucode").join("daemon").join("daemon.log"),
     };
@@ -88,6 +92,7 @@ pub fn launchd_plist(spec: &ServiceSpec) -> String {
         spec.listen.clone(),
     ]
     .iter()
+    .chain(&spec.relay_args)
     .map(|arg| format!("    <string>{}</string>", xml_escape(arg)))
     .collect::<Vec<_>>()
     .join("\n");
@@ -129,7 +134,7 @@ pub fn systemd_unit(spec: &ServiceSpec) -> String {
          Description=JuCode daemon\n\
          \n\
          [Service]\n\
-         ExecStart={program} daemon --listen {listen}\n\
+         ExecStart={program} daemon --listen {listen}{relay}\n\
          Environment=\"PATH={path}\"\n\
          Restart=on-failure\n\
          StandardOutput=append:{log}\n\
@@ -139,6 +144,11 @@ pub fn systemd_unit(spec: &ServiceSpec) -> String {
          WantedBy=default.target\n",
         program = systemd_quote(&spec.program.display().to_string()),
         listen = spec.listen,
+        relay = spec
+            .relay_args
+            .iter()
+            .map(|arg| format!(" {}", systemd_quote(arg)))
+            .collect::<String>(),
         path = spec.path_env.replace('"', "\\\""),
         log = spec.log.display(),
     )
@@ -192,6 +202,7 @@ mod tests {
         ServiceSpec {
             program: PathBuf::from("/opt/Ju Code/bin/jucode"),
             listen: "127.0.0.1:7788".to_string(),
+            relay_args: Vec::new(),
             path_env: "/opt/homebrew/bin:/usr/bin".to_string(),
             log: PathBuf::from("/home/u/.jucode/daemon/daemon.log"),
         }
@@ -215,6 +226,17 @@ mod tests {
         );
         assert!(unit.contains("Environment=\"PATH=/opt/homebrew/bin:/usr/bin\""));
         assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn relay_flags_are_passed_to_the_service() {
+        let mut spec = spec();
+        spec.relay_args = vec!["--relay".to_string(), "wss://relay.example/v1".to_string()];
+        assert!(launchd_plist(&spec).contains("<string>wss://relay.example/v1</string>"));
+        assert!(systemd_unit(&spec)
+            .contains("--listen 127.0.0.1:7788 --relay wss://relay.example/v1\n"));
+        spec.relay_args = vec!["--no-relay".to_string()];
+        assert!(systemd_unit(&spec).contains("--listen 127.0.0.1:7788 --no-relay\n"));
     }
 
     #[test]

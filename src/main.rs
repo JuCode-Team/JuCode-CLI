@@ -376,7 +376,17 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
             .filter(|dir| dir.join("index.html").is_file())
     });
     let outcome = match action {
-        "install" => Some(jucode_daemon::install::install(&listen)),
+        // The service runs with the same relay choice as this command line.
+        "install" => Some(jucode_daemon::install::install(
+            &listen,
+            match &relay {
+                None => vec!["--no-relay".to_string()],
+                Some(url) if url != jucode_daemon::DEFAULT_RELAY => {
+                    vec!["--relay".to_string(), url.clone()]
+                }
+                Some(_) => Vec::new(),
+            },
+        )),
         "uninstall" => Some(jucode_daemon::install::uninstall()),
         _ => None,
     };
