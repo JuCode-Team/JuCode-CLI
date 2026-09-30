@@ -28,13 +28,16 @@ pub struct ServiceSpec {
 pub fn install(listen: &str, relay_args: Vec<String>) -> io::Result<String> {
     let home = home()?;
     let spec = ServiceSpec {
-        program: env::current_exe()?,
+        program: stable_program()?,
         listen: listen.to_string(),
         relay_args,
         path_env: env::var("PATH").unwrap_or_default(),
         log: home.join(".jucode").join("daemon").join("daemon.log"),
     };
     fs::create_dir_all(spec.log.parent().expect("log has a parent"))?;
+    // A daemon already on the port (one Desktop started, say) would keep the
+    // service from binding it.
+    stop_listener(listen);
     if cfg!(target_os = "macos") {
         let plist = home
             .join("Library/LaunchAgents")
@@ -116,7 +119,10 @@ pub fn launchd_plist(spec: &ServiceSpec) -> String {
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
   <key>StandardOutPath</key>
   <string>{log}</string>
   <key>StandardErrorPath</key>
@@ -152,6 +158,63 @@ pub fn systemd_unit(spec: &ServiceSpec) -> String {
         path = spec.path_env.replace('"', "\\\""),
         log = spec.log.display(),
     )
+}
+
+/// The program the service should run: the `jucode` on PATH when there is
+/// one, else this executable. An npm install runs from a versioned path inside
+/// node_modules that the next upgrade or uninstall removes; the PATH entry
+/// (a link or shim) keeps pointing at whatever is installed.
+fn stable_program() -> io::Result<PathBuf> {
+    let name = if cfg!(windows) {
+        "jucode.exe"
+    } else {
+        "jucode"
+    };
+    let on_path = env::var_os("PATH").and_then(|path| {
+        env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    });
+    match on_path {
+        Some(path) => Ok(path),
+        None => env::current_exe(),
+    }
+}
+
+/// Ends the process listening on `listen` (the daemon's address), if any, and
+/// waits up to 5s for the port to free up. Best effort, Unix only.
+fn stop_listener(listen: &str) {
+    #[cfg(unix)]
+    {
+        let Some(port) = listen.rsplit(':').next() else {
+            return;
+        };
+        let Ok(out) = Command::new("lsof")
+            .args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+            .output()
+        else {
+            return;
+        };
+        let pids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|pid| !pid.is_empty())
+            .collect();
+        if pids.is_empty() {
+            return;
+        }
+        for pid in &pids {
+            let _ = Command::new("kill").args(["-TERM", pid]).status();
+        }
+        for _ in 0..50 {
+            if std::net::TcpStream::connect(listen).is_err() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = listen;
 }
 
 fn home() -> io::Result<PathBuf> {
@@ -216,6 +279,9 @@ mod tests {
         assert!(plist.contains("<string>127.0.0.1:7788</string>"));
         assert!(plist.contains("<string>/opt/homebrew/bin:/usr/bin</string>"));
         assert!(plist.contains("<key>KeepAlive</key>"));
+        // Restarted only after a failure: a daemon that found the port taken
+        // exits 0 and is left alone.
+        assert!(plist.contains("<key>SuccessfulExit</key>\n    <false/>"));
     }
 
     #[test]

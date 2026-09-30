@@ -441,7 +441,17 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
     // The token exists before the port answers: a client that connects as
     // soon as it can (Desktop starting the daemon) reads it right away.
     store.token()?;
-    let listener = std::net::TcpListener::bind(&listen)?;
+    let listener = match std::net::TcpListener::bind(&listen) {
+        Ok(listener) => listener,
+        // Another daemon has the port. Exit successfully so a service manager
+        // (launchd SuccessfulExit=false, systemd Restart=on-failure) does not
+        // retry forever.
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+            eprintln!("jucode daemon: {listen} is already in use; another daemon is running");
+            return Ok(0);
+        }
+        Err(error) => return Err(error),
+    };
     eprintln!(
         "jucode daemon listening on ws://{} (token in {})",
         listener.local_addr()?,
