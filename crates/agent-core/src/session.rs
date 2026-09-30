@@ -9,7 +9,7 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const ROOT_BRANCH: &str = "root";
@@ -1285,7 +1285,10 @@ impl SessionLock {
         let dir = sessions_dir(profile_dir, cwd);
         fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
         let path = dir.join(format!("{session_id}.lock"));
-        for attempt in 0..2 {
+        // A restart (crash recovery, provider switch) may reach here while the
+        // previous engine is still exiting: give its lock a moment to go away.
+        let deadline = Instant::now() + LOCK_WAIT;
+        loop {
             match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -1300,32 +1303,32 @@ impl SessionLock {
                         .ok()
                         .and_then(|content| serde_json::from_str::<Value>(content.trim()).ok())
                         .and_then(|value| value.get("pid").and_then(Value::as_u64));
-                    match holder_pid {
-                        Some(pid) if attempt == 0 && !process_is_alive(pid) => {
-                            // Stale lock from a crashed process: reclaim it.
-                            let _ = fs::remove_file(&path);
-                            continue;
-                        }
-                        _ => {
-                            return Err(format!(
-                                "session {session_id} is already open{}; close it first or delete {} if stale",
-                                holder_pid
-                                    .map(|pid| format!(" by pid {pid}"))
-                                    .unwrap_or_default(),
-                                path.display()
-                            ));
-                        }
+                    // Stale lock from a crashed or killed process: reclaim it.
+                    if holder_pid.is_some_and(|pid| !process_is_alive(pid))
+                        && fs::remove_file(&path).is_ok()
+                    {
+                        continue;
                     }
+                    if Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                    return Err(format!(
+                        "session {session_id} is already open{}; close it first or delete {} if stale",
+                        holder_pid
+                            .map(|pid| format!(" by pid {pid}"))
+                            .unwrap_or_default(),
+                        path.display()
+                    ));
                 }
                 Err(error) => return Err(error.to_string()),
             }
         }
-        Err(format!(
-            "session {session_id} is already open; delete {} if stale",
-            path.display()
-        ))
     }
 }
+
+/// How long `SessionLock::acquire` waits for a live holder to release.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
 
 impl Drop for SessionLock {
     fn drop(&mut self) {
@@ -1333,15 +1336,27 @@ impl Drop for SessionLock {
     }
 }
 
-/// Best-effort liveness probe for a lock-holder pid. On Linux this consults
-/// /proc; where /proc is unavailable the holder is assumed alive (the user is
-/// told which file to delete if the lock is actually stale).
+/// Best-effort liveness probe for a lock-holder pid. On Unix a signal-0 kill
+/// tells whether the pid exists (EPERM: it does, owned by someone else);
+/// elsewhere the holder is assumed alive (the user is told which file to
+/// delete if the lock is actually stale).
 fn process_is_alive(pid: u64) -> bool {
-    let proc_root = Path::new("/proc");
-    if proc_root.exists() {
-        return proc_root.join(pid.to_string()).exists();
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: kill with signal 0 only checks the target; it sends nothing.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
-    true
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
 }
 
 /// Drop tool-call items that would be invalid input: a `function_call_output`
@@ -1951,26 +1966,45 @@ mod tests {
 
         drop(lock);
         let reacquired = SessionLock::acquire(&profile, &cwd, "s1");
-        assert!(reacquired.is_ok());
+        assert!(reacquired.is_ok(), "{:?}", reacquired.err());
 
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn session_lock_reclaims_stale_lock_from_dead_pid() {
-        if !Path::new("/proc").exists() {
-            return; // liveness probe requires /proc; skip elsewhere
-        }
         let root = temp_profile("stale");
         let profile = root.join("profile");
         let cwd = root.join("cwd");
         let dir = sessions_dir(&profile, &cwd);
         fs::create_dir_all(&dir).unwrap();
-        // Pid values this large cannot exist (pid_max caps far lower).
-        fs::write(dir.join("s2.lock"), "{\"pid\":4294900000}\n").unwrap();
+        // A process that has exited and been reaped (what a SIGKILLed engine
+        // leaves behind).
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        fs::write(dir.join("s2.lock"), format!("{{\"pid\":{dead}}}\n")).unwrap();
 
         let lock = SessionLock::acquire(&profile, &cwd, "s2");
         assert!(lock.is_ok());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_lock_waits_for_a_holder_that_is_exiting() {
+        let root = temp_profile("wait");
+        let profile = root.join("profile");
+        let cwd = root.join("cwd");
+
+        let lock = SessionLock::acquire(&profile, &cwd, "s3").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(lock);
+        });
+        assert!(SessionLock::acquire(&profile, &cwd, "s3").is_ok());
+        release.join().unwrap();
 
         let _ = fs::remove_dir_all(root);
     }
