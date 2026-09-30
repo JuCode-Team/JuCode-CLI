@@ -185,12 +185,33 @@ pub fn refresh(api_url: &str, refresh_token: &str) -> Result<Tokens, String> {
 /// session.
 static SESSION_REFRESH: Mutex<()> = Mutex::new(());
 
+/// Serializes session checks across processes: the desktop, the daemon and
+/// every `jucode serve` share auth.json, and the gateway revokes a refresh
+/// token as soon as it is used, so two processes refreshing at once leave one
+/// of them saving a dead token. Held from the reload to the save; the lock is
+/// released when the file closes.
+fn lock_auth_refresh() -> Result<std::fs::File, String> {
+    let dir = crate::config::profile_dir().map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let path = dir.join("auth.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+    file.lock()
+        .map_err(|error| format!("failed to lock {}: {error}", path.display()))?;
+    Ok(file)
+}
+
 /// Reloads auth.json and returns it holding a JuCode access token that is good
 /// for at least two more minutes, refreshing the session first when needed.
 pub fn ensure_session(api_url: &str, encrypt_secrets: bool) -> Result<AuthStore, String> {
     let _guard = SESSION_REFRESH
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _file_guard = lock_auth_refresh()?;
     // Reload from disk first. The Desktop shell shares ~/.jucode/auth.json and
     // may have rotated the refresh token out-of-band; picking up its tokens
     // avoids refreshing with a stale one and a spurious "session expired".
