@@ -6,6 +6,7 @@
 //! clients that start watching mid-session.
 
 pub mod claude;
+pub mod codex;
 
 use crate::hub::Hub;
 use serde_json::{json, Value};
@@ -25,10 +26,13 @@ use std::{
 /// How long a retired engine gets to exit on its own after its stdin closes.
 const EXIT_GRACE: Duration = Duration::from_millis(1500);
 const POLL: Duration = Duration::from_millis(20);
+/// How long an engine may take to open its conversation.
+const START_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Claude,
+    Codex,
 }
 
 impl Kind {
@@ -36,6 +40,7 @@ impl Kind {
         match name {
             "" | "jucode" => Ok(None),
             "claude" => Ok(Some(Kind::Claude)),
+            "codex" => Ok(Some(Kind::Codex)),
             other => Err(format!("unknown engine {other}")),
         }
     }
@@ -43,6 +48,7 @@ impl Kind {
     pub fn name(self) -> &'static str {
         match self {
             Kind::Claude => "claude",
+            Kind::Codex => "codex",
         }
     }
 }
@@ -115,15 +121,17 @@ pub trait Adapter: Send {
     fn conversation(&self) -> Option<String>;
 }
 
-fn adapter(kind: Kind, options: &Options) -> Box<dyn Adapter> {
+fn adapter(kind: Kind, cwd: &Path, options: &Options) -> Box<dyn Adapter> {
     match kind {
         Kind::Claude => Box::new(claude::Claude::new(options)),
+        Kind::Codex => Box::new(codex::Codex::new(cwd, options)),
     }
 }
 
 fn command(kind: Kind, id: &str, options: &Options) -> Command {
     match kind {
         Kind::Claude => claude::command(id, options),
+        Kind::Codex => codex::command(),
     }
 }
 
@@ -256,6 +264,10 @@ impl Snapshot {
             return;
         }
         match kind {
+            "transcript" => {
+                self.in_reply = false;
+                self.transcript = event["items"].as_array().cloned().unwrap_or_default();
+            }
             "user_message" => {
                 self.in_reply = false;
                 self.transcript
@@ -340,39 +352,70 @@ impl Snapshot {
     }
 }
 
-/// Starts a `kind` engine session in `cwd` on its own thread: a new one with
-/// id `id`, or `options.resume`. Returns the thread's ops channel and
+/// Starts a `kind` engine session in `cwd` on its own thread: a new one
+/// named `id` when the daemon picks the id (Claude Code), or `options.resume`,
+/// or a new one the engine names (Codex). Returns the session id once the
+/// engine has opened its conversation, with the thread's ops channel and
 /// generation, or the start error.
 pub fn spawn(
     hub: Arc<Hub>,
     kind: Kind,
-    id: String,
+    id: Option<String>,
     cwd: PathBuf,
     options: Options,
     transcript: Vec<Value>,
-) -> Result<(Sender<Value>, u64), String> {
-    let process = Process::spawn(command(kind, &id, &options), &cwd)?;
+) -> Result<(String, Sender<Value>, u64), String> {
+    let process = Process::spawn(
+        command(kind, id.as_deref().unwrap_or_default(), &options),
+        &cwd,
+    )?;
     let (ops_tx, ops) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::channel();
     let generation = hub.next_generation();
     thread::spawn(move || {
         let mut session = Session {
             hub: &hub,
-            id: &id,
+            id: None,
+            ready: Some(ready_tx),
+            early: Vec::new(),
+            last_error: None,
             kind,
             cwd,
             snapshot: Snapshot::default(),
             restart: None,
         };
         session.snapshot.seed(transcript);
+        // A resumed conversation is ready once the engine has opened it.
+        if let Some(id) = id {
+            session.named(id);
+        }
         session.run(process, options, ops);
-        hub.session_ended(&id, generation);
+        match (session.id.clone(), session.ready.take()) {
+            (Some(id), _) => hub.session_ended(&id, generation),
+            (None, Some(ready)) => {
+                let reason = session.last_error.take().unwrap_or_else(|| {
+                    format!("{} stopped before opening a conversation", kind.name())
+                });
+                let _ = ready.send(Err(reason));
+            }
+            (None, None) => {}
+        }
     });
-    Ok((ops_tx, generation))
+    // A timeout drops the ops channel, which stops the engine.
+    let id = ready_rx
+        .recv_timeout(START_TIMEOUT)
+        .map_err(|_| format!("{} did not open a conversation in time", kind.name()))??;
+    Ok((id, ops_tx, generation))
 }
 
 struct Session<'a> {
     hub: &'a Hub,
-    id: &'a str,
+    /// The session id: the engine's conversation id, known once it opened.
+    id: Option<String>,
+    ready: Option<Sender<Result<String, String>>>,
+    /// Events from before the id was known.
+    early: Vec<Value>,
+    last_error: Option<String>,
     kind: Kind,
     cwd: PathBuf,
     snapshot: Snapshot,
@@ -382,7 +425,7 @@ struct Session<'a> {
 
 impl Session<'_> {
     fn run(&mut self, mut process: Process, options: Options, ops: Receiver<Value>) {
-        let mut adapter = adapter(self.kind, &options);
+        let mut adapter = adapter(self.kind, &self.cwd, &options);
         process.write(adapter.start());
         loop {
             loop {
@@ -415,6 +458,11 @@ impl Session<'_> {
                     Ok(Ok(line)) => {
                         let output = adapter.translate(line);
                         process.write(output.frames);
+                        if self.id.is_none() {
+                            if let Some(id) = adapter.conversation() {
+                                self.named(id);
+                            }
+                        }
                         self.publish(output.events);
                     }
                     Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {
@@ -429,15 +477,18 @@ impl Session<'_> {
                 }
             }
             let busy = adapter.busy();
-            self.hub.set_busy(self.id, busy);
+            if let Some(id) = &self.id {
+                self.hub.set_busy(id, busy);
+            }
             if !busy {
                 if let Some(mut next) = self.restart.take() {
                     next.resume = adapter.conversation().or(next.resume);
                     process.stop();
-                    match Process::spawn(command(self.kind, self.id, &next), &self.cwd) {
+                    let id = self.id.clone().unwrap_or_default();
+                    match Process::spawn(command(self.kind, &id, &next), &self.cwd) {
                         Ok(started) => {
                             process = started;
-                            adapter = self::adapter(self.kind, &next);
+                            adapter = self::adapter(self.kind, &self.cwd, &next);
                             process.write(adapter.start());
                         }
                         Err(error) => {
@@ -453,13 +504,16 @@ impl Session<'_> {
     /// Applies one op; returns true when the session should stop.
     fn apply(&mut self, process: &mut Process, adapter: &mut dyn Adapter, op: &Value) -> bool {
         if op["claimed"] == true {
-            self.hub.release_claim(self.id);
+            if let Some(id) = &self.id {
+                self.hub.release_claim(id);
+            }
         }
         match op["op"].as_str().unwrap_or_default() {
             "snapshot" => {
                 if let Some(client) = op["client"].as_u64() {
                     for event in self.snapshot.events(adapter.busy()) {
-                        self.hub.send_to(client, &self.tagged(event));
+                        let event = self.tagged(event);
+                        self.hub.send_to(client, &event);
                     }
                 }
                 false
@@ -503,12 +557,58 @@ impl Session<'_> {
         event
     }
 
-    fn publish(&mut self, events: Vec<Value>) {
-        for event in events {
-            self.snapshot.apply(&event);
+    /// The conversation is open under `id`: the session starts answering to
+    /// it, and whatever it said before goes out.
+    fn named(&mut self, id: String) {
+        self.id = Some(id.clone());
+        if let Some(ready) = self.ready.take() {
+            let _ = ready.send(Ok(id));
+        }
+        let early = std::mem::take(&mut self.early);
+        for event in early {
             self.hub.broadcast(&self.tagged(event));
         }
     }
+
+    fn publish(&mut self, events: Vec<Value>) {
+        for event in events {
+            if event["type"] == "error" {
+                self.last_error = event["message"].as_str().map(str::to_string);
+            }
+            self.snapshot.apply(&event);
+            if self.id.is_some() {
+                self.hub.broadcast(&self.tagged(event));
+            } else {
+                self.early.push(event);
+            }
+        }
+    }
+}
+
+pub fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The level of a `2026-…T…Z LEVEL …` tracing line an engine logs.
+pub fn log_level(line: &str) -> Option<&str> {
+    let mut words = line.split_whitespace();
+    let (stamp, level) = (words.next()?, words.next()?);
+    let stamped = stamp.len() > 10 && stamp.as_bytes()[4] == b'-' && stamp.contains('T');
+    (stamped && matches!(level, "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE")).then_some(level)
 }
 
 /// The engine binary: `<NAME>_BIN`, then PATH, then the usual install

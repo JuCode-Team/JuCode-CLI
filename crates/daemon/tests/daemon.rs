@@ -1539,3 +1539,76 @@ fn full_access_restarts_claude_on_the_same_conversation_and_reopening_resumes_it
         .windows(2)
         .any(|w| w == ["--resume", session.as_str()]));
 }
+
+fn fake_codex() -> PathBuf {
+    let log = temp_dir("fake-codex").with_extension("log");
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_codex.py");
+    std::env::set_var("CODEX_BIN", script);
+    std::env::set_var("FAKE_CODEX_LOG", &log);
+    log
+}
+
+#[test]
+fn a_codex_session_is_named_by_its_thread_and_resumes_with_its_history() {
+    let _guard = setup();
+    fake_codex();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-codex");
+    fs::create_dir_all(&dir).unwrap();
+    let mut desktop = Client::connect(&daemon);
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "codex" }),
+    );
+    let session = created["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    assert!(
+        session.starts_with("th-"),
+        "the session is the codex thread: {session}"
+    );
+    desktop.send(json!({ "op": "watch", "session": session }));
+    desktop.until(|f| f["session"] == session.as_str() && f["type"] == "attended");
+
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "hello" }));
+    let frames = desktop.until(turn_done(&session));
+    assert_eq!(claude_reply(&frames, &session), "ok: hello");
+
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "use a tool" }));
+    let asked =
+        desktop.until(|f| f["session"] == session.as_str() && f["type"] == "approval_request");
+    let call = asked.last().unwrap()["call_id"].clone();
+    desktop
+        .send(json!({ "op": "approve", "session": session, "call_id": call, "decision": "allow" }));
+    let frames = desktop.until(turn_done(&session));
+    assert!(frames
+        .iter()
+        .any(|f| f["type"] == "tool_output" && f["is_error"] == false));
+
+    let history = request(&mut desktop, json!({ "op": "session_history", "cwd": dir }));
+    assert!(
+        history["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["session"] == session.as_str()
+                && s["engine"] == "codex"
+                && s["title"] == "hello"),
+        "{history}"
+    );
+
+    desktop.send(json!({ "op": "session_close", "session": session }));
+    desktop.until(|f| f["type"] == "session_closed" && f["session"] == session.as_str());
+    request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": session }),
+    );
+    desktop.send(json!({ "op": "watch", "session": session }));
+    let frames = desktop.until(|f| f["session"] == session.as_str() && f["type"] == "transcript");
+    let items = frames.last().unwrap()["items"].as_array().unwrap().clone();
+    assert_eq!(items[0], json!({ "role": "user", "content": "hello" }));
+    assert!(items
+        .iter()
+        .any(|i| i["role"] == "tool" && i["name"] == "bash"));
+}

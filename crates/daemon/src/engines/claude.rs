@@ -1303,9 +1303,11 @@ impl Adapter for Claude {
     fn translate(&mut self, line: Line) -> Output {
         let frame = match line {
             Line::Stderr(line) => {
-                let line = strip_ansi(&line);
+                let line = super::strip_ansi(&line);
                 let line = line.trim();
-                if line.is_empty() || is_routine_log(line) {
+                if line.is_empty()
+                    || matches!(super::log_level(line), Some("INFO" | "DEBUG" | "TRACE"))
+                {
                     return Output::default();
                 }
                 if line.contains("No conversation found with session ID") {
@@ -1564,36 +1566,6 @@ fn rate_limit_events(frame: &Value) -> Vec<Value> {
     } else {
         vec![]
     }
-}
-
-fn strip_ansi(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' && chars.peek() == Some(&'[') {
-            chars.next();
-            for c in chars.by_ref() {
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// `2026-…T…Z INFO …` tracing lines; ERROR and WARN lines are kept.
-fn is_routine_log(line: &str) -> bool {
-    let mut words = line.split_whitespace();
-    let (Some(stamp), Some(level)) = (words.next(), words.next()) else {
-        return false;
-    };
-    stamp.len() > 10
-        && stamp.as_bytes()[4] == b'-'
-        && stamp.contains('T')
-        && matches!(level, "INFO" | "DEBUG" | "TRACE")
 }
 
 // --- saved conversations ---

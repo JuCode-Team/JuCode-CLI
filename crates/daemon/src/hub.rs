@@ -265,16 +265,12 @@ impl Hub {
         let (id, ops, generation) = match engine {
             None => session::spawn(Arc::clone(self), cwd.clone(), None, agent.clone())?,
             Some(kind) => {
-                let id = engines::new_uuid()?;
-                let (ops, generation) = engines::spawn(
-                    Arc::clone(self),
-                    kind,
-                    id.clone(),
-                    cwd.clone(),
-                    options,
-                    vec![],
-                )?;
-                (id, ops, generation)
+                // Claude Code takes its conversation id from us; others name it.
+                let id = match kind {
+                    engines::Kind::Claude => Some(engines::new_uuid()?),
+                    engines::Kind::Codex => None,
+                };
+                engines::spawn(Arc::clone(self), kind, id, cwd.clone(), options, vec![])?
             }
         };
         self.store
@@ -322,6 +318,9 @@ impl Hub {
                     Some(engines::Kind::Claude) => engines::claude::saved(&cwd)
                         .iter()
                         .any(|(saved, _, _)| saved == id),
+                    Some(engines::Kind::Codex) => engines::codex::saved(&cwd)
+                        .iter()
+                        .any(|(saved, _, _)| saved == id),
                 };
                 if !saved {
                     return Err(format!("no session {id} in {}", cwd.display()));
@@ -353,26 +352,33 @@ impl Hub {
             Some(kind) => {
                 // A conversation with no turn yet was never saved: start it
                 // again under the same id instead of resuming it.
+                // Codex resumes through its protocol, which also sends the
+                // history back.
                 let saved = match kind {
                     engines::Kind::Claude => engines::claude::saved(&record.cwd)
                         .iter()
                         .any(|(saved, _, _)| saved == id),
+                    engines::Kind::Codex => true,
                 };
                 let transcript = match kind {
                     engines::Kind::Claude => engines::claude::transcript(&record.cwd, id),
+                    engines::Kind::Codex => Vec::new(),
                 };
                 let options = engines::Options {
                     resume: saved.then(|| id.to_string()),
                     ..options
                 };
-                engines::spawn(
+                // A new start keeps the recorded id; a resume opens it.
+                let fresh = options.resume.is_none().then(|| id.to_string());
+                let (_, ops, generation) = engines::spawn(
                     Arc::clone(self),
                     kind,
-                    id.to_string(),
+                    fresh,
                     record.cwd.clone(),
                     options,
                     transcript,
-                )?
+                )?;
+                (ops, generation)
             }
         };
         if record.closed {
@@ -880,6 +886,13 @@ impl Hub {
                     .into_iter()
                     .map(|(id, title, updated_at)| {
                         item(id, title, updated_at, Value::Null, "claude")
+                    }),
+            )
+            .chain(
+                engines::codex::saved(cwd)
+                    .into_iter()
+                    .map(|(id, title, updated_at)| {
+                        item(id, title, updated_at, Value::Null, "codex")
                     }),
             )
             .collect();
