@@ -1598,10 +1598,12 @@ fn is_routine_log(line: &str) -> bool {
 
 // --- saved conversations ---
 
-/// Claude Code's project directory for `cwd`: every character that is not
-/// ASCII alphanumeric becomes `-`.
+/// Claude Code's project directory for `cwd`: every character of the real
+/// path (Claude Code resolves symlinks, e.g. macOS `/tmp` → `/private/tmp`)
+/// that is not ASCII alphanumeric becomes `-`.
 fn project_dir(home: &Path, cwd: &Path) -> PathBuf {
-    let munged: String = cwd
+    let real = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let munged: String = real
         .to_string_lossy()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -2005,5 +2007,15 @@ mod tests {
         assert_eq!(listed[0].0, "11-22");
         assert_eq!(listed[0].1, "hello there");
         assert!(transcript_in(&home, cwd, "../etc").is_empty());
+
+        // A symlinked directory is saved under its real path.
+        let real = home.join("real-dir");
+        let link = home.join("link-dir");
+        fs::create_dir_all(&real).unwrap();
+        let _ = fs::remove_file(&link);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(unix)]
+        assert_eq!(project_dir(&home, &link), project_dir(&home, &real));
     }
 }
