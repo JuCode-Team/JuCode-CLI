@@ -38,14 +38,17 @@ identified to the daemon by its static public key.
 Desktop shows a QR code / link:
 
 ```
-https://app.jucode.net/remote#pair=<host_id>.<host_static_pub>.<code>
+https://<relay host>/remote#pair=<host_id>.<host_static_pub>.<code>
 ```
+
+The link is on the relay's own origin (`--relay wss://host/relay/v1` →
+`https://host/remote`; `app.jucode.net` by default).
 
 - `host_static_pub`: the daemon's X25519 public key (32 bytes, base64url).
 - `code`: a one-time pairing code from the existing `pair_start` op (8 chars,
   5 minutes, single use).
 - The fragment is never sent to any server. The PWA reads it, stores
-  `{host_id, host_static_pub, relay: "wss://app.jucode.net/relay/v1"}` under
+  `{host_id, host_static_pub, relay: "wss://<link origin>/relay/v1"}` under
   localStorage `jucode-relay-host`, then clears the fragment
   (`history.replaceState`).
 
