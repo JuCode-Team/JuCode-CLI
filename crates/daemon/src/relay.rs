@@ -24,7 +24,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tungstenite::{stream::MaybeTlsStream, Message, WebSocket};
 
@@ -265,9 +265,7 @@ fn host_connection(
     backoff: &mut Duration,
 ) -> Result<(), String> {
     let base = hub.relay.url().unwrap_or_default();
-    let (mut socket, _) =
-        tungstenite::connect(format!("{base}/host")).map_err(|error| error.to_string())?;
-    set_read_timeout(&socket, HANDSHAKE_TIMEOUT)?;
+    let mut socket = connect_host(&format!("{base}/host"))?;
     let challenge = read_json(&mut socket)?;
     if challenge["t"] != "challenge" {
         return Err(format!("expected a challenge, got {challenge}"));
@@ -294,7 +292,13 @@ fn host_connection(
     }
     set_read_timeout(&socket, POLL)?;
     hub.relay.connected.store(true, Ordering::SeqCst);
-    *backoff = Duration::from_secs(1);
+    // Back to the short backoff only once this connection proved stable: a
+    // relay that accepts the host and drops it right away (another daemon
+    // with this identity, say) would otherwise be retried every second.
+    let _reset = ResetWhenStable {
+        backoff,
+        since: Instant::now(),
+    };
     jucode_agent_core::log_info!("daemon", "relay connected", host = identity.host_id());
 
     // Stream threads send finished frames here; this thread writes them.
@@ -355,6 +359,62 @@ fn host_connection(
                 .map_err(|error| error.to_string())?;
         }
     }
+}
+
+/// How long a host connection must last before the backoff starts over.
+const STABLE: Duration = Duration::from_secs(30);
+
+struct ResetWhenStable<'a> {
+    backoff: &'a mut Duration,
+    since: Instant,
+}
+
+impl Drop for ResetWhenStable<'_> {
+    fn drop(&mut self) {
+        if self.since.elapsed() >= STABLE {
+            *self.backoff = Duration::from_secs(1);
+        }
+    }
+}
+
+/// Opens the host WebSocket with every step bounded: TCP connect, TLS and the
+/// HTTP upgrade (a proxy that accepts the connection and then says nothing
+/// would otherwise block this thread for good, `relay_set(false)` included).
+fn connect_host(url: &str) -> Result<HostSocket, String> {
+    use std::net::ToSocketAddrs;
+    use tungstenite::client::IntoClientRequest;
+    let request = url
+        .into_client_request()
+        .map_err(|error| error.to_string())?;
+    let uri = request.uri();
+    let host = uri.host().ok_or("relay url without a host")?.to_string();
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("wss") {
+            443
+        } else {
+            80
+        });
+    let mut last = format!("could not resolve {host}");
+    let mut tcp = None;
+    for addr in (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|error| error.to_string())?
+    {
+        match TcpStream::connect_timeout(&addr, HANDSHAKE_TIMEOUT) {
+            Ok(stream) => {
+                tcp = Some(stream);
+                break;
+            }
+            Err(error) => last = error.to_string(),
+        }
+    }
+    let tcp = tcp.ok_or(last)?;
+    tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT))
+        .and_then(|_| tcp.set_write_timeout(Some(HANDSHAKE_TIMEOUT)))
+        .map_err(|error| error.to_string())?;
+    let (socket, _) = tungstenite::client_tls(request, tcp).map_err(|error| error.to_string())?;
+    Ok(socket)
 }
 
 fn set_read_timeout(socket: &HostSocket, timeout: Duration) -> Result<(), String> {
