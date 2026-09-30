@@ -1403,6 +1403,7 @@ fn run_command_session(
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to start {program}: {error}"))?;
+    track_tool_group(child.id());
 
     let stdin = child.stdin.take();
     let started = SystemTime::now();
@@ -1615,6 +1616,56 @@ fn kill_child(child: &mut Child) {
         }
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+/// Process groups of the tool commands this process started (each child is
+/// a group leader). Entries are never removed; `terminate_tool_processes`
+/// signals only leaders that are still unreaped children of this process, so
+/// a stale entry whose pid was reused is skipped.
+static TOOL_GROUPS: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
+
+fn track_tool_group(pid: u32) {
+    if let Ok(mut groups) = TOOL_GROUPS.get_or_init(|| Mutex::new(Vec::new())).lock() {
+        groups.push(pid);
+    }
+}
+
+/// Ends every tool command this process started that is still running —
+/// foreground commands and background shells (dev servers, watchers) alike —
+/// with their descendants: SIGTERM to each group, SIGKILL to what is left
+/// after half a second. Call when the engine process is about to exit, so
+/// nothing it started outlives it.
+pub fn terminate_tool_processes() {
+    #[cfg(unix)]
+    {
+        let pids = TOOL_GROUPS
+            .get()
+            .and_then(|groups| groups.lock().ok().map(|mut g| std::mem::take(&mut *g)))
+            .unwrap_or_default();
+        // Still our unreaped child: its pid (and group id) cannot have been reused.
+        let running = |pid: u32| {
+            let mut status = 0;
+            // SAFETY: WNOHANG never blocks; the pid is one this process spawned.
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) == 0 }
+        };
+        let mut live: Vec<u32> = pids.into_iter().filter(|&pid| running(pid)).collect();
+        for &pid in &live {
+            // SAFETY: signals the group this process created for that child.
+            unsafe { libc::killpg(pid as libc::pid_t, libc::SIGTERM) };
+        }
+        for _ in 0..10 {
+            live.retain(|&pid| running(pid));
+            if live.is_empty() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        for &pid in &live {
+            // SAFETY: as above.
+            unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+            unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0) };
+        }
     }
 }
 
@@ -2397,6 +2448,26 @@ struct ToolStateInner {
     web: Option<crate::web::WebTools>,
 }
 
+impl Drop for ToolStateInner {
+    /// The engine owning these background shells is gone (a daemon session
+    /// closed, say): end them rather than leave them running unattended.
+    fn drop(&mut self) {
+        if self.shells.is_empty() {
+            return;
+        }
+        let Ok(mut sessions) = shell_sessions().lock() else {
+            return;
+        };
+        for id in self.shells.drain() {
+            if let Some(mut session) = sessions.remove(&id) {
+                kill_child(&mut session.child);
+                let _ = fs::remove_file(&session.stdout_path);
+                let _ = fs::remove_file(&session.stderr_path);
+            }
+        }
+    }
+}
+
 impl ToolState {
     pub fn set_sandbox(&self, sandbox: Option<crate::sandbox::SandboxPolicy>) {
         if let Ok(mut inner) = self.0.lock() {
@@ -2795,6 +2866,7 @@ fn run_command_events(
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to start {program}: {error}"))?;
+    track_tool_group(child.id());
 
     if let Some(input) = stdin {
         if let Some(mut child_stdin) = child.stdin.take() {
@@ -3556,6 +3628,34 @@ fn expand_tilde(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_tool_processes_ends_commands_and_their_children() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        track_tool_group(child.id());
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        let grandchild: i32 = line.trim().parse().unwrap();
+
+        terminate_tool_processes();
+
+        // SAFETY: signal 0 only probes the pid.
+        let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!alive(grandchild), "the command's child outlived it");
+        assert!(matches!(child.try_wait(), Err(_) | Ok(Some(_))));
+    }
 
     #[test]
     fn write_root_guard_blocks_targets_outside_workspace() {

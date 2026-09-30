@@ -62,6 +62,30 @@ impl TuiRuntime for Runtime {
     }
 }
 
+/// SIGTERM, SIGHUP or SIGINT ends the tool commands before exiting. The
+/// signals are blocked in every thread (call this before any is spawned) and
+/// taken by one waiting thread; spawned commands start with a clean mask.
+#[cfg(unix)]
+fn end_tool_processes_on_signal() {
+    // SAFETY: plain sigset manipulation; the set outlives the waiting thread
+    // (moved into it).
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+            libc::sigaddset(&mut set, signal);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        std::thread::spawn(move || {
+            let mut signal = 0;
+            if libc::sigwait(&set, &mut signal) == 0 {
+                jucode_agent_core::terminate_tool_processes();
+                std::process::exit(128 + signal);
+            }
+        });
+    }
+}
+
 fn main() -> io::Result<()> {
     jucode_agent_core::logging::init_global();
     let mut args = env::args().skip(1).collect::<Vec<_>>();
@@ -86,23 +110,34 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
+    // The engine modes run tool commands in their own process groups; none of
+    // them may outlive the engine, however it ends (input closed, a signal,
+    // an error).
+    let engine_mode = matches!(
+        args.first().map(String::as_str),
+        Some("--headless" | "serve" | "daemon" | "acp")
+    );
+    if engine_mode {
+        #[cfg(unix)]
+        end_tool_processes_on_signal();
+    }
+    let exit = |code: io::Result<i32>| -> io::Result<()> {
+        jucode_agent_core::terminate_tool_processes();
+        std::process::exit(code?);
+    };
     if args.first().map(String::as_str) == Some("--headless") {
         args.remove(0);
-        let code = run_headless(args, approval_mode)?;
-        std::process::exit(code);
+        return exit(run_headless(args, approval_mode));
     }
     if args.first().map(String::as_str) == Some("serve") {
         let chat = args.iter().skip(1).any(|arg| arg == "--chat");
-        let code = run_serve(approval_mode, chat)?;
-        std::process::exit(code);
+        return exit(run_serve(approval_mode, chat));
     }
     if args.first().map(String::as_str) == Some("daemon") {
-        let code = run_daemon(&args[1..])?;
-        std::process::exit(code);
+        return exit(run_daemon(&args[1..]));
     }
     if args.first().map(String::as_str) == Some("acp") {
-        let code = acp::run_acp(approval_mode)?;
-        std::process::exit(code);
+        return exit(acp::run_acp(approval_mode));
     }
     if args.first().map(String::as_str) == Some("update") {
         std::process::exit(run_update());

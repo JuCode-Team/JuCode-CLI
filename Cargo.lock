@@ -842,6 +842,7 @@ dependencies = [
  "jucode-agent-core",
  "jucode-daemon",
  "jucode-tui",
+ "libc",
  "serde_json",
 ]
 

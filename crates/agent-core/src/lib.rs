@@ -36,3 +36,4 @@ pub use event::{
     ModelOptionView, PlanItem, SessionListItemView, TranscriptItem, TreeNodeView,
 };
 pub use hunks::HunkView;
+pub use tools::terminate_tool_processes;
