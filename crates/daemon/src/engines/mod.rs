@@ -637,11 +637,8 @@ impl Session<'_> {
                 self.last_error = event["message"].as_str().map(str::to_string);
             }
             self.snapshot.apply(&event);
-            if let (Some(id), "user_message") =
-                (&self.id, event["type"].as_str().unwrap_or_default())
-            {
-                self.hub
-                    .note_user_message(id, event["content"].as_str().unwrap_or_default());
+            if let Some(id) = &self.id {
+                self.hub.observe(id, &event);
             }
             if self.id.is_some() {
                 self.hub.broadcast(&self.tagged(event));

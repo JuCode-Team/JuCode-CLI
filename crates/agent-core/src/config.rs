@@ -196,6 +196,9 @@ pub struct Config {
     /// empty in config.json falls back to `compact_model`.
     pub safety_model: String,
     pub safety_reasoning_effort: String,
+    /// Model that names conversations (`jucode daemon`). Empty: the main
+    /// `model`.
+    pub title_model: String,
     pub models: Vec<ModelConfig>,
     /// The JuCode gateway models the user chose to show (`jucode_models`),
     /// out of everything their account can reach. Becomes `models` whenever
@@ -353,6 +356,7 @@ impl Config {
                 compact_reasoning_effort: DEFAULT_COMPACT_REASONING_EFFORT.to_string(),
                 safety_model: "gpt-5.5".to_string(),
                 safety_reasoning_effort: DEFAULT_COMPACT_REASONING_EFFORT.to_string(),
+                title_model: String::new(),
                 models: models_for_provider("jucode"),
                 jucode_models: Vec::new(),
                 jucode_groups: BTreeMap::new(),
@@ -450,6 +454,7 @@ impl Config {
             compact_reasoning_effort,
             safety_model,
             safety_reasoning_effort,
+            title_model: read_string(&value, "title_model", ""),
             models,
             jucode_models: value
                 .get("jucode_models")
@@ -536,6 +541,7 @@ impl Config {
             "compact_reasoning_effort": self.compact_reasoning_effort,
             "safety_model": self.safety_model,
             "safety_reasoning_effort": self.safety_reasoning_effort,
+            "title_model": self.title_model,
             "models": self.models.iter().map(model_config_value).collect::<Vec<_>>(),
             "jucode_models": self.jucode_models.iter().map(model_config_value).collect::<Vec<_>>(),
             "jucode_groups": self.jucode_groups,
@@ -595,6 +601,23 @@ impl Config {
     /// Safety-classifier model and effort, with the same fallback as `compact`.
     pub fn safety(&self) -> (String, String) {
         self.helper_model(&self.safety_model, &self.safety_reasoning_effort)
+    }
+
+    /// Conversation-title model: `title_model` when it is one of `models`,
+    /// else the main model; at its lightest reasoning effort.
+    pub fn title(&self) -> (String, String) {
+        let model = if self.models.iter().any(|m| m.name == self.title_model) {
+            self.title_model.clone()
+        } else {
+            self.model.clone()
+        };
+        let effort = self
+            .models
+            .iter()
+            .find(|m| m.name == model)
+            .and_then(|m| m.reasoning_efforts.first().cloned())
+            .unwrap_or_default();
+        (model, effort)
     }
 
     fn helper_model(&self, model: &str, effort: &str) -> (String, String) {
@@ -1716,6 +1739,7 @@ mod tests {
             compact_reasoning_effort: "low".to_string(),
             safety_model: "compact-model".to_string(),
             safety_reasoning_effort: "low".to_string(),
+            title_model: String::new(),
             models: vec![
                 ModelConfig {
                     name: "chat-model".to_string(),

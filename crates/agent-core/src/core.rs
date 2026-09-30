@@ -1087,33 +1087,11 @@ impl AgentCore {
     /// access token for the jucode provider, a stored omp OAuth access token
     /// when logged in via the catalog, otherwise the raw provider key.
     fn provider_api_key(&self) -> Option<String> {
-        if self.config.provider == "jucode" {
-            return self.auth.jucode_access_token().map(str::to_string);
-        }
-        let catalog = llm_provider_kit::omp::catalog();
-        let store_id = catalog
-            .auth_provider(&self.config.provider)
-            .and_then(|p| p.store_as.as_deref())
-            .unwrap_or(&self.config.provider);
-        if let Some(credential) = self.auth.oauth_credential(store_id) {
-            return Some(provider_auth::bearer_token(credential));
-        }
-        self.auth.key_for(&self.config.provider).map(str::to_string)
+        provider_api_key(&self.config, &self.auth)
     }
 
-    /// The JuCode group chosen per model, as the gateway's routing header.
-    /// Read from disk so a group picked in Desktop applies from the next turn.
     fn model_headers(&self) -> HashMap<String, Vec<(String, String)>> {
-        if self.config.provider != "jucode" {
-            return HashMap::new();
-        }
-        let groups = Config::load_or_create()
-            .map(|disk| disk.jucode_groups)
-            .unwrap_or_else(|_| self.config.jucode_groups.clone());
-        groups
-            .into_iter()
-            .map(|(model, group)| (model, vec![("X-JuCode-Group".to_string(), group)]))
-            .collect()
+        model_headers(&self.config)
     }
 
     /// Refreshes the active provider's bearer when it's near expiry so the
@@ -4124,6 +4102,80 @@ fn login_kind(login: &llm_provider_kit::omp::LoginRule) -> Option<(&'static str,
         LoginRule::ApiKey(_) => Some(("api key", true)),
         LoginRule::Custom { .. } => None,
     }
+}
+
+/// The active provider's bearer: the JuCode session, an omp OAuth credential
+/// or a stored API key.
+fn provider_api_key(config: &Config, auth: &AuthStore) -> Option<String> {
+    if config.provider == "jucode" {
+        return auth.jucode_access_token().map(str::to_string);
+    }
+    let catalog = llm_provider_kit::omp::catalog();
+    let store_id = catalog
+        .auth_provider(&config.provider)
+        .and_then(|p| p.store_as.as_deref())
+        .unwrap_or(&config.provider);
+    if let Some(credential) = auth.oauth_credential(store_id) {
+        return Some(provider_auth::bearer_token(credential));
+    }
+    auth.key_for(&config.provider).map(str::to_string)
+}
+
+/// The JuCode group chosen per model, as the gateway's routing header.
+/// Read from disk so a group picked in Desktop applies from the next turn.
+fn model_headers(config: &Config) -> HashMap<String, Vec<(String, String)>> {
+    if config.provider != "jucode" {
+        return HashMap::new();
+    }
+    let groups = Config::load_or_create()
+        .map(|disk| disk.jucode_groups)
+        .unwrap_or_else(|_| config.jucode_groups.clone());
+    groups
+        .into_iter()
+        .map(|(model, group)| (model, vec![("X-JuCode-Group".to_string(), group)]))
+        .collect()
+}
+
+/// One request to the conversation-title model (`Config::title`) on the
+/// user's configured provider: no tools, returns the reply text.
+pub fn title_completion(system: &str, user: &str) -> Result<String, String> {
+    let config = Config::load_or_create().map_err(|error| error.to_string())?;
+    let auth = if config.provider == "jucode" {
+        oauth::ensure_session(&config.jucode_api_url, config.encrypt_secrets)?
+    } else {
+        AuthStore::load_or_create(config.encrypt_secrets).map_err(|error| error.to_string())?
+    };
+    let (model, reasoning_effort) = config.title();
+    let client = OpenAiClient::from_config(OpenAiClientConfig {
+        model: model.clone(),
+        provider: config.provider.clone(),
+        protocol: config.protocol.clone(),
+        reasoning_effort,
+        model_reasoning_efforts: Vec::new(),
+        system_prompt: String::new(),
+        prompt_cache_key: String::new(),
+        mcp: McpManager::default(),
+        base_url: config.base_url.clone(),
+        max_output_tokens: config.model_config(&model).max_output_tokens,
+        api_key: provider_api_key(&config, &auth).as_deref(),
+        api_key_env: &config.api_key_env,
+        retry_attempts: config.retry_attempts,
+        connect_timeout: Duration::from_secs(config.connect_timeout_seconds),
+        read_timeout: Duration::from_secs(config.read_timeout_seconds),
+        goal_tool_tx: None,
+        approval_tx: None,
+        approval_mode: config.approval_mode,
+        safety_model: None,
+        safety_reasoning_effort: String::new(),
+        model_headers: model_headers(&config),
+        edit_tools: Vec::new(),
+        extra_read_roots: Vec::new(),
+        tool_state: crate::tools::ToolState::default(),
+        host: None,
+        subagent_manager: None,
+        hooks: Hooks::default(),
+    })?;
+    client.summarize_text(system, user, |_| Ok(()))
 }
 
 #[cfg(test)]

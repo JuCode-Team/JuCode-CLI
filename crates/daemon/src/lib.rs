@@ -16,6 +16,7 @@ mod projects;
 mod relay;
 mod session;
 mod store;
+mod titles;
 
 pub use agents::Agents;
 pub use store::Store;
@@ -320,7 +321,11 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             Some(cwd) => hub.session_history(std::path::Path::new(cwd)),
             None => Err("session_history requires cwd".to_string()),
         },
-        ("session_meta", Some(session)) => match hub.store.record_session_meta(&session, &op) {
+        // A client's title is its own: never one the daemon may rewrite.
+        ("session_meta", Some(session)) => match hub.store.record_session_meta(
+            &session,
+            &json!({ "title": op["title"], "archived": op["archived"], "hidden": op["hidden"] }),
+        ) {
             Ok(true) => {
                 hub.broadcast(&hub.sessions_json());
                 Ok(Value::Null)

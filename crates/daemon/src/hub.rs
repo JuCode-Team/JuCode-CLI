@@ -10,6 +10,7 @@ use crate::{
     store::{
         now, random_hex, token_hash, Device, Message, Question, Report, SessionRecord, Store, Timer,
     },
+    titles::{self, Turns},
 };
 use serde_json::{json, Value};
 use std::{
@@ -18,8 +19,9 @@ use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::Sender,
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, Weak,
     },
+    thread,
 };
 
 /// How long a pairing code shown on the desktop stays valid.
@@ -56,6 +58,12 @@ pub struct Hub {
     /// Sessions created here that have not had a user message yet: the
     /// first one becomes their title.
     untitled: Mutex<HashSet<String>>,
+    /// Each session's conversation so far, for its model-written title.
+    turns: Mutex<HashMap<String, Turns>>,
+    /// Sessions whose title is being written now.
+    titling: Mutex<HashSet<String>>,
+    /// This hub, for the threads it starts.
+    me: Weak<Hub>,
 }
 
 struct Client {
@@ -86,7 +94,10 @@ impl Hub {
         version: &'static str,
         relay: Option<String>,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
+            turns: Mutex::new(HashMap::new()),
+            titling: Mutex::new(HashSet::new()),
             relay: Relay::new(relay, &store),
             store,
             agents,
@@ -346,6 +357,7 @@ impl Hub {
                     created_at: now(),
                     closed: true,
                     title: None,
+                    title_auto: false,
                     archived: false,
                     hidden: false,
                     engine: engine.map(|kind| kind.name().to_string()),
@@ -839,6 +851,86 @@ impl Hub {
     }
 
     /// Every recorded session with whether it is hosted right now.
+    /// Every event a session publishes: its title follows the conversation
+    /// (see `titles`).
+    pub fn observe(&self, session: &str, event: &Value) {
+        if event["type"] == "user_message" {
+            self.note_user_message(session, event["content"].as_str().unwrap_or_default());
+        }
+        let due = lock(&self.turns)
+            .entry(session.to_string())
+            .or_default()
+            .observe(event);
+        if due {
+            self.retitle(session);
+        }
+    }
+
+    /// Asks the title model for a title in the background, unless a client
+    /// named the session by hand.
+    fn retitle(&self, session: &str) {
+        let Some(record) = self.auto_titled(session) else {
+            return;
+        };
+        let Some(hub) = self.me.upgrade() else {
+            return;
+        };
+        if !lock(&self.titling).insert(session.to_string()) {
+            return;
+        }
+        let project = record
+            .cwd
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let Some(prompt) = lock(&self.turns)
+            .get(session)
+            .map(|turns| turns.prompt(&project, record.title.as_deref()))
+        else {
+            lock(&self.titling).remove(session);
+            return;
+        };
+        let id = session.to_string();
+        thread::spawn(move || {
+            let reply = jucode_agent_core::title_completion(titles::SYSTEM, &prompt);
+            lock(&hub.titling).remove(&id);
+            let title = match reply {
+                Ok(reply) => titles::clean(&reply),
+                Err(error) => {
+                    jucode_agent_core::log_warn!(
+                        "daemon",
+                        "conversation title failed",
+                        error = error
+                    );
+                    None
+                }
+            };
+            // Renamed by hand meanwhile, or unchanged: nothing to do.
+            let Some(title) = title else { return };
+            let Some(record) = hub.auto_titled(&id) else {
+                return;
+            };
+            if record.title.as_deref() != Some(title.as_str())
+                && hub
+                    .store
+                    .record_session_meta(&id, &json!({ "title": title, "title_auto": true }))
+                    .is_ok()
+            {
+                hub.broadcast(&hub.sessions_json());
+            }
+        });
+    }
+
+    /// The session's record when its title is ours to write (none yet, or
+    /// one the daemon wrote).
+    fn auto_titled(&self, session: &str) -> Option<SessionRecord> {
+        self.store
+            .sessions()
+            .into_iter()
+            .find(|record| record.id == session)
+            .filter(|record| record.title.is_none() || record.title_auto)
+    }
+
     /// A session accepted a user message: a new session is titled after
     /// its first one (first line, 40 characters), as the desktop does.
     pub fn note_user_message(&self, session: &str, content: &str) {
@@ -864,7 +956,7 @@ impl Hub {
         if untouched
             && self
                 .store
-                .record_session_meta(session, &json!({ "title": title }))
+                .record_session_meta(session, &json!({ "title": title, "title_auto": true }))
                 .is_ok()
         {
             self.broadcast(&self.sessions_json());

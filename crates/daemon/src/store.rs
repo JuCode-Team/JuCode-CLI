@@ -39,6 +39,9 @@ pub struct SessionRecord {
     pub closed: bool,
     /// Set by a client; None: the engine's own label for the session.
     pub title: Option<String>,
+    /// The daemon wrote `title` (first line, or the title model), so it may
+    /// write it again; a title a client set stays.
+    pub title_auto: bool,
     pub archived: bool,
     /// Removed from session lists (its conversation stays on disk).
     pub hidden: bool,
@@ -213,6 +216,9 @@ impl Store {
         let mut changed = false;
         if let Some(title) = changes["title"].as_str() {
             entry["title"] = json!(title.trim());
+            if changes["title_auto"] == true {
+                entry["title_auto"] = json!(true);
+            }
             changed = true;
         }
         for flag in ["archived", "hidden"] {
@@ -279,6 +285,7 @@ impl Store {
                             created_at: entry["at"].as_u64().unwrap_or_default(),
                             closed: false,
                             title: None,
+                            title_auto: false,
                             archived: false,
                             hidden: false,
                             engine: entry["engine"].as_str().map(str::to_string),
@@ -297,6 +304,7 @@ impl Store {
                     if let Some(record) = records.get_mut(id) {
                         if let Some(title) = entry["title"].as_str() {
                             record.title = Some(title.to_string()).filter(|t| !t.is_empty());
+                            record.title_auto = entry["title_auto"] == true;
                         }
                         if let Some(archived) = entry["archived"].as_bool() {
                             record.archived = archived;

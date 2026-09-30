@@ -290,6 +290,46 @@ fn watching_sends_that_client_a_snapshot_of_the_session() {
 }
 
 #[test]
+fn the_title_model_names_a_session_and_leaves_a_hand_set_title_alone() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-title");
+    let mut client = Client::connect(&daemon);
+    let session = client.create_session(&dir);
+    let title_of = |frame: &Value| {
+        frame["sessions"]
+            .as_array()
+            .and_then(|list| list.iter().find(|s| s["session"] == session.as_str()))
+            .map(|s| s["title"].as_str().unwrap_or_default().to_string())
+    };
+    client.send(
+        json!({ "op": "user_message", "session": session, "content": "fix the login redirect" }),
+    );
+    client.until(ready(&session));
+    // The title model gets the project, the current title and the request
+    // (the test model echoes what it was asked).
+    client.until(|frame| {
+        frame["type"] == "sessions"
+            && title_of(frame).is_some_and(|title| title.starts_with("user said: Project:"))
+    });
+
+    client.send(json!({ "op": "session_meta", "session": session, "title": "my own title" }));
+    client.until(|frame| {
+        frame["type"] == "sessions" && title_of(frame).as_deref() == Some("my own title")
+    });
+    for message in ["and the logout", "and the signup"] {
+        client.send(json!({ "op": "user_message", "session": session, "content": message }));
+        client.until(ready(&session));
+    }
+    // Turn 3 was due for a new title; a hand-set one is kept.
+    for _ in 0..5 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let listed = request(&mut client, json!({ "op": "session_list" }));
+        assert_eq!(title_of(&listed).as_deref(), Some("my own title"));
+    }
+}
+
+#[test]
 fn a_session_closed_before_its_first_message_reopens() {
     let _guard = setup();
     let daemon = start_daemon();
@@ -1369,6 +1409,15 @@ fn is_ready(session: &str) -> impl Fn(&Value) -> bool + '_ {
     move |f| f["session"] == session && f["type"] == "status" && f["message"] == "ready"
 }
 
+/// A title from the first message "hello", or the one the title model
+/// wrote after the first turn (the test model echoes its request).
+fn titled(title: &Value) -> bool {
+    title == "hello"
+        || title
+            .as_str()
+            .is_some_and(|t| t.starts_with("user said: Project:"))
+}
+
 /// The end of a turn: `ready` after the reply (the first turn's init also
 /// says ready).
 fn turn_done(session: &str) -> impl FnMut(&Value) -> bool + '_ {
@@ -1456,8 +1505,9 @@ fn a_claude_session_runs_turns_and_shares_approvals_with_every_client() {
         .unwrap()
         .clone();
     assert_eq!(entry["engine"], "claude");
-    // Titled after its first message, the same on every client.
-    assert_eq!(entry["title"], "hello");
+    // Titled after its first message, the same on every client (or already
+    // by the title model once the first turn ended).
+    assert!(titled(&entry["title"]), "{entry}");
     let history = request(&mut desktop, json!({ "op": "session_history", "cwd": dir }));
     assert!(
         history["sessions"]
@@ -1466,7 +1516,7 @@ fn a_claude_session_runs_turns_and_shares_approvals_with_every_client() {
             .iter()
             .any(|s| s["session"] == session.as_str()
                 && s["engine"] == "claude"
-                && s["title"] == "hello"),
+                && titled(&s["title"])),
         "{history}"
     );
 
@@ -1613,7 +1663,7 @@ fn a_codex_session_is_named_by_its_thread_and_resumes_with_its_history() {
             .iter()
             .any(|s| s["session"] == session.as_str()
                 && s["engine"] == "codex"
-                && s["title"] == "hello"),
+                && titled(&s["title"])),
         "{history}"
     );
 

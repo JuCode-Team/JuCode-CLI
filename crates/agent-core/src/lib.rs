@@ -30,7 +30,7 @@ mod web_fetch;
 pub use config::{
     builtin_providers, jucode_visible_models, models_for_provider, ApprovalMode, ModelConfig,
 };
-pub use core::AgentCore;
+pub use core::{title_completion, AgentCore};
 pub use event::{
     AgentEvent, CommandView, GoalView, LoginProviderView, McpServerView, McpToolView,
     ModelOptionView, PlanItem, SessionListItemView, TranscriptItem, TreeNodeView,
