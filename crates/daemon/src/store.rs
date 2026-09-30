@@ -40,6 +40,8 @@ pub struct SessionRecord {
     /// Set by a client; None: the engine's own label for the session.
     pub title: Option<String>,
     pub archived: bool,
+    /// The engine running it; None: jucode.
+    pub engine: Option<String>,
 }
 
 /// A message for an agent: from the user, another agent or a timer.
@@ -166,13 +168,25 @@ impl Store {
         cwd: &std::path::Path,
         agent: Option<&str>,
     ) -> io::Result<()> {
-        self.append(
-            SESSIONS,
-            json!({
-                "kind": "open", "session": id, "cwd": cwd.display().to_string(),
-                "agent": agent, "at": now(),
-            }),
-        )
+        self.record_engine_session(id, cwd, agent, None)
+    }
+
+    /// Like `record_session`, for a session run by `engine` (None: jucode).
+    pub fn record_engine_session(
+        &self,
+        id: &str,
+        cwd: &std::path::Path,
+        agent: Option<&str>,
+        engine: Option<&str>,
+    ) -> io::Result<()> {
+        let mut entry = json!({
+            "kind": "open", "session": id, "cwd": cwd.display().to_string(),
+            "agent": agent, "at": now(),
+        });
+        if let Some(engine) = engine {
+            entry["engine"] = json!(engine);
+        }
+        self.append(SESSIONS, entry)
     }
 
     pub fn record_session_closed(&self, id: &str) -> io::Result<()> {
@@ -253,6 +267,7 @@ impl Store {
                             closed: false,
                             title: None,
                             archived: false,
+                            engine: entry["engine"].as_str().map(str::to_string),
                         }
                     });
                     record.closed = false;

@@ -134,8 +134,8 @@ every connected client.
 | `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers`, `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at` |
 | `session_meta` | `session`, `title` and/or `archived` | none; every client receives the new `sessions` list. An empty title goes back to the engine's label |
 | `session_history` | `cwd` | `session_history`: every session saved in `cwd`, newest first, whoever ran it (daemon, TUI, `jucode serve`), with `title`, `updated_at`, `entries`, `archived`, `agent`, `open` |
-| `session_create` | `cwd` | `session_created` with `session`; the session's startup events follow |
-| `session_open` | `session`, optional `cwd` | `session_opened`; with `cwd`, also opens a session saved there that the daemon never hosted. Reopens a closed session (or one from before a restart), resuming its transcript and its undecided deferred actions |
+| `session_create` | `cwd`, optional `engine` (`jucode`, default, or `claude`) and `options` | `session_created` with `session`; the session's startup events follow. See "Other engines" |
+| `session_open` | `session`, optional `cwd`, `engine`, `options` | `session_opened`; with `cwd`, also opens a session saved there that the daemon never hosted. Reopens a closed session (or one from before a restart), resuming its transcript and its undecided deferred actions |
 | `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped |
 | `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
 | `actions_list` | — | `actions`: undecided deferred actions across all sessions |
@@ -184,6 +184,41 @@ folders anywhere under the home directory (for picking a new project).
 Credentials (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.jucode/auth.json`,
 `~/.jucode/daemon`) are never readable. Paths are resolved (symlinks
 followed) before the check.
+
+## Other engines
+
+`session_create` with `engine: "claude"` runs Claude Code
+(`claude --print --input-format stream-json ...`, found through
+`CLAUDE_BIN`, PATH, then the usual install directories) in `cwd` instead of
+a jucode engine. The daemon translates its stream into the same session
+events a jucode session sends and client ops into Claude Code frames, so
+clients need nothing engine-specific. `options`:
+
+| Field | Meaning |
+| --- | --- |
+| `approval_mode` | `manual`/`read-only` (Claude's `default`), `plan`, `auto`, `auto-edit`, `full-access`/`full-auto` |
+| `model` | Model to start with |
+| `resume_at` | Resume the conversation as it was at this assistant message uuid |
+
+The session id is Claude Code's conversation id, so reopening a closed
+session resumes the same conversation (`--resume`), and `session_open` with
+`cwd` and `engine: "claude"` opens any conversation Claude Code saved for
+that directory. `session_history` lists those too, with `engine: "claude"`.
+Every session in `session_list` carries its `engine`.
+
+Differences from a jucode session:
+
+- A watching client gets a snapshot rebuilt by the daemon: the latest state
+  events, the conversation so far (text and tool results; a reopened
+  session starts from the text Claude Code saved) and any open permission
+  prompts. Prompts wait for whichever client answers them first; an
+  unwatched session is not switched to deferred actions.
+- Switching into or out of full access restarts Claude Code on the same
+  conversation (it only honors that mode as a start flag), after the running
+  turn.
+- `steer`, `decide_action`, MCP ops and the jucode-only commands (`/resume`,
+  `/rewind`, `/tree`, ...) are refused with an `error` event. Other slash
+  commands go to Claude Code as a user message, as Claude Code expects.
 
 ## Agents
 

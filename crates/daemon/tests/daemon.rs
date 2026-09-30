@@ -1338,3 +1338,187 @@ fn sessions_carry_titles_and_archive_state_and_history_reopens_unknown_ones() {
     );
     assert_eq!(opened["type"], "session_opened", "{opened}");
 }
+
+/// Points the daemon's Claude Code engine at the fake CLI; returns the file
+/// its starts are logged to.
+fn fake_claude() -> PathBuf {
+    let log = temp_dir("fake-claude").with_extension("log");
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_claude.py");
+    std::env::set_var("CLAUDE_BIN", script);
+    std::env::set_var("FAKE_CLAUDE_LOG", &log);
+    log
+}
+
+fn starts(log: &PathBuf) -> Vec<Vec<String>> {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn claude_reply(frames: &[Value], session: &str) -> String {
+    frames
+        .iter()
+        .filter(|f| f["session"] == session && f["type"] == "assistant_delta")
+        .map(|f| f["delta"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn is_ready(session: &str) -> impl Fn(&Value) -> bool + '_ {
+    move |f| f["session"] == session && f["type"] == "status" && f["message"] == "ready"
+}
+
+/// The end of a turn: `ready` after the reply (the first turn's init also
+/// says ready).
+fn turn_done(session: &str) -> impl FnMut(&Value) -> bool + '_ {
+    let mut replied = false;
+    move |f| {
+        replied |= f["session"] == session && f["type"] == "assistant_delta";
+        replied && is_ready(session)(f)
+    }
+}
+
+#[test]
+fn a_claude_session_runs_turns_and_shares_approvals_with_every_client() {
+    let _guard = setup();
+    let log = fake_claude();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-claude");
+    fs::create_dir_all(&dir).unwrap();
+    let mut desktop = Client::connect(&daemon);
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": { "approval_mode": "auto-edit" } }),
+    );
+    let session = created["session"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{created}"))
+        .to_string();
+    assert_eq!(
+        session.len(),
+        36,
+        "a claude session id is its conversation uuid"
+    );
+    desktop.send(json!({ "op": "watch", "session": session }));
+    desktop.until(is_ready(&session));
+    let args = &starts(&log)[0];
+    assert!(
+        args.windows(2)
+            .any(|w| w == ["--session-id", session.as_str()]),
+        "{args:?}"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w == ["--permission-mode", "acceptEdits"]),
+        "{args:?}"
+    );
+
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "hello" }));
+    let frames = desktop.until(turn_done(&session));
+    assert!(frames
+        .iter()
+        .any(|f| f["type"] == "user_message" && f["content"] == "hello"));
+    assert_eq!(claude_reply(&frames, &session), "ok: hello");
+
+    // A turn waits on a permission prompt; a phone that starts watching sees
+    // the conversation and the open prompt, and answers it.
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "use a tool" }));
+    desktop.until(|f| f["session"] == session.as_str() && f["type"] == "approval_request");
+    let mut phone = Client::connect(&daemon);
+    phone.send(json!({ "op": "watch", "session": session }));
+    let snapshot =
+        phone.until(|f| f["session"] == session.as_str() && f["type"] == "approval_request");
+    let transcript = snapshot.iter().find(|f| f["type"] == "transcript").unwrap();
+    assert_eq!(
+        transcript["items"][1],
+        json!({ "role": "assistant", "content": "ok: hello" })
+    );
+    let call = snapshot.last().unwrap()["call_id"].clone();
+    phone
+        .send(json!({ "op": "approve", "session": session, "call_id": call, "decision": "allow" }));
+    let frames = desktop.until(turn_done(&session));
+    let output = frames.iter().find(|f| f["type"] == "tool_output").unwrap();
+    assert!(
+        output["output"]
+            .as_str()
+            .unwrap()
+            .contains("\"stdout\":\"hi\""),
+        "{output}"
+    );
+
+    let listed = request(&mut desktop, json!({ "op": "session_list" }));
+    let entry = listed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session"] == session.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(entry["engine"], "claude");
+    let history = request(&mut desktop, json!({ "op": "session_history", "cwd": dir }));
+    assert!(
+        history["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["session"] == session.as_str()
+                && s["engine"] == "claude"
+                && s["title"] == "hello"),
+        "{history}"
+    );
+}
+
+#[test]
+fn full_access_restarts_claude_on_the_same_conversation_and_reopening_resumes_it() {
+    let _guard = setup();
+    let log = fake_claude();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-claude-restart");
+    fs::create_dir_all(&dir).unwrap();
+    let mut client = Client::connect(&daemon);
+    let created = request(
+        &mut client,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude" }),
+    );
+    let session = created["session"].as_str().unwrap().to_string();
+    client.send(json!({ "op": "watch", "session": session }));
+    client.until(is_ready(&session));
+    client.send(json!({ "op": "user_message", "session": session, "content": "first" }));
+    client.until(turn_done(&session));
+
+    client.send(json!({ "op": "set_approval_mode", "session": session, "mode": "full-access" }));
+    client.until(|f| {
+        f["session"] == session.as_str() && f["type"] == "approval_mode" && f["mode"] == "full-auto"
+    });
+    let restarted = starts(&log).pop().unwrap();
+    assert!(
+        restarted.contains(&"--dangerously-skip-permissions".to_string()),
+        "{restarted:?}"
+    );
+    assert!(
+        restarted
+            .windows(2)
+            .any(|w| w == ["--resume", session.as_str()]),
+        "{restarted:?}"
+    );
+
+    client.send(json!({ "op": "session_close", "session": session }));
+    client.until(|f| f["type"] == "session_closed" && f["session"] == session.as_str());
+    let opened = request(
+        &mut client,
+        json!({ "op": "session_open", "session": session }),
+    );
+    assert_eq!(opened["type"], "session_opened", "{opened}");
+    client.send(json!({ "op": "watch", "session": session }));
+    let frames = client.until(|f| f["session"] == session.as_str() && f["type"] == "transcript");
+    assert_eq!(
+        frames.last().unwrap()["items"],
+        json!([{ "role": "user", "content": "first" }, { "role": "assistant", "content": "ok: first" }])
+    );
+    assert!(starts(&log)
+        .pop()
+        .unwrap()
+        .windows(2)
+        .any(|w| w == ["--resume", session.as_str()]));
+}

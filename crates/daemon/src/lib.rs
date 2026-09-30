@@ -6,6 +6,7 @@
 
 mod agent_tools;
 mod agents;
+mod engines;
 mod files;
 mod http;
 mod hub;
@@ -336,12 +337,16 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             None => Err("device_revoke requires device".to_string()),
         },
         ("session_list", _) => Ok(hub.sessions_json()),
-        ("session_create", _) => hub
-            .create_session(
-                op["cwd"].as_str().map(PathBuf::from),
-                op["agent"].as_str(),
-                op["chat"].as_bool().unwrap_or(false),
-            )
+        ("session_create", _) => engines::Kind::parse(op["engine"].as_str().unwrap_or_default())
+            .and_then(|engine| {
+                hub.create_engine_session(
+                    op["cwd"].as_str().map(PathBuf::from),
+                    op["agent"].as_str(),
+                    op["chat"].as_bool().unwrap_or(false),
+                    engine,
+                    engines::Options::from_json(&op["options"]),
+                )
+            })
             .map(|session| json!({ "type": "session_created", "session": session })),
         ("agent_list", _) => Ok(hub.agents_json()),
         ("agent_create", _) => {
@@ -443,8 +448,15 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 "body": timer.body,
             })).collect::<Vec<_>>(),
         })),
-        ("session_open", Some(session)) => hub
-            .open_session(&session, op["cwd"].as_str().map(PathBuf::from))
+        ("session_open", Some(session)) => engines::Kind::parse(op["engine"].as_str().unwrap_or_default())
+            .and_then(|engine| {
+                hub.open_engine_session(
+                    &session,
+                    op["cwd"].as_str().map(PathBuf::from),
+                    engine,
+                    engines::Options::from_json(&op["options"]),
+                )
+            })
             .map(|()| json!({ "type": "session_opened", "session": session })),
         // Confirmed by the `session_closed` broadcast once the engine has
         // stopped and released the session.

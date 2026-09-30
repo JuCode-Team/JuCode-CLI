@@ -4,6 +4,7 @@
 
 use crate::{
     agents::Agents,
+    engines,
     relay::Relay,
     session,
     store::{
@@ -225,6 +226,22 @@ impl Hub {
         agent: Option<&str>,
         chat: bool,
     ) -> Result<String, String> {
+        self.create_engine_session(cwd, agent, chat, None, engines::Options::default())
+    }
+
+    /// `create_session` with the engine to run (None: jucode) and its start
+    /// options.
+    pub fn create_engine_session(
+        self: &Arc<Self>,
+        cwd: Option<PathBuf>,
+        agent: Option<&str>,
+        chat: bool,
+        engine: Option<engines::Kind>,
+        options: engines::Options,
+    ) -> Result<String, String> {
+        if engine.is_some() && agent.is_some() {
+            return Err("agents run on the jucode engine".to_string());
+        }
         let cwd = match agent {
             None if chat => {
                 jucode_agent_core::chat::ensure_chats_dir().map_err(|error| error.to_string())?
@@ -245,10 +262,23 @@ impl Hub {
             return Err(format!("not a directory: {}", cwd.display()));
         }
         let agent = agent.map(str::to_string);
-        let (id, ops, generation) =
-            session::spawn(Arc::clone(self), cwd.clone(), None, agent.clone())?;
+        let (id, ops, generation) = match engine {
+            None => session::spawn(Arc::clone(self), cwd.clone(), None, agent.clone())?,
+            Some(kind) => {
+                let id = engines::new_uuid()?;
+                let (ops, generation) = engines::spawn(
+                    Arc::clone(self),
+                    kind,
+                    id.clone(),
+                    cwd.clone(),
+                    options,
+                    vec![],
+                )?;
+                (id, ops, generation)
+            }
+        };
         self.store
-            .record_session(&id, &cwd, agent.as_deref())
+            .record_engine_session(&id, &cwd, agent.as_deref(), engine.map(engines::Kind::name))
             .map_err(|error| error.to_string())?;
         self.host(id.clone(), ops, cwd, generation);
         self.broadcast(&self.agents_json());
@@ -260,6 +290,19 @@ impl Hub {
     /// `cwd` also opens a session the daemon never hosted (one saved by
     /// the TUI or `jucode serve` in that directory).
     pub fn open_session(self: &Arc<Self>, id: &str, cwd: Option<PathBuf>) -> Result<(), String> {
+        self.open_engine_session(id, cwd, None, engines::Options::default())
+    }
+
+    /// `open_session` with start options; `engine` names the engine of a
+    /// session the daemon never hosted (a Claude Code conversation saved in
+    /// `cwd`).
+    pub fn open_engine_session(
+        self: &Arc<Self>,
+        id: &str,
+        cwd: Option<PathBuf>,
+        engine: Option<engines::Kind>,
+        options: engines::Options,
+    ) -> Result<(), String> {
         if lock(&self.sessions).contains_key(id) {
             return Ok(());
         }
@@ -271,10 +314,15 @@ impl Hub {
         let record = match (known, cwd) {
             (Some(record), _) => record,
             (None, Some(cwd)) => {
-                let saved = jucode_agent_core::saved_sessions(&cwd)
-                    .map_err(|error| error.to_string())?
-                    .iter()
-                    .any(|summary| summary.id == id);
+                let saved = match engine {
+                    None => jucode_agent_core::saved_sessions(&cwd)
+                        .map_err(|error| error.to_string())?
+                        .iter()
+                        .any(|summary| summary.id == id),
+                    Some(engines::Kind::Claude) => engines::claude::saved(&cwd)
+                        .iter()
+                        .any(|(saved, _, _)| saved == id),
+                };
                 if !saved {
                     return Err(format!("no session {id} in {}", cwd.display()));
                 }
@@ -286,19 +334,48 @@ impl Hub {
                     closed: true,
                     title: None,
                     archived: false,
+                    engine: engine.map(|kind| kind.name().to_string()),
                 }
             }
             (None, None) => return Err(format!("unknown session {id}")),
         };
-        let (_, ops, generation) = session::spawn(
-            Arc::clone(self),
-            record.cwd.clone(),
-            Some(id.to_string()),
-            record.agent.clone(),
-        )?;
+        let kind = engines::Kind::parse(record.engine.as_deref().unwrap_or_default())?;
+        let (ops, generation) = match kind {
+            None => {
+                let (_, ops, generation) = session::spawn(
+                    Arc::clone(self),
+                    record.cwd.clone(),
+                    Some(id.to_string()),
+                    record.agent.clone(),
+                )?;
+                (ops, generation)
+            }
+            Some(kind) => {
+                let transcript = match kind {
+                    engines::Kind::Claude => engines::claude::transcript(&record.cwd, id),
+                };
+                let options = engines::Options {
+                    resume: Some(id.to_string()),
+                    ..options
+                };
+                engines::spawn(
+                    Arc::clone(self),
+                    kind,
+                    id.to_string(),
+                    record.cwd.clone(),
+                    options,
+                    transcript,
+                )?
+            }
+        };
         if record.closed {
             self.store
-                .record_session(id, &record.cwd, record.agent.as_deref())
+                .record_engine_session(
+                    id,
+                    &record.cwd,
+                    record.agent.as_deref(),
+                    record.engine.as_deref(),
+                )
                 .map_err(|error| error.to_string())?;
         }
         self.host(id.to_string(), ops, record.cwd, generation);
@@ -745,6 +822,7 @@ impl Hub {
                     "updated_at": summary.map_or(record.created_at, |s| s.updated_at * 1000),
                     "title": record.title.or_else(|| summary.map(|s| s.label.clone())),
                     "archived": record.archived,
+                    "engine": record.engine.as_deref().unwrap_or("jucode"),
                     "agent": record.agent,
                     "open": hosted.is_some(),
                     "watchers": hosted.map(|h| h.watchers.len()).unwrap_or(0),
@@ -766,21 +844,39 @@ impl Hub {
             .map(|record| (record.id.clone(), record))
             .collect();
         let sessions = lock(&self.sessions);
-        let list: Vec<Value> = saved
-            .into_iter()
-            .map(|summary| {
-                let record = records.get(&summary.id);
-                json!({
-                    "session": summary.id,
-                    "title": record.and_then(|r| r.title.clone()).unwrap_or(summary.label),
-                    "updated_at": summary.updated_at * 1000,
-                    "entries": summary.entries,
-                    "archived": record.is_some_and(|r| r.archived),
-                    "agent": record.and_then(|r| r.agent.clone()),
-                    "open": sessions.contains_key(&summary.id),
-                })
+        let item = |id: String, label: String, updated_at: u64, entries: Value, engine: &str| {
+            let record = records.get(&id);
+            json!({
+                "title": record.and_then(|r| r.title.clone()).unwrap_or(label),
+                "updated_at": updated_at,
+                "entries": entries,
+                "archived": record.is_some_and(|r| r.archived),
+                "agent": record.and_then(|r| r.agent.clone()),
+                "open": sessions.contains_key(&id),
+                "engine": engine,
+                "session": id,
             })
+        };
+        let mut list: Vec<Value> = saved
+            .into_iter()
+            .map(|s| {
+                item(
+                    s.id,
+                    s.label,
+                    s.updated_at * 1000,
+                    json!(s.entries),
+                    "jucode",
+                )
+            })
+            .chain(
+                engines::claude::saved(cwd)
+                    .into_iter()
+                    .map(|(id, title, updated_at)| {
+                        item(id, title, updated_at, Value::Null, "claude")
+                    }),
+            )
             .collect();
+        list.sort_by_key(|item| std::cmp::Reverse(item["updated_at"].as_u64().unwrap_or(0)));
         Ok(json!({ "type": "session_history", "cwd": cwd, "sessions": list }))
     }
 }
