@@ -1027,7 +1027,7 @@ fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
         let reasoning_efforts =
             if name.starts_with("claude-") && is_thinking_disabled(&reasoning_efforts) {
                 max_output_tokens = max_output_tokens.max(CLAUDE_MIN_MAX_OUTPUT_TOKENS);
-                claude_thinking_tiers()
+                claude_thinking_tiers(name)
             } else {
                 reasoning_efforts
             };
@@ -1236,11 +1236,15 @@ pub(crate) const CLAUDE_MIN_MAX_OUTPUT_TOKENS: u64 = 32_000;
 /// Thinking-strength tiers offered for Claude models. They map to an Anthropic
 /// extended-thinking budget on the Messages path and to `reasoning.effort` on
 /// the Responses path.
-pub(crate) fn claude_thinking_tiers() -> Vec<String> {
-    ["none", "low", "medium", "high"]
-        .iter()
-        .map(|value| value.to_string())
-        .collect()
+/// Thinking-strength choices for a Claude model: the adaptive effort levels
+/// on current models, budget tiers on older ones.
+pub(crate) fn claude_thinking_tiers(model: &str) -> Vec<String> {
+    let tiers: &[&str] = if llm_provider_kit::anthropic::uses_adaptive_thinking(model) {
+        &["none", "low", "medium", "high", "xhigh", "max"]
+    } else {
+        &["none", "low", "medium", "high"]
+    };
+    tiers.iter().map(|value| value.to_string()).collect()
 }
 
 /// True when an effort list offers no actual thinking — empty, or only "none".
@@ -1658,7 +1662,7 @@ mod tests {
             .expect("claude entry present");
         assert_eq!(
             claude.reasoning_efforts,
-            vec!["none", "low", "medium", "high"]
+            vec!["none", "low", "medium", "high", "xhigh", "max"]
         );
         assert!(claude.max_output_tokens >= CLAUDE_MIN_MAX_OUTPUT_TOKENS);
     }

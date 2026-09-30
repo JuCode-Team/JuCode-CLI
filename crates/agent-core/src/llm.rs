@@ -26,6 +26,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Wire protocol for a model. The JuCode gateway serves each model in its own
+/// dialect (Claude over Anthropic Messages, the rest over Responses), so the
+/// config-wide `protocol` applies to other providers only.
+fn protocol_for(provider: &str, protocol: &str, model: &str) -> Protocol {
+    if provider == "jucode" {
+        return Protocol::resolve("", model);
+    }
+    llm_provider_kit::omp::catalog()
+        .protocol_for(provider, model)
+        .unwrap_or_else(|| Protocol::resolve(protocol, model))
+}
+
 const MAX_SUBAGENT_OUTPUT_BYTES: usize = 16 * 1024;
 const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_SUBAGENT_MAX_TOOL_CALLS: u64 = 12;
@@ -368,9 +380,7 @@ impl OpenAiClient {
                 )
             })?,
         };
-        let provider_kind = llm_provider_kit::omp::catalog()
-            .protocol_for(&config.provider, &config.model)
-            .unwrap_or_else(|| Protocol::resolve(&config.protocol, &config.model));
+        let provider_kind = protocol_for(&config.provider, &config.protocol, &config.model);
         let transport = TransportClient::new(TransportConfig {
             api_key: &api_key,
             prompt_cache_key: &config.prompt_cache_key,
@@ -389,9 +399,7 @@ impl OpenAiClient {
             ));
         }
         let safety = config.safety_model.map(|model| SafetySpec {
-            protocol: llm_provider_kit::omp::catalog()
-                .protocol_for(&config.provider, &model)
-                .unwrap_or_else(|| Protocol::resolve(&config.protocol, &model)),
+            protocol: protocol_for(&config.provider, &config.protocol, &model),
             reasoning_effort: config.safety_reasoning_effort,
             model,
         });

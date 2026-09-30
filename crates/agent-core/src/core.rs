@@ -3776,7 +3776,7 @@ fn jucode_model_config(model: &OAuthModel) -> ModelConfig {
             (
                 200_000,
                 crate::config::CLAUDE_MIN_MAX_OUTPUT_TOKENS,
-                crate::config::claude_thinking_tiers(),
+                crate::config::claude_thinking_tiers(&model.id),
             )
         } else {
             (
@@ -3799,7 +3799,7 @@ fn jucode_model_config(model: &OAuthModel) -> ModelConfig {
     // The gateway may advertise Claude models with only "none"; still surface
     // the thinking tiers (and a budget large enough to use them).
     if is_claude && crate::config::is_thinking_disabled(&reasoning_efforts) {
-        reasoning_efforts = crate::config::claude_thinking_tiers();
+        reasoning_efforts = crate::config::claude_thinking_tiers(&model.id);
         max_output_tokens = max_output_tokens.max(crate::config::CLAUDE_MIN_MAX_OUTPUT_TOKENS);
     }
     ModelConfig {
@@ -4319,7 +4319,7 @@ mod model_config_tests {
         let config = jucode_model_config(&oauth_model("claude-opus-4-8"));
         assert_eq!(
             config.reasoning_efforts,
-            vec!["none", "low", "medium", "high"]
+            vec!["none", "low", "medium", "high", "xhigh", "max"]
         );
         // max_output must leave room for the higher tiers' thinking budgets.
         assert!(config.max_output_tokens >= 32_000);
