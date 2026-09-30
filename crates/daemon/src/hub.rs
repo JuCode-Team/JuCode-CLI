@@ -47,6 +47,7 @@ pub struct Hub {
     /// Serializes message delivery (scheduler ticks, sends, tool calls).
     delivering: Mutex<()>,
     next_id: AtomicU64,
+    next_generation: AtomicU64,
     clients: Mutex<HashMap<u64, Client>>,
     /// Pairing code → expiry (ms). Single use.
     pairings: Mutex<HashMap<String, u64>>,
@@ -64,6 +65,8 @@ struct Hosted {
     ops: Sender<Value>,
     cwd: PathBuf,
     watchers: HashSet<u64>,
+    /// Which engine thread backs this entry (see `session_ended`).
+    generation: u64,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -90,6 +93,7 @@ impl Hub {
             last_active: Mutex::new(HashMap::new()),
             delivering: Mutex::new(()),
             next_id: AtomicU64::new(0),
+            next_generation: AtomicU64::new(0),
             clients: Mutex::new(HashMap::new()),
             pairings: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
@@ -241,11 +245,12 @@ impl Hub {
             return Err(format!("not a directory: {}", cwd.display()));
         }
         let agent = agent.map(str::to_string);
-        let (id, ops) = session::spawn(Arc::clone(self), cwd.clone(), None, agent.clone())?;
+        let (id, ops, generation) =
+            session::spawn(Arc::clone(self), cwd.clone(), None, agent.clone())?;
         self.store
             .record_session(&id, &cwd, agent.as_deref())
             .map_err(|error| error.to_string())?;
-        self.host(id.clone(), ops, cwd);
+        self.host(id.clone(), ops, cwd, generation);
         self.broadcast(&self.agents_json());
         Ok(id)
     }
@@ -285,7 +290,7 @@ impl Hub {
             }
             (None, None) => return Err(format!("unknown session {id}")),
         };
-        let (_, ops) = session::spawn(
+        let (_, ops, generation) = session::spawn(
             Arc::clone(self),
             record.cwd.clone(),
             Some(id.to_string()),
@@ -296,19 +301,25 @@ impl Hub {
                 .record_session(id, &record.cwd, record.agent.as_deref())
                 .map_err(|error| error.to_string())?;
         }
-        self.host(id.to_string(), ops, record.cwd);
+        self.host(id.to_string(), ops, record.cwd, generation);
         Ok(())
     }
 
-    fn host(&self, id: String, ops: Sender<Value>, cwd: PathBuf) {
+    fn host(&self, id: String, ops: Sender<Value>, cwd: PathBuf, generation: u64) {
         lock(&self.sessions).insert(
             id,
             Hosted {
                 ops,
                 cwd,
                 watchers: HashSet::new(),
+                generation,
             },
         );
+    }
+
+    /// A number unique to one engine thread, tying it to its `Hosted` entry.
+    pub fn next_generation(&self) -> u64 {
+        self.next_generation.fetch_add(1, Ordering::SeqCst)
     }
 
     pub fn close_session(&self, id: &str) -> Result<(), String> {
@@ -323,9 +334,21 @@ impl Hub {
 
     /// Called by a session thread when its engine stops on its own (`/quit`
     /// or a failed open), so the session no longer counts as hosted.
-    pub fn session_ended(&self, id: &str) {
-        if lock(&self.sessions).remove(id).is_some() {
-            let _ = self.store.record_session_closed(id);
+    ///
+    /// `generation` is the ending thread's: when the session was closed and
+    /// reopened while that thread was still finishing, the entry now belongs
+    /// to the new engine, which must stay hosted.
+    pub fn session_ended(&self, id: &str, generation: u64) {
+        {
+            let mut sessions = lock(&self.sessions);
+            match sessions.get(id) {
+                Some(hosted) if hosted.generation == generation => {
+                    sessions.remove(id);
+                    let _ = self.store.record_session_closed(id);
+                }
+                Some(_) => return,
+                None => {}
+            }
         }
         lock(&self.busy).remove(id);
         lock(&self.claims).remove(id);
@@ -798,4 +821,40 @@ fn delivery_text(message: &Message) -> String {
         _ => format!("message from {}", message.from),
     };
     format!("[{origin} · {}]\n{}", message.id, message.body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{store::now, Agents};
+    use std::{fs, sync::mpsc};
+
+    #[test]
+    fn a_finishing_engine_leaves_its_successor_hosted() {
+        let dir = std::env::temp_dir().join(format!(
+            "jucode-hub-generation-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let hub = Hub::new(
+            Store::open(dir.join("daemon")).unwrap(),
+            Agents::open(dir.join("agents")).unwrap(),
+            "test",
+            None,
+        );
+        let (old_ops, _old_rx) = mpsc::channel();
+        let old = hub.next_generation();
+        hub.host("s1".to_string(), old_ops, dir.clone(), old);
+        // Closed and reopened while the old engine thread is still finishing.
+        lock(&hub.sessions).remove("s1");
+        let (new_ops, _new_rx) = mpsc::channel();
+        let new = hub.next_generation();
+        hub.host("s1".to_string(), new_ops, dir.clone(), new);
+
+        hub.session_ended("s1", old);
+        assert!(lock(&hub.sessions).contains_key("s1"));
+        hub.session_ended("s1", new);
+        assert!(!lock(&hub.sessions).contains_key("s1"));
+        let _ = fs::remove_dir_all(dir);
+    }
 }

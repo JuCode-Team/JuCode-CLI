@@ -19,15 +19,17 @@ use std::{
 
 /// Opens an engine in `cwd` (resuming `resume` when given) on a new thread,
 /// set up for `agent` when the session belongs to one. Returns the session
-/// id once the engine is ready, or the open error.
+/// id once the engine is ready, with the thread's generation (see
+/// `Hub::session_ended`), or the open error.
 pub fn spawn(
     hub: Arc<Hub>,
     cwd: PathBuf,
     resume: Option<String>,
     agent: Option<String>,
-) -> Result<(String, Sender<Value>), String> {
+) -> Result<(String, Sender<Value>, u64), String> {
     let (ops_tx, ops_rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
+    let generation = hub.next_generation();
     thread::spawn(move || {
         let core = match open(&hub, cwd, resume.as_deref(), agent.as_deref()) {
             Ok(core) => core,
@@ -39,12 +41,12 @@ pub fn spawn(
         let id = core.session_id().to_string();
         let _ = ready_tx.send(Ok(id.clone()));
         run(&hub, core, &id, ops_rx);
-        hub.session_ended(&id);
+        hub.session_ended(&id, generation);
     });
     let id = ready_rx
         .recv()
         .map_err(|_| "session thread stopped while opening".to_string())??;
-    Ok((id, ops_tx))
+    Ok((id, ops_tx, generation))
 }
 
 fn open(
