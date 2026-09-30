@@ -201,6 +201,10 @@ pub struct Config {
     /// out of everything their account can reach. Becomes `models` whenever
     /// the provider is jucode; empty until the first login.
     pub jucode_models: Vec<ModelConfig>,
+    /// JuCode group id per model name (`jucode_groups`): requests for that
+    /// model go only through that group (`X-JuCode-Group`). A model without
+    /// an entry is routed automatically across every group the account has.
+    pub jucode_groups: BTreeMap<String, String>,
     pub base_url: String,
     pub jucode_web_url: String,
     pub jucode_api_url: String,
@@ -351,6 +355,7 @@ impl Config {
                 safety_reasoning_effort: DEFAULT_COMPACT_REASONING_EFFORT.to_string(),
                 models: models_for_provider("jucode"),
                 jucode_models: Vec::new(),
+                jucode_groups: BTreeMap::new(),
                 base_url: "https://api.jucode.net/v1".to_string(),
                 jucode_web_url: "https://api.jucode.net".to_string(),
                 jucode_api_url: "https://api.jucode.net".to_string(),
@@ -450,6 +455,19 @@ impl Config {
                 .get("jucode_models")
                 .map(|list| read_model_configs(&json!({ "models": list }), "jucode"))
                 .unwrap_or_default(),
+            jucode_groups: value
+                .get("jucode_groups")
+                .and_then(Value::as_object)
+                .map(|groups| {
+                    groups
+                        .iter()
+                        .filter_map(|(model, group)| {
+                            let group = group.as_str()?.trim();
+                            (!group.is_empty()).then(|| (model.clone(), group.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             base_url: normalize_base_url(&read_string(&value, "base_url", &default_base_url)),
             provider,
             jucode_web_url: normalize_base_url(&read_string(
@@ -520,6 +538,7 @@ impl Config {
             "safety_reasoning_effort": self.safety_reasoning_effort,
             "models": self.models.iter().map(model_config_value).collect::<Vec<_>>(),
             "jucode_models": self.jucode_models.iter().map(model_config_value).collect::<Vec<_>>(),
+            "jucode_groups": self.jucode_groups,
             "base_url": normalize_base_url(&self.base_url),
             "jucode_web_url": normalize_base_url(&self.jucode_web_url),
             "jucode_api_url": normalize_base_url(&self.jucode_api_url),
@@ -1735,6 +1754,7 @@ mod tests {
             web_search_engine: crate::web::DEFAULT_SEARCH_ENGINE.to_string(),
             web_fetch_engine: crate::web::DEFAULT_FETCH_ENGINE.to_string(),
             jucode_models: Vec::new(),
+            jucode_groups: BTreeMap::new(),
             path: PathBuf::from("config.json"),
         };
 
@@ -1891,6 +1911,19 @@ mod tests {
             "oauth": { "client_id": "only-one-field" }
         }))
         .is_err());
+    }
+
+    #[test]
+    fn jucode_groups_skip_blank_entries() {
+        let config = Config::from_value(
+            r#"{"provider":"jucode","jucode_groups":{"claude-opus-5-5":"g1","gpt-6-sol":" ","x":3}}"#,
+            PathBuf::from("config.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            config.jucode_groups,
+            BTreeMap::from([("claude-opus-5-5".to_string(), "g1".to_string())])
+        );
     }
 
     #[test]

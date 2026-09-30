@@ -1101,6 +1101,21 @@ impl AgentCore {
         self.auth.key_for(&self.config.provider).map(str::to_string)
     }
 
+    /// The JuCode group chosen per model, as the gateway's routing header.
+    /// Read from disk so a group picked in Desktop applies from the next turn.
+    fn model_headers(&self) -> HashMap<String, Vec<(String, String)>> {
+        if self.config.provider != "jucode" {
+            return HashMap::new();
+        }
+        let groups = Config::load_or_create()
+            .map(|disk| disk.jucode_groups)
+            .unwrap_or_else(|_| self.config.jucode_groups.clone());
+        groups
+            .into_iter()
+            .map(|(model, group)| (model, vec![("X-JuCode-Group".to_string(), group)]))
+            .collect()
+    }
+
     /// Refreshes the active provider's bearer when it's near expiry so the
     /// inference call carries a valid token. Handles the JuCode session and
     /// omp OAuth credentials; BYOK providers return early.
@@ -1821,6 +1836,7 @@ impl AgentCore {
             approval_mode: self.approval_mode,
             safety_model: Some(self.config.safety().0).filter(|model| !model.trim().is_empty()),
             safety_reasoning_effort: self.config.safety().1,
+            model_headers: self.model_headers(),
             edit_tools: self.config.edit_tools.clone(),
             extra_read_roots,
             tool_state: self.tool_state.clone(),
@@ -2052,6 +2068,7 @@ impl AgentCore {
             approval_mode: self.approval_mode,
             safety_model: None,
             safety_reasoning_effort: String::new(),
+            model_headers: self.model_headers(),
             // Summarization clients never expose or execute tools.
             edit_tools: Vec::new(),
             extra_read_roots: Vec::new(),
@@ -2103,6 +2120,7 @@ impl AgentCore {
             approval_mode: self.approval_mode,
             safety_model: None,
             safety_reasoning_effort: String::new(),
+            model_headers: self.model_headers(),
             // Summarization clients never expose or execute tools.
             edit_tools: Vec::new(),
             extra_read_roots: Vec::new(),
@@ -3620,10 +3638,6 @@ impl AgentCore {
         }
     }
 
-    /// Applies `change` to the config file as it is on disk now, then to this
-    /// engine's copy. Other engines (in this process or another) may have
-    /// saved since this one loaded the file; saving the whole in-memory copy
-    /// would silently undo their changes.
     /// Desktop edits the visible JuCode models in config.json; pick them up
     /// when the model list opens instead of waiting for a restart.
     fn reload_model_list(&mut self) {
@@ -3631,10 +3645,15 @@ impl AgentCore {
             if disk.provider == self.config.provider {
                 self.config.models = disk.models;
                 self.config.jucode_models = disk.jucode_models;
+                self.config.jucode_groups = disk.jucode_groups;
             }
         }
     }
 
+    /// Applies `change` to the config file as it is on disk now, then to this
+    /// engine's copy. Other engines (in this process or another) may have
+    /// saved since this one loaded the file; saving the whole in-memory copy
+    /// would silently undo their changes.
     fn change_config(&mut self, change: impl Fn(&mut Config)) -> io::Result<()> {
         let mut current = Config::load_or_create()?;
         change(&mut current);

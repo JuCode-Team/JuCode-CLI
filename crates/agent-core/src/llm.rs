@@ -18,7 +18,7 @@ use llm_provider_kit::transport::{
 use llm_provider_kit::{anthropic, chat, responses, Protocol, WireEvent};
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     path::{Path, PathBuf},
     sync::mpsc::{self, Sender},
@@ -153,6 +153,8 @@ pub struct OpenAiClientConfig<'a> {
     /// as the main model). Pass None to disable classification.
     pub safety_model: Option<String>,
     pub safety_reasoning_effort: String,
+    /// Extra request headers per model name (the JuCode group choice).
+    pub model_headers: HashMap<String, Vec<(String, String)>>,
     /// Canonical edit-tool names to expose (see `Config::edit_tools`).
     pub edit_tools: Vec<String>,
     /// Directories outside the workspace that read-only file tools may also
@@ -388,6 +390,7 @@ impl OpenAiClient {
             connect_timeout: config.connect_timeout,
             retry_attempts: retry_attempts_from_env(config.retry_attempts),
             cache_debug: cache_debug_enabled(),
+            model_headers: config.model_headers,
         });
         // Azure is the one provider whose endpoint the catalog cannot supply —
         // deployments live at a per-resource host — so fail with the reason
@@ -2384,6 +2387,7 @@ mod tests {
             approval_mode: ApprovalMode::default(),
             safety_model: None,
             safety_reasoning_effort: String::new(),
+            model_headers: HashMap::new(),
             edit_tools: crate::config::default_edit_tools(),
             extra_read_roots: Vec::new(),
             tool_state: tools::ToolState::default(),
