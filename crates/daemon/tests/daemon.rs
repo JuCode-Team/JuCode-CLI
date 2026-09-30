@@ -242,8 +242,16 @@ fn a_closed_session_reopens_with_its_open_actions() {
     client.send(json!({ "op": "session_close", "session": session }));
     client.until(|frame| frame["type"] == "session_closed");
 
-    // A second daemon on the same state stands in for a restart.
-    let restarted = start_daemon_on(daemon.state.clone(), daemon.agents.clone());
+    // A second daemon on a copy of the state stands in for a restart (the
+    // first keeps running, and holds its state directory).
+    let state = temp_dir("daemon-restarted").join("daemon");
+    fs::create_dir_all(&state).unwrap();
+    for entry in fs::read_dir(&daemon.state).unwrap().flatten() {
+        if entry.path().is_file() {
+            fs::copy(entry.path(), state.join(entry.file_name())).unwrap();
+        }
+    }
+    let restarted = start_daemon_on(state, daemon.agents.clone());
     let mut client = Client::connect(&restarted);
     client.send(json!({ "op": "session_open", "session": session }));
     client.until(|frame| frame["type"] == "session_opened");

@@ -453,7 +453,16 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
             }
         });
     }
-    let store = jucode_daemon::Store::open(jucode_daemon::state_dir()?)?;
+    let store = match jucode_daemon::Store::open(jucode_daemon::state_dir()?) {
+        Ok(store) => store,
+        // Another daemon holds the state directory: exit successfully, as for
+        // a taken port below.
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            eprintln!("jucode daemon: {error}");
+            return Ok(0);
+        }
+        Err(error) => return Err(error),
+    };
     // The token exists before the port answers: a client that connects as
     // soon as it can (Desktop starting the daemon) reads it right away.
     store.token()?;

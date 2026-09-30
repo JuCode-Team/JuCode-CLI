@@ -1,15 +1,18 @@
 //! Append-only state under `~/.jucode/daemon/`. The daemon is the only
-//! writer; every read folds the whole log, which stays small (one line per
-//! session opened or closed, per action deferred or decided).
+//! writer (`Store::open` holds a lock on the directory), so each log is read
+//! from disk once and then kept in memory alongside its appends; every read
+//! folds the whole log. Opening compacts the logs that only ever grow: the
+//! session log down to one line per fact, and decided actions and finished
+//! timers out of theirs.
 
 use jucode_agent_core::actions::DeferredAction;
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -24,9 +27,16 @@ const TOKEN: &str = "token";
 const SETTINGS: &str = "settings.json";
 const WORKSPACES: &str = "workspaces.json";
 
+const LOCK: &str = "lock";
+
 pub struct Store {
     dir: PathBuf,
     write: Mutex<()>,
+    /// Parsed logs by file name, loaded on first read.
+    logs: Mutex<HashMap<&'static str, Arc<Vec<Value>>>>,
+    /// Held for the store's lifetime: a second daemon on the same directory
+    /// would write behind this one's cached logs.
+    _lock: fs::File,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,10 +134,99 @@ pub struct Timer {
 impl Store {
     pub fn open(dir: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
-        Ok(Self {
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(LOCK))?;
+        if let Err(error) = lock.try_lock() {
+            return Err(match error {
+                fs::TryLockError::WouldBlock => io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("another daemon is using {}", dir.display()),
+                ),
+                fs::TryLockError::Error(error) => error,
+            });
+        }
+        let store = Self {
             dir,
             write: Mutex::new(()),
-        })
+            logs: Mutex::new(HashMap::new()),
+            _lock: lock,
+        };
+        store.compact()?;
+        Ok(store)
+    }
+
+    /// Rewrites the session, action and timer logs without the lines their
+    /// folds no longer need. Runs before anything else reads the store.
+    fn compact(&self) -> io::Result<()> {
+        let mut sessions = Vec::new();
+        for record in self.sessions() {
+            let mut open = json!({
+                "kind": "open", "session": record.id, "cwd": record.cwd.display().to_string(),
+                "agent": record.agent, "at": record.created_at,
+            });
+            if let Some(engine) = &record.engine {
+                open["engine"] = json!(engine);
+            }
+            if record.gateway {
+                open["gateway"] = json!(true);
+            }
+            sessions.push(open);
+            let mut meta = json!({ "kind": "meta", "session": record.id });
+            if let Some(title) = &record.title {
+                meta["title"] = json!(title);
+                if record.title_auto {
+                    meta["title_auto"] = json!(true);
+                }
+            }
+            for (flag, value) in [("archived", record.archived), ("hidden", record.hidden)] {
+                if value {
+                    meta[flag] = json!(true);
+                }
+            }
+            if meta.as_object().is_some_and(|fields| fields.len() > 2) {
+                sessions.push(meta);
+            }
+            if record.closed {
+                sessions.push(json!({ "kind": "close", "session": record.id }));
+            }
+        }
+        self.rewrite(SESSIONS, sessions)?;
+        let actions = self
+            .open_actions()
+            .iter()
+            .map(|action| json!({ "kind": "deferred", "action": action.to_json() }))
+            .collect();
+        self.rewrite(ACTIONS, actions)?;
+        let active: HashSet<String> = self.active_timers().into_iter().map(|t| t.id).collect();
+        let timers = self
+            .read(TIMERS)
+            .iter()
+            .filter(|entry| entry["kind"] == "set")
+            .filter(|entry| entry["id"].as_str().is_some_and(|id| active.contains(id)))
+            .cloned()
+            .collect();
+        self.rewrite(TIMERS, timers)
+    }
+
+    /// Replaces a log with `entries` (temp file + rename) when that drops
+    /// lines, and keeps them as its cached copy.
+    fn rewrite(&self, file: &'static str, entries: Vec<Value>) -> io::Result<()> {
+        let _guard = self.lock();
+        if entries.len() >= self.read(file).len() {
+            return Ok(());
+        }
+        let text: String = entries.iter().map(|entry| format!("{entry}\n")).collect();
+        let temp = self.dir.join(format!("{file}.tmp"));
+        let mut out = fs::File::create(&temp)?;
+        out.write_all(text.as_bytes())?;
+        // On disk before the rename replaces the only other copy.
+        out.sync_all()?;
+        fs::rename(&temp, self.dir.join(file))?;
+        self.cached().insert(file, Arc::new(entries));
+        Ok(())
     }
 
     pub fn dir(&self) -> &Path {
@@ -267,7 +366,7 @@ impl Store {
     pub fn sessions(&self) -> Vec<SessionRecord> {
         let mut order = Vec::new();
         let mut records: BTreeMap<String, SessionRecord> = BTreeMap::new();
-        for entry in self.read(SESSIONS) {
+        for entry in self.read(SESSIONS).iter() {
             let Some(id) = entry["session"].as_str() else {
                 continue;
             };
@@ -411,7 +510,7 @@ impl Store {
     /// The session a delivered message went to.
     pub fn delivered_session(&self, id: &str) -> Option<String> {
         self.read(MESSAGES)
-            .into_iter()
+            .iter()
             .find(|entry| entry["kind"] == "delivered" && entry["id"] == id)
             .and_then(|entry| entry["session"].as_str().map(str::to_string))
     }
@@ -617,26 +716,44 @@ impl Store {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    fn append(&self, file: &str, value: Value) -> io::Result<()> {
+    fn cached(&self) -> std::sync::MutexGuard<'_, HashMap<&'static str, Arc<Vec<Value>>>> {
+        self.logs
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn append(&self, file: &'static str, value: Value) -> io::Result<()> {
         let _guard = self.lock();
         self.append_locked(file, value)
     }
 
-    fn append_locked(&self, file: &str, value: Value) -> io::Result<()> {
+    fn append_locked(&self, file: &'static str, value: Value) -> io::Result<()> {
         let mut out = OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.dir.join(file))?;
-        out.write_all(format!("{value}\n").as_bytes())
+        out.write_all(format!("{value}\n").as_bytes())?;
+        if let Some(entries) = self.cached().get_mut(file) {
+            Arc::make_mut(entries).push(value);
+        }
+        Ok(())
     }
 
     /// Every parseable line; a torn last line from a crash is skipped.
-    fn read(&self, file: &str) -> Vec<Value> {
-        fs::read_to_string(self.dir.join(file))
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()
+    fn read(&self, file: &'static str) -> Arc<Vec<Value>> {
+        let mut logs = self.cached();
+        if let Some(entries) = logs.get(file) {
+            return Arc::clone(entries);
+        }
+        let entries: Arc<Vec<Value>> = Arc::new(
+            fs::read_to_string(self.dir.join(file))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect(),
+        );
+        logs.insert(file, Arc::clone(&entries));
+        entries
     }
 }
 
@@ -775,6 +892,91 @@ mod tests {
             .record_session("a", std::path::Path::new("/p/a"), None)
             .unwrap();
         assert!(!store.sessions()[0].closed);
+    }
+
+    #[test]
+    fn only_one_store_opens_a_directory() {
+        let store = store("lock");
+        let error = Store::open(store.dir.clone()).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        let dir = store.dir.clone();
+        drop(store);
+        assert!(Store::open(dir).is_ok());
+    }
+
+    #[test]
+    fn reopening_compacts_the_logs_without_changing_what_they_say() {
+        let store = store("compact");
+        let cwd = std::path::Path::new("/p");
+        store
+            .record_engine_session("a", cwd, Some("ops"), Some("claude"), true)
+            .unwrap();
+        store.record_session("b", cwd, None).unwrap();
+        for title in ["one", "two", "three"] {
+            store
+                .record_session_meta("a", &json!({ "title": title, "title_auto": true }))
+                .unwrap();
+        }
+        store
+            .record_session_meta("b", &json!({ "archived": true, "hidden": true }))
+            .unwrap();
+        store
+            .record_session_meta("b", &json!({ "hidden": false }))
+            .unwrap();
+        store.record_session_closed("a").unwrap();
+        store.record_session("a", cwd, Some("ops")).unwrap();
+        store.record_session_closed("b").unwrap();
+        let deferred = |id: &str| {
+            DeferredAction::from_json(&json!({
+                "id": id, "session_id": "a", "cwd": "/p", "call_id": id, "name": "bash",
+                "arguments": "{}", "summary": "ls", "digest": id, "created_at": 1,
+            }))
+            .unwrap()
+        };
+        store.record_deferred(&deferred("x")).unwrap();
+        store.record_deferred(&deferred("y")).unwrap();
+        store.record_decided("x", true).unwrap();
+        for (id, fire_at) in [("t1", 10), ("t2", 20)] {
+            store
+                .record_timer(&Timer {
+                    id: id.into(),
+                    agent: "ops".into(),
+                    session: None,
+                    fire_at,
+                    body: "wake".into(),
+                })
+                .unwrap();
+        }
+        store.record_timer_done("t1", "fired").unwrap();
+
+        let dir = store.dir.clone();
+        let before = (
+            store.sessions(),
+            store.open_actions(),
+            store.active_timers(),
+        );
+        let lines = |file: &str| fs::read_to_string(dir.join(file)).unwrap().lines().count();
+        let session_lines = lines(SESSIONS);
+        drop(store);
+
+        let store = Store::open(dir.clone()).unwrap();
+        assert_eq!(store.sessions(), before.0);
+        assert_eq!(store.open_actions(), before.1);
+        assert_eq!(
+            store
+                .active_timers()
+                .iter()
+                .map(|t| &t.id)
+                .collect::<Vec<_>>(),
+            before.2.iter().map(|t| &t.id).collect::<Vec<_>>()
+        );
+        assert!(lines(SESSIONS) < session_lines);
+        assert_eq!(lines(ACTIONS), 1);
+        assert_eq!(lines(TIMERS), 1);
+        // A fresh read from disk agrees with the cached copy.
+        drop(store);
+        let store = Store::open(dir).unwrap();
+        assert_eq!(store.sessions(), before.0);
     }
 
     #[test]
