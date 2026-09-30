@@ -36,4 +36,11 @@ pub use event::{
     ModelOptionView, PlanItem, SessionListItemView, TranscriptItem, TreeNodeView,
 };
 pub use hunks::HunkView;
-pub use tools::terminate_tool_processes;
+pub use session::SessionSummary;
+pub use tools::{git_diff, terminate_tool_processes};
+
+/// Sessions saved for `cwd`, most recently updated first (`updated_at` in
+/// seconds).
+pub fn saved_sessions(cwd: &std::path::Path) -> std::io::Result<Vec<SessionSummary>> {
+    session::SessionStore::list_for_cwd(&config::profile_dir()?, cwd)
+}

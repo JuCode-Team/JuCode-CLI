@@ -22,6 +22,7 @@ const REPORTS: &str = "reports.jsonl";
 const DEVICES: &str = "devices.jsonl";
 const TOKEN: &str = "token";
 const SETTINGS: &str = "settings.json";
+const WORKSPACES: &str = "workspaces.json";
 
 pub struct Store {
     dir: PathBuf,
@@ -36,6 +37,9 @@ pub struct SessionRecord {
     pub agent: Option<String>,
     pub created_at: u64,
     pub closed: bool,
+    /// Set by a client; None: the engine's own label for the session.
+    pub title: Option<String>,
+    pub archived: bool,
 }
 
 /// A message for an agent: from the user, another agent or a timer.
@@ -178,6 +182,53 @@ impl Store {
         )
     }
 
+    /// Renames or (un)archives a session; a field left None is unchanged and
+    /// an empty title goes back to the engine's label.
+    pub fn record_session_meta(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        archived: Option<bool>,
+    ) -> io::Result<()> {
+        let mut entry = json!({ "kind": "meta", "session": id, "at": now() });
+        if let Some(title) = title {
+            entry["title"] = json!(title.trim());
+        }
+        if let Some(archived) = archived {
+            entry["archived"] = json!(archived);
+        }
+        self.append(SESSIONS, entry)
+    }
+
+    /// Workspaces and their projects: `{rev, workspaces: [...]}`. `rev`
+    /// counts saves so a client can tell whether it saw the latest.
+    pub fn workspaces(&self) -> Value {
+        fs::read_to_string(self.dir.join(WORKSPACES))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .filter(|doc| doc["workspaces"].is_array())
+            .unwrap_or_else(|| json!({ "rev": 0, "workspaces": [] }))
+    }
+
+    /// Changes the workspace list under the write lock and saves it with the
+    /// next `rev`. `change` sees the current list; an error saves nothing.
+    pub fn update_workspaces(
+        &self,
+        change: impl FnOnce(&mut Vec<Value>) -> Result<(), String>,
+    ) -> Result<Value, String> {
+        let _guard = self.lock();
+        let doc = self.workspaces();
+        let mut list = doc["workspaces"].as_array().cloned().unwrap_or_default();
+        change(&mut list)?;
+        let doc = json!({ "rev": doc["rev"].as_u64().unwrap_or(0) + 1, "workspaces": list });
+        let path = self.dir.join(WORKSPACES);
+        let temp = self.dir.join(format!("{WORKSPACES}.tmp"));
+        fs::write(&temp, format!("{doc:#}\n"))
+            .and_then(|()| fs::rename(&temp, &path))
+            .map_err(|error| error.to_string())?;
+        Ok(doc)
+    }
+
     /// Sessions in the order they were first opened. Reopening a closed
     /// session clears `closed`.
     pub fn sessions(&self) -> Vec<SessionRecord> {
@@ -200,6 +251,8 @@ impl Store {
                             agent: entry["agent"].as_str().map(str::to_string),
                             created_at: entry["at"].as_u64().unwrap_or_default(),
                             closed: false,
+                            title: None,
+                            archived: false,
                         }
                     });
                     record.closed = false;
@@ -207,6 +260,16 @@ impl Store {
                 Some("close") => {
                     if let Some(record) = records.get_mut(id) {
                         record.closed = true;
+                    }
+                }
+                Some("meta") => {
+                    if let Some(record) = records.get_mut(id) {
+                        if let Some(title) = entry["title"].as_str() {
+                            record.title = Some(title.to_string()).filter(|t| !t.is_empty());
+                        }
+                        if let Some(archived) = entry["archived"].as_bool() {
+                            record.archived = archived;
+                        }
                     }
                 }
                 _ => {}

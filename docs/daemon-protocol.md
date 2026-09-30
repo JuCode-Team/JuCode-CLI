@@ -45,6 +45,7 @@ State lives in `~/.jucode/daemon/`:
 | `reports.jsonl` | Append log of reports posted and read. |
 | `devices.jsonl` | Paired devices (a hash of each token, never the token) and revocations. |
 | `settings.json` | Daemon settings: `relay` (whether the relay connection is on). |
+| `workspaces.json` | Workspaces and their projects, with a save counter `rev`. |
 | `relay-identity.json` | Relay keys (Ed25519 identity, X25519 Noise static key), mode 0600. |
 
 ## Plain HTTP
@@ -111,7 +112,8 @@ Each WebSocket text message is one JSON frame. The daemon first sends:
 
 ```json
 {"type":"hello","protocol":2,"version":"0.3.0"}
-{"type":"sessions","sessions":[{"session":"...","cwd":"...","created_at":0,"open":true,"watchers":0}]}
+{"type":"sessions","sessions":[{"session":"...","cwd":"...","created_at":0,"updated_at":0,"title":"...","archived":false,"open":true,"watchers":0}]}
+{"type":"workspaces","rev":1,"workspaces":[...]}
 ```
 
 followed by the current `agents`, `questions` and `actions` lists.
@@ -129,9 +131,11 @@ every connected client.
 
 | Op | Fields | Reply |
 | --- | --- | --- |
-| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers` |
+| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers`, `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at` |
+| `session_meta` | `session`, `title` and/or `archived` | none; every client receives the new `sessions` list. An empty title goes back to the engine's label |
+| `session_history` | `cwd` | `session_history`: every session saved in `cwd`, newest first, whoever ran it (daemon, TUI, `jucode serve`), with `title`, `updated_at`, `entries`, `archived`, `agent`, `open` |
 | `session_create` | `cwd` | `session_created` with `session`; the session's startup events follow |
-| `session_open` | `session` | `session_opened`; reopens a closed session (or one from before a restart), resuming its transcript and its undecided deferred actions |
+| `session_open` | `session`, optional `cwd` | `session_opened`; with `cwd`, also opens a session saved there that the daemon never hosted. Reopens a closed session (or one from before a restart), resuming its transcript and its undecided deferred actions |
 | `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped |
 | `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
 | `actions_list` | — | `actions`: undecided deferred actions across all sessions |
@@ -141,6 +145,16 @@ every connected client.
 | `relay_status` | — | `relay_status` with `enabled`, `connected`, `host` (the host id), `url` (null with `--no-relay`) (local clients only) |
 | `relay_set` | `enabled` | `relay_status`; turns the relay connection on or off and remembers it (local clients only) |
 | `pair_link` | — | `pair_link` with `link`, `code` and `expires_at`; an error while the relay is off (local clients only) |
+| `ping` | — | `pong`. Clients behind the relay send it every minute so an idle stream is not closed |
+| `workspaces` | — | `workspaces` with `rev` and `workspaces: [{id, name, is_default?, color?, icon?, projects: [{id, name, path, chats?, worktree?}]}]` |
+| `workspaces_set` | `rev`, `workspaces` | `workspaces`; replaces the list when `rev` is the current one, else an error (another client changed it). Desktop imports its list with `rev: 0` into an empty daemon |
+| `project_add` | `path`, optional `workspace`, `project_name`, `workspace_name` | `workspaces`; adds an existing directory. With no workspaces yet, one named `workspace_name` is created |
+| `project_create` | `parent`, `name`, optional `git_init`, `workspace`, `workspace_name` | `workspaces`; makes the folder `parent/name` (optionally `git init`) and adds it |
+| `project_remove` | `workspace`, `project` | `workspaces`; the files stay |
+| `fs_list` | `path` (`~` is the home directory), optional `dirs_only` | `fs_list` with `path`, `git`, `entries: [{name, dir, size}]`, `truncated`. Git-ignored entries and `.git` are left out |
+| `fs_read` | `path` | `fs_read` with `size`, `binary`, `text` (first 1 MiB), `truncated` |
+| `git_status` | `path` | `git_status` with `repo`, `branch`, `files: [{path, status, from}]` (porcelain codes) |
+| `git_diff` | `path`, optional `file` | `git_diff` with `diff` (unified, untracked files included, first 1 MiB), `truncated` |
 | `agent_list` | — | `agents` |
 | `agent_create` | `agent` (the new agent's id), `name`, `cwd`, `role` | `agent_created`; every client also receives the new `agents` list |
 | `message_send` | `agent`, `body`, optional `session`, `reply_to`, `dedupe_key` | `message_accepted` with `message` and `duplicate` |
@@ -161,6 +175,15 @@ a chat: it runs in `~/.jucode/chats` with the chat prompt (conversation and
 web research) and without project instructions or project skills. Any session
 whose directory is `~/.jucode/chats` or lies inside it is a chat session, so
 reopening one keeps it a chat.
+
+Changes to workspaces are broadcast to every client as a `workspaces` frame.
+
+`fs_*` and `git_*` read only inside known directories: projects, session
+directories and agent directories. `fs_list` with `dirs_only` may browse
+folders anywhere under the home directory (for picking a new project).
+Credentials (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.jucode/auth.json`,
+`~/.jucode/daemon`) are never readable. Paths are resolved (symlinks
+followed) before the check.
 
 ## Agents
 

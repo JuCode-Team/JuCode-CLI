@@ -1126,3 +1126,215 @@ fn a_relay_client_pairs_gets_hello_and_is_dropped_on_revoke() {
     closed.sort();
     assert_eq!(closed, [1, 2]);
 }
+
+fn git(dir: &PathBuf, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?}");
+}
+
+/// Sends `op` with a fresh id and returns the reply to it.
+fn request(client: &mut Client, mut op: Value) -> Value {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    op["id"] = json!(id);
+    client.send(op);
+    client.until(|frame| frame["id"] == id).pop().unwrap()
+}
+
+#[test]
+fn projects_are_shared_and_their_files_readable_but_nothing_else() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let project = temp_dir("daemon-project");
+    fs::create_dir_all(&project).unwrap();
+    git(&project, &["init", "-q"]);
+    fs::write(project.join(".gitignore"), "*.log\n").unwrap();
+    fs::write(project.join("a.txt"), "hello\n").unwrap();
+    fs::write(project.join("noise.log"), "x").unwrap();
+    let outside = temp_dir("daemon-outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("secret.txt"), "no").unwrap();
+
+    let mut desktop = Client::connect(&daemon);
+    let mut phone = Client::connect(&daemon);
+    let added = request(
+        &mut desktop,
+        json!({ "op": "project_add", "path": project, "workspace_name": "Mine" }),
+    );
+    assert_eq!(added["type"], "workspaces", "{added}");
+    assert_eq!(added["rev"], 1);
+    assert_eq!(added["workspaces"][0]["name"], "Mine");
+    let real = project.canonicalize().unwrap();
+    assert_eq!(added["workspaces"][0]["projects"][0]["path"], json!(real));
+    // Everyone hears about it.
+    phone.until(|frame| frame["type"] == "workspaces" && frame["rev"] == 1);
+
+    let listing = request(&mut phone, json!({ "op": "fs_list", "path": project }));
+    let names: Vec<&str> = listing["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, [".gitignore", "a.txt"], "{listing}");
+
+    let file = request(
+        &mut phone,
+        json!({ "op": "fs_read", "path": project.join("a.txt") }),
+    );
+    assert_eq!(file["text"], "hello\n");
+    let refused = request(
+        &mut phone,
+        json!({ "op": "fs_read", "path": outside.join("secret.txt") }),
+    );
+    assert_eq!(refused["type"], "error");
+    let escape = request(
+        &mut phone,
+        json!({ "op": "fs_read", "path": project.join("../").join(outside.file_name().unwrap()).join("secret.txt") }),
+    );
+    assert_eq!(escape["type"], "error");
+
+    let status = request(&mut phone, json!({ "op": "git_status", "path": project }));
+    assert_eq!(status["repo"], true);
+    assert!(status["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|file| file["path"] == "a.txt" && file["status"] == "??"));
+    let diff = request(
+        &mut phone,
+        json!({ "op": "git_diff", "path": project, "file": "a.txt" }),
+    );
+    assert!(diff["diff"].as_str().unwrap().contains("+hello"), "{diff}");
+
+    // A save based on an old list is refused; one on the current list wins.
+    let stale = request(
+        &mut desktop,
+        json!({ "op": "workspaces_set", "rev": 0, "workspaces": [] }),
+    );
+    assert_eq!(stale["type"], "error");
+    let workspace = added["workspaces"][0]["id"].as_str().unwrap().to_string();
+    let project_id = added["workspaces"][0]["projects"][0]["id"].clone();
+    let removed = request(
+        &mut desktop,
+        json!({ "op": "project_remove", "workspace": workspace, "project": project_id }),
+    );
+    assert_eq!(removed["workspaces"][0]["projects"], json!([]));
+    assert!(
+        project.join("a.txt").exists(),
+        "removing a project keeps its files"
+    );
+}
+
+#[test]
+fn a_new_project_folder_is_made_under_home_and_credentials_stay_unreadable() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let parent = home.join(format!("code-{}", std::process::id()));
+    fs::create_dir_all(&parent).unwrap();
+    fs::create_dir_all(home.join(".ssh")).unwrap();
+    fs::write(home.join(".ssh/id_test"), "key").unwrap();
+    let mut phone = Client::connect(&daemon);
+
+    let dirs = request(
+        &mut phone,
+        json!({ "op": "fs_list", "path": home, "dirs_only": true }),
+    );
+    let names: Vec<&str> = dirs["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&parent.file_name().unwrap().to_str().unwrap()));
+    assert!(!names.contains(&".ssh"), "{names:?}");
+    let files = request(&mut phone, json!({ "op": "fs_list", "path": home }));
+    assert_eq!(files["type"], "error", "only folders outside projects");
+
+    let bad = request(
+        &mut phone,
+        json!({ "op": "project_create", "parent": parent, "name": "../x" }),
+    );
+    assert_eq!(bad["type"], "error");
+    let made = request(
+        &mut phone,
+        json!({ "op": "project_create", "parent": parent, "name": "fresh", "git_init": true }),
+    );
+    assert_eq!(
+        made["workspaces"][0]["projects"][0]["name"], "fresh",
+        "{made}"
+    );
+    assert!(parent.join("fresh/.git").is_dir());
+
+    // Even with the home directory as a project, credentials stay out.
+    request(&mut phone, json!({ "op": "project_add", "path": home }));
+    let key = request(
+        &mut phone,
+        json!({ "op": "fs_read", "path": home.join(".ssh/id_test") }),
+    );
+    assert!(
+        key["message"].as_str().unwrap().contains("protected"),
+        "{key}"
+    );
+}
+
+#[test]
+fn sessions_carry_titles_and_archive_state_and_history_reopens_unknown_ones() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-history");
+    let mut client = Client::connect(&daemon);
+    let session = client.create_session(&dir);
+
+    client.send(
+        json!({ "op": "session_meta", "session": session, "title": "Fix login", "archived": true }),
+    );
+    let frames = client.until(|frame| {
+        frame["type"] == "sessions"
+            && frame["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["session"] == session.as_str() && s["title"] == "Fix login")
+    });
+    let listed = frames.last().unwrap()["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session"] == session.as_str())
+        .cloned()
+        .unwrap();
+    assert_eq!(listed["archived"], true);
+
+    let history = request(&mut client, json!({ "op": "session_history", "cwd": dir }));
+    let entry = history["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session"] == session.as_str())
+        .cloned()
+        .unwrap_or_else(|| panic!("{history}"));
+    assert_eq!(entry["title"], "Fix login");
+    assert_eq!(entry["open"], true);
+
+    client.send(json!({ "op": "session_close", "session": session }));
+    client.until(|frame| frame["type"] == "session_closed");
+    // Another daemon never hosted it, but finds it saved in that directory.
+    let other = start_daemon();
+    let mut fresh = Client::connect(&other);
+    let unknown = request(
+        &mut fresh,
+        json!({ "op": "session_open", "session": session }),
+    );
+    assert_eq!(unknown["type"], "error");
+    let opened = request(
+        &mut fresh,
+        json!({ "op": "session_open", "session": session, "cwd": dir }),
+    );
+    assert_eq!(opened["type"], "session_opened", "{opened}");
+}

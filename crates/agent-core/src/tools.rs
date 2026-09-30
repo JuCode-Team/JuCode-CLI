@@ -3055,7 +3055,9 @@ pub(crate) fn unified_diff_for_file(
     Some(simple_unified_diff(&label, original, updated))
 }
 
-fn git_diff(cwd: &Path, path: Option<&Path>) -> Result<String, String> {
+/// The working tree's changes against the index as a unified diff,
+/// untracked files included; `path` limits it to one file or directory.
+pub fn git_diff(cwd: &Path, path: Option<&Path>) -> Result<String, String> {
     if path.is_some_and(|path| is_internal_tool_path(cwd, path)) {
         return Ok(String::new());
     }

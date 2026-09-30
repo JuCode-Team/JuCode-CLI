@@ -6,7 +6,9 @@ use crate::{
     agents::Agents,
     relay::Relay,
     session,
-    store::{now, random_hex, token_hash, Device, Message, Question, Report, Store, Timer},
+    store::{
+        now, random_hex, token_hash, Device, Message, Question, Report, SessionRecord, Store, Timer,
+    },
 };
 use serde_json::{json, Value};
 use std::{
@@ -250,16 +252,39 @@ impl Hub {
 
     /// Hosts a session recorded earlier (after a restart or a close). A
     /// session that is already hosted is left as it is.
-    pub fn open_session(self: &Arc<Self>, id: &str) -> Result<(), String> {
+    /// `cwd` also opens a session the daemon never hosted (one saved by
+    /// the TUI or `jucode serve` in that directory).
+    pub fn open_session(self: &Arc<Self>, id: &str, cwd: Option<PathBuf>) -> Result<(), String> {
         if lock(&self.sessions).contains_key(id) {
             return Ok(());
         }
-        let record = self
+        let known = self
             .store
             .sessions()
             .into_iter()
-            .find(|record| record.id == id)
-            .ok_or_else(|| format!("unknown session {id}"))?;
+            .find(|record| record.id == id);
+        let record = match (known, cwd) {
+            (Some(record), _) => record,
+            (None, Some(cwd)) => {
+                let saved = jucode_agent_core::saved_sessions(&cwd)
+                    .map_err(|error| error.to_string())?
+                    .iter()
+                    .any(|summary| summary.id == id);
+                if !saved {
+                    return Err(format!("no session {id} in {}", cwd.display()));
+                }
+                SessionRecord {
+                    id: id.to_string(),
+                    cwd,
+                    agent: None,
+                    created_at: now(),
+                    closed: true,
+                    title: None,
+                    archived: false,
+                }
+            }
+            (None, None) => return Err(format!("unknown session {id}")),
+        };
         let (_, ops) = session::spawn(
             Arc::clone(self),
             record.cwd.clone(),
@@ -648,7 +673,7 @@ impl Hub {
     fn deliver(self: &Arc<Self>, message: &Message, target: Option<String>) -> Result<(), String> {
         let session = match target {
             Some(session) => {
-                self.open_session(&session)?;
+                self.open_session(&session, None)?;
                 session
             }
             None => self.create_session(None, Some(&message.to), false)?,
@@ -680,19 +705,23 @@ impl Hub {
 
     /// Every recorded session with whether it is hosted right now.
     pub fn sessions_json(&self) -> Value {
+        let records = self.store.sessions();
+        let saved = saved_by_id(records.iter().map(|record| record.cwd.as_path()));
         let sessions = lock(&self.sessions);
-        let list: Vec<Value> = self
-            .store
-            .sessions()
+        let list: Vec<Value> = records
             .into_iter()
             .map(|record| {
                 let hosted = sessions.get(&record.id);
                 let cwd = hosted.map(|h| h.cwd.clone()).unwrap_or(record.cwd);
+                let summary = saved.get(&record.id);
                 json!({
                     "session": record.id,
                     "chat": jucode_agent_core::chat::is_chat_dir(&cwd),
                     "cwd": cwd.display().to_string(),
                     "created_at": record.created_at,
+                    "updated_at": summary.map_or(record.created_at, |s| s.updated_at * 1000),
+                    "title": record.title.or_else(|| summary.map(|s| s.label.clone())),
+                    "archived": record.archived,
                     "agent": record.agent,
                     "open": hosted.is_some(),
                     "watchers": hosted.map(|h| h.watchers.len()).unwrap_or(0),
@@ -701,6 +730,47 @@ impl Hub {
             .collect();
         json!({ "type": "sessions", "sessions": list })
     }
+
+    /// Every session saved in `cwd`, newest first, whoever ran it (the
+    /// daemon, the TUI or `jucode serve`), with the daemon's title and
+    /// archive state for the ones it knows.
+    pub fn session_history(&self, cwd: &std::path::Path) -> Result<Value, String> {
+        let saved = jucode_agent_core::saved_sessions(cwd).map_err(|error| error.to_string())?;
+        let records: HashMap<String, SessionRecord> = self
+            .store
+            .sessions()
+            .into_iter()
+            .map(|record| (record.id.clone(), record))
+            .collect();
+        let sessions = lock(&self.sessions);
+        let list: Vec<Value> = saved
+            .into_iter()
+            .map(|summary| {
+                let record = records.get(&summary.id);
+                json!({
+                    "session": summary.id,
+                    "title": record.and_then(|r| r.title.clone()).unwrap_or(summary.label),
+                    "updated_at": summary.updated_at * 1000,
+                    "entries": summary.entries,
+                    "archived": record.is_some_and(|r| r.archived),
+                    "agent": record.and_then(|r| r.agent.clone()),
+                    "open": sessions.contains_key(&summary.id),
+                })
+            })
+            .collect();
+        Ok(json!({ "type": "session_history", "cwd": cwd, "sessions": list }))
+    }
+}
+
+/// Saved-session summaries of the given directories, by session id.
+fn saved_by_id<'a>(
+    dirs: impl Iterator<Item = &'a std::path::Path>,
+) -> HashMap<String, jucode_agent_core::SessionSummary> {
+    let dirs: HashSet<&std::path::Path> = dirs.collect();
+    dirs.into_iter()
+        .flat_map(|dir| jucode_agent_core::saved_sessions(dir).unwrap_or_default())
+        .map(|summary| (summary.id.clone(), summary))
+        .collect()
 }
 
 /// How a message reads in the receiving session: the user's own words

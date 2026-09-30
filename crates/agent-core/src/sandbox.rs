@@ -500,7 +500,8 @@ fn home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn denied_reads() -> Vec<PathBuf> {
+/// Credentials no sandboxed command, and no remote client, may read.
+pub fn denied_reads() -> Vec<PathBuf> {
     let Some(home) = home() else {
         return Vec::new();
     };

@@ -6,10 +6,12 @@
 
 mod agent_tools;
 mod agents;
+mod files;
 mod http;
 mod hub;
 pub mod install;
 pub mod noise;
+mod projects;
 mod relay;
 mod session;
 mod store;
@@ -202,6 +204,7 @@ fn pump(
     for frame in [
         protocol::hello_json(hub.version),
         hub.sessions_json(),
+        projects::workspaces_json(hub),
         hub.agents_json(),
         hub.questions_json(),
         hub.actions_json(),
@@ -277,7 +280,42 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         reply(json!({ "type": "error", "message": "only the desktop can manage devices" }));
         return;
     }
+    // File and git reads can take a while; they must not hold up this
+    // client's other frames.
+    if matches!(name, "fs_list" | "fs_read" | "git_status" | "git_diff") {
+        let hub = Arc::clone(hub);
+        let name = name.to_string();
+        thread::spawn(move || {
+            let result = files::handle(&hub, &name, &op);
+            respond(&hub, client, &request, result);
+        });
+        return;
+    }
     let result = match (name, session) {
+        ("ping", _) => Ok(json!({ "type": "pong" })),
+        ("workspaces", _) => Ok(projects::workspaces_json(hub)),
+        ("workspaces_set" | "project_add" | "project_create" | "project_remove", _) => {
+            projects::handle(hub, name, &op)
+        }
+        ("session_history", _) => match op["cwd"].as_str() {
+            Some(cwd) => hub.session_history(std::path::Path::new(cwd)),
+            None => Err("session_history requires cwd".to_string()),
+        },
+        ("session_meta", Some(session)) => {
+            let title = op["title"].as_str();
+            let archived = op["archived"].as_bool();
+            if title.is_none() && archived.is_none() {
+                Err("session_meta requires title or archived".to_string())
+            } else {
+                hub.store
+                    .record_session_meta(&session, title, archived)
+                    .map_err(|error| error.to_string())
+                    .map(|()| {
+                        hub.broadcast(&hub.sessions_json());
+                        Value::Null
+                    })
+            }
+        }
         ("pair_link", _) => hub.relay.pair_link(hub),
         ("relay_status", _) => Ok(hub.relay.status_json()),
         ("relay_set", _) => match op["enabled"].as_bool() {
@@ -392,7 +430,7 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         // An action can be decided after its session closed or the daemon
         // restarted: reopen the session so its engine can run the action.
         ("decide_action", Some(session)) => hub
-            .open_session(&session)
+            .open_session(&session, None)
             .and_then(|()| hub.forward(&session, op.clone()))
             .map(|()| Value::Null),
         ("timer_list", _) => Ok(json!({
@@ -406,7 +444,7 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             })).collect::<Vec<_>>(),
         })),
         ("session_open", Some(session)) => hub
-            .open_session(&session)
+            .open_session(&session, op["cwd"].as_str().map(PathBuf::from))
             .map(|()| json!({ "type": "session_opened", "session": session })),
         // Confirmed by the `session_closed` broadcast once the engine has
         // stopped and released the session.
@@ -427,9 +465,18 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         (_, Some(session)) => hub.forward(&session, op.clone()).map(|()| Value::Null),
         (name, None) => Err(format!("{name} requires session")),
     };
-    match result {
-        Ok(Value::Null) => {}
-        Ok(frame) => reply(frame),
-        Err(message) => reply(json!({ "type": "error", "message": message })),
+    respond(hub, client, &request, result);
+}
+
+/// Replies to an op: `Null` means no reply; the frame echoes the op's `id`.
+fn respond(hub: &Hub, client: u64, request: &Value, result: Result<Value, String>) {
+    let mut frame = match result {
+        Ok(Value::Null) => return,
+        Ok(frame) => frame,
+        Err(message) => json!({ "type": "error", "message": message }),
+    };
+    if !request.is_null() {
+        frame["id"] = request.clone();
     }
+    hub.send_to(client, &frame);
 }
