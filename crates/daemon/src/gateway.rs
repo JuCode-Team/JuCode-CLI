@@ -39,6 +39,8 @@ struct State {
     keys: HashMap<String, String>,
     /// Session → the group it routes to.
     groups: HashMap<String, String>,
+    /// Session → its running turn (`X-JuCode-Turn`, see crate::usage).
+    turns: HashMap<String, String>,
     /// The gateway's groups (`/v1/open/groups`), and when they were read.
     catalog: Option<(Instant, Vec<Value>)>,
 }
@@ -92,6 +94,15 @@ pub fn set_group(session: &str, group: Option<&str>) {
     match group.map(str::trim).filter(|g| !g.is_empty()) {
         Some(group) => state.groups.insert(session.to_string(), group.to_string()),
         None => state.groups.remove(session),
+    };
+}
+
+/// `session`'s requests belong to `turn` (None: between turns).
+pub fn set_turn(session: &str, turn: Option<&str>) {
+    let mut state = state();
+    match turn {
+        Some(turn) => state.turns.insert(session.to_string(), turn.to_string()),
+        None => state.turns.remove(session),
     };
 }
 
@@ -237,7 +248,7 @@ fn dropped_request_header(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "host" | "authorization" | "x-api-key" | "content-length" | "transfer-encoding" | "connection"
             | "keep-alive" | "proxy-connection" | "proxy-authorization" | "te" | "upgrade" | "expect"
-            | "accept-encoding" | "x-jucode-group"
+            | "accept-encoding" | "x-jucode-group" | "x-jucode-turn"
     )
 }
 
@@ -314,6 +325,9 @@ fn serve_with(
     }
     if let Some(group) = &group {
         call = call.set("X-JuCode-Group", group);
+    }
+    if let Some(turn) = state().turns.get(&session).cloned() {
+        call = call.set("X-JuCode-Turn", &turn);
     }
     let result = if request.body.is_empty() && request.method.eq_ignore_ascii_case("GET") {
         call.call()

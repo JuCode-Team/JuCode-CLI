@@ -63,6 +63,33 @@ pub fn jucode_gateway_token() -> Result<(String, String), String> {
     Ok((api, token))
 }
 
+/// Which kind of channel a provider id is, for usage records: `jucode`
+/// (the JuCode gateway), `third_party` (a provider from the built-in
+/// catalog, on the user's key or plan) or `local` (anything the user set up
+/// themselves: their own Claude / ChatGPT login, a custom provider, a local
+/// model server).
+pub fn provider_channel_kind(provider: &str) -> &'static str {
+    match provider {
+        "jucode" | "jucode_gateway" => "jucode",
+        // The same subscriptions Claude Code and Codex sign in to.
+        "anthropic" | "openai-codex" | "openai-codex-device" => "local",
+        _ if llm_provider_kit::omp::catalog()
+            .auth_provider(provider)
+            .is_some() =>
+        {
+            "third_party"
+        }
+        _ => "local",
+    }
+}
+
+/// Whether this computer is signed in to JuCode (no network, no refresh).
+pub fn jucode_signed_in() -> bool {
+    config::Config::load_existing()
+        .and_then(|config| config::AuthStore::load_or_create(config.encrypt_secrets))
+        .is_ok_and(|auth| auth.jucode_tokens().is_some())
+}
+
 /// Signs this computer out of JuCode and revokes its device login.
 pub fn jucode_logout() -> Result<(), String> {
     let config = config::Config::load_existing().map_err(|error| error.to_string())?;

@@ -20,6 +20,7 @@ mod session;
 mod skills;
 mod store;
 mod titles;
+mod usage;
 
 pub use agents::Agents;
 pub use store::Store;
@@ -77,6 +78,8 @@ pub fn serve(
     }
     // Fires due timers and retries messages waiting for a free run slot,
     // including ones left over from before a restart.
+    let uploads = Arc::clone(&hub);
+    thread::spawn(move || uploads.usage.run_uploads());
     let scheduler = Arc::clone(&hub);
     thread::spawn(move || loop {
         scheduler.tick();
@@ -302,6 +305,7 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             | "relay_status"
             | "relay_set"
             | "restart_when_idle"
+            | "usage_import_legacy"
     ) && !hub.is_local(client)
     {
         reply(json!({ "type": "error", "message": "only the desktop can manage devices" }));
@@ -463,6 +467,14 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 _ => Err("message_send requires agent and body".to_string()),
             }
         }
+        ("usage_local", _) => Ok(hub.usage.local_json(
+            op["days"].as_u64().unwrap_or(30),
+            op["tz_offset"].as_i64().unwrap_or(0),
+        )),
+        ("usage_import_legacy", _) => hub
+            .usage
+            .import_legacy(&hub.store, &op["days"])
+            .map(|imported| json!({ "type": "usage_imported", "imported": imported })),
         ("question_list", _) => Ok(hub.questions_json()),
         ("question_answer", _) => match (op["question"].as_str(), op["answer"].as_str()) {
             (Some(question), Some(answer)) if !answer.trim().is_empty() => hub

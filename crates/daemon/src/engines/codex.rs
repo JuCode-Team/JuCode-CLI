@@ -255,7 +255,10 @@ pub struct Codex {
     model: String,
     provider: String,
     effort: String,
-    previous_total: (u64, u64),
+    /// Thread totals at the last usage update: input, cached input, output,
+    /// reasoning. None after a resume until the first update: the thread's
+    /// totals then include every earlier turn.
+    previous_total: Option<(u64, u64, u64, u64)>,
     context_window: u64,
     catalog: Vec<Value>,
     pending_pick: Option<(String, Option<String>)>,
@@ -286,7 +289,7 @@ impl Codex {
             model: String::new(),
             provider: String::new(),
             effort: String::new(),
-            previous_total: (0, 0),
+            previous_total: Some((0, 0, 0, 0)),
             context_window: 0,
             catalog: Vec::new(),
             pending_pick: None,
@@ -437,7 +440,7 @@ impl Codex {
         self.provider = text(&result["modelProvider"]).to_string();
         self.effort = text(&result["reasoningEffort"]).to_string();
         self.items.clear();
-        self.previous_total = (0, 0);
+        self.previous_total = if resumed { None } else { Some((0, 0, 0, 0)) };
         let mut events = Vec::new();
         if resumed {
             let rows = transcript(&result["thread"]["turns"]);
@@ -925,15 +928,36 @@ impl Codex {
                     self.context_window = window;
                     events.push(self.model_status());
                 }
-                let input = usage["total"]["inputTokens"].as_u64().unwrap_or(0);
-                let output = usage["total"]["outputTokens"].as_u64().unwrap_or(0);
+                let counts = |part: &Value| {
+                    let n = |key: &str| part[key].as_u64().unwrap_or(0);
+                    (
+                        n("inputTokens"),
+                        n("cachedInputTokens"),
+                        n("outputTokens"),
+                        n("reasoningOutputTokens"),
+                    )
+                };
+                let total = counts(&usage["total"]);
+                // Since the last update; right after a resume only the last
+                // request is new.
+                let spent = match self.previous_total {
+                    Some(previous) => (
+                        total.0.saturating_sub(previous.0),
+                        total.1.saturating_sub(previous.1),
+                        total.2.saturating_sub(previous.2),
+                        total.3.saturating_sub(previous.3),
+                    ),
+                    None => counts(&usage["last"]),
+                };
                 events.push(json!({
                     "type": "usage",
-                    "input_tokens": input.saturating_sub(self.previous_total.0),
-                    "output_tokens": output.saturating_sub(self.previous_total.1),
+                    "input_tokens": spent.0,
+                    "cached_input_tokens": spent.1,
+                    "output_tokens": spent.2,
+                    "reasoning_tokens": spent.3,
                 }));
                 events.push(json!({ "type": "context_usage", "tokens": usage["last"]["totalTokens"].as_u64().unwrap_or(0) }));
-                self.previous_total = (input, output);
+                self.previous_total = Some(total);
                 events
             }
             "turn/plan/updated" => vec![
@@ -1370,6 +1394,51 @@ mod tests {
             Some(true)
         );
         assert_eq!(Options::from_json(&json!({})).gateway, None);
+    }
+
+    #[test]
+    fn usage_reports_per_update_deltas_with_cached_input() {
+        let mut c = opened();
+        let update = |c: &mut Codex, input: u64, cached: u64, output: u64| {
+            let params = json!({ "tokenUsage": {
+                "total": { "inputTokens": input, "cachedInputTokens": cached, "outputTokens": output },
+                "last": { "totalTokens": input + output }
+            } });
+            c.on_notification("thread/tokenUsage/updated", &params)
+                .into_iter()
+                .find(|e| e["type"] == "usage")
+                .unwrap()
+        };
+        let first = update(&mut c, 1000, 0, 10);
+        assert_eq!(first["cached_input_tokens"], 0);
+        let second = update(&mut c, 2500, 900, 30);
+        assert_eq!(second["input_tokens"], 1500);
+        assert_eq!(second["cached_input_tokens"], 900);
+        assert_eq!(second["output_tokens"], 20);
+    }
+
+    #[test]
+    fn a_resumed_thread_counts_only_new_requests() {
+        let mut c = opened();
+        let _ = c.thread_opened(
+            &json!({ "thread": { "id": "th", "turns": [] }, "model": "gpt-5.5" }),
+            true,
+        );
+        let update = |c: &mut Codex, total: u64, last: u64| {
+            let params = json!({ "tokenUsage": {
+                "total": { "inputTokens": total, "outputTokens": total / 10 },
+                "last": { "inputTokens": last, "outputTokens": last / 10, "totalTokens": last }
+            } });
+            c.on_notification("thread/tokenUsage/updated", &params)
+                .into_iter()
+                .find(|e| e["type"] == "usage")
+                .unwrap()
+        };
+        // The thread already holds 500k tokens from before the restart.
+        let first = update(&mut c, 500_000, 2_000);
+        assert_eq!(first["input_tokens"], 2_000);
+        let second = update(&mut c, 503_000, 3_000);
+        assert_eq!(second["input_tokens"], 3_000);
     }
 
     #[test]

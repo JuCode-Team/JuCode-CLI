@@ -12,6 +12,7 @@ use crate::{
         now, random_hex, token_hash, Device, Message, Question, Report, SessionRecord, Store, Timer,
     },
     titles::{self, Turns},
+    usage::{SessionInfo, Usage},
 };
 use serde_json::{json, Value};
 use std::{
@@ -69,6 +70,8 @@ pub struct Hub {
     titling: Mutex<HashSet<String>>,
     /// This hub, for the threads it starts.
     me: Weak<Hub>,
+    /// Each turn's token usage (see `usage`).
+    pub usage: Usage,
 }
 
 struct Client {
@@ -106,6 +109,7 @@ impl Hub {
             turns: Mutex::new(HashMap::new()),
             titling: Mutex::new(HashSet::new()),
             relay: Relay::new(relay, &store),
+            usage: Usage::new(&store),
             store,
             agents,
             version,
@@ -485,6 +489,7 @@ impl Hub {
         }
         lock(&self.busy).remove(id);
         lock(&self.claims).remove(id);
+        self.usage.close(id);
         self.broadcast(&json!({ "type": "session_closed", "session": id }));
     }
 
@@ -951,6 +956,18 @@ impl Hub {
     /// Every event a session publishes: its title follows the conversation
     /// (see `titles`).
     pub fn observe(&self, session: &str, event: &Value) {
+        self.usage.observe(session, event, || {
+            let record = self
+                .store
+                .sessions()
+                .into_iter()
+                .find(|record| record.id == session)?;
+            Some(SessionInfo {
+                engine: record.engine.unwrap_or_else(|| "jucode".to_string()),
+                gateway: record.gateway,
+                cwd: record.cwd.to_string_lossy().into_owned(),
+            })
+        });
         if event["type"] == "user_message" {
             self.note_user_message(session, event["content"].as_str().unwrap_or_default());
         }

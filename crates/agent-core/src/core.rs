@@ -125,6 +125,11 @@ enum WorkerEvent {
 pub struct AgentCore {
     config: Config,
     auth: AuthStore,
+    /// Tag each turn's JuCode gateway requests (`X-JuCode-Turn`) so the
+    /// gateway can put their cost on the turn the daemon records.
+    tag_turns: bool,
+    /// The current turn's tag, new for every turn.
+    turn_tag: Option<String>,
     session: SessionStore,
     /// Held for the lifetime of the active session so a second process cannot
     /// resume it and interleave journal appends. Released on session switch.
@@ -253,6 +258,8 @@ impl AgentCore {
             login_receiver: None,
             omp_login_receiver: None,
             omp_login_code_tx: None,
+            tag_turns: false,
+            turn_tag: None,
             total_input_tokens: 0,
             total_cached_input_tokens: 0,
             total_output_tokens: 0,
@@ -1098,7 +1105,51 @@ impl AgentCore {
     }
 
     fn model_headers(&self) -> HashMap<String, Vec<(String, String)>> {
-        model_headers(&self.config)
+        let mut headers = model_headers(&self.config);
+        if let (true, Some(tag)) = (self.config.provider == "jucode", &self.turn_tag) {
+            // Headers go per model; a turn may call any of these.
+            let config = &self.config;
+            let names = config
+                .models
+                .iter()
+                .chain(&config.jucode_models)
+                .map(|m| m.name.clone())
+                .chain(config.subagent_models.iter().map(|m| m.name.clone()))
+                .chain([
+                    config.model.clone(),
+                    config.compact().0,
+                    config.safety_model.clone(),
+                ]);
+            for name in names {
+                let entry = headers.entry(name).or_default();
+                if !entry.iter().any(|(header, _)| header == "X-JuCode-Turn") {
+                    entry.push(("X-JuCode-Turn".to_string(), tag.clone()));
+                }
+            }
+        }
+        headers
+    }
+
+    /// Tag this engine's turns (see `tag_turns`); the daemon records usage
+    /// per turn.
+    pub fn set_tag_turns(&mut self, on: bool) {
+        self.tag_turns = on;
+    }
+
+    /// The running (or last) turn's tag, when turns are tagged.
+    pub fn turn_tag(&self) -> Option<&str> {
+        self.turn_tag.as_deref()
+    }
+
+    fn new_turn_tag(&mut self) {
+        if !self.tag_turns {
+            return;
+        }
+        let mut bytes = [0u8; 12];
+        if getrandom::getrandom(&mut bytes).is_ok() {
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            self.turn_tag = Some(format!("t-{hex}"));
+        }
     }
 
     /// Refreshes the active provider's bearer when it's near expiry so the
@@ -1697,6 +1748,7 @@ impl AgentCore {
             self.session.append(EntryKind::UserImage { paths: images });
         }
         self.turn_started_at = Some(SystemTime::now());
+        self.new_turn_tag();
         self.turn_goal_tokens = 0;
         let save_event = self.save_session_event();
 
@@ -2139,6 +2191,7 @@ impl AgentCore {
 
     fn start_turn_from_existing_context(&mut self) -> Vec<AgentEvent> {
         self.turn_started_at = Some(SystemTime::now());
+        self.new_turn_tag();
         self.turn_goal_tokens = 0;
         let save_event = self.save_session_event();
 

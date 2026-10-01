@@ -516,6 +516,9 @@ pub struct Claude {
     blocks: HashMap<u64, Block>,
     completed_blocks: u64,
     last_context: u64,
+    /// The input counts of the message streaming now, from its start: a
+    /// `message_delta` may leave them out.
+    start_usage: Value,
     active_turn: bool,
     interrupting: bool,
     /// The composer's slash commands: the CLI's `initialize` reply (with
@@ -546,6 +549,7 @@ impl Claude {
             blocks: HashMap::new(),
             completed_blocks: 0,
             last_context: 0,
+            start_usage: Value::Null,
             active_turn: false,
             interrupting: false,
             commands: Vec::new(),
@@ -1001,7 +1005,8 @@ impl Claude {
                 self.active_turn = true;
                 self.blocks.clear();
                 self.completed_blocks = 0;
-                self.last_context = context_tokens(&event["message"]["usage"]);
+                self.start_usage = event["message"]["usage"].clone();
+                self.last_context = context_tokens(&self.start_usage);
                 vec![json!({ "type": "context_usage", "tokens": self.last_context })]
             }
             "content_block_start" => {
@@ -1053,9 +1058,21 @@ impl Claude {
                     return vec![];
                 }
                 let output = usage["output_tokens"].as_u64().unwrap_or(0);
-                self.last_context = context_tokens(usage) + output;
+                let input = if context_tokens(usage) > 0 {
+                    usage
+                } else {
+                    &self.start_usage
+                };
+                let count = |key: &str| input[key].as_u64().unwrap_or(0);
+                self.last_context = context_tokens(input) + output;
                 vec![
-                    json!({ "type": "usage", "input_tokens": context_tokens(usage), "output_tokens": output }),
+                    json!({
+                        "type": "usage",
+                        "input_tokens": context_tokens(input),
+                        "cached_input_tokens": count("cache_read_input_tokens"),
+                        "cache_write_tokens": count("cache_creation_input_tokens"),
+                        "output_tokens": output,
+                    }),
                     json!({ "type": "context_usage", "tokens": self.last_context }),
                 ]
             }
@@ -1983,6 +2000,24 @@ mod tests {
             &mut c,
             json!({ "type": "stream_event", "event": { "type": "message_start", "message": { "usage": { "input_tokens": 10 } } } }),
         );
+        let usage = frame(
+            &mut c,
+            json!({ "type": "stream_event", "event": { "type": "message_delta", "usage": { "input_tokens": 10, "cache_read_input_tokens": 3000, "cache_creation_input_tokens": 40, "output_tokens": 5 } } }),
+        );
+        assert_eq!(
+            usage[0],
+            json!({ "type": "usage", "input_tokens": 3050, "cached_input_tokens": 3000, "cache_write_tokens": 40, "output_tokens": 5 })
+        );
+        frame(
+            &mut c,
+            json!({ "type": "stream_event", "event": { "type": "message_start", "message": { "usage": { "input_tokens": 7, "cache_read_input_tokens": 100 } } } }),
+        );
+        let usage = frame(
+            &mut c,
+            json!({ "type": "stream_event", "event": { "type": "message_delta", "usage": { "output_tokens": 2 } } }),
+        );
+        assert_eq!(usage[0]["input_tokens"], 107);
+        assert_eq!(usage[0]["cached_input_tokens"], 100);
         assert_eq!(
             types(&frame(
                 &mut c,

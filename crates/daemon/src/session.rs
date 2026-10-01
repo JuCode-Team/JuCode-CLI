@@ -60,6 +60,7 @@ fn open(
         .with_version(hub.version);
     // Nobody watches a session until a client asks to.
     core.set_attended(false);
+    core.set_tag_turns(true);
     let result = match resume {
         // Persist the new session right away: a session closed before its
         // first message must still reopen by id.
@@ -125,7 +126,11 @@ fn run(hub: &Hub, mut core: AgentCore, id: &str, ops: Receiver<Value>) {
             }
         }
         for event in core.poll_events() {
-            publish(hub, id, event);
+            // Usage goes on the turn that spent it (see crate::usage).
+            let turn = matches!(event, AgentEvent::Usage { .. })
+                .then(|| core.turn_tag().map(str::to_string))
+                .flatten();
+            publish_on(hub, id, event, turn);
         }
         let status = session_event_json(id, core.model_status_event());
         // Reconciled every tick, so a message that never started a run (an
@@ -203,6 +208,11 @@ fn rejected(op: &Value) -> Option<String> {
 /// Records deferred-action events before sending any event to clients, so
 /// an action a client sees is always one the daemon can restore.
 fn publish(hub: &Hub, id: &str, event: AgentEvent) {
+    publish_on(hub, id, event, None);
+}
+
+/// `publish`, naming the turn a usage event belongs to.
+fn publish_on(hub: &Hub, id: &str, event: AgentEvent, turn: Option<String>) {
     if let AgentEvent::ActionDeferred(action) = &event {
         if let Err(error) = hub.store.record_deferred(action) {
             hub.broadcast(&json!({
@@ -216,7 +226,10 @@ fn publish(hub: &Hub, id: &str, event: AgentEvent) {
         event,
         AgentEvent::ActionDeferred(_) | AgentEvent::ActionDecided { .. }
     );
-    let json = session_event_json(id, event);
+    let mut json = session_event_json(id, event);
+    if let Some(turn) = turn {
+        json["turn"] = json!(turn);
+    }
     hub.observe(id, &json);
     hub.broadcast(&json);
     if actions_changed {
