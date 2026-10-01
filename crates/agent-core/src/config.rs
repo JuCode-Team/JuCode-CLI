@@ -1132,12 +1132,12 @@ fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
             .get("max_output_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(128_000);
-        // Migrate older / metadata-poor Claude entries that only offer "none":
-        // Claude supports extended thinking, so surface the standard tiers
-        // (and lift the tiny default cap so high-tier budgets fit) without
-        // forcing a re-login.
+        // Migrate older / metadata-poor Claude entries that only offer "none",
+        // or the budget tiers older versions wrote for a model that now takes
+        // adaptive effort: surface the current tiers (and lift the tiny
+        // default cap so high-tier budgets fit) without forcing a re-login.
         let reasoning_efforts =
-            if name.starts_with("claude-") && is_thinking_disabled(&reasoning_efforts) {
+            if name.starts_with("claude-") && stale_claude_tiers(name, &reasoning_efforts) {
                 max_output_tokens = max_output_tokens.max(CLAUDE_MIN_MAX_OUTPUT_TOKENS);
                 claude_thinking_tiers(name)
             } else {
@@ -1357,6 +1357,16 @@ pub(crate) fn claude_thinking_tiers(model: &str) -> Vec<String> {
         &["none", "low", "medium", "high"]
     };
     tiers.iter().map(|value| value.to_string()).collect()
+}
+
+/// A stored Claude effort list to replace with `claude_thinking_tiers`: no
+/// thinking at all, or the budget tiers every Claude model got before adaptive
+/// effort (xhigh, max) came in, kept on a model that now takes it.
+fn stale_claude_tiers(model: &str, efforts: &[String]) -> bool {
+    const BUDGET_TIERS: [&str; 4] = ["none", "low", "medium", "high"];
+    is_thinking_disabled(efforts)
+        || (efforts.iter().map(String::as_str).eq(BUDGET_TIERS)
+            && llm_provider_kit::anthropic::uses_adaptive_thinking(model))
 }
 
 /// True when an effort list offers no actual thinking — empty, or only "none".
@@ -1785,6 +1795,26 @@ mod tests {
             vec!["none", "low", "medium", "high", "xhigh", "max"]
         );
         assert!(claude.max_output_tokens >= CLAUDE_MIN_MAX_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn budget_tiers_written_before_adaptive_effort_are_upgraded() {
+        let value = json!({
+            "models": [
+                { "name": "claude-opus-5-5", "reasoning_efforts": ["none", "low", "medium", "high"] },
+                { "name": "claude-haiku-4-5-20251001", "reasoning_efforts": ["none", "low", "medium", "high"] }
+            ]
+        });
+        let configs = read_model_configs(&value, "jucode");
+        assert_eq!(
+            configs[0].reasoning_efforts,
+            vec!["none", "low", "medium", "high", "xhigh", "max"]
+        );
+        // Haiku keeps budget thinking: its four tiers are still right.
+        assert_eq!(
+            configs[1].reasoning_efforts,
+            vec!["none", "low", "medium", "high"]
+        );
     }
 
     #[test]
