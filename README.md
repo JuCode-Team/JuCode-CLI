@@ -28,8 +28,8 @@ npm install -g @jucode/cli
 jucode
 ```
 
-[JuCode Desktop](https://github.com/JuCode-Team/JuCode-Desktop) installs the CLI
-during its first-run setup.
+[JuCode Desktop](https://github.com/JuCode-Team/JuCode-Desktop) ships its own copy
+of the CLI in `~/.jucode/bin` and updates it with the app.
 
 ### From source
 
@@ -52,16 +52,18 @@ JuCode is written in Rust and uses the workspace binary name `jucode`.
 ### Updating
 
 JuCode checks for new versions at startup and prints a notice when one is
-available. npm installs self-update with:
+available. Update with:
 
 ```bash
 jucode update
 ```
 
-which runs `npm i -g @jucode/cli@latest` (on Windows the update runs right
-after the process exits, since the running executable is locked). Installs
-from GitHub Releases or source print the release URL instead — replace the
-binary manually.
+- npm installs run `npm i -g @jucode/cli@latest` (on Windows right after the
+  process exits, since the running executable is locked).
+- Release binaries download the new binary from GitHub Releases, or from the
+  JuCode server when GitHub is unreachable or slow, verify it and replace
+  themselves; the new version runs from the next start.
+- The copy JuCode Desktop keeps in `~/.jucode/bin` updates with the app.
 
 ## Configuration
 
@@ -95,6 +97,8 @@ You can switch model and reasoning effort inside the TUI:
 `ctrl+t` cycles the effort for the current model; inside the `/model` picker, `tab` cycles it for the highlighted model.
 
 The config also supports custom OpenAI-compatible base URLs, retry settings, model metadata, and project-instruction discovery.
+
+On the JuCode gateway, each model's context window, output cap and effort levels come from the gateway; values it does not set stay unknown rather than guessed. `context_window_overrides` in `config.json` (`{"<model>": tokens}`) sets a window by hand: it fills in a missing one or raises the advertised window up to the gateway's largest. With no known window JuCode does not compact on a guess; when the model rejects a request as too long, it compacts and retries the turn.
 
 ### Edit tools (`edit_tools`)
 
@@ -208,6 +212,12 @@ The `final_result` event reports the effective `approval_mode` and how many appr
 
 This mode is useful for evaluation harnesses and reproducible agent experiments. A minimal in-repo harness lives in [`evals/`](evals/README.md).
 
+### Daemon (`jucode daemon`)
+
+`jucode daemon` is the local background service JuCode Desktop and the JuCode web app talk to (`ws://127.0.0.1:7788`). It hosts every session — JuCode's own engine, Claude Code, Codex and ACP agents — translated into one event stream, plus long-lived agents with schedules, and keeps them running when no window is open. With remote access turned on it also holds an end-to-end encrypted relay connection for the web app. The protocol is documented in [docs/daemon-protocol.md](docs/daemon-protocol.md).
+
+`jucode logout` signs this computer out of JuCode and revokes its device.
+
 ### ACP mode (`jucode acp`)
 
 `jucode acp` speaks the [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC over stdio) so ACP-capable editors such as Zed can drive JuCode as an external agent. It maps prompts, streaming message/thought chunks, tool-call progress, plan updates, cancellation, and permission requests; features ACP cannot express (session loading, hunk-subset approvals, the conversation tree) are explicitly rejected rather than half-implemented. `jucode serve` (the native newline-JSON protocol) is unchanged and remains the richer interface; its command/event schema is documented in [docs/serve-protocol.md](docs/serve-protocol.md).
@@ -270,6 +280,7 @@ Run the full Rust test suite:
 
 ```bash
 cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
