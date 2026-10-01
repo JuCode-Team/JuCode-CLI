@@ -83,11 +83,8 @@ same install code as `/skills`. The session's engine picks the directory: Claude
 install into `~/.claude/skills`, all others into `~/.jucode/skills`. A marketplace failure only
 adds a warning; the Anthropic catalog stays installable.
 
-Desktop also installs the source-available Anthropic document skills on explicit request. JuCode
-does not bundle or redistribute those files: the install downloads the folder from Anthropic's
-repository to the user's machine, and the user remains responsible for the upstream terms. A copy
-in `~/.claude/skills` is a filesystem custom skill; it is not Anthropic's preset hosted document
-skill and does not carry its runtime guarantees.
+Desktop lists the source-available Anthropic document skills the same way: shown with their
+license and repository link, not installed (the daemon's `skill_install` refuses them).
 
 Skills are executable instructions and may include scripts. Treat installation like installing
 software and review upstream content before using it with sensitive projects.

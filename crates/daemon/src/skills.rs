@@ -90,8 +90,8 @@ fn catalog(dir: PathBuf) -> Result<Value, String> {
 }
 
 /// The skill is looked up again here rather than trusting anything the
-/// client sent beyond its source and id. Source-available Anthropic skills
-/// install too: they come from Anthropic's repository, not from JuCode.
+/// client sent beyond its source and id. Anthropic's source-available skills
+/// are listed but not installed, as in the TUI's `/skills`.
 fn install(dir: PathBuf, source: &str, id: &str) -> Result<PathBuf, String> {
     match source {
         "anthropic" => {
@@ -101,6 +101,12 @@ fn install(dir: PathBuf, source: &str, id: &str) -> Result<PathBuf, String> {
                 .iter()
                 .find(|skill| skill.id == id)
                 .ok_or_else(|| format!("Anthropic skill not found: {id}"))?;
+            if !skill.redistributable {
+                return Err(format!(
+                    "skill {id} is not offered: {}; not redistributed by JuCode",
+                    skill.license
+                ));
+            }
             skills::install_source_skill(&dir, &anthropic, skill)
         }
         "jucode" => {

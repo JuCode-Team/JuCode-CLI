@@ -1885,6 +1885,11 @@ fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
         .as_str()
         .unwrap()
         .starts_with("https://github.com/anthropics/skills/tree/"));
+    let refused = request(
+        &mut desktop,
+        json!({ "op": "skill_install", "source": "anthropic", "skill": "pdf" }),
+    );
+    assert_eq!(refused["type"], "error", "{refused}");
 
     let installed = request(
         &mut desktop,

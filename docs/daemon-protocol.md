@@ -195,7 +195,8 @@ the configured JuCode API, with the JuCode login's token when there is one)
 and the bundled index of github.com/anthropics/skills. When the marketplace
 cannot be reached its error is one of `warnings` and only the Anthropic
 skills are listed. `source` is `jucode` or `anthropic`; `redistributable` is
-false for Anthropic's source-available document skills.
+false for Anthropic's source-available document skills, which `skill_install`
+refuses.
 
 `backend` picks the directory: `claude` installs into `~/.claude/skills`,
 anything else into `~/.jucode/skills`. `installed` means
