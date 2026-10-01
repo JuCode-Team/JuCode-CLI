@@ -116,6 +116,9 @@ jobs:
             cp "$dir"/* "artifacts-normalized/$target/"
           done
 
+      - name: Write third-party notices
+        run: node scripts/third-party-notices.mjs --cargo Cargo.toml --title "JuCode CLI: third-party software" --out jucode-third-party-notices.txt
+
       - name: Sync npm versions
         env:
           RELEASE_VERSION: ${{ steps.release_meta.outputs.version }}
@@ -142,6 +145,7 @@ jobs:
           files: |
             jucode-x86_64-unknown-linux-gnu
             jucode-x86_64-pc-windows-msvc.exe
+            jucode-third-party-notices.txt
             dist/npm/*.tgz
 
       - name: Publish npm packages

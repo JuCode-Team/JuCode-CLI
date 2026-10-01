@@ -10,4 +10,6 @@
 /npm/cli-win32-x64/bin/
 /npm/*/LICENSE
 /npm/*/NOTICE
+/npm/*/THIRD-PARTY-NOTICES.txt
+/jucode-third-party-notices.txt
 /.jucode/

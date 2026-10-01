@@ -49,9 +49,15 @@ for (const target of selectedTargets) {
 
 for (const directory of [...selectedTargets.map((target) => target.directory), rootPackageDirectory]) {
   const cwd = path.join(repoRoot, "npm", directory);
-  // Apache-2.0 §4: every published package carries the license and notices.
+  // Apache-2.0 §4: every published package carries the license and notices,
+  // and the license texts of the crates in the binary (written by the
+  // release workflow).
   for (const file of ["LICENSE", "NOTICE"]) {
     copyFileSync(path.join(repoRoot, file), path.join(cwd, file));
+  }
+  const thirdParty = path.join(repoRoot, "jucode-third-party-notices.txt");
+  if (existsSync(thirdParty)) {
+    copyFileSync(thirdParty, path.join(cwd, "THIRD-PARTY-NOTICES.txt"));
   }
   if (process.platform === "win32") {
     execFileSync(

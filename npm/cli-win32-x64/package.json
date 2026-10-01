@@ -14,6 +14,7 @@
   ],
   "files": [
     "bin/jucode.exe",
-    "NOTICE"
+    "NOTICE",
+    "THIRD-PARTY-NOTICES.txt"
   ]
 }

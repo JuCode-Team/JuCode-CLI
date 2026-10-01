@@ -11,7 +11,8 @@
   },
   "files": [
     "bin/jucode.cjs",
-    "NOTICE"
+    "NOTICE",
+    "THIRD-PARTY-NOTICES.txt"
   ],
   "optionalDependencies": {
     "@jucode/cli-linux-x64": "0.3.0",
