@@ -160,6 +160,15 @@ fn main() -> io::Result<()> {
             }
         }
     }
+    if args.first().map(String::as_str) == Some("logout") {
+        match jucode_agent_core::jucode_logout() {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.first().map(String::as_str) == Some("providers") {
         // JuCode lists the models the user chose to show, once they have.
         let jucode_models = jucode_agent_core::jucode_visible_models();
@@ -481,6 +490,8 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
             }
         });
     }
+    // A login started from a daemon session is the desktop's.
+    jucode_agent_core::set_login_client_label("JuCode Desktop");
     let store = match jucode_daemon::Store::open(jucode_daemon::state_dir()?) {
         Ok(store) => store,
         // Another daemon holds the state directory: exit successfully, as for

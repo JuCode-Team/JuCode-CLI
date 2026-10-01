@@ -16,12 +16,14 @@ use std::{
     io::{BufRead, BufReader},
     net::TcpListener,
     process::Command,
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
 
 const CLIENT_ID: &str = "jucode-cli";
+/// How a revoke may hold up a logout or a new login: it is only tidying.
+const REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 /// Text the browser shows after landing on the CLI callback.
 const CALLBACK_LOGIN_COMPLETE: &str = "JuCode CLI login complete. You can close this tab.";
@@ -217,6 +219,15 @@ pub fn ensure_session(api_url: &str, encrypt_secrets: bool) -> Result<AuthStore,
     // avoids refreshing with a stale one and a spurious "session expired".
     let mut auth = AuthStore::load_or_create(encrypt_secrets)
         .map_err(|error| format!("failed to reload auth.json: {error}"))?;
+    if auth.jucode_login_copied() {
+        return Err(
+            "this JuCode login was copied from another computer. Run /login to sign in on this one."
+                .to_string(),
+        );
+    }
+    if auth.claim_jucode_login() {
+        auth.save().map_err(|error| error.to_string())?;
+    }
     let now = unix_now();
     let (access_ok, refresh_token, refresh_alive) = match auth.jucode_tokens() {
         Some(t) => (
@@ -242,6 +253,7 @@ pub fn ensure_session(api_url: &str, encrypt_secrets: bool) -> Result<AuthStore,
                 refresh_token: t.refresh_token,
                 access_expires_at: t.access_expires_at,
                 refresh_expires_at: t.refresh_expires_at,
+                machine: crate::machine::machine_id().map(str::to_string),
             });
             auth.save().map_err(|error| error.to_string())?;
             Ok(auth)
@@ -253,6 +265,38 @@ pub fn ensure_session(api_url: &str, encrypt_secrets: bool) -> Result<AuthStore,
             ))
         }
     }
+}
+
+/// Signs this computer out: the device authorization is revoked on the
+/// gateway (best effort: offline, the web console can still revoke it) and
+/// the tokens are dropped. A login copied from another computer is only
+/// dropped; revoking it would sign that computer out.
+pub fn logout(api_url: &str, encrypt_secrets: bool) -> Result<(), String> {
+    let _guard = SESSION_REFRESH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _file_guard = lock_auth_refresh()?;
+    let mut auth = AuthStore::load_or_create(encrypt_secrets)
+        .map_err(|error| format!("failed to reload auth.json: {error}"))?;
+    if let Some(tokens) = auth.jucode_tokens() {
+        if let Err(error) = revoke(api_url, &tokens.refresh_token) {
+            crate::log_error!("oauth", "device revoke failed", error = error);
+        }
+    }
+    auth.clear_jucode();
+    auth.save().map_err(|error| error.to_string())
+}
+
+/// Revokes the device authorization a refresh token belongs to.
+pub fn revoke(api_url: &str, refresh_token: &str) -> Result<(), String> {
+    let url = format!("{}/v1/oauth/revoke", api_url.trim().trim_end_matches('/'));
+    json_response(
+        ureq::post(&url)
+            .timeout(REVOKE_TIMEOUT)
+            .set("Content-Type", "application/json")
+            .send_json(json!({ "refresh_token": refresh_token })),
+    )
+    .map(|_| ())
 }
 
 fn parse_tokens(value: &Value) -> Result<Tokens, String> {
@@ -308,11 +352,25 @@ fn fetch_models(base_url: &str, access_token: &str) -> Result<Vec<OAuthModel>, S
     Ok(parse_models_response(&value))
 }
 
-/// A human-facing device label shown under 授权设备管理. Best-effort
-/// hostname + OS; never fails (falls back to a generic label).
+static CLIENT_LABEL: OnceLock<&'static str> = OnceLock::new();
+
+/// Names the app in device labels ("JuCode CLI" unless set): the daemon
+/// signs in for the desktop.
+pub fn set_client_label(label: &'static str) {
+    let _ = CLIENT_LABEL.set(label);
+}
+
+/// A human-facing device label shown under 授权设备管理: the app, hostname,
+/// OS and the start of the machine id, which tells apart two computers
+/// with the same default hostname. Never fails.
 fn device_name() -> String {
+    let app = CLIENT_LABEL.get().copied().unwrap_or("JuCode CLI");
     let host = hostname().unwrap_or_else(|| "unknown-host".to_string());
-    format!("JuCode CLI · {host} ({})", std::env::consts::OS)
+    let mut name = format!("{app} · {host} ({})", std::env::consts::OS);
+    if let Some(id) = crate::machine::machine_id() {
+        name.push_str(&format!(" · {}", &id[..4]));
+    }
+    name
 }
 
 fn hostname() -> Option<String> {

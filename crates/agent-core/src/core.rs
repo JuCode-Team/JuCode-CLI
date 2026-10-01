@@ -3233,6 +3233,19 @@ impl AgentCore {
         } else {
             kept
         };
+        // Signing in again replaces this computer's device login: the old one
+        // is revoked rather than left behind in 授权设备管理.
+        let replaced = AuthStore::load_or_create(self.config.encrypt_secrets)
+            .ok()
+            .and_then(|auth| auth.jucode_tokens().map(|t| t.refresh_token.clone()));
+        if let Some(refresh_token) = replaced {
+            let api_url = self.config.jucode_api_url.clone();
+            thread::spawn(move || {
+                if let Err(error) = oauth::revoke(&api_url, &refresh_token) {
+                    crate::log_error!("oauth", "revoking the replaced login failed", error = error);
+                }
+            });
+        }
         self.config.provider = "jucode".to_string();
         self.config.jucode_web_url = result.web_url.clone();
         self.config.jucode_api_url = result.api_url.clone();
@@ -3261,6 +3274,7 @@ impl AgentCore {
             refresh_token: result.tokens.refresh_token,
             access_expires_at: result.tokens.access_expires_at,
             refresh_expires_at: result.tokens.refresh_expires_at,
+            machine: crate::machine::machine_id().map(str::to_string),
         });
         match self.auth.save().and_then(|_| self.config.save()) {
             Ok(()) => {

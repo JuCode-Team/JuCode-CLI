@@ -10,6 +10,7 @@ pub mod host;
 mod hunks;
 mod llm;
 pub mod logging;
+pub mod machine;
 mod mcp;
 mod oauth;
 mod prompt;
@@ -60,6 +61,17 @@ pub fn jucode_gateway_token() -> Result<(String, String), String> {
     let config = config::Config::load_existing().map_err(|error| error.to_string())?;
     let (api, token, _) = gateway_credentials(config)?;
     Ok((api, token))
+}
+
+/// Signs this computer out of JuCode and revokes its device login.
+pub fn jucode_logout() -> Result<(), String> {
+    let config = config::Config::load_existing().map_err(|error| error.to_string())?;
+    oauth::logout(&config.jucode_api_url, config.encrypt_secrets)
+}
+
+/// Names the app in the device label of the next JuCode login.
+pub fn set_login_client_label(label: &'static str) {
+    oauth::set_client_label(label);
 }
 
 fn gateway_credentials(config: config::Config) -> Result<(String, String, u64), String> {

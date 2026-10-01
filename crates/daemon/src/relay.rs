@@ -137,6 +137,12 @@ impl Identity {
     }
 }
 
+/// Drops the relay identity in `dir`; the next connection makes a new one
+/// (and phones must pair again).
+pub fn forget_identity(dir: &std::path::Path) {
+    let _ = fs::remove_file(dir.join(IDENTITY_FILE));
+}
+
 /// Relay configuration and state, shared by the relay thread and the ops
 /// that report or change it.
 pub struct Relay {

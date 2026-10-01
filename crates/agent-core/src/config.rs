@@ -351,6 +351,9 @@ pub struct JucodeTokens {
     pub refresh_token: String,
     pub access_expires_at: u64,
     pub refresh_expires_at: u64,
+    /// The computer the login was made on (`machine::machine_id`); None for
+    /// logins saved before it was recorded.
+    pub machine: Option<String>,
 }
 
 impl Config {
@@ -744,14 +747,35 @@ impl AuthStore {
         self.keys.insert(provider.to_string(), key);
     }
 
-    /// The current JuCode OAuth token bundle, if logged in.
+    /// The current JuCode OAuth token bundle, if logged in on this computer.
+    /// A login copied from another computer is not one: refreshing it would
+    /// sign that computer out.
     pub fn jucode_tokens(&self) -> Option<&JucodeTokens> {
-        self.jucode.as_ref()
+        self.jucode
+            .as_ref()
+            .filter(|t| crate::machine::is_this_machine(t.machine.as_deref()))
     }
 
     /// The current JuCode access token (used as the gateway Bearer).
     pub fn jucode_access_token(&self) -> Option<&str> {
-        self.jucode.as_ref().map(|t| t.access_token.as_str())
+        self.jucode_tokens().map(|t| t.access_token.as_str())
+    }
+
+    /// A JuCode login is saved but was made on another computer.
+    pub fn jucode_login_copied(&self) -> bool {
+        self.jucode.is_some() && self.jucode_tokens().is_none()
+    }
+
+    /// A login saved here before computers were recorded: claimed for this
+    /// one. Returns whether it changed.
+    pub fn claim_jucode_login(&mut self) -> bool {
+        match (self.jucode.as_mut(), crate::machine::machine_id()) {
+            (Some(tokens), Some(id)) if tokens.machine.is_none() => {
+                tokens.machine = Some(id.to_string());
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn set_jucode_tokens(&mut self, tokens: JucodeTokens) {
@@ -795,6 +819,9 @@ impl AuthStore {
                 "access_expires_at": t.access_expires_at,
                 "refresh_expires_at": t.refresh_expires_at,
             });
+            if let Some(machine) = &t.machine {
+                value["jucode"]["machine"] = json!(machine);
+            }
         }
         if !self.oauth.is_empty() {
             value["oauth"] = json!(self
@@ -1577,6 +1604,7 @@ fn read_jucode_tokens(value: &Value) -> Option<JucodeTokens> {
             .get("refresh_expires_at")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        machine: read_nonempty_str(value, "machine"),
     })
 }
 
@@ -1695,6 +1723,31 @@ mod tests {
         assert_eq!(restored.account_id, credential.account_id);
         assert_eq!(restored.project_id, credential.project_id);
         assert_eq!(restored.org_id, None);
+    }
+
+    #[test]
+    fn a_jucode_login_from_another_computer_is_not_used() {
+        let Some(here) = crate::machine::machine_id() else {
+            return;
+        };
+        let mut auth = AuthStore {
+            keys: BTreeMap::new(),
+            jucode: read_jucode_tokens(&json!({
+                "access_token": "a", "refresh_token": "r", "machine": "another-computer"
+            })),
+            oauth: BTreeMap::new(),
+            encryption_key: None,
+            path: PathBuf::from("auth.json"),
+        };
+        assert!(auth.jucode_tokens().is_none());
+        assert!(auth.jucode_login_copied());
+        assert!(!auth.claim_jucode_login());
+
+        // Saved before computers were recorded: claimed for this one.
+        auth.jucode = read_jucode_tokens(&json!({ "access_token": "a", "refresh_token": "r" }));
+        assert!(auth.claim_jucode_login());
+        assert_eq!(auth.jucode_tokens().unwrap().machine.as_deref(), Some(here));
+        assert!(!auth.jucode_login_copied());
     }
 
     #[test]

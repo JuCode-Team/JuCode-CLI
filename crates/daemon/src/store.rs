@@ -23,6 +23,8 @@ const TIMERS: &str = "timers.jsonl";
 const QUESTIONS: &str = "questions.jsonl";
 const REPORTS: &str = "reports.jsonl";
 const DEVICES: &str = "devices.jsonl";
+/// The computer this state belongs to (see `claim_machine`).
+const MACHINE: &str = "machine";
 const TOKEN: &str = "token";
 const SETTINGS: &str = "settings.json";
 const WORKSPACES: &str = "workspaces.json";
@@ -256,6 +258,34 @@ impl Store {
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
             .filter(Value::is_object)
             .unwrap_or_else(|| json!({}))
+    }
+
+    /// Records which computer this state belongs to. State copied from
+    /// another computer (see `jucode_agent_core::machine`) would answer to
+    /// that computer's token and paired devices: here it gets a new token
+    /// and its devices are unpaired. Returns true when that happened.
+    pub fn claim_machine(&self) -> io::Result<bool> {
+        let Some(current) = jucode_agent_core::machine::machine_id() else {
+            return Ok(false);
+        };
+        let path = self.dir.join(MACHINE);
+        let recorded = fs::read_to_string(&path).unwrap_or_default();
+        let recorded = recorded.trim();
+        if recorded == current {
+            return Ok(false);
+        }
+        let copied = !recorded.is_empty();
+        if copied {
+            match fs::remove_file(self.dir.join(TOKEN)) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                _ => {}
+            }
+            for device in self.devices().into_iter().filter(|device| !device.revoked) {
+                self.record_device_revoked(&device.id)?;
+            }
+        }
+        fs::write(&path, format!("{current}\n"))?;
+        Ok(copied)
     }
 
     /// The local client token, created on first use and readable only by
@@ -1166,6 +1196,38 @@ mod tests {
             vec!["r3", "r2"]
         );
         assert!(reports[1].read && !reports[0].read);
+    }
+
+    #[test]
+    fn state_copied_from_another_computer_gets_a_new_token_and_no_devices() {
+        let store = store("machine");
+        let Some(current) = jucode_agent_core::machine::machine_id() else {
+            return;
+        };
+        let token = store.token().unwrap();
+        store
+            .record_device(&Device {
+                id: "d1".to_string(),
+                name: "phone".to_string(),
+                token_hash: token_hash("secret"),
+                paired_at: 1,
+                revoked: false,
+            })
+            .unwrap();
+        // First run here: claimed, nothing reset.
+        assert!(!store.claim_machine().unwrap());
+        assert_eq!(store.token().unwrap(), token);
+        assert!(store.device_for_token("secret").is_some());
+        assert_eq!(
+            fs::read_to_string(store.dir.join(MACHINE)).unwrap().trim(),
+            current
+        );
+        // The same state on another computer.
+        fs::write(store.dir.join(MACHINE), "another-computer\n").unwrap();
+        assert!(store.claim_machine().unwrap());
+        assert_ne!(store.token().unwrap(), token);
+        assert!(store.device_for_token("secret").is_none());
+        assert!(!store.claim_machine().unwrap());
     }
 
     #[test]

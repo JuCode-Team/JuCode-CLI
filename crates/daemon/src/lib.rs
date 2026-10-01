@@ -58,6 +58,13 @@ pub fn serve(
     version: &'static str,
     relay: Option<String>,
 ) -> io::Result<()> {
+    if store.claim_machine()? {
+        relay::forget_identity(store.dir());
+        jucode_agent_core::log_warn!(
+            "daemon",
+            "state copied from another computer: new token, devices unpaired, new relay identity"
+        );
+    }
     let token = store.token()?;
     gateway::set_port(listener.local_addr()?.port());
     for record in store.sessions() {
