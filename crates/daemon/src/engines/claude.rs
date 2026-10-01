@@ -66,6 +66,9 @@ pub fn use_gateway(command: &mut Command, id: &str, base: &str, key: &str) -> Re
         name = bytes.iter().map(|b| format!("{b:02x}")).collect();
     }
     let path = dir.join(format!("claude-gateway-{name}.json"));
+    // A fresh install has no daemon directory before its first gateway session.
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
     crate::store::write_private(&path, settings.to_string().as_bytes())
         .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
     GATEWAY_FILES
