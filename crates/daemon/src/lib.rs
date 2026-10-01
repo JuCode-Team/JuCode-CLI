@@ -429,6 +429,7 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                     text("name"),
                     &PathBuf::from(text("cwd")),
                     text("role"),
+                    &op,
                 )
                 .map(|agent| {
                     hub.broadcast(&hub.agents_json());

@@ -5,7 +5,7 @@
 //! reads the brief into every turn of the agent's sessions; the agent keeps
 //! it current with the `brief` tool.
 
-use crate::store::write_private;
+use crate::store::{random_hex, write_private};
 use jucode_agent_core::sandbox::{
     default_rules_json, directories_from_json, rules_from_json, rules_to_json, CommandRule,
     SandboxMode, SandboxPolicy,
@@ -39,6 +39,14 @@ pub struct Agent {
     /// Directories outside `cwd` it may use, each `ro` or `rw`.
     pub directories: Vec<Directory>,
     pub command_rules: Vec<CommandRule>,
+    /// Custom icon, shaped as the clients' tab icons (`{kind, id | value |
+    /// markup}`); clients sanitize an SVG before drawing it.
+    pub icon: Option<Value>,
+    /// `#rrggbb`.
+    pub color: Option<String>,
+    /// Seeds the generated avatar; agents from before it have none and
+    /// clients use the id.
+    pub avatar_seed: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,7 +58,7 @@ pub struct Directory {
 
 impl Agent {
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "id": self.id,
             "name": self.name,
             "cwd": self.cwd.display().to_string(),
@@ -63,7 +71,17 @@ impl Agent {
                 "mode": dir.mode,
             })).collect::<Vec<_>>(),
             "command_rules": rules_to_json(&self.command_rules),
-        })
+        });
+        if let Some(icon) = &self.icon {
+            value["icon"] = icon.clone();
+        }
+        if let Some(color) = &self.color {
+            value["color"] = json!(color);
+        }
+        if let Some(seed) = &self.avatar_seed {
+            value["avatar_seed"] = json!(seed);
+        }
+        value
     }
 
     /// The sandbox its sessions run in.
@@ -139,11 +157,23 @@ impl Agents {
             // A directory that has gone away is dropped, not an error.
             directories: directories(&value["directories"], false).unwrap_or_default(),
             command_rules: rules_from_json(&value["command_rules"]).unwrap_or_default(),
+            icon: value.get("icon").filter(|icon| !icon.is_null()).cloned(),
+            color: value["color"].as_str().map(str::to_string),
+            avatar_seed: value["avatar_seed"].as_str().map(str::to_string),
         })
     }
 
     /// Creates an agent working in `cwd`, with `role` as its first brief.
-    pub fn create(&self, id: &str, name: &str, cwd: &Path, role: &str) -> Result<Agent, String> {
+    /// `appearance` may carry `icon`, `color` and `avatar_seed`; without a
+    /// seed it gets a random one.
+    pub fn create(
+        &self,
+        id: &str,
+        name: &str,
+        cwd: &Path,
+        role: &str,
+        appearance: &Value,
+    ) -> Result<Agent, String> {
         if !valid_id(id) {
             return Err(format!(
                 "invalid agent id '{id}': use 1-40 lowercase letters, digits or '-'"
@@ -171,11 +201,16 @@ impl Agents {
             network: true,
             directories: Vec::new(),
             command_rules: rules_from_json(&default_rules_json()).expect("default rules parse"),
+            icon: None,
+            color: None,
+            avatar_seed: None,
         };
+        let mut settings = agent.to_json();
+        settings.as_object_mut().map(|map| map.remove("id"));
+        settings["avatar_seed"] = json!(random_hex(8).map_err(|error| error.to_string())?);
+        set_appearance(&mut settings, appearance)?;
         let write = || -> io::Result<()> {
             fs::create_dir_all(dir.join("memory"))?;
-            let mut settings = agent.to_json();
-            settings.as_object_mut().map(|map| map.remove("id"));
             fs::write(
                 dir.join("agent.json"),
                 serde_json::to_string_pretty(&settings)? + "\n",
@@ -187,13 +222,13 @@ impl Agents {
             Ok(())
         };
         write().map_err(|error| error.to_string())?;
-        Ok(agent)
+        self.get(id).ok_or_else(|| format!("unknown agent {id}"))
     }
 
     /// Changes the settings present in `changes` (`name`, `enabled`,
     /// `approval_mode`, `sandbox`, `network`, `directories`,
-    /// `command_rules`), keeping the rest of `agent.json`; `role` rewrites
-    /// `role.md`.
+    /// `command_rules`, `icon`, `color`, `avatar_seed`), keeping the rest of
+    /// `agent.json`; `role` rewrites `role.md`.
     pub fn update(&self, id: &str, changes: &Value) -> Result<Agent, String> {
         if !valid_id(id) {
             return Err(format!("unknown agent {id}"));
@@ -233,6 +268,7 @@ impl Agents {
             rules_from_json(&changes["command_rules"])?;
             settings["command_rules"] = changes["command_rules"].clone();
         }
+        set_appearance(&mut settings, changes)?;
         let text = serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())?;
         fs::write(&path, text + "\n").map_err(|error| error.to_string())?;
         if let Some(role) = changes["role"].as_str() {
@@ -393,6 +429,57 @@ impl Agents {
     }
 }
 
+/// Applies `icon`, `color` and `avatar_seed` from `changes`; `null` clears
+/// one. Only shapes and sizes are checked here: an SVG icon is sanitized by
+/// the clients that draw it.
+fn set_appearance(settings: &mut Value, changes: &Value) -> Result<(), String> {
+    for key in ["icon", "color", "avatar_seed"] {
+        let Some(change) = changes.get(key) else {
+            continue;
+        };
+        let value = match (key, change) {
+            (_, Value::Null) => {
+                settings.as_object_mut().map(|map| map.remove(key));
+                continue;
+            }
+            ("icon", icon) => valid_icon(icon)?,
+            ("color", Value::String(color))
+                if color.len() == 7
+                    && color.starts_with('#')
+                    && color[1..].chars().all(|c| c.is_ascii_hexdigit()) =>
+            {
+                json!(color.to_ascii_lowercase())
+            }
+            ("avatar_seed", Value::String(seed)) if !seed.is_empty() && seed.len() <= 64 => {
+                json!(seed)
+            }
+            _ => return Err(format!("invalid {key}: {change}")),
+        };
+        settings[key] = value;
+    }
+    Ok(())
+}
+
+/// `{kind: builtin, id}`, `{kind: slug, value}` (at most 32 UTF-16 units, as
+/// the clients count) or `{kind: svg, markup}` (at most 8192 bytes), with
+/// only those fields kept.
+fn valid_icon(icon: &Value) -> Result<Value, String> {
+    let text = |key: &str| icon[key].as_str().map(str::trim).filter(|s| !s.is_empty());
+    match icon["kind"].as_str() {
+        Some("builtin") => text("id").map(|id| json!({ "kind": "builtin", "id": id })),
+        Some("slug") => text("value")
+            .filter(|value| value.encode_utf16().count() <= 32)
+            .map(|value| json!({ "kind": "slug", "value": value })),
+        Some("svg") => text("markup")
+            .filter(|markup| markup.len() <= 8192)
+            .map(|markup| json!({ "kind": "svg", "markup": markup })),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        "invalid icon: use {kind: builtin, id}, {kind: slug, value} (32 characters at most) or {kind: svg, markup} (8192 bytes at most)".to_string()
+    })
+}
+
 /// Windows has no sandbox yet: its agents start without one.
 fn default_sandbox() -> &'static str {
     if cfg!(windows) {
@@ -440,15 +527,25 @@ mod tests {
     fn create_writes_the_brief_and_reads_back() {
         let (agents, work) = agents("create");
         let agent = agents
-            .create("ops", "Ops", &work, "# Keeps the deploys green")
+            .create(
+                "ops",
+                "Ops",
+                &work,
+                "# Keeps the deploys green",
+                &Value::Null,
+            )
             .unwrap();
         assert_eq!(agents.get("ops"), Some(agent.clone()));
         assert_eq!(agent.approval_mode, "auto");
         assert_eq!(agents.summary("ops"), "Keeps the deploys green");
-        assert!(agents.create("ops", "Ops", &work, "").is_err());
-        assert!(agents.create("Bad Id", "x", &work, "").is_err());
         assert!(agents
-            .create("nowhere", "x", &work.join("missing"), "")
+            .create("ops", "Ops", &work, "", &Value::Null)
+            .is_err());
+        assert!(agents
+            .create("Bad Id", "x", &work, "", &Value::Null)
+            .is_err());
+        assert!(agents
+            .create("nowhere", "x", &work.join("missing"), "", &Value::Null)
             .is_err());
     }
 
@@ -457,7 +554,9 @@ mod tests {
     #[test]
     fn update_changes_only_the_given_settings() {
         let (agents, work) = agents("update");
-        agents.create("ops", "Ops", &work, "role").unwrap();
+        agents
+            .create("ops", "Ops", &work, "role", &Value::Null)
+            .unwrap();
         let updated = agents
             .update(
                 "ops",
@@ -500,9 +599,60 @@ mod tests {
     }
 
     #[test]
+    fn appearance_is_checked_saved_and_cleared() {
+        let (agents, work) = agents("appearance");
+        let created = agents
+            .create("ops", "Ops", &work, "role", &Value::Null)
+            .unwrap();
+        assert_eq!(created.avatar_seed.as_ref().map(String::len), Some(16));
+        let web = agents
+            .create("web", "Web", &work, "role", &json!({ "avatar_seed": "s1" }))
+            .unwrap();
+        assert_eq!(web.avatar_seed.as_deref(), Some("s1"));
+        assert!(agents
+            .create("api", "Api", &work, "role", &json!({ "color": "red" }))
+            .is_err());
+        assert!(agents.get("api").is_none());
+
+        let rocket = json!({ "kind": "builtin", "id": "rocket" });
+        let updated = agents
+            .update(
+                "ops",
+                &json!({ "icon": { "kind": "builtin", "id": "rocket", "extra": 1 }, "color": "#2563EB" }),
+            )
+            .unwrap();
+        assert_eq!(updated.icon, Some(rocket.clone()));
+        assert_eq!(updated.color.as_deref(), Some("#2563eb"));
+        assert_eq!(updated.to_json()["icon"], rocket);
+        assert_eq!(agents.get("ops"), Some(updated));
+        for bad in [
+            json!({ "icon": { "kind": "emoji", "value": "x" } }),
+            json!({ "icon": { "kind": "slug", "value": "x".repeat(33) } }),
+            json!({ "icon": { "kind": "svg", "markup": "x".repeat(8193) } }),
+            json!({ "icon": "rocket" }),
+            json!({ "color": "#abc" }),
+            json!({ "avatar_seed": "" }),
+        ] {
+            assert!(agents.update("ops", &bad).is_err(), "{bad}");
+        }
+        let cleared = agents
+            .update(
+                "ops",
+                &json!({ "icon": null, "color": null, "avatar_seed": "abc" }),
+            )
+            .unwrap();
+        assert_eq!((cleared.icon.clone(), cleared.color.clone()), (None, None));
+        assert_eq!(cleared.avatar_seed.as_deref(), Some("abc"));
+        assert!(cleared.to_json().get("icon").is_none());
+        assert_eq!(agents.get("ops"), Some(cleared));
+    }
+
+    #[test]
     fn brief_files_are_limited_to_the_brief_and_memory() {
         let (agents, work) = agents("brief");
-        agents.create("ops", "Ops", &work, "role").unwrap();
+        agents
+            .create("ops", "Ops", &work, "role", &Value::Null)
+            .unwrap();
         agents.write_brief("ops", "state.md", "halfway").unwrap();
         agents
             .write_brief("ops", "memory/deploy.md", "use make ship")
@@ -524,9 +674,11 @@ mod tests {
     fn prompt_carries_the_brief_memory_and_other_agents() {
         let (agents, work) = agents("prompt");
         agents
-            .create("ops", "Ops", &work, "Keeps deploys green")
+            .create("ops", "Ops", &work, "Keeps deploys green", &Value::Null)
             .unwrap();
-        agents.create("web", "Web", &work, "Owns the site").unwrap();
+        agents
+            .create("web", "Web", &work, "Owns the site", &Value::Null)
+            .unwrap();
         agents
             .write_brief("ops", "state.md", "waiting on CI")
             .unwrap();

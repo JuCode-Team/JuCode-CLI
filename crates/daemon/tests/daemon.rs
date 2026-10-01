@@ -506,6 +506,7 @@ fn a_timer_due_while_the_daemon_was_down_fires_on_start() {
             "sleeper",
             &temp_dir("agent-sleeper"),
             "Was asleep",
+            &Value::Null,
         )
         .unwrap();
     let timers = root.join("daemon").join("timers.jsonl");
@@ -531,7 +532,9 @@ fn at_most_four_runs_are_in_progress_at_once() {
     let agents = jucode_daemon::Agents::open(root.join("agents")).unwrap();
     let ids = ["slot-a", "slot-b", "slot-c", "slot-d", "slot-e"];
     for id in ids {
-        agents.create(id, id, &temp_dir(id), "Waits").unwrap();
+        agents
+            .create(id, id, &temp_dir(id), "Waits", &Value::Null)
+            .unwrap();
         // Run shell commands without asking, so each run takes real time.
         let settings = root.join("agents").join(id).join("agent.json");
         let text = fs::read_to_string(&settings).unwrap();
@@ -852,6 +855,7 @@ fn a_schedule_due_while_the_daemon_was_down_fires_once_on_start() {
             "nightly",
             &temp_dir("agent-nightly"),
             "Runs at night",
+            &Value::Null,
         )
         .unwrap();
     // Due long ago: many runs were missed.
