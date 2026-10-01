@@ -143,6 +143,23 @@ fn main() -> io::Result<()> {
     if args.first().map(String::as_str) == Some("update") {
         std::process::exit(run_update());
     }
+    if args.first().map(String::as_str) == Some("token") {
+        // The desktop's own gateway calls take the token from here, so one
+        // implementation refreshes it.
+        match jucode_agent_core::jucode_session() {
+            Ok((api_url, access_token, expires_at)) => {
+                println!(
+                    "{}",
+                    json!({ "api_url": api_url, "access_token": access_token, "expires_at": expires_at })
+                );
+                std::process::exit(0);
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.first().map(String::as_str) == Some("providers") {
         // JuCode lists the models the user chose to show, once they have.
         let jucode_models = jucode_agent_core::jucode_visible_models();
@@ -205,6 +222,7 @@ USAGE:
                                          JSON-RPC adapter over stdio, for
                                          ACP-capable editors like Zed
     jucode providers                     print built-in providers as JSON
+    jucode token                         print a JuCode access token as JSON (refreshed when needed)
     jucode update                        update an npm-installed jucode
     jucode version                       print the version
 

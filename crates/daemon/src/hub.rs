@@ -932,7 +932,7 @@ impl Hub {
     }
 
     /// A session accepted a user message: a new session is titled after
-    /// its first one (first line, 40 characters), as the desktop does.
+    /// its first one (first line, 40 characters); clients show the daemon's titles.
     pub fn note_user_message(&self, session: &str, content: &str) {
         if !lock(&self.untitled).remove(session) {
             return;

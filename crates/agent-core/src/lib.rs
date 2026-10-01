@@ -43,14 +43,23 @@ pub use tools::{git_diff, terminate_tool_processes};
 /// minutes (refreshed first when needed), for tools spawned to call the
 /// gateway on the user's JuCode login.
 pub fn jucode_gateway_credentials() -> Result<(String, String), String> {
+    let (api, token, _) = jucode_session()?;
+    Ok((api, token))
+}
+
+/// `jucode_gateway_credentials` plus when the token expires (unix seconds).
+pub fn jucode_session() -> Result<(String, String, u64), String> {
     let config = config::Config::load_or_create().map_err(|error| error.to_string())?;
     let auth = oauth::ensure_session(&config.jucode_api_url, config.encrypt_secrets)?;
-    let token = auth
-        .jucode_access_token()
-        .filter(|token| !token.is_empty())
-        .ok_or("not logged in to JuCode. Run /login.")?
-        .to_string();
-    Ok((config.jucode_api_url, token))
+    let tokens = auth
+        .jucode_tokens()
+        .filter(|tokens| !tokens.access_token.is_empty())
+        .ok_or("not logged in to JuCode. Run /login.")?;
+    Ok((
+        config.jucode_api_url,
+        tokens.access_token.clone(),
+        tokens.access_expires_at,
+    ))
 }
 
 /// Sessions saved for `cwd`, most recently updated first (`updated_at` in
