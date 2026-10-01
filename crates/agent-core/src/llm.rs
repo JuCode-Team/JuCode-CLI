@@ -796,7 +796,7 @@ impl OpenAiClient {
                 let body = json!({
                     "model": self.model,
                     "system": system,
-                    "max_tokens": self.max_output_tokens.max(1),
+                    "max_tokens": anthropic::max_tokens_or_default(self.max_output_tokens),
                     "messages": [{ "role": "user", "content": [{ "type": "text", "text": user }] }],
                     "stream": true
                 });
@@ -817,15 +817,17 @@ impl OpenAiClient {
                     })?
             }
             Protocol::OpenAiChatCompletions => {
-                let body = json!({
+                let mut body = json!({
                     "model": self.model,
                     "messages": [
                         { "role": "system", "content": system },
                         { "role": "user", "content": user }
                     ],
-                    "max_tokens": self.max_output_tokens.max(1),
                     "stream": true
                 });
+                if self.max_output_tokens > 0 {
+                    body["max_tokens"] = json!(self.max_output_tokens);
+                }
                 let url = chat::completions_url(&self.base_url);
                 let response = self.transport.send_with_retry(
                     Protocol::OpenAiChatCompletions,
@@ -1181,7 +1183,11 @@ impl OpenAiClient {
             .get("max_output_tokens")
             .and_then(Value::as_u64)
             .map_or(model_max_output_tokens, |value| {
-                value.clamp(512, model_max_output_tokens.max(512))
+                // 0 = the model's cap is unknown: only the floor applies.
+                match model_max_output_tokens {
+                    0 => value.max(512),
+                    cap => value.clamp(512, cap.max(512)),
+                }
             });
         let fork_turns = args
             .get("fork_turns")
@@ -2607,6 +2613,7 @@ mod tests {
         ModelConfig {
             name: name.to_string(),
             context_window: 200_000,
+            max_context_window: 0,
             max_output_tokens,
             reasoning_efforts: efforts.iter().map(|e| e.to_string()).collect(),
             input_cost: 0.0,

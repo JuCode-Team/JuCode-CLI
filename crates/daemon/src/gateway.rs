@@ -187,14 +187,29 @@ pub fn catalog_json() -> Value {
         .map(|home| std::path::PathBuf::from(home).join(".jucode").join("config.json"))
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|config| config["jucode_models"].as_array().cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|model| {
-            let name = model["name"].as_str()?;
-            Some(json!({ "name": name, "context_window": model["context_window"] }))
+        .map(|config| {
+            // The window the engine budgets with: a hand-set override
+            // (capped at the gateway's largest) wins over the gateway's.
+            let overrides = config["context_window_overrides"].clone();
+            config["jucode_models"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|model| {
+                    let name = model["name"].as_str()?;
+                    let mut window = model["context_window"].as_u64().unwrap_or(0);
+                    if let Some(set) = overrides[name].as_u64().filter(|w| *w > 0) {
+                        window = match model["max_context_window"].as_u64().unwrap_or(0) {
+                            0 => set,
+                            max => set.min(max),
+                        };
+                    }
+                    Some(json!({ "name": name, "context_window": window }))
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     let groups = live_upstream()
         .ok()
         .and_then(|upstream| live_groups(&upstream))

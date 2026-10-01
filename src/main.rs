@@ -186,6 +186,7 @@ fn main() -> io::Result<()> {
                         json!({
                             "name": m.name,
                             "context_window": m.context_window,
+                            "max_context_window": m.max_context_window,
                             "max_output_tokens": m.max_output_tokens,
                             "reasoning_efforts": m.reasoning_efforts,
                         })

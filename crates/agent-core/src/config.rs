@@ -212,6 +212,12 @@ pub struct Config {
     /// model go only through that group (`X-JuCode-Group`). A model without
     /// an entry is routed automatically across every group the account has.
     pub jucode_groups: BTreeMap<String, String>,
+    /// Context windows the user set by hand (`context_window_overrides`),
+    /// keyed by model name. Applied by `model_config`: fills in a window the
+    /// gateway did not configure, or raises the advertised (smallest-account)
+    /// window toward the model's `max_context_window`. Survives re-login,
+    /// which rewrites `jucode_models` from the gateway.
+    pub context_window_overrides: BTreeMap<String, u64>,
     pub base_url: String,
     pub jucode_web_url: String,
     pub jucode_api_url: String,
@@ -312,7 +318,11 @@ pub struct SubagentModel {
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub name: String,
+    /// 0 = unknown: no window-based compaction, nothing shown.
     pub context_window: u64,
+    /// Largest window any route offers (JuCode: the biggest account window;
+    /// `context_window` is the smallest). 0 = same as `context_window`.
+    pub max_context_window: u64,
     pub max_output_tokens: u64,
     pub reasoning_efforts: Vec<String>,
     /// USD price per 1M tokens. 0 means unknown, which suppresses cost display.
@@ -375,6 +385,7 @@ impl Config {
                 subagent_models: Vec::new(),
                 jucode_models: Vec::new(),
                 jucode_groups: BTreeMap::new(),
+                context_window_overrides: BTreeMap::new(),
                 base_url: "https://api.jucode.net/v1".to_string(),
                 jucode_web_url: "https://api.jucode.net".to_string(),
                 jucode_api_url: "https://api.jucode.net".to_string(),
@@ -497,6 +508,7 @@ impl Config {
                         .collect()
                 })
                 .unwrap_or_default(),
+            context_window_overrides: read_context_window_overrides(&value),
             base_url: normalize_base_url(&read_string(&value, "base_url", &default_base_url)),
             provider,
             jucode_web_url: normalize_base_url(&read_string(
@@ -573,6 +585,7 @@ impl Config {
             })).collect::<Vec<_>>(),
             "jucode_models": self.jucode_models.iter().map(model_config_value).collect::<Vec<_>>(),
             "jucode_groups": self.jucode_groups,
+            "context_window_overrides": self.context_window_overrides,
             "base_url": normalize_base_url(&self.base_url),
             "jucode_web_url": normalize_base_url(&self.jucode_web_url),
             "jucode_api_url": normalize_base_url(&self.jucode_api_url),
@@ -668,11 +681,13 @@ impl Config {
     }
 
     pub fn model_config(&self, model: &str) -> ModelConfig {
-        self.models
+        let config = self
+            .models
             .iter()
             .find(|entry| entry.name == model)
             .cloned()
-            .unwrap_or_else(|| default_model_config(model))
+            .unwrap_or_else(|| default_model_config(model));
+        apply_context_window_override(config, &self.context_window_overrides)
     }
 
     pub fn system_prompt(&self) -> io::Result<String> {
@@ -1160,10 +1175,12 @@ fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
             })
             .filter(|values| !values.is_empty())
             .unwrap_or_else(default_reasoning_efforts);
+        // Missing = unknown (0): requests then omit the cap where the protocol
+        // allows it instead of inventing one.
         let mut max_output_tokens = model
             .get("max_output_tokens")
             .and_then(Value::as_u64)
-            .unwrap_or(128_000);
+            .unwrap_or(0);
         // Migrate older / metadata-poor Claude entries that only offer "none",
         // or the budget tiers older versions wrote for a model that now takes
         // adaptive effort: surface the current tiers (and lift the tiny
@@ -1181,7 +1198,11 @@ fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
             context_window: model
                 .get("context_window")
                 .and_then(Value::as_u64)
-                .unwrap_or(400_000),
+                .unwrap_or(0),
+            max_context_window: model
+                .get("max_context_window")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
             max_output_tokens,
             reasoning_efforts,
             input_cost: read_f64(model, "input_cost", 0.0),
@@ -1358,6 +1379,7 @@ fn model_config_value(model: &ModelConfig) -> Value {
     json!({
         "name": model.name,
         "context_window": model.context_window,
+        "max_context_window": model.max_context_window,
         "max_output_tokens": model.max_output_tokens,
         "reasoning_efforts": model.reasoning_efforts,
         "input_cost": model.input_cost,
@@ -1431,6 +1453,7 @@ fn model_config_from_catalog(model: &llm_provider_kit::omp::CatalogModel) -> Mod
     ModelConfig {
         name: model.id.clone(),
         context_window: model.context_window,
+        max_context_window: 0,
         max_output_tokens: model.max_tokens,
         reasoning_efforts: efforts_for_catalog_model(model),
         input_cost: model.input_cost,
@@ -1443,6 +1466,7 @@ fn model_config_from_template(model: &llm_provider_kit::ModelTemplate) -> ModelC
     ModelConfig {
         name: model.name.to_string(),
         context_window: model.context_window,
+        max_context_window: 0,
         max_output_tokens: model.max_output_tokens,
         reasoning_efforts: model
             .reasoning_efforts
@@ -1458,8 +1482,54 @@ fn model_config_from_template(model: &llm_provider_kit::ModelTemplate) -> ModelC
 /// The JuCode models the user chose to show (empty before the first login).
 pub fn jucode_visible_models() -> Vec<ModelConfig> {
     Config::load_or_create()
-        .map(|c| c.jucode_models)
+        .map(|c| {
+            c.jucode_models
+                .into_iter()
+                .map(|m| apply_context_window_override(m, &c.context_window_overrides))
+                .collect()
+        })
         .unwrap_or_default()
+}
+
+/// Applies the user's hand-set window for `config.name`, if any. A gateway
+/// that advertises a range caps the override at `max_context_window`: above
+/// it no account can serve the request.
+pub(crate) fn apply_context_window_override(
+    mut config: ModelConfig,
+    overrides: &BTreeMap<String, u64>,
+) -> ModelConfig {
+    if let Some(&window) = overrides.get(&config.name).filter(|w| **w > 0) {
+        config.context_window = match config.max_context_window {
+            0 => window,
+            max => window.min(max),
+        };
+    }
+    config
+}
+
+/// `context_window_overrides` as saved in config.json; Desktop edits it
+/// while engines run, so turns re-read it (see `read_context_window_overrides_at`).
+fn read_context_window_overrides(value: &Value) -> BTreeMap<String, u64> {
+    value
+        .get("context_window_overrides")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(model, window)| {
+                    let window = window.as_u64().filter(|w| *w > 0)?;
+                    let model = model.trim();
+                    (!model.is_empty()).then(|| (model.to_string(), window))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn read_context_window_overrides_at(path: &Path) -> io::Result<BTreeMap<String, u64>> {
+    let content = fs::read_to_string(path)?;
+    let value = serde_json::from_str::<Value>(&content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(read_context_window_overrides(&value))
 }
 
 /// Built-in providers as (id, default base_url, protocol) — for UIs to offer a
@@ -1534,9 +1604,12 @@ fn default_model_config(name: &str) -> ModelConfig {
         .find(|entry| entry.name == name)
         .map(model_config_from_template)
         .unwrap_or_else(|| ModelConfig {
+            // Not in any table: nothing is known about it, so nothing is
+            // claimed (no window-based compaction, no output cap sent).
             name: name.to_string(),
-            context_window: 400_000,
-            max_output_tokens: 128_000,
+            context_window: 0,
+            max_context_window: 0,
+            max_output_tokens: 0,
             reasoning_efforts: default_reasoning_efforts(),
             input_cost: 0.0,
             cached_input_cost: 0.0,
@@ -1756,10 +1829,42 @@ mod tests {
     }
 
     #[test]
+    fn context_window_override_is_capped_by_the_gateway_range() {
+        let model = |window, max| ModelConfig {
+            name: "gpt-6-sol".to_string(),
+            context_window: window,
+            max_context_window: max,
+            max_output_tokens: 0,
+            reasoning_efforts: vec![],
+            input_cost: 0.0,
+            cached_input_cost: 0.0,
+            output_cost: 0.0,
+        };
+        let overrides = BTreeMap::from([("gpt-6-sol".to_string(), 2_000_000)]);
+        // Raised toward, but never past, the largest account window.
+        let raised = apply_context_window_override(model(272_000, 1_050_000), &overrides);
+        assert_eq!(raised.context_window, 1_050_000);
+        // Nothing configured on the gateway: the user's value is all there is.
+        let filled = apply_context_window_override(model(0, 0), &overrides);
+        assert_eq!(filled.context_window, 2_000_000);
+        // No override: the gateway's smallest window stands.
+        let untouched = apply_context_window_override(model(272_000, 1_050_000), &BTreeMap::new());
+        assert_eq!(untouched.context_window, 272_000);
+    }
+
+    #[test]
+    fn context_window_overrides_round_trip_through_config_json() {
+        let value = json!({ "context_window_overrides": { "gpt-6-sol": 400000, " ": 1, "bad": 0 } });
+        let overrides = read_context_window_overrides(&value);
+        assert_eq!(overrides, BTreeMap::from([("gpt-6-sol".to_string(), 400_000)]));
+    }
+
+    #[test]
     fn cost_for_prices_cached_input_separately() {
         let model = ModelConfig {
             name: "m".to_string(),
             context_window: 1,
+            max_context_window: 0,
             max_output_tokens: 1,
             reasoning_efforts: vec![],
             input_cost: 2.0,
@@ -1911,6 +2016,7 @@ mod tests {
                 ModelConfig {
                     name: "chat-model".to_string(),
                     context_window: 100,
+                    max_context_window: 0,
                     max_output_tokens: 10,
                     reasoning_efforts: vec!["medium".to_string()],
                     input_cost: 0.0,
@@ -1920,6 +2026,7 @@ mod tests {
                 ModelConfig {
                     name: "compact-model".to_string(),
                     context_window: 200,
+                    max_context_window: 0,
                     max_output_tokens: 20,
                     reasoning_efforts: vec!["low".to_string()],
                     input_cost: 0.0,
@@ -1946,6 +2053,7 @@ mod tests {
             web_fetch_engine: crate::web::DEFAULT_FETCH_ENGINE.to_string(),
             jucode_models: Vec::new(),
             jucode_groups: BTreeMap::new(),
+            context_window_overrides: BTreeMap::new(),
             path: PathBuf::from("config.json"),
         };
 

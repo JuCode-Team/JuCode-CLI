@@ -180,6 +180,13 @@ pub struct AgentCore {
     turn_started_at: Option<SystemTime>,
     turn_goal_tokens: u64,
     goal_continuation_running: bool,
+    /// Set when the upstream rejected a turn as over the context window: the
+    /// next spawn compacts first (`force_compaction`) and the turn is retried
+    /// once (`overflow_retry_pending`). `overflow_retried` stops a second
+    /// retry until the user sends a new message.
+    force_compaction: bool,
+    overflow_retry_pending: bool,
+    overflow_retried: bool,
     resume_summary_running: bool,
     interrupt_flag: Arc<AtomicBool>,
     subagent_manager: SubagentManager,
@@ -270,6 +277,9 @@ impl AgentCore {
             turn_started_at: None,
             turn_goal_tokens: 0,
             goal_continuation_running: false,
+            force_compaction: false,
+            overflow_retry_pending: false,
+            overflow_retried: false,
             resume_summary_running: false,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             subagent_manager: SubagentManager::default(),
@@ -1480,6 +1490,9 @@ impl AgentCore {
                         });
                     }
                     WorkerEvent::ResponseItem(item) => {
+                        // The request went through: a later overflow in this
+                        // turn may compact and retry again.
+                        self.overflow_retried = false;
                         self.session.append(EntryKind::ResponseItem { item });
                         events.extend(self.save_session_event());
                         events.push(self.context_usage_event());
@@ -1571,6 +1584,31 @@ impl AgentCore {
                         } else {
                             format!("queued: {}", self.queued.len())
                         }));
+                    }
+                    WorkerEvent::Error(error)
+                        if is_context_overflow(&error)
+                            && !self.overflow_retried
+                            && self
+                                .session
+                                .plan_compaction(COMPACTION_KEEP_RECENT_TOKENS, &self.config.model)
+                                .is_some() =>
+                    {
+                        // Over the window (unknown, or raised past what this
+                        // route serves): compact and retry once instead of
+                        // failing the turn. The retry spawns from the idle
+                        // branch below, once this worker is drained.
+                        self.subagent_manager
+                            .close_all_with_message("parent turn hit the context window");
+                        self.running = false;
+                        disconnected = true;
+                        self.goal_tool_receiver = None;
+                        self.overflow_retried = true;
+                        self.overflow_retry_pending = true;
+                        self.force_compaction = true;
+                        events.push(AgentEvent::Info(
+                            "request exceeded the model's context window; compacting and retrying"
+                                .to_string(),
+                        ));
                     }
                     WorkerEvent::Error(error) => {
                         self.subagent_manager
@@ -1665,7 +1703,10 @@ impl AgentCore {
         }
 
         if !self.running {
-            if let Some((next, images)) = self.queued.pop_front() {
+            if std::mem::take(&mut self.overflow_retry_pending) {
+                let save_event = self.save_session_event();
+                events.extend(self.spawn_current_context_turn(save_event));
+            } else if let Some((next, images)) = self.queued.pop_front() {
                 self.goal_continuation_running = false;
                 events.push(AgentEvent::PendingMessages(self.pending_texts()));
                 events.push(AgentEvent::UserMessage(next.clone()));
@@ -1756,6 +1797,7 @@ impl AgentCore {
     }
 
     fn start_turn(&mut self, message: String, images: Vec<String>) -> Vec<AgentEvent> {
+        self.overflow_retried = false;
         self.session.append(EntryKind::User { content: message });
         if !images.is_empty() {
             self.session.append(EntryKind::UserImage { paths: images });
@@ -1860,6 +1902,10 @@ impl AgentCore {
         if let Ok(models) = crate::config::read_subagent_models_at(self.config.path()) {
             self.config.subagent_models = models;
         }
+        // Same for the hand-set context windows (model settings in Desktop).
+        if let Ok(overrides) = crate::config::read_context_window_overrides_at(self.config.path()) {
+            self.config.context_window_overrides = overrides;
+        }
         let (goal_tool_tx, goal_tool_rx) = mpsc::channel();
         self.goal_tool_receiver = Some(goal_tool_rx);
         let (approval_tx, approval_rx) = mpsc::channel();
@@ -1909,7 +1955,8 @@ impl AgentCore {
             &self.config.current_model_config(),
             self.config.compaction_threshold_percent,
         );
-        let compaction = if should_auto_compact(context_tokens, model_context_budget) {
+        let forced = std::mem::take(&mut self.force_compaction);
+        let compaction = if forced || should_auto_compact(context_tokens, model_context_budget) {
             self.session
                 .plan_compaction(COMPACTION_KEEP_RECENT_TOKENS, &self.config.model)
         } else {
@@ -3819,6 +3866,7 @@ impl AgentCore {
     /// when the model list opens instead of waiting for a restart.
     fn reload_model_list(&mut self) {
         if let Ok(disk) = Config::load_or_create() {
+            self.config.context_window_overrides = disk.context_window_overrides.clone();
             if disk.provider == self.config.provider {
                 self.config.models = disk.models;
                 self.config.jucode_models = disk.jucode_models;
@@ -3867,7 +3915,9 @@ impl AgentCore {
                 ModelOptionView {
                     model: model_config.name.clone(),
                     active,
-                    context_window: model_config.context_window,
+                    // The window this engine budgets with: the user's
+                    // override when set, else the gateway's.
+                    context_window: self.config.model_config(&model_config.name).context_window,
                     max_output_tokens: model_config.max_output_tokens,
                     reasoning_efforts: model_config.reasoning_efforts.clone(),
                 }
@@ -3975,45 +4025,30 @@ fn default_jucode_models(available: &[ModelConfig]) -> Vec<ModelConfig> {
     }
 }
 
+/// A gateway model as the engine runs it. Values the gateway leaves unset stay
+/// unknown (window 0, no output cap) rather than defaulted: the operator
+/// configures them in the gateway admin, or the user per model
+/// (`context_window_overrides`). Claude keeps its thinking tiers and a 32K
+/// output floor — the tiers follow from the model family and Anthropic's
+/// Messages API requires `max_tokens`.
 fn jucode_model_config(model: &OAuthModel) -> ModelConfig {
     let is_claude = model.id.starts_with("claude-");
-    let (default_context_window, default_max_output_tokens, default_reasoning_efforts) =
-        if is_claude {
-            // Claude models support extended thinking, so offer the thinking-strength
-            // tiers (mapped to an Anthropic budget in llm.rs::anthropic_thinking_budget,
-            // or forwarded as `reasoning.effort` on the Responses path).
-            (
-                200_000,
-                crate::config::CLAUDE_MIN_MAX_OUTPUT_TOKENS,
-                crate::config::claude_thinking_tiers(&model.id),
-            )
-        } else {
-            (
-                400_000,
-                128_000,
-                vec![
-                    "none".to_string(),
-                    "low".to_string(),
-                    "medium".to_string(),
-                    "high".to_string(),
-                    "xhigh".to_string(),
-                ],
-            )
-        };
     let mut reasoning_efforts = model
         .reasoning_efforts
         .clone()
-        .unwrap_or_else(|| default_reasoning_efforts.clone());
-    let mut max_output_tokens = model.max_output_tokens.unwrap_or(default_max_output_tokens);
-    // The gateway may advertise Claude models with only "none"; still surface
-    // the thinking tiers (and a budget large enough to use them).
+        .unwrap_or_else(|| vec!["none".to_string()]);
+    let mut max_output_tokens = model.max_output_tokens.unwrap_or(0);
+    // The gateway may advertise Claude models with only "none" (or nothing);
+    // still surface the thinking tiers (and a budget large enough to use them).
     if is_claude && crate::config::is_thinking_disabled(&reasoning_efforts) {
         reasoning_efforts = crate::config::claude_thinking_tiers(&model.id);
         max_output_tokens = max_output_tokens.max(crate::config::CLAUDE_MIN_MAX_OUTPUT_TOKENS);
     }
+    let context_window = model.context_window.unwrap_or(0);
     ModelConfig {
         name: model.id.clone(),
-        context_window: model.context_window.unwrap_or(default_context_window),
+        context_window,
+        max_context_window: model.max_context_window.unwrap_or(context_window),
         max_output_tokens,
         reasoning_efforts,
         input_cost: 0.0,
@@ -4062,8 +4097,29 @@ fn target_context_budget(model_config: &ModelConfig, threshold_percent: u64) -> 
     (model_config.context_window as usize).saturating_mul(percent) / 100
 }
 
+/// A budget of 0 means the window is unknown: never compact on a guess. An
+/// over-long request is then caught by the upstream's rejection instead
+/// (`is_context_overflow`).
 fn should_auto_compact(context_tokens: usize, model_context_budget: usize) -> bool {
-    context_tokens > model_context_budget
+    model_context_budget > 0 && context_tokens > model_context_budget
+}
+
+/// An upstream rejection because the input exceeded the model's context
+/// window. Wording varies by vendor and by the gateway's own rewrite.
+fn is_context_overflow(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    [
+        "context_length_exceeded",
+        "maximum context length",
+        "prompt is too long",
+        "prompt too long",
+        "exceeds the context window",
+        "input exceeds the context",
+        "exceed context limit",
+        "上下文过长",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn format_context_statistics(
@@ -4591,9 +4647,55 @@ mod model_config_tests {
         OAuthModel {
             id: id.to_string(),
             context_window: None,
+            max_context_window: None,
             max_output_tokens: None,
             reasoning_efforts: None,
         }
+    }
+
+    #[test]
+    fn unconfigured_gateway_values_stay_unknown() {
+        let config = jucode_model_config(&oauth_model("gpt-6-sol"));
+        assert_eq!(config.context_window, 0);
+        assert_eq!(config.max_context_window, 0);
+        assert_eq!(config.max_output_tokens, 0);
+        assert!(crate::config::is_thinking_disabled(&config.reasoning_efforts));
+    }
+
+    #[test]
+    fn gateway_window_range_is_kept() {
+        let model = OAuthModel {
+            context_window: Some(272_000),
+            max_context_window: Some(1_050_000),
+            ..oauth_model("gpt-6-sol")
+        };
+        let config = jucode_model_config(&model);
+        assert_eq!((config.context_window, config.max_context_window), (272_000, 1_050_000));
+        // A gateway that only sends the smallest window means "one size".
+        let single = jucode_model_config(&OAuthModel {
+            context_window: Some(200_000),
+            ..oauth_model("x")
+        });
+        assert_eq!(single.max_context_window, 200_000);
+    }
+
+    #[test]
+    fn unknown_window_never_triggers_compaction() {
+        assert!(!should_auto_compact(1_000_000, 0));
+        assert!(should_auto_compact(150_001, 150_000));
+    }
+
+    #[test]
+    fn detects_context_overflow_rejections() {
+        assert!(is_context_overflow(
+            r#"HTTP 400: {"error":{"code":"context_length_exceeded","message":"..."}}"#
+        ));
+        assert!(is_context_overflow("prompt is too long: 210000 tokens > 200000 maximum"));
+        assert!(is_context_overflow("上下文过长：当前约 300000 tokens，模型上限 272000。"));
+        assert!(is_context_overflow(
+            "input length and `max_tokens` exceed context limit: 188240 + 32000 > 200000"
+        ));
+        assert!(!is_context_overflow("HTTP 429: rate limited"));
     }
 
     #[test]
@@ -4614,6 +4716,7 @@ mod model_config_tests {
         let model = OAuthModel {
             id: "claude-sonnet-4-6".to_string(),
             context_window: Some(1_000_000),
+            max_context_window: None,
             max_output_tokens: Some(64_000),
             reasoning_efforts: Some(vec!["low".to_string(), "high".to_string()]),
         };

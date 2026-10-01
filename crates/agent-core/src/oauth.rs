@@ -50,7 +50,10 @@ pub struct Tokens {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OAuthModel {
     pub id: String,
+    /// Smallest window among the gateway accounts serving the model;
+    /// `max_context_window` the largest. None: the gateway has none set.
     pub context_window: Option<u64>,
+    pub max_context_window: Option<u64>,
     pub max_output_tokens: Option<u64>,
     pub reasoning_efforts: Option<Vec<String>>,
 }
@@ -414,6 +417,7 @@ fn parse_model(item: &Value) -> Option<OAuthModel> {
     Some(OAuthModel {
         id,
         context_window: read_u64_field(item, &["context_window", "context_length"]),
+        max_context_window: read_u64_field(item, &["max_context_window"]),
         max_output_tokens: read_u64_field(item, &["max_output_tokens", "max_output"]),
         reasoning_efforts: item
             .get("reasoning_efforts")
@@ -431,10 +435,12 @@ fn parse_model(item: &Value) -> Option<OAuthModel> {
     })
 }
 
+/// A positive count under the first of `keys` present; 0 reads as unset.
 fn read_u64_field(value: &Value, keys: &[&str]) -> Option<u64> {
     keys.iter()
         .filter_map(|key| value.get(*key))
         .find_map(Value::as_u64)
+        .filter(|v| *v > 0)
 }
 
 /// Gateway errors name the service; the kit's helper reports the bare status.
@@ -478,7 +484,8 @@ mod tests {
         let value = json!({
             "data": [{
                 "id": "gpt-5.5",
-                "context_window": 1050000,
+                "context_window": 272000,
+                "max_context_window": 1050000,
                 "max_output_tokens": 128000,
                 "reasoning_efforts": ["low", "medium"]
             }]
@@ -488,7 +495,8 @@ mod tests {
             parse_models_response(&value),
             vec![OAuthModel {
                 id: "gpt-5.5".to_string(),
-                context_window: Some(1_050_000),
+                context_window: Some(272_000),
+                max_context_window: Some(1_050_000),
                 max_output_tokens: Some(128_000),
                 reasoning_efforts: Some(vec!["low".to_string(), "medium".to_string()])
             }]
@@ -504,6 +512,7 @@ mod tests {
             vec![OAuthModel {
                 id: "gpt-5.4-mini".to_string(),
                 context_window: None,
+                max_context_window: None,
                 max_output_tokens: None,
                 reasoning_efforts: None
             }]
