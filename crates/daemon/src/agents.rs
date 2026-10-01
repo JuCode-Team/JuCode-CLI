@@ -533,7 +533,9 @@ impl Agents {
 /// to leave it to the default workspace.
 fn set_workspace(settings: &mut Value, changes: &Value) {
     match changes.get("workspace") {
-        Some(Value::String(id)) if !id.trim().is_empty() => settings["workspace"] = json!(id.trim()),
+        Some(Value::String(id)) if !id.trim().is_empty() => {
+            settings["workspace"] = json!(id.trim())
+        }
         Some(Value::Null) => {
             settings.as_object_mut().map(|map| map.remove("workspace"));
         }
@@ -713,18 +715,35 @@ mod tests {
     #[test]
     fn an_agent_is_listed_in_a_workspace_that_can_change() {
         let (agents, work) = agents("workspace");
-        let old = agents.create("old", "Old", &work, "role", &Value::Null).unwrap();
+        let old = agents
+            .create("old", "Old", &work, "role", &Value::Null)
+            .unwrap();
         assert_eq!(old.workspace, None);
         assert!(old.to_json().get("workspace").is_none());
         let ops = agents
             .create("ops", "Ops", &work, "role", &json!({ "workspace": "ws-1" }))
             .unwrap();
         assert_eq!(ops.to_json()["workspace"], "ws-1");
-        let moved = agents.update("ops", &json!({ "workspace": "ws-2" })).unwrap();
+        let moved = agents
+            .update("ops", &json!({ "workspace": "ws-2" }))
+            .unwrap();
         assert_eq!(moved.workspace.as_deref(), Some("ws-2"));
         // Other changes leave it; null hands it back to the default workspace.
-        assert_eq!(agents.update("ops", &json!({ "name": "Ops 2" })).unwrap().workspace.as_deref(), Some("ws-2"));
-        assert_eq!(agents.update("ops", &json!({ "workspace": null })).unwrap().workspace, None);
+        assert_eq!(
+            agents
+                .update("ops", &json!({ "name": "Ops 2" }))
+                .unwrap()
+                .workspace
+                .as_deref(),
+            Some("ws-2")
+        );
+        assert_eq!(
+            agents
+                .update("ops", &json!({ "workspace": null }))
+                .unwrap()
+                .workspace,
+            None
+        );
     }
 
     #[test]

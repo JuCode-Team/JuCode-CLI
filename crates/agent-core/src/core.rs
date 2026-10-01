@@ -4659,7 +4659,9 @@ mod model_config_tests {
         assert_eq!(config.context_window, 0);
         assert_eq!(config.max_context_window, 0);
         assert_eq!(config.max_output_tokens, 0);
-        assert!(crate::config::is_thinking_disabled(&config.reasoning_efforts));
+        assert!(crate::config::is_thinking_disabled(
+            &config.reasoning_efforts
+        ));
     }
 
     #[test]
@@ -4670,7 +4672,10 @@ mod model_config_tests {
             ..oauth_model("gpt-6-sol")
         };
         let config = jucode_model_config(&model);
-        assert_eq!((config.context_window, config.max_context_window), (272_000, 1_050_000));
+        assert_eq!(
+            (config.context_window, config.max_context_window),
+            (272_000, 1_050_000)
+        );
         // A gateway that only sends the smallest window means "one size".
         let single = jucode_model_config(&OAuthModel {
             context_window: Some(200_000),
@@ -4690,8 +4695,12 @@ mod model_config_tests {
         assert!(is_context_overflow(
             r#"HTTP 400: {"error":{"code":"context_length_exceeded","message":"..."}}"#
         ));
-        assert!(is_context_overflow("prompt is too long: 210000 tokens > 200000 maximum"));
-        assert!(is_context_overflow("上下文过长：当前约 300000 tokens，模型上限 272000。"));
+        assert!(is_context_overflow(
+            "prompt is too long: 210000 tokens > 200000 maximum"
+        ));
+        assert!(is_context_overflow(
+            "上下文过长：当前约 300000 tokens，模型上限 272000。"
+        ));
         assert!(is_context_overflow(
             "input length and `max_tokens` exceed context limit: 188240 + 32000 > 200000"
         ));

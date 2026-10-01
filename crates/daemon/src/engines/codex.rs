@@ -116,7 +116,12 @@ fn plan_usage(snapshot: &Value) -> Option<Value> {
         .filter_map(|key| {
             let window = &snapshot[*key];
             let used = window["usedPercent"].as_f64()?;
-            Some(super::plan_window(key, used, &window["resetsAt"], window["windowDurationMins"].as_u64()))
+            Some(super::plan_window(
+                key,
+                used,
+                &window["resetsAt"],
+                window["windowDurationMins"].as_u64(),
+            ))
         })
         .collect();
     let plan = snapshot["planType"].as_str();
@@ -542,7 +547,9 @@ impl Codex {
             }
             "thread/start" => self.thread_opened(result, false),
             "thread/resume" => self.thread_opened(result, true),
-            "account/rateLimits/read" => Output::events(plan_usage(&result["rateLimits"]).into_iter().collect()),
+            "account/rateLimits/read" => {
+                Output::events(plan_usage(&result["rateLimits"]).into_iter().collect())
+            }
             "model/list" => {
                 self.catalog = result["data"]
                     .as_array()
@@ -1563,15 +1570,27 @@ mod tests {
         let mut c = Codex::new(Path::new("/p"), &Options::default());
         c.start();
         let next = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
-        let read = next.iter().find(|f| f["method"] == "account/rateLimits/read").expect("asked for the limits");
+        let read = next
+            .iter()
+            .find(|f| f["method"] == "account/rateLimits/read")
+            .expect("asked for the limits");
         let snapshot = json!({ "planType": "plus",
             "primary": { "usedPercent": 37, "windowDurationMins": 300, "resetsAt": 1790800000 },
             "secondary": { "usedPercent": 12, "windowDurationMins": 10080, "resetsAt": 1791300000 } });
-        let out = frame(&mut c, json!({ "id": read["id"], "result": { "rateLimits": snapshot } }));
+        let out = frame(
+            &mut c,
+            json!({ "id": read["id"], "result": { "rateLimits": snapshot } }),
+        );
         assert_eq!(types(&out.events), ["plan_usage"]);
         assert_eq!(out.events[0]["plan"], "plus");
-        assert_eq!(out.events[0]["windows"][0], json!({ "key": "primary", "used": 37.0, "resets_at": 1_790_800_000_000u64, "minutes": 300 }));
-        let out = frame(&mut c, json!({ "method": "account/rateLimits/updated", "params": { "rateLimits": { "primary": { "usedPercent": 40 } } } }));
+        assert_eq!(
+            out.events[0]["windows"][0],
+            json!({ "key": "primary", "used": 37.0, "resets_at": 1_790_800_000_000u64, "minutes": 300 })
+        );
+        let out = frame(
+            &mut c,
+            json!({ "method": "account/rateLimits/updated", "params": { "rateLimits": { "primary": { "usedPercent": 40 } } } }),
+        );
         assert_eq!(out.events[0]["windows"][0]["used"], 40.0);
         assert_eq!(out.events[0]["windows"][0]["resets_at"], Value::Null);
     }
@@ -1581,14 +1600,28 @@ mod tests {
         let mut c = Codex::new(Path::new("/p"), &Options::default());
         c.start();
         let next = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
-        let read = next.iter().find(|f| f["method"] == "account/rateLimits/read").unwrap();
-        let out = frame(&mut c, json!({ "id": read["id"], "error": { "code": -32600, "message": "not signed in with ChatGPT" } }));
+        let read = next
+            .iter()
+            .find(|f| f["method"] == "account/rateLimits/read")
+            .unwrap();
+        let out = frame(
+            &mut c,
+            json!({ "id": read["id"], "error": { "code": -32600, "message": "not signed in with ChatGPT" } }),
+        );
         assert!(out.events.is_empty());
         // A gateway session does not ask.
-        let mut g = Codex::new(Path::new("/p"), &Options { gateway: Some(true), ..Options::default() });
+        let mut g = Codex::new(
+            Path::new("/p"),
+            &Options {
+                gateway: Some(true),
+                ..Options::default()
+            },
+        );
         g.start();
         let next = sent(&frame(&mut g, json!({ "id": 1, "result": {} })).frames);
-        assert!(next.iter().all(|f| f["method"] != "account/rateLimits/read"));
+        assert!(next
+            .iter()
+            .all(|f| f["method"] != "account/rateLimits/read"));
     }
 
     #[test]
@@ -1620,7 +1653,10 @@ mod tests {
         let next = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
         assert_eq!(next[1]["method"], "thread/resume");
         assert_eq!(next[1]["params"]["threadId"], "th-9");
-        assert!(next[1]["params"].get("modelProvider").is_none(), "keeps the thread's provider");
+        assert!(
+            next[1]["params"].get("modelProvider").is_none(),
+            "keeps the thread's provider"
+        );
         let resumed = frame(
             &mut c,
             json!({ "id": 2, "result": { "thread": { "id": "th-9", "turns": [{ "items": [

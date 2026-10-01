@@ -231,7 +231,9 @@ fn channel_for_path(path: &str, desktop_bin: &str) -> InstallChannel {
     let desktop_bin = desktop_bin.replace('\\', "/");
     if path.contains("node_modules/@jucode/") {
         InstallChannel::Npm
-    } else if !desktop_bin.is_empty() && path.starts_with(&format!("{}/", desktop_bin.trim_end_matches('/'))) {
+    } else if !desktop_bin.is_empty()
+        && path.starts_with(&format!("{}/", desktop_bin.trim_end_matches('/')))
+    {
         InstallChannel::Desktop
     } else {
         InstallChannel::Other
@@ -297,22 +299,30 @@ fn download(asset: &Asset, dest: &Path, need_rate: bool) -> Result<(), String> {
         .call()
         .map_err(|error| error.to_string())?;
     let mut reader = response.into_reader();
-    let mut file = fs::File::create(dest).map_err(|error| format!("{}: {error}", dest.display()))?;
+    let mut file =
+        fs::File::create(dest).map_err(|error| format!("{}: {error}", dest.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 64 * 1024];
     let started = Instant::now();
     let mut total = 0u64;
     loop {
-        let read = reader.read(&mut buffer).map_err(|error| error.to_string())?;
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
         if read == 0 {
             break;
         }
-        file.write_all(&buffer[..read]).map_err(|error| error.to_string())?;
+        file.write_all(&buffer[..read])
+            .map_err(|error| error.to_string())?;
         hasher.update(&buffer[..read]);
         total += read as u64;
         let elapsed = started.elapsed();
         if need_rate && elapsed >= RATE_WINDOW && total < MIN_DOWNLOAD_RATE * elapsed.as_secs() {
-            return Err(format!("too slow ({} KB in {}s)", total / 1024, elapsed.as_secs()));
+            return Err(format!(
+                "too slow ({} KB in {}s)",
+                total / 1024,
+                elapsed.as_secs()
+            ));
         }
     }
     file.sync_all().map_err(|error| error.to_string())?;
@@ -334,7 +344,8 @@ fn check_binary(path: &Path, version: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(|error| error.to_string())?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .map_err(|error| error.to_string())?;
     }
     let output = Command::new(path)
         .arg("--version")
@@ -436,7 +447,10 @@ mod tests {
     fn detects_install_channels_across_platforms() {
         let desktop = "/home/x/.jucode/bin";
         assert_eq!(
-            channel_for_path("/usr/local/lib/node_modules/@jucode/cli-darwin-arm64/bin/jucode", desktop),
+            channel_for_path(
+                "/usr/local/lib/node_modules/@jucode/cli-darwin-arm64/bin/jucode",
+                desktop
+            ),
             InstallChannel::Npm
         );
         assert_eq!(
@@ -446,22 +460,41 @@ mod tests {
             ),
             InstallChannel::Npm
         );
-        assert_eq!(channel_for_path("/home/x/.jucode/bin/jucode", desktop), InstallChannel::Desktop);
         assert_eq!(
-            channel_for_path("C:\\Users\\x\\.jucode\\bin\\jucode.exe", "C:\\Users\\x\\.jucode\\bin"),
+            channel_for_path("/home/x/.jucode/bin/jucode", desktop),
             InstallChannel::Desktop
         );
-        assert_eq!(channel_for_path("/home/x/.jucode/binaries/jucode", desktop), InstallChannel::Other);
-        assert_eq!(channel_for_path("/home/x/bin/jucode", desktop), InstallChannel::Other);
-        assert_eq!(channel_for_path("/repo/target/debug/jucode", desktop), InstallChannel::Other);
+        assert_eq!(
+            channel_for_path(
+                "C:\\Users\\x\\.jucode\\bin\\jucode.exe",
+                "C:\\Users\\x\\.jucode\\bin"
+            ),
+            InstallChannel::Desktop
+        );
+        assert_eq!(
+            channel_for_path("/home/x/.jucode/binaries/jucode", desktop),
+            InstallChannel::Other
+        );
+        assert_eq!(
+            channel_for_path("/home/x/bin/jucode", desktop),
+            InstallChannel::Other
+        );
+        assert_eq!(
+            channel_for_path("/repo/target/debug/jucode", desktop),
+            InstallChannel::Other
+        );
     }
 
     #[test]
     fn reads_releases_from_github_and_the_jucode_server() {
-        let github = github_release_at("https://github.com/JuCode-Team/JuCode-CLI/releases/tag/v0.4.0").unwrap();
+        let github =
+            github_release_at("https://github.com/JuCode-Team/JuCode-CLI/releases/tag/v0.4.0")
+                .unwrap();
         assert_eq!(github.version, "0.4.0");
         let binary = github.binary().unwrap();
-        assert!(binary.url.starts_with("https://github.com/JuCode-Team/JuCode-CLI/releases/download/v0.4.0/jucode-"));
+        assert!(binary.url.starts_with(
+            "https://github.com/JuCode-Team/JuCode-CLI/releases/download/v0.4.0/jucode-"
+        ));
         assert_eq!(binary.sha256, None);
         assert!(github_release_at("https://github.com/JuCode-Team/JuCode-CLI/releases").is_err());
         let server = parse_server_release(&serde_json::json!({
@@ -485,7 +518,10 @@ mod tests {
             while reader.read_line(&mut line).unwrap() > 2 {
                 line.clear();
             }
-            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
             stream.write_all(head.as_bytes()).unwrap();
             stream.write_all(body).unwrap();
         });
@@ -499,7 +535,11 @@ mod tests {
         let dest = dir.join("jucode");
         // sha256("binary")
         let good = "9a3a45d01531a20e89ac6ae10b0b0beb0492acd7216a368aa062d1a5fecaf9cd";
-        let asset = |url: String, sha: &str| Asset { name: "jucode".into(), url, sha256: Some(sha.into()) };
+        let asset = |url: String, sha: &str| Asset {
+            name: "jucode".into(),
+            url,
+            sha256: Some(sha.into()),
+        };
         download(&asset(serve_once(b"binary"), good), &dest, false).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"binary");
         let error = download(&asset(serve_once(b"tampered"), good), &dest, false).unwrap_err();

@@ -214,7 +214,12 @@ fn command(kind: Kind, id: &str, options: &Options) -> Result<(Command, Option<S
 
 /// One window of an official plan's usage for the `plan_usage` event: its
 /// share used (0-100), when it resets (unix ms) and its length.
-pub(crate) fn plan_window(key: &str, used_percent: f64, resets_secs: &Value, minutes: Option<u64>) -> Value {
+pub(crate) fn plan_window(
+    key: &str,
+    used_percent: f64,
+    resets_secs: &Value,
+    minutes: Option<u64>,
+) -> Value {
     json!({
         "key": key,
         "used": (used_percent * 10.0).round() / 10.0,
@@ -499,7 +504,10 @@ pub fn spawn(
             (Some(id), _) => hub.session_ended(&id, generation),
             (None, Some(ready)) => {
                 let reason = session.last_error.take().unwrap_or_else(|| {
-                    session.stopped_message(&format!("{} stopped before opening a conversation", kind.name()))
+                    session.stopped_message(&format!(
+                        "{} stopped before opening a conversation",
+                        kind.name()
+                    ))
                 });
                 let _ = ready.send(Err(reason));
             }
@@ -613,7 +621,8 @@ impl Session<'_> {
                     }
                     Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {
                         let reason = process.exit_reason();
-                        let message = self.stopped_message(&format!("{} stopped ({reason})", self.kind.name()));
+                        let message = self
+                            .stopped_message(&format!("{} stopped ({reason})", self.kind.name()));
                         self.publish(vec![json!({ "type": "error", "message": message })]);
                         return;
                     }
@@ -683,7 +692,9 @@ impl Session<'_> {
             // once the running turn ends.
             "set_gateway" => {
                 let Some(gateway) = op["gateway"].as_bool() else {
-                    self.publish(vec![json!({ "type": "error", "message": "set_gateway requires gateway" })]);
+                    self.publish(vec![
+                        json!({ "type": "error", "message": "set_gateway requires gateway" }),
+                    ]);
                     return false;
                 };
                 if self.kind == Kind::Acp {
@@ -692,12 +703,18 @@ impl Session<'_> {
                 }
                 self.restart = Some(Options {
                     gateway: Some(gateway),
-                    model: op["model"].as_str().filter(|m| !m.is_empty()).map(str::to_string),
+                    model: op["model"]
+                        .as_str()
+                        .filter(|m| !m.is_empty())
+                        .map(str::to_string),
                     approval_mode: adapter.approval_mode(),
                     ..Options::default()
                 });
                 if let Some(id) = &self.id {
-                    let _ = self.hub.store.record_session_meta(id, &json!({ "gateway": gateway }));
+                    let _ = self
+                        .hub
+                        .store
+                        .record_session_meta(id, &json!({ "gateway": gateway }));
                     self.hub.broadcast(&self.hub.sessions_json());
                 }
                 if adapter.busy() {

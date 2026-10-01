@@ -2363,7 +2363,12 @@ fn map_transport_event(event: TransportEvent) -> Result<StreamEvent, String> {
             reason,
             delay_ms,
         } => {
-            crate::log_warn!("llm", "retrying request", attempt = attempt, reason = reason);
+            crate::log_warn!(
+                "llm",
+                "retrying request",
+                attempt = attempt,
+                reason = reason
+            );
             StreamEvent::Retrying {
                 attempt,
                 max_attempts,

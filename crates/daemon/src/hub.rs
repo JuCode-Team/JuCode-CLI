@@ -1252,7 +1252,12 @@ fn shown_title(record: &SessionRecord, label: Option<&str>) -> Option<String> {
     record
         .title
         .clone()
-        .filter(|title| !(record.title_auto && DELIVERY_HEADERS.iter().any(|header| title.starts_with(header))))
+        .filter(|title| {
+            !(record.title_auto
+                && DELIVERY_HEADERS
+                    .iter()
+                    .any(|header| title.starts_with(header)))
+        })
         .or_else(|| label.and_then(title_from))
 }
 
@@ -1268,7 +1273,10 @@ const DELIVERY_HEADERS: [&str; 4] = [
 /// was actually asked, for titles and handoff notes.
 pub(crate) fn without_delivery_header(text: &str) -> &str {
     let text = text.trim_start();
-    if DELIVERY_HEADERS.iter().any(|header| text.starts_with(header)) {
+    if DELIVERY_HEADERS
+        .iter()
+        .any(|header| text.starts_with(header))
+    {
         return text.split_once('\n').map_or("", |(_, rest)| rest);
     }
     text
@@ -1284,7 +1292,11 @@ pub(crate) fn title_from(text: &str) -> Option<String> {
         .chars()
         .take(40)
         .collect();
-    let title = title.trim().trim_end_matches([':', '：']).trim().to_string();
+    let title = title
+        .trim()
+        .trim_end_matches([':', '：'])
+        .trim()
+        .to_string();
     (!title.is_empty()).then_some(title)
 }
 
@@ -1320,9 +1332,18 @@ mod tests {
             dedupe_key: None,
             at: 0,
         });
-        assert_eq!(title_from(&scheduled).as_deref(), Some("定时任务「每日巡检」"));
-        assert_eq!(without_delivery_header(&scheduled), "定时任务「每日巡检」：\n检查部署");
-        assert_eq!(title_from("  修复登录跳转\n细节").as_deref(), Some("修复登录跳转"));
+        assert_eq!(
+            title_from(&scheduled).as_deref(),
+            Some("定时任务「每日巡检」")
+        );
+        assert_eq!(
+            without_delivery_header(&scheduled),
+            "定时任务「每日巡检」：\n检查部署"
+        );
+        assert_eq!(
+            title_from("  修复登录跳转\n细节").as_deref(),
+            Some("修复登录跳转")
+        );
         assert_eq!(title_from("[timer t-1 fired · m-2]\n"), None);
 
         // An older daemon's header title gives way to the first prompt.
@@ -1340,9 +1361,16 @@ mod tests {
             gateway: false,
             group: None,
         };
-        assert_eq!(shown_title(&record, Some(&scheduled)).as_deref(), Some("定时任务「每日巡检」"));
+        assert_eq!(
+            shown_title(&record, Some(&scheduled)).as_deref(),
+            Some("定时任务「每日巡检」")
+        );
         assert_eq!(shown_title(&record, Some("")), None);
-        let named = SessionRecord { title: Some("我的标题".into()), title_auto: false, ..record };
+        let named = SessionRecord {
+            title: Some("我的标题".into()),
+            title_auto: false,
+            ..record
+        };
         assert_eq!(shown_title(&named, None).as_deref(), Some("我的标题"));
     }
 

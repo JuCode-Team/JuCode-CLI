@@ -419,7 +419,10 @@ fn each_user_task_gets_a_new_session_that_reads_the_last_handoff() {
         thread::sleep(Duration::from_millis(100));
     }
     assert!(written.contains("user said: Session:"), "{written}");
-    let listed = request(&mut client, json!({ "op": "handoff_list", "agent": "route" }));
+    let listed = request(
+        &mut client,
+        json!({ "op": "handoff_list", "agent": "route" }),
+    );
     assert_eq!(listed["handoffs"][0]["session"], session.as_str());
 
     // A new task is a new session, told what the last one concluded.

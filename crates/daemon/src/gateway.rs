@@ -120,7 +120,13 @@ pub struct Upstream {
 /// Answers one gateway request on `stream` (`head` is its request head,
 /// peeked, still unread).
 pub fn serve(stream: TcpStream, head: &str) -> Result<(), String> {
-    serve_with(stream, head, live_upstream, live_catalog, read_default_groups)
+    serve_with(
+        stream,
+        head,
+        live_upstream,
+        live_catalog,
+        read_default_groups,
+    )
 }
 
 fn live_upstream() -> Result<Upstream, String> {
@@ -133,7 +139,11 @@ fn live_upstream() -> Result<Upstream, String> {
 fn read_default_groups() -> BTreeMap<String, String> {
     let path = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(|home| std::path::PathBuf::from(home).join(".jucode").join("config.json"));
+        .map(|home| {
+            std::path::PathBuf::from(home)
+                .join(".jucode")
+                .join("config.json")
+        });
     path.and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|config| serde_json::from_value(config["jucode_groups"].clone()).ok())
@@ -149,7 +159,12 @@ fn live_catalog(upstream: &Upstream) -> Option<HashMap<String, HashSet<String>>>
             .iter()
             .filter_map(|group| {
                 let id = group["id"].as_str()?.to_string();
-                let models = group["models"].as_array()?.iter().filter_map(Value::as_str).map(str::to_string).collect();
+                let models = group["models"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect();
                 Some((id, models))
             })
             .collect(),
@@ -184,7 +199,11 @@ fn live_groups(upstream: &Upstream) -> Option<Vec<Value>> {
 pub fn catalog_json() -> Value {
     let models: Vec<Value> = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(|home| std::path::PathBuf::from(home).join(".jucode").join("config.json"))
+        .map(|home| {
+            std::path::PathBuf::from(home)
+                .join(".jucode")
+                .join("config.json")
+        })
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .map(|config| {
@@ -243,7 +262,11 @@ fn pick_group(
     [chosen, default]
         .into_iter()
         .flatten()
-        .find(|group| catalog.get(*group).is_some_and(|models| models.contains(model)))
+        .find(|group| {
+            catalog
+                .get(*group)
+                .is_some_and(|models| models.contains(model))
+        })
         .map(str::to_string)
 }
 
@@ -261,9 +284,21 @@ struct Request {
 fn dropped_request_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "host" | "authorization" | "x-api-key" | "content-length" | "transfer-encoding" | "connection"
-            | "keep-alive" | "proxy-connection" | "proxy-authorization" | "te" | "upgrade" | "expect"
-            | "accept-encoding" | "x-jucode-group" | "x-jucode-turn"
+        "host"
+            | "authorization"
+            | "x-api-key"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "proxy-authorization"
+            | "te"
+            | "upgrade"
+            | "expect"
+            | "accept-encoding"
+            | "x-jucode-group"
+            | "x-jucode-turn"
     )
 }
 
@@ -272,7 +307,12 @@ fn dropped_request_header(name: &str) -> bool {
 fn dropped_reply_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "content-length" | "transfer-encoding" | "connection" | "keep-alive" | "content-encoding" | "upgrade"
+        "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "keep-alive"
+            | "content-encoding"
+            | "upgrade"
     )
 }
 
@@ -288,13 +328,23 @@ fn serve_with(
     // Who is asking is in the head: refuse before reading a body.
     let (method, target, headers) = parse_head(head);
     let header = |name: &str| {
-        headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+        headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
     };
     if !loopback_host(header("host").unwrap_or_default()) {
-        return reply_error(&mut out, 403, "the local gateway only answers on the loopback address");
+        return reply_error(
+            &mut out,
+            403,
+            "the local gateway only answers on the loopback address",
+        );
     }
     let presented = header("authorization")
-        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        })
         .or_else(|| header("x-api-key"))
         .unwrap_or_default()
         .trim()
@@ -307,7 +357,12 @@ fn serve_with(
         return reply_error(&mut out, 404, "the local gateway serves /v1/ only");
     }
     let request = match read_body(stream, &headers) {
-        Ok(body) => Request { method, target, headers, body },
+        Ok(body) => Request {
+            method,
+            target,
+            headers,
+            body,
+        },
         Err((status, message)) => return reply_error(&mut out, status, &message),
     };
     let upstream = match upstream() {
@@ -320,12 +375,21 @@ fn serve_with(
         .and_then(|body| body["model"].as_str().map(str::to_string))
         .unwrap_or_default();
     let chosen = state().groups.get(&session).cloned();
-    let default = if model.is_empty() { None } else { defaults().get(&model).cloned() };
+    let default = if model.is_empty() {
+        None
+    } else {
+        defaults().get(&model).cloned()
+    };
     // Nothing chosen: no catalog lookup on the way.
     let group = if model.is_empty() || (chosen.is_none() && default.is_none()) {
         None
     } else {
-        pick_group(chosen.as_deref(), default.as_deref(), &model, catalog(&upstream).as_ref())
+        pick_group(
+            chosen.as_deref(),
+            default.as_deref(),
+            &model,
+            catalog(&upstream).as_ref(),
+        )
     };
 
     let url = format!("{}{}", upstream.api.trim_end_matches('/'), request.target);
@@ -352,10 +416,18 @@ fn serve_with(
     let response = match result {
         Ok(response) | Err(ureq::Error::Status(_, response)) => response,
         Err(ureq::Error::Transport(error)) => {
-            return reply_error(&mut out, 502, &format!("cannot reach the JuCode gateway: {error}"));
+            return reply_error(
+                &mut out,
+                502,
+                &format!("cannot reach the JuCode gateway: {error}"),
+            );
         }
     };
-    let mut head = format!("HTTP/1.1 {} {}\r\n", response.status(), response.status_text());
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\n",
+        response.status(),
+        response.status_text()
+    );
     for name in response.headers_names() {
         if dropped_reply_header(&name) {
             continue;
@@ -365,7 +437,8 @@ fn serve_with(
         }
     }
     head.push_str("Connection: close\r\n\r\n");
-    out.write_all(head.as_bytes()).map_err(|error| error.to_string())?;
+    out.write_all(head.as_bytes())
+        .map_err(|error| error.to_string())?;
     // Relayed as it arrives (server-sent events); a client that hangs up
     // ends the copy, and dropping the reader closes the upstream request.
     let mut body = response.into_reader();
@@ -376,7 +449,11 @@ fn serve_with(
             Ok(read) => read,
             Err(error) => return Err(format!("upstream read failed: {error}")),
         };
-        if out.write_all(&buffer[..read]).and_then(|()| out.flush()).is_err() {
+        if out
+            .write_all(&buffer[..read])
+            .and_then(|()| out.flush())
+            .is_err()
+        {
             break;
         }
     }
@@ -421,16 +498,25 @@ fn read_body(stream: TcpStream, headers: &[(String, String)]) -> Result<Vec<u8>,
             Err(error) => return Err((400, error.to_string())),
         }
     }
-    let find = |name: &str| headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone());
+    let find = |name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
     if find("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
         return read_chunked(&mut reader);
     }
-    let length: usize = find("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let length: usize = find("content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     if length > MAX_BODY {
         return Err((413, "request body too large".into()));
     }
     let mut body = vec![0u8; length];
-    reader.read_exact(&mut body).map_err(|error| (400, error.to_string()))?;
+    reader
+        .read_exact(&mut body)
+        .map_err(|error| (400, error.to_string()))?;
     Ok(body)
 }
 
@@ -439,14 +525,21 @@ fn read_chunked(reader: &mut impl BufRead) -> Result<Vec<u8>, (u16, String)> {
     let mut line = String::new();
     loop {
         line.clear();
-        reader.read_line(&mut line).map_err(|error| (400, error.to_string()))?;
+        reader
+            .read_line(&mut line)
+            .map_err(|error| (400, error.to_string()))?;
         let size = usize::from_str_radix(line.trim().split(';').next().unwrap_or_default(), 16)
             .map_err(|_| (400, "bad chunk size".to_string()))?;
         if size == 0 {
             // Trailers, then the blank line.
             loop {
                 line.clear();
-                if reader.read_line(&mut line).map_err(|error| (400, error.to_string()))? == 0 || line.trim().is_empty() {
+                if reader
+                    .read_line(&mut line)
+                    .map_err(|error| (400, error.to_string()))?
+                    == 0
+                    || line.trim().is_empty()
+                {
                     return Ok(body);
                 }
             }
@@ -456,9 +549,13 @@ fn read_chunked(reader: &mut impl BufRead) -> Result<Vec<u8>, (u16, String)> {
         }
         let start = body.len();
         body.resize(start + size, 0);
-        reader.read_exact(&mut body[start..]).map_err(|error| (400, error.to_string()))?;
+        reader
+            .read_exact(&mut body[start..])
+            .map_err(|error| (400, error.to_string()))?;
         line.clear();
-        reader.read_line(&mut line).map_err(|error| (400, error.to_string()))?;
+        reader
+            .read_line(&mut line)
+            .map_err(|error| (400, error.to_string()))?;
     }
 }
 
@@ -471,12 +568,14 @@ fn reply_error(out: &mut TcpStream, status: u16, message: &str) -> Result<(), St
         413 => "Payload Too Large",
         _ => "Bad Gateway",
     };
-    let body = json!({ "error": { "type": "local_gateway_error", "message": message } }).to_string();
+    let body =
+        json!({ "error": { "type": "local_gateway_error", "message": message } }).to_string();
     let reply = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    out.write_all(reply.as_bytes()).map_err(|error| error.to_string())?;
+    out.write_all(reply.as_bytes())
+        .map_err(|error| error.to_string())?;
     // Closing with the request still unread would reset the connection and
     // lose this reply: finish writing, then drop what already arrived (a
     // little, briefly — a refused body is never read in full).
@@ -512,17 +611,35 @@ mod tests {
     #[test]
     fn a_group_is_sent_only_where_it_serves_the_model() {
         let catalog: HashMap<String, HashSet<String>> = HashMap::from([
-            ("g-claude".into(), HashSet::from(["claude-opus-5-5".to_string()])),
-            ("g-all".into(), HashSet::from(["claude-opus-5-5".to_string(), "claude-haiku-4-5".to_string()])),
+            (
+                "g-claude".into(),
+                HashSet::from(["claude-opus-5-5".to_string()]),
+            ),
+            (
+                "g-all".into(),
+                HashSet::from([
+                    "claude-opus-5-5".to_string(),
+                    "claude-haiku-4-5".to_string(),
+                ]),
+            ),
         ]);
         let pick = |chosen, default, model| pick_group(chosen, default, model, Some(&catalog));
-        assert_eq!(pick(Some("g-claude"), None, "claude-opus-5-5").as_deref(), Some("g-claude"));
+        assert_eq!(
+            pick(Some("g-claude"), None, "claude-opus-5-5").as_deref(),
+            Some("g-claude")
+        );
         // The session's group lacks the background model: the default, then none.
-        assert_eq!(pick(Some("g-claude"), Some("g-all"), "claude-haiku-4-5").as_deref(), Some("g-all"));
+        assert_eq!(
+            pick(Some("g-claude"), Some("g-all"), "claude-haiku-4-5").as_deref(),
+            Some("g-all")
+        );
         assert_eq!(pick(Some("g-claude"), None, "claude-haiku-4-5"), None);
         assert_eq!(pick(None, None, "claude-opus-5-5"), None);
         // Unknown catalog: never a group that might not serve the model.
-        assert_eq!(pick_group(Some("g-claude"), None, "claude-opus-5-5", None), None);
+        assert_eq!(
+            pick_group(Some("g-claude"), None, "claude-opus-5-5", None),
+            None
+        );
     }
 
     #[test]
@@ -563,7 +680,9 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
                 .unwrap();
             for chunk in ["data: one\n\n", "data: two\n\n"] {
-                stream.write_all(format!("{:x}\r\n{chunk}\r\n", chunk.len()).as_bytes()).unwrap();
+                stream
+                    .write_all(format!("{:x}\r\n{chunk}\r\n", chunk.len()).as_bytes())
+                    .unwrap();
                 stream.flush().unwrap();
             }
             stream.write_all(b"0\r\n\r\n").unwrap();
@@ -584,9 +703,19 @@ mod tests {
             serve_with(
                 stream,
                 &head,
-                || Ok(Upstream { api: api.clone(), token: "real-token".into() }),
+                || {
+                    Ok(Upstream {
+                        api: api.clone(),
+                        token: "real-token".into(),
+                    })
+                },
                 |_| Some(catalog.clone()),
-                || group.iter().map(|g| ("m1".to_string(), g.clone())).collect(),
+                || {
+                    group
+                        .iter()
+                        .map(|g| ("m1".to_string(), g.clone()))
+                        .collect()
+                },
             )
             .unwrap();
         });
@@ -654,7 +783,12 @@ mod tests {
             serve_with(
                 stream,
                 &head,
-                || Ok(Upstream { api: api.clone(), token: "t".into() }),
+                || {
+                    Ok(Upstream {
+                        api: api.clone(),
+                        token: "t".into(),
+                    })
+                },
                 |_| panic!("the catalog was read with no group chosen"),
                 BTreeMap::new,
             )
@@ -668,7 +802,11 @@ mod tests {
         let mut reply = String::new();
         client.read_to_string(&mut reply).unwrap();
         server.join().unwrap();
-        assert!(!upstream.join().unwrap().to_ascii_lowercase().contains("x-jucode-group"));
+        assert!(!upstream
+            .join()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("x-jucode-group"));
         assert!(reply.starts_with("HTTP/1.1 200"));
         revoke(&key);
     }

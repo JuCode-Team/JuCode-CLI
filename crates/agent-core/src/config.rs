@@ -1854,9 +1854,13 @@ mod tests {
 
     #[test]
     fn context_window_overrides_round_trip_through_config_json() {
-        let value = json!({ "context_window_overrides": { "gpt-6-sol": 400000, " ": 1, "bad": 0 } });
+        let value =
+            json!({ "context_window_overrides": { "gpt-6-sol": 400000, " ": 1, "bad": 0 } });
         let overrides = read_context_window_overrides(&value);
-        assert_eq!(overrides, BTreeMap::from([("gpt-6-sol".to_string(), 400_000)]));
+        assert_eq!(
+            overrides,
+            BTreeMap::from([("gpt-6-sol".to_string(), 400_000)])
+        );
     }
 
     #[test]
@@ -2484,8 +2488,13 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
-        fs::write(&path, "{\"model\":\"gpt-5.5\",\"asr\":{\"engine\":\"whisper\"}}\n").unwrap();
-        let mut config = Config::from_value(&fs::read_to_string(&path).unwrap(), path.clone()).unwrap();
+        fs::write(
+            &path,
+            "{\"model\":\"gpt-5.5\",\"asr\":{\"engine\":\"whisper\"}}\n",
+        )
+        .unwrap();
+        let mut config =
+            Config::from_value(&fs::read_to_string(&path).unwrap(), path.clone()).unwrap();
         config.model = "gpt-6-sol".to_string();
         config.save().unwrap();
 
