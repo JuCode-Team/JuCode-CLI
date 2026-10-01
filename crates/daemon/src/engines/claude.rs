@@ -35,24 +35,52 @@ pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const DEFAULT_EFFORT: &str = "medium";
 const SUMMARY_CAP: usize = 4000;
 
-/// This session talks to the JuCode gateway: a settings file (owner-only)
-/// that overrides the endpoint and token for this process alone. An empty
-/// ANTHROPIC_API_KEY masks one the user's own settings set.
-pub fn use_gateway(command: &mut Command, api: &str, token: &str) -> Result<(), String> {
-    let api = super::gateway_url(api)?;
+/// Settings files written for gateway keys (see `use_gateway`).
+static GATEWAY_FILES: std::sync::Mutex<Vec<(String, std::path::PathBuf)>> = std::sync::Mutex::new(Vec::new());
+
+/// This session talks to the JuCode gateway through the daemon's local
+/// gateway (`base`, see crate::gateway): a settings file (owner-only) that
+/// overrides the endpoint and credential for this process alone. The
+/// credential is the local `key`, never the JuCode token; the file is named
+/// by the session (`id`), not the key, since its path is in the engine's argv
+/// for anyone on the machine to read. An empty ANTHROPIC_API_KEY masks one
+/// the user's own settings set.
+pub fn use_gateway(command: &mut Command, id: &str, base: &str, key: &str) -> Result<(), String> {
     let settings = json!({ "env": {
-        "ANTHROPIC_BASE_URL": api,
-        "ANTHROPIC_AUTH_TOKEN": token,
+        "ANTHROPIC_BASE_URL": base,
+        "ANTHROPIC_AUTH_TOKEN": key,
         "ANTHROPIC_API_KEY": "",
     } });
-    let path = home()
-        .join(".jucode")
-        .join("daemon")
-        .join("claude-gateway.json");
+    let dir = home().join(".jucode").join("daemon");
+    // Older daemons wrote the JuCode token itself here.
+    let _ = std::fs::remove_file(dir.join("claude-gateway.json"));
+    let mut name: String = id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+    if name.is_empty() {
+        // No id yet: any name unrelated to the key.
+        let mut bytes = [0u8; 8];
+        getrandom::getrandom(&mut bytes).map_err(|error| error.to_string())?;
+        name = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    }
+    let path = dir.join(format!("claude-gateway-{name}.json"));
     crate::store::write_private(&path, settings.to_string().as_bytes())
         .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    GATEWAY_FILES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push((key.to_string(), path.clone()));
     command.arg("--settings").arg(path);
     Ok(())
+}
+
+/// The engine holding `key` is gone: its settings file goes too.
+pub fn forget_gateway(key: &str) {
+    let mut files = GATEWAY_FILES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    files.retain(|(k, path)| {
+        if k == key {
+            let _ = std::fs::remove_file(path);
+        }
+        k != key
+    });
 }
 
 pub fn command(id: &str, options: &Options) -> Command {
@@ -648,6 +676,7 @@ impl Claude {
                     "context_window": self.context_window,
                     "max_output_tokens": 0,
                     "reasoning_efforts": [],
+                    "listed": false,
                 }),
             ),
             None => {}
@@ -1594,12 +1623,40 @@ impl Adapter for Claude {
     }
 }
 
+/// A subscription's usage from a `rate_limit_info`: per window when the
+/// event carries `unifiedWindows` (5-hour, weekly), else the limiting window.
+/// `utilization` is the share used, 0-1 (above 1 past a cap). Absent for
+/// API-key sessions.
+fn plan_usage(info: &Value) -> Option<Value> {
+    const WINDOWS: [(&str, u64); 3] =
+        [("five_hour", 300), ("seven_day", 10_080), ("seven_day_overage_included", 10_080)];
+    let mut windows = Vec::new();
+    if let Some(unified) = info["unifiedWindows"].as_object() {
+        for (key, minutes) in WINDOWS {
+            if let Some(used) = unified.get(key).and_then(|w| w["utilization"].as_f64()) {
+                windows.push(super::plan_window(key, used * 100.0, &unified[key]["resetsAt"], Some(minutes)));
+            }
+        }
+    } else if let (Some(used), Some(key)) = (info["utilization"].as_f64(), info["rateLimitType"].as_str()) {
+        let minutes = WINDOWS.iter().find(|(k, _)| *k == key).map(|(_, m)| *m);
+        windows.push(super::plan_window(key, used * 100.0, &info["resetsAt"], minutes));
+    }
+    (!windows.is_empty()).then(|| json!({ "type": "plan_usage", "plan": null, "windows": windows }))
+}
+
 fn rate_limit_events(frame: &Value) -> Vec<Value> {
-    let info = if frame["rate_limit"].is_object() {
-        &frame["rate_limit"]
-    } else {
-        frame
-    };
+    // Claude Code nests it as `rate_limit_info`; older builds as `rate_limit`.
+    let info = ["rate_limit_info", "rate_limit"]
+        .iter()
+        .map(|key| &frame[*key])
+        .find(|value| value.is_object())
+        .unwrap_or(frame);
+    let mut events = limit_banner(frame, info);
+    events.extend(plan_usage(info));
+    events
+}
+
+fn limit_banner(frame: &Value, info: &Value) -> Vec<Value> {
     let status = [text(&info["status"]), text(&frame["status"])]
         .into_iter()
         .find(|s| !s.is_empty())
@@ -1807,6 +1864,52 @@ mod tests {
     }
 
     #[test]
+    fn the_gateway_key_stays_out_of_the_command_line() {
+        let mut command = Command::new("claude");
+        use_gateway(&mut command, "sess-1", "http://127.0.0.1:7788/gw", "jgw-secretkey").unwrap();
+        let args: Vec<String> = command.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        assert!(args.iter().all(|a| !a.contains("secretkey")), "{args:?}");
+        let path = args.last().unwrap().clone();
+        assert!(path.ends_with("claude-gateway-sess-1.json"));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("jgw-secretkey"));
+        forget_gateway("jgw-secretkey");
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn a_rate_limit_event_shows_the_banner_and_the_plan_usage() {
+        let mut c = claude();
+        // The shape Claude Code 2.1 emits for a subscription session.
+        let events = frame(
+            &mut c,
+            json!({ "type": "rate_limit_event", "rate_limit_info": {
+                "status": "allowed_warning", "resetsAt": 1790800000, "rateLimitType": "five_hour", "utilization": 0.83,
+                "unifiedWindows": {
+                    "five_hour": { "utilization": 0.83, "resetsAt": 1790800000 },
+                    "seven_day": { "utilization": 0.412, "resetsAt": 1791300000 }
+                }
+            } }),
+        );
+        assert_eq!(types(&events), ["rate_limit", "plan_usage"]);
+        assert_eq!(events[0]["level"], "warning");
+        assert_eq!(events[0]["resets_at"], 1_790_800_000_000u64);
+        let windows = events[1]["windows"].as_array().unwrap();
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0], json!({ "key": "five_hour", "used": 83.0, "resets_at": 1_790_800_000_000u64, "minutes": 300 }));
+        assert_eq!(windows[1]["used"], 41.2);
+        // Only the limiting window: that one.
+        let events = frame(
+            &mut c,
+            json!({ "type": "rate_limit_event", "rate_limit_info": { "status": "allowed", "rateLimitType": "seven_day", "utilization": 0.2 } }),
+        );
+        assert_eq!(types(&events), ["rate_limit", "plan_usage"]);
+        assert_eq!(events[1]["windows"][0]["minutes"], 10_080);
+        // An API-key session: status only.
+        let events = frame(&mut c, json!({ "type": "rate_limit_event", "rate_limit_info": { "status": "allowed" } }));
+        assert_eq!(types(&events), ["rate_limit"]);
+    }
+
+    #[test]
     fn a_turn_streams_text_and_tools_and_ends_ready() {
         let mut c = claude();
         let boot = c.start();
@@ -2005,7 +2108,7 @@ mod tests {
             "env": { "CLAUDE_CONFIG_DIR": "/tmp/c" },
         }));
         assert!(options.runs_programs());
-        let command = super::super::command(super::super::Kind::Claude, "x", &options).unwrap();
+        let (command, _) = super::super::command(super::super::Kind::Claude, "x", &options).unwrap();
         assert_eq!(command.get_program(), "/opt/claude/bin/claude");
         assert!(command
             .get_envs()

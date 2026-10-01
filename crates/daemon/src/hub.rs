@@ -362,6 +362,7 @@ impl Hub {
                     hidden: false,
                     engine: engine.map(|kind| kind.name().to_string()),
                     gateway: false,
+                    group: None,
                 }
             }
             (None, None) => return Err(format!("unknown session {id}")),
@@ -999,6 +1000,8 @@ impl Hub {
                     "updated_at": summary.map_or(record.created_at, |s| s.updated_at * 1000),
                     "title": record.title.or_else(|| summary.map(|s| s.label.clone())),
                     "archived": record.archived,
+                    "group": record.group,
+                    "gateway": record.gateway,
                     "engine": record.engine.as_deref().unwrap_or("jucode"),
                     "agent": record.agent,
                     "open": hosted.is_some(),

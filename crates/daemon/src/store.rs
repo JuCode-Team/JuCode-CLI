@@ -59,6 +59,8 @@ pub struct SessionRecord {
     pub engine: Option<String>,
     /// Claude / Codex: it last ran through the JuCode gateway.
     pub gateway: bool,
+    /// The JuCode group its gateway requests route to (None: automatic).
+    pub group: Option<String>,
 }
 
 /// A message for an agent: from the user, another agent or a timer.
@@ -306,10 +308,10 @@ impl Store {
         )
     }
 
-    /// Renames, (un)archives or hides a session from `changes` (`title`,
-    /// `archived`, `hidden`); fields left out are unchanged and an empty
-    /// title goes back to the engine's label. False when `changes` names
-    /// none of them.
+    /// Renames, (un)archives, hides or regroups a session from `changes`
+    /// (`title`, `archived`, `hidden`, `group`); fields left out are
+    /// unchanged, an empty title goes back to the engine's label and an
+    /// empty group to automatic routing. False when `changes` names none.
     pub fn record_session_meta(&self, id: &str, changes: &Value) -> io::Result<bool> {
         let mut entry = json!({ "kind": "meta", "session": id, "at": now() });
         let mut changed = false;
@@ -325,6 +327,10 @@ impl Store {
                 entry[flag] = json!(value);
                 changed = true;
             }
+        }
+        if let Some(group) = changes["group"].as_str() {
+            entry["group"] = json!(group.trim());
+            changed = true;
         }
         if changed {
             self.append(SESSIONS, entry)?;
@@ -389,6 +395,7 @@ impl Store {
                             hidden: false,
                             engine: entry["engine"].as_str().map(str::to_string),
                             gateway: false,
+                            group: None,
                         }
                     });
                     record.closed = false;
@@ -410,6 +417,9 @@ impl Store {
                         }
                         if let Some(hidden) = entry["hidden"].as_bool() {
                             record.hidden = hidden;
+                        }
+                        if let Some(group) = entry["group"].as_str() {
+                            record.group = Some(group.to_string()).filter(|g| !g.is_empty());
                         }
                     }
                 }
@@ -992,6 +1002,22 @@ mod tests {
             .record_engine_session("c", cwd, None, Some("claude"), false)
             .unwrap();
         assert!(!store.sessions()[0].gateway);
+    }
+
+    #[test]
+    fn a_session_keeps_its_group_until_cleared() {
+        let store = store("group");
+        store
+            .record_engine_session("c", std::path::Path::new("/p"), None, Some("codex"), true)
+            .unwrap();
+        assert_eq!(store.sessions()[0].group, None);
+        assert!(store.record_session_meta("c", &json!({ "group": " g-1 " })).unwrap());
+        assert_eq!(store.sessions()[0].group.as_deref(), Some("g-1"));
+        // Other changes leave it; an empty group goes back to automatic.
+        store.record_session_meta("c", &json!({ "title": "t" })).unwrap();
+        assert_eq!(store.sessions()[0].group.as_deref(), Some("g-1"));
+        store.record_session_meta("c", &json!({ "group": "" })).unwrap();
+        assert_eq!(store.sessions()[0].group, None);
     }
 
     #[test]

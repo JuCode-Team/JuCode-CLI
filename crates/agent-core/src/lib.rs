@@ -50,6 +50,18 @@ pub fn jucode_gateway_credentials() -> Result<(String, String), String> {
 /// `jucode_gateway_credentials` plus when the token expires (unix seconds).
 pub fn jucode_session() -> Result<(String, String, u64), String> {
     let config = config::Config::load_or_create().map_err(|error| error.to_string())?;
+    gateway_credentials(config)
+}
+
+/// The same for each request of the daemon's local gateway: config.json is
+/// read, never rewritten (concurrent requests would race on it).
+pub fn jucode_gateway_token() -> Result<(String, String), String> {
+    let config = config::Config::load_existing().map_err(|error| error.to_string())?;
+    let (api, token, _) = gateway_credentials(config)?;
+    Ok((api, token))
+}
+
+fn gateway_credentials(config: config::Config) -> Result<(String, String, u64), String> {
     let auth = oauth::ensure_session(&config.jucode_api_url, config.encrypt_secrets)?;
     let tokens = auth
         .jucode_tokens()

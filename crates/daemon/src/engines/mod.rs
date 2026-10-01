@@ -178,31 +178,53 @@ fn adapter(kind: Kind, cwd: &Path, options: &Options) -> Box<dyn Adapter> {
     }
 }
 
-fn command(kind: Kind, id: &str, options: &Options) -> Result<Command, String> {
+/// The engine's command, and the local gateway key it holds when it runs
+/// on the JuCode gateway (see crate::gateway).
+fn command(kind: Kind, id: &str, options: &Options) -> Result<(Command, Option<String>), String> {
     let mut command = match kind {
         Kind::Claude => claude::command(id, options),
         Kind::Codex => codex::command(options),
         Kind::Acp => acp::command(options),
     };
     command.envs(options.env.iter().map(|(name, value)| (name, value)));
-    if options.gateway == Some(true) {
-        let (api, token) = jucode_agent_core::jucode_gateway_credentials()?;
-        match kind {
-            Kind::Claude => claude::use_gateway(&mut command, &api, &token)?,
-            Kind::Codex => codex::use_gateway(&mut command, &api, &token)?,
-            Kind::Acp => return Err("an ACP agent has no JuCode gateway mode".to_string()),
-        }
+    if options.gateway != Some(true) {
+        return Ok((command, None));
     }
-    Ok(command)
+    if kind == Kind::Acp {
+        return Err("an ACP agent has no JuCode gateway mode".to_string());
+    }
+    // Not signed in fails the start, not the first request.
+    jucode_agent_core::jucode_gateway_credentials()?;
+    let base = crate::gateway::base_url()?;
+    let key = crate::gateway::issue(id)?;
+    let configured = match kind {
+        Kind::Claude => claude::use_gateway(&mut command, id, &base, &key),
+        _ => codex::use_gateway(&mut command, &base, &key),
+    };
+    if let Err(error) = configured {
+        crate::gateway::revoke(&key);
+        return Err(error);
+    }
+    Ok((command, Some(key)))
 }
 
-/// The gateway URL as it may go into a spawned tool's config.
-fn gateway_url(api: &str) -> Result<&str, String> {
-    let api = api.trim().trim_end_matches('/');
-    if !api.starts_with("https://") || api.contains(['"', '\\', '\n']) {
-        return Err(format!("invalid JuCode API URL: {api}"));
+/// One window of an official plan's usage for the `plan_usage` event: its
+/// share used (0-100), when it resets (unix ms) and its length.
+pub(crate) fn plan_window(key: &str, used_percent: f64, resets_secs: &Value, minutes: Option<u64>) -> Value {
+    json!({
+        "key": key,
+        "used": (used_percent * 10.0).round() / 10.0,
+        "resets_at": resets_secs.as_f64().map(|s| (s * 1000.0) as u64),
+        "minutes": minutes,
+    })
+}
+
+/// A local gateway key is done with: no request may use it again.
+fn release_key(kind: Kind, key: &str) {
+    crate::gateway::revoke(key);
+    if kind == Kind::Claude {
+        claude::forget_gateway(key);
     }
-    Ok(api)
 }
 
 /// A running engine process: its stdin writer and merged output.
@@ -320,6 +342,7 @@ const STATE_EVENTS: &[&str] = &[
     "mcp_servers",
     "plan",
     "rate_limit",
+    "plan_usage",
 ];
 
 impl Snapshot {
@@ -435,10 +458,16 @@ pub fn spawn(
     options: Options,
     transcript: Vec<Value>,
 ) -> Result<(String, Sender<Value>, u64), String> {
-    let process = Process::spawn(
-        command(kind, id.as_deref().unwrap_or_default(), &options)?,
-        &cwd,
-    )?;
+    let (command, gateway_key) = command(kind, id.as_deref().unwrap_or_default(), &options)?;
+    let process = match Process::spawn(command, &cwd) {
+        Ok(process) => process,
+        Err(error) => {
+            if let Some(key) = &gateway_key {
+                release_key(kind, key);
+            }
+            return Err(error);
+        }
+    };
     let (ops_tx, ops) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     let generation = hub.next_generation();
@@ -453,6 +482,7 @@ pub fn spawn(
             cwd,
             snapshot: Snapshot::default(),
             restart: None,
+            gateway_key,
         };
         session.snapshot.seed(transcript);
         // A resumed conversation is ready once the engine has opened it.
@@ -491,6 +521,16 @@ struct Session<'a> {
     snapshot: Snapshot,
     /// Options to restart with once the running turn ends.
     restart: Option<Options>,
+    /// The engine's local gateway key (gateway sessions).
+    gateway_key: Option<String>,
+}
+
+impl Drop for Session<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = self.gateway_key.take() {
+            release_key(self.kind, &key);
+        }
+    }
 }
 
 impl Session<'_> {
@@ -560,9 +600,13 @@ impl Session<'_> {
                     next.gateway = next.gateway.or(options.gateway);
                     process.stop();
                     let id = self.id.clone().unwrap_or_default();
-                    match command(self.kind, &id, &next)
-                        .and_then(|command| Process::spawn(command, &self.cwd))
-                    {
+                    if let Some(key) = self.gateway_key.take() {
+                        release_key(self.kind, &key);
+                    }
+                    match command(self.kind, &id, &next).and_then(|(command, key)| {
+                        self.gateway_key = key;
+                        Process::spawn(command, &self.cwd)
+                    }) {
                         Ok(started) => {
                             process = started;
                             adapter = self::adapter(self.kind, &self.cwd, &next);
@@ -638,6 +682,9 @@ impl Session<'_> {
     /// it, and whatever it said before goes out.
     fn named(&mut self, id: String) {
         self.id = Some(id.clone());
+        if let Some(key) = &self.gateway_key {
+            crate::gateway::bind(key, &id);
+        }
         if let Some(ready) = self.ready.take() {
             let _ = ready.send(Ok(id));
         }

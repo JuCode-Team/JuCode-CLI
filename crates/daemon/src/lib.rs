@@ -8,6 +8,7 @@ mod agent_tools;
 mod agents;
 mod engines;
 mod files;
+mod gateway;
 mod http;
 mod hub;
 pub mod install;
@@ -57,6 +58,10 @@ pub fn serve(
     relay: Option<String>,
 ) -> io::Result<()> {
     let token = store.token()?;
+    gateway::set_port(listener.local_addr()?.port());
+    for record in store.sessions() {
+        gateway::set_group(&record.id, record.group.as_deref());
+    }
     let hub = Hub::new(store, agents, version, relay);
     if hub.relay.url().is_some() {
         let relay = Arc::clone(&hub);
@@ -107,6 +112,10 @@ fn connection(
     web: Option<&std::path::Path>,
 ) -> Result<(), String> {
     let head = http::peek_head(&stream)?;
+    let path = head.split(' ').nth(1).unwrap_or_default();
+    if gateway::is_gateway(path.split('?').next().unwrap_or_default()) {
+        return gateway::serve(stream, &head);
+    }
     if !http::is_websocket(&head) {
         return http::serve(hub, stream, &head, web);
     }
@@ -349,13 +358,17 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         // A client's title is its own: never one the daemon may rewrite.
         ("session_meta", Some(session)) => match hub.store.record_session_meta(
             &session,
-            &json!({ "title": op["title"], "archived": op["archived"], "hidden": op["hidden"] }),
+            &json!({ "title": op["title"], "archived": op["archived"], "hidden": op["hidden"], "group": op["group"] }),
         ) {
             Ok(true) => {
+                // The local gateway routes this session's next request there.
+                if let Some(group) = op["group"].as_str() {
+                    gateway::set_group(&session, Some(group));
+                }
                 hub.broadcast(&hub.sessions_json());
                 Ok(Value::Null)
             }
-            Ok(false) => Err("session_meta requires title, archived or hidden".to_string()),
+            Ok(false) => Err("session_meta requires title, archived, hidden or group".to_string()),
             Err(error) => Err(error.to_string()),
         },
         ("pair_link", _) => hub.relay.pair_link(hub),

@@ -860,6 +860,7 @@ dependencies = [
  "sha2",
  "snow",
  "tungstenite",
+ "ureq",
 ]
 
 [[package]]

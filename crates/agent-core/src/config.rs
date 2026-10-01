@@ -399,6 +399,14 @@ impl Config {
         }
     }
 
+    /// The saved config, only read: `load_or_create` rewrites the file, which
+    /// a caller on every request (the daemon's local gateway) must not do.
+    pub(crate) fn load_existing() -> io::Result<Self> {
+        let path = config_path()?;
+        let content = fs::read_to_string(&path)?;
+        Self::from_value(&content, path)
+    }
+
     /// Parse `content` as config.json. Malformed JSON and invalid field values
     /// are hard errors; `load_or_create` offers to reset the file in that case.
     fn from_value(content: &str, path: PathBuf) -> io::Result<Self> {

@@ -29,6 +29,11 @@ Performance and lightweight behavior are the first priorities. Do not introduce 
 
 This project implements a standard MCP client (stdio and streamable HTTP transports, no tokio — blocking I/O plus threads) alongside skills; MCP support must stay dependency-light (hand-rolled JSON-RPC over serde_json, HTTP via the existing blocking `ureq`). See `docs/mcp.md`. Sub-agent functionality is built in, so do not design a separate subsystem for it.
 
+## Recurring Defects
+
+- `Config::load_or_create` rewrites `config.json` (and drops keys it does not know, such as the desktop's); code that runs per request or concurrently reads it with `Config::load_existing`.
+- Do not enable `ureq`'s `try_proxy_from_env`: it reads `ALL_PROXY` first, has no SOCKS support built in and ignores `NO_PROXY`, so a common shell proxy setup fails every request.
+
 ## TUI Guidelines
 
 Keep the TUI minimal and fast. Chat history may use native scrolling; avoid complex custom scroll systems unless required. Use a restrained palette with only a few semantic colors. Theme selection is allowed, but themes must remain simple and readable.

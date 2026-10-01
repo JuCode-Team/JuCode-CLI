@@ -33,19 +33,22 @@ pub fn command(options: &Options) -> Command {
     command
 }
 
+/// The provider a gateway session configures (see `use_gateway`).
+const GATEWAY_PROVIDER: &str = "jucode_gateway";
+
 /// The env var a gateway session reads its key from.
 const GATEWAY_KEY_ENV: &str = "JUCODE_GATEWAY_TOKEN";
 
-/// This session talks to the JuCode gateway: config overrides for this
-/// process alone, with the key in its environment (never in argv).
-pub fn use_gateway(command: &mut Command, api: &str, token: &str) -> Result<(), String> {
-    let api = super::gateway_url(api)?;
+/// This session talks to the JuCode gateway through the daemon's local
+/// gateway (`base`, see crate::gateway): config overrides for this process
+/// alone, with the local `key` (never the JuCode token) in its environment.
+pub fn use_gateway(command: &mut Command, base: &str, key: &str) -> Result<(), String> {
     command
-        .args(["-c", "model_provider=\"jucode_gateway\"", "-c"])
+        .args(["-c", &format!("model_provider=\"{GATEWAY_PROVIDER}\""), "-c"])
         .arg(format!(
-            "model_providers.jucode_gateway={{name=\"JuCode\",base_url=\"{api}/v1\",env_key=\"{GATEWAY_KEY_ENV}\",wire_api=\"responses\"}}"
+            "model_providers.{GATEWAY_PROVIDER}={{name=\"JuCode\",base_url=\"{base}/v1\",env_key=\"{GATEWAY_KEY_ENV}\",wire_api=\"responses\"}}"
         ))
-        .env(GATEWAY_KEY_ENV, token);
+        .env(GATEWAY_KEY_ENV, key);
     Ok(())
 }
 
@@ -103,6 +106,21 @@ fn error_event(message: &str, info: &Value) -> Value {
         ""
     };
     json!({ "type": "error", "message": format!("{message}{hint}") })
+}
+
+/// A ChatGPT plan's usage from a rate-limit snapshot: its primary and
+/// secondary windows (`usedPercent` 0-100, `resetsAt` unix seconds).
+fn plan_usage(snapshot: &Value) -> Option<Value> {
+    let windows: Vec<Value> = ["primary", "secondary"]
+        .iter()
+        .filter_map(|key| {
+            let window = &snapshot[*key];
+            let used = window["usedPercent"].as_f64()?;
+            Some(super::plan_window(key, used, &window["resetsAt"], window["windowDurationMins"].as_u64()))
+        })
+        .collect();
+    let plan = snapshot["planType"].as_str();
+    (!windows.is_empty()).then(|| json!({ "type": "plan_usage", "plan": plan, "windows": windows }))
 }
 
 fn file_change_output(changes: &[Value], error: Option<&str>) -> String {
@@ -221,6 +239,9 @@ pub struct Codex {
     pending: HashMap<u64, (String, String)>,
     thread: Option<String>,
     resume: Option<String>,
+    /// Talks to the JuCode gateway: a resumed thread must too, whichever
+    /// provider it was written with (`thread/resume` would use that one).
+    gateway: bool,
     active_turn: Option<String>,
     /// A turn is starting or running.
     busy: bool,
@@ -254,6 +275,7 @@ impl Codex {
             pending: HashMap::new(),
             thread: None,
             resume: options.resume.clone(),
+            gateway: options.gateway == Some(true),
             active_turn: None,
             busy: false,
             queued: Vec::new(),
@@ -401,7 +423,7 @@ impl Codex {
             })
             .collect();
         if !self.model.is_empty() && !rows.iter().any(|r| r["active"] == true) {
-            rows.insert(0, json!({ "model": self.model, "active": true, "context_window": self.context_window, "max_output_tokens": 0, "reasoning_efforts": self.efforts(&self.model) }));
+            rows.insert(0, json!({ "model": self.model, "active": true, "context_window": self.context_window, "max_output_tokens": 0, "reasoning_efforts": self.efforts(&self.model), "listed": false }));
         }
         json!({ "type": "model_view", "models": rows, "active_effort": self.effort })
     }
@@ -448,6 +470,10 @@ impl Codex {
                 "" => format!("JSON-RPC error {}", error["code"]),
                 message => message.to_string(),
             };
+            // An account without a ChatGPT plan has no limits to read.
+            if method == "account/rateLimits/read" {
+                return Output::default();
+            }
             if method == "thread/compact/start" {
                 return Output::events(vec![
                     json!({ "type": "compaction_failed", "error": message }),
@@ -492,6 +518,9 @@ impl Codex {
                     Some(thread) => {
                         let mut params = open;
                         params["threadId"] = json!(thread);
+                        if self.gateway {
+                            params["modelProvider"] = json!(GATEWAY_PROVIDER);
+                        }
                         self.request("thread/resume", params, "")
                     }
                     None => self.request("thread/start", open, ""),
@@ -499,6 +528,10 @@ impl Codex {
                 frames.push(self.request("model/list", json!({}), ""));
                 let cwd = self.cwd.clone();
                 frames.push(self.request("skills/list", json!({ "cwds": [cwd] }), ""));
+                // The ChatGPT plan's limits (a gateway session has none).
+                if !self.gateway {
+                    frames.push(self.request("account/rateLimits/read", json!({}), ""));
+                }
                 Output {
                     events: vec![],
                     frames,
@@ -506,6 +539,7 @@ impl Codex {
             }
             "thread/start" => self.thread_opened(result, false),
             "thread/resume" => self.thread_opened(result, true),
+            "account/rateLimits/read" => Output::events(plan_usage(&result["rateLimits"]).into_iter().collect()),
             "model/list" => {
                 self.catalog = result["data"]
                     .as_array()
@@ -822,6 +856,7 @@ impl Codex {
 
     fn on_notification(&mut self, method: &str, params: &Value) -> Vec<Value> {
         match method {
+            "account/rateLimits/updated" => plan_usage(&params["rateLimits"]).into_iter().collect(),
             "turn/started" => {
                 self.busy = true;
                 if let Some(turn) = params["turn"]["id"].as_str() {
@@ -1310,13 +1345,13 @@ mod tests {
     #[test]
     fn the_gateway_goes_to_this_process_only() {
         let mut command = std::process::Command::new("codex");
-        use_gateway(&mut command, "https://api.jucode.net/", "tok").unwrap();
+        use_gateway(&mut command, "http://127.0.0.1:7788/gw", "tok").unwrap();
         let args: Vec<String> = command
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
             .collect();
         assert_eq!(args[1], "model_provider=\"jucode_gateway\"");
-        assert!(args[3].contains("base_url=\"https://api.jucode.net/v1\""));
+        assert!(args[3].contains("base_url=\"http://127.0.0.1:7788/gw/v1\""));
         assert!(!args.concat().contains("tok\""));
         let env: Vec<_> = command.get_envs().collect();
         assert_eq!(
@@ -1326,8 +1361,6 @@ mod tests {
                 Some(std::ffi::OsStr::new("tok"))
             )]
         );
-        assert!(use_gateway(&mut command, "http://api.jucode.net", "tok").is_err());
-        assert!(use_gateway(&mut command, "https://a\"b", "tok").is_err());
         assert_eq!(
             Options::from_json(&json!({ "jucode_gateway": true })).gateway,
             Some(true)
@@ -1461,6 +1494,55 @@ mod tests {
     }
 
     #[test]
+    fn the_chatgpt_plan_usage_is_read_and_followed() {
+        let mut c = Codex::new(Path::new("/p"), &Options::default());
+        c.start();
+        let next = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        let read = next.iter().find(|f| f["method"] == "account/rateLimits/read").expect("asked for the limits");
+        let snapshot = json!({ "planType": "plus",
+            "primary": { "usedPercent": 37, "windowDurationMins": 300, "resetsAt": 1790800000 },
+            "secondary": { "usedPercent": 12, "windowDurationMins": 10080, "resetsAt": 1791300000 } });
+        let out = frame(&mut c, json!({ "id": read["id"], "result": { "rateLimits": snapshot } }));
+        assert_eq!(types(&out.events), ["plan_usage"]);
+        assert_eq!(out.events[0]["plan"], "plus");
+        assert_eq!(out.events[0]["windows"][0], json!({ "key": "primary", "used": 37.0, "resets_at": 1_790_800_000_000u64, "minutes": 300 }));
+        let out = frame(&mut c, json!({ "method": "account/rateLimits/updated", "params": { "rateLimits": { "primary": { "usedPercent": 40 } } } }));
+        assert_eq!(out.events[0]["windows"][0]["used"], 40.0);
+        assert_eq!(out.events[0]["windows"][0]["resets_at"], Value::Null);
+    }
+
+    #[test]
+    fn an_account_without_a_plan_reads_no_limits_quietly() {
+        let mut c = Codex::new(Path::new("/p"), &Options::default());
+        c.start();
+        let next = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        let read = next.iter().find(|f| f["method"] == "account/rateLimits/read").unwrap();
+        let out = frame(&mut c, json!({ "id": read["id"], "error": { "code": -32600, "message": "not signed in with ChatGPT" } }));
+        assert!(out.events.is_empty());
+        // A gateway session does not ask.
+        let mut g = Codex::new(Path::new("/p"), &Options { gateway: Some(true), ..Options::default() });
+        g.start();
+        let next = sent(&frame(&mut g, json!({ "id": 1, "result": {} })).frames);
+        assert!(next.iter().all(|f| f["method"] != "account/rateLimits/read"));
+    }
+
+    #[test]
+    fn a_gateway_resume_stays_on_the_gateway() {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                resume: Some("th-9".into()),
+                gateway: Some(true),
+                ..Options::default()
+            },
+        );
+        c.start();
+        let next = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        assert_eq!(next[1]["method"], "thread/resume");
+        assert_eq!(next[1]["params"]["modelProvider"], GATEWAY_PROVIDER);
+    }
+
+    #[test]
     fn a_resume_replays_history_and_falls_back_to_a_new_thread() {
         let mut c = Codex::new(
             Path::new("/p"),
@@ -1473,6 +1555,7 @@ mod tests {
         let next = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
         assert_eq!(next[1]["method"], "thread/resume");
         assert_eq!(next[1]["params"]["threadId"], "th-9");
+        assert!(next[1]["params"].get("modelProvider").is_none(), "keeps the thread's provider");
         let resumed = frame(
             &mut c,
             json!({ "id": 2, "result": { "thread": { "id": "th-9", "turns": [{ "items": [
