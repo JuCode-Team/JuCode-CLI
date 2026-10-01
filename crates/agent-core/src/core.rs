@@ -3850,14 +3850,23 @@ fn current_utc_date() -> String {
 /// in this order. An account that can reach none of them sees its first few
 /// models instead.
 const DEFAULT_JUCODE_MODELS: &[&str] = &[
-    "gpt-6-sol",
+    "gpt-6.1-sol",
+    "codex-auto-review",
     "gpt-6-astra",
+    "gpt-6-sol",
     "gpt-6-luna",
-    "claude-fable-5-1",
-    "claude-opus-5-5",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "claude-sonnet-5-5",
+    "claude-opus-5-5",
+    "claude-fable-5-1",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-sonnet-5",
     "deepseek-v4.1-flash",
     "glm-5.3-flash",
+    "kimi-k3",
 ];
 
 fn default_jucode_models(available: &[ModelConfig]) -> Vec<ModelConfig> {
