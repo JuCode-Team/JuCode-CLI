@@ -1691,6 +1691,58 @@ fn a_codex_session_is_named_by_its_thread_and_resumes_with_its_history() {
 }
 
 #[test]
+fn the_desktop_saves_mcp_servers_for_every_session_without_one() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-mcp");
+    let mut desktop = Client::connect(&daemon);
+    let session = desktop.create_session(&dir);
+    let server =
+        json!({ "name": "probe", "transport": "stdio", "command": "false", "enabled": false });
+
+    let saved = request(&mut desktop, json!({ "op": "mcp_set", "server": server }));
+    assert_eq!(saved["type"], "mcp_saved", "{saved}");
+    let config = fs::read_to_string(
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap()
+            .join(".jucode/config.json"),
+    )
+    .unwrap();
+    assert!(config.contains("\"probe\""), "{config}");
+    // The open session applies it too.
+    desktop.until(|f| {
+        f["session"] == session.as_str()
+            && f["type"] == "mcp_servers"
+            && f["servers"]
+                .as_array()
+                .is_some_and(|s| s.iter().any(|s| s["name"] == "probe"))
+    });
+
+    // A paired device may not name a command to run.
+    desktop.send(json!({ "op": "pair_start", "id": 1 }));
+    let code = desktop.until(|f| f["id"] == 1).pop().unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, response) = http(&daemon, &pair_request(&code));
+    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let mut phone = Client::connect_with(&daemon, body["token"].as_str().unwrap());
+    for op in [
+        json!({ "op": "mcp_set", "server": server }),
+        json!({ "op": "mcp_set", "session": session, "server": server }),
+    ] {
+        let refused = request(&mut phone, op);
+        assert_eq!(refused["type"], "error", "{refused}");
+    }
+
+    let removed = request(&mut desktop, json!({ "op": "mcp_remove", "name": "probe" }));
+    assert_eq!(removed["type"], "mcp_saved", "{removed}");
+    let unknown = request(&mut desktop, json!({ "op": "mcp_remove", "name": "probe" }));
+    assert_eq!(unknown["type"], "error");
+}
+
+#[test]
 fn only_the_desktop_starts_acp_agents_which_run_like_any_session() {
     let _guard = setup();
     let daemon = start_daemon();

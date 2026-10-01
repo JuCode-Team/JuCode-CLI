@@ -479,6 +479,23 @@ impl Hub {
         self.broadcast(&json!({ "type": "session_closed", "session": id }));
     }
 
+    /// Sends `op` to every open JuCode session (other engines have no MCP
+    /// servers of the daemon's).
+    pub fn forward_to_jucode_sessions(&self, op: &Value) {
+        let jucode: HashSet<String> = self
+            .store
+            .sessions()
+            .into_iter()
+            .filter(|record| record.engine.is_none())
+            .map(|record| record.id)
+            .collect();
+        for (id, hosted) in lock(&self.sessions).iter() {
+            if jucode.contains(id) {
+                let _ = hosted.ops.send(op.clone());
+            }
+        }
+    }
+
     pub fn forward(&self, session: &str, op: Value) -> Result<(), String> {
         let sessions = lock(&self.sessions);
         let hosted = sessions

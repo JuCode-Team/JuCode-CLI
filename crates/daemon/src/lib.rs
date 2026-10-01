@@ -282,6 +282,11 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         reply(json!({ "type": "error", "message": "only the desktop can manage devices" }));
         return;
     }
+    // An MCP server is a command to run or a place to send credentials.
+    if matches!(name, "mcp_set" | "mcp_remove" | "mcp_toggle") && !hub.is_local(client) {
+        reply(json!({ "type": "error", "message": "only the desktop can change MCP servers" }));
+        return;
+    }
     // File and git reads can take a while; they must not hold up this
     // client's other frames.
     if matches!(name, "fs_list" | "fs_read" | "git_status" | "git_diff") {
@@ -494,6 +499,14 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             "actions": hub.store.open_actions().iter().map(|action| action.to_json()).collect::<Vec<_>>(),
         })),
         ("set_attended", Some(_)) => Err("the daemon sets attended from watch/unwatch".to_string()),
+        // MCP servers are saved for every session: the config first, then the
+        // open JuCode sessions apply the same op.
+        ("mcp_set" | "mcp_remove" | "mcp_toggle", None) => {
+            jucode_agent_core::change_mcp_config(&op).map(|()| {
+                hub.forward_to_jucode_sessions(&op);
+                json!({ "type": "mcp_saved" })
+            })
+        }
         (_, Some(session)) => hub.forward(&session, op.clone()).map(|()| Value::Null),
         (name, None) => Err(format!("{name} requires session")),
     };
