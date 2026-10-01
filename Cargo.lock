@@ -818,7 +818,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jucode-agent-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "chacha20poly1305 0.11.0",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "jucode-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "jucode-agent-core",
  "jucode-daemon",
@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "jucode-daemon"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "jucode-tui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "jucode-agent-core",
