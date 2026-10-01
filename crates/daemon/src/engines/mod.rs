@@ -482,6 +482,7 @@ pub fn spawn(
             ready: Some(ready_tx),
             early: Vec::new(),
             last_error: None,
+            stderr: Default::default(),
             kind,
             cwd,
             snapshot: Snapshot::default(),
@@ -498,7 +499,7 @@ pub fn spawn(
             (Some(id), _) => hub.session_ended(&id, generation),
             (None, Some(ready)) => {
                 let reason = session.last_error.take().unwrap_or_else(|| {
-                    format!("{} stopped before opening a conversation", kind.name())
+                    session.stopped_message(&format!("{} stopped before opening a conversation", kind.name()))
                 });
                 let _ = ready.send(Err(reason));
             }
@@ -520,6 +521,10 @@ struct Session<'a> {
     /// Events from before the id was known.
     early: Vec<Value>,
     last_error: Option<String>,
+    /// The engine's latest stderr lines. Stderr is diagnostics (codex echoes
+    /// code it is working on there), so it stays out of the conversation and
+    /// only explains an exit (`stopped_message`).
+    stderr: std::collections::VecDeque<String>,
     kind: Kind,
     cwd: PathBuf,
     snapshot: Snapshot,
@@ -538,6 +543,30 @@ impl Drop for Session<'_> {
 }
 
 impl Session<'_> {
+    const STDERR_KEPT: usize = 8;
+
+    fn note_stderr(&mut self, line: &str) {
+        let line = strip_ansi(line);
+        let line = line.trim();
+        if line.is_empty() || matches!(log_level(line), Some("INFO" | "DEBUG" | "TRACE")) {
+            return;
+        }
+        if self.stderr.len() == Self::STDERR_KEPT {
+            self.stderr.pop_front();
+        }
+        self.stderr.push_back(line.to_string());
+    }
+
+    /// `head`, then the engine's last stderr lines, which usually say why it
+    /// stopped.
+    fn stopped_message(&self, head: &str) -> String {
+        if self.stderr.is_empty() {
+            return head.to_string();
+        }
+        let tail: Vec<&str> = self.stderr.iter().map(String::as_str).collect();
+        format!("{head}\n{}", tail.join("\n"))
+    }
+
     fn run(&mut self, mut process: Process, options: Options, ops: Receiver<Value>) {
         let mut adapter = adapter(self.kind, &self.cwd, &options);
         process.write(adapter.start());
@@ -570,6 +599,9 @@ impl Session<'_> {
                 first = false;
                 match next {
                     Ok(Ok(line)) => {
+                        if let Line::Stderr(text) = &line {
+                            self.note_stderr(text);
+                        }
                         let output = adapter.translate(line);
                         process.write(output.frames);
                         if self.id.is_none() {
@@ -581,10 +613,8 @@ impl Session<'_> {
                     }
                     Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {
                         let reason = process.exit_reason();
-                        self.publish(vec![json!({
-                            "type": "error",
-                            "message": format!("{} stopped ({reason})", self.kind.name()),
-                        })]);
+                        let message = self.stopped_message(&format!("{} stopped ({reason})", self.kind.name()));
+                        self.publish(vec![json!({ "type": "error", "message": message })]);
                         return;
                     }
                     Err(RecvTimeoutError::Timeout) => break,

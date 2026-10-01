@@ -1037,16 +1037,8 @@ impl Adapter for Codex {
 
     fn translate(&mut self, line: Line) -> Output {
         let frame = match line {
-            Line::Stderr(line) => {
-                let line = super::strip_ansi(&line);
-                let line = line.trim();
-                if line.is_empty() || super::log_level(line).is_some() {
-                    return Output::default();
-                }
-                return Output::events(vec![
-                    json!({ "type": "info", "message": format!("[codex] {line}") }),
-                ]);
-            }
+            // Diagnostics only; kept for an exit message (Session::note_stderr).
+            Line::Stderr(_) => return Output::default(),
             Line::Frame(frame) => frame,
         };
         let id = &frame["id"];

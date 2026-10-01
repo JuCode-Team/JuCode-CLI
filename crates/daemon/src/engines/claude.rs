@@ -1421,20 +1421,14 @@ impl Adapter for Claude {
 
     fn translate(&mut self, line: Line) -> Output {
         let frame = match line {
+            // Diagnostics, kept for an exit message (Session::note_stderr);
+            // only a failed resume is acted on.
             Line::Stderr(line) => {
-                let line = super::strip_ansi(&line);
-                let line = line.trim();
-                if line.is_empty()
-                    || matches!(super::log_level(line), Some("INFO" | "DEBUG" | "TRACE"))
-                {
-                    return Output::default();
-                }
-                if line.contains("No conversation found with session ID") {
-                    return Output::events(vec![json!({ "type": "resume_failed" })]);
-                }
-                return Output::events(vec![
-                    json!({ "type": "info", "message": format!("[claude] {line}") }),
-                ]);
+                return if line.contains("No conversation found with session ID") {
+                    Output::events(vec![json!({ "type": "resume_failed" })])
+                } else {
+                    Output::default()
+                };
             }
             Line::Frame(frame) => frame,
         };

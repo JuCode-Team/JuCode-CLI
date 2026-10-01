@@ -406,17 +406,8 @@ impl Adapter for Acp {
 
     fn translate(&mut self, line: Line) -> Output {
         let frame = match line {
-            Line::Stderr(line) => {
-                let line = super::strip_ansi(&line);
-                let line = line.trim();
-                return if line.is_empty() {
-                    Output::default()
-                } else {
-                    Output::events(vec![
-                        json!({ "type": "info", "message": format!("[acp] {line}") }),
-                    ])
-                };
-            }
+            // Diagnostics only; kept for an exit message (Session::note_stderr).
+            Line::Stderr(_) => return Output::default(),
             Line::Frame(frame) => frame,
         };
         // No turn-started notification: the first frame after a prompt
