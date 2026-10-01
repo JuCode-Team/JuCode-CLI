@@ -17,7 +17,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::Sender,
         Arc, Mutex, MutexGuard, Weak,
     },
@@ -41,6 +41,8 @@ pub struct Hub {
     sessions: Mutex<HashMap<String, Hosted>>,
     /// Sessions whose engine is running a turn or has queued messages.
     busy: Mutex<HashSet<String>>,
+    /// A newer daemon waits to replace this one (`restart_when_idle`).
+    restart_pending: AtomicBool,
     /// Delivered messages a session thread has not processed yet. They hold
     /// a running slot: the engine still reports "ready" until it has read
     /// the message, and that must not free the slot early.
@@ -104,6 +106,7 @@ impl Hub {
             version,
             sessions: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashSet::new()),
+            restart_pending: AtomicBool::new(false),
             claims: Mutex::new(HashMap::new()),
             last_active: Mutex::new(HashMap::new()),
             delivering: Mutex::new(()),
@@ -533,6 +536,26 @@ impl Hub {
     }
 
     /// Called by a session thread with its engine's state every tick. A
+    /// The desktop brought a newer daemon (an app update): this one exits
+    /// once no session is running, and the desktop starts the new one, which
+    /// reopens the sessions. Running turns are never cut off.
+    pub fn restart_when_idle(&self) {
+        if self.restart_pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Some(hub) = self.me.upgrade() else {
+            return;
+        };
+        thread::spawn(move || loop {
+            if lock(&hub.busy).is_empty() {
+                hub.broadcast(&json!({ "type": "daemon_restarting" }));
+                thread::sleep(std::time::Duration::from_millis(300));
+                std::process::exit(0);
+            }
+            thread::sleep(std::time::Duration::from_secs(1));
+        });
+    }
+
     /// session with an unprocessed delivery stays busy.
     pub fn set_busy(&self, session: &str, busy: bool) {
         let busy = busy

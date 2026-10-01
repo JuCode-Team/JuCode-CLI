@@ -1195,6 +1195,10 @@ impl Adapter for Codex {
     fn conversation(&self) -> Option<String> {
         self.thread.clone()
     }
+
+    fn approval_mode(&self) -> Option<String> {
+        Some(self.mode.to_string())
+    }
 }
 
 // --- saved threads ---

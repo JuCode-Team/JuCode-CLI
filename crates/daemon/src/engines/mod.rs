@@ -168,6 +168,10 @@ pub trait Adapter: Send {
     fn restart_for(&self, op: &Value) -> Option<Options>;
     /// The engine's conversation id, for resuming it.
     fn conversation(&self) -> Option<String>;
+    /// The approval mode it runs in now (client names), kept across a restart.
+    fn approval_mode(&self) -> Option<String> {
+        None
+    }
 }
 
 fn adapter(kind: Kind, cwd: &Path, options: &Options) -> Box<dyn Adapter> {
@@ -598,6 +602,7 @@ impl Session<'_> {
                     next.bin = options.bin.clone();
                     next.env = options.env.clone();
                     next.gateway = next.gateway.or(options.gateway);
+                    next.approval_mode = next.approval_mode.or(options.approval_mode.clone());
                     process.stop();
                     let id = self.id.clone().unwrap_or_default();
                     if let Some(key) = self.gateway_key.take() {
@@ -643,6 +648,36 @@ impl Session<'_> {
             // A client watching or not changes nothing: approvals wait for
             // whoever answers them next.
             "set_attended" => false,
+            // Claude Code / Codex move between this machine's own login and
+            // the JuCode gateway (a new process; the conversation resumes),
+            // once the running turn ends.
+            "set_gateway" => {
+                let Some(gateway) = op["gateway"].as_bool() else {
+                    self.publish(vec![json!({ "type": "error", "message": "set_gateway requires gateway" })]);
+                    return false;
+                };
+                if self.kind == Kind::Acp {
+                    self.publish(vec![json!({ "type": "error", "message": "an ACP agent has no JuCode gateway mode" })]);
+                    return false;
+                }
+                self.restart = Some(Options {
+                    gateway: Some(gateway),
+                    model: op["model"].as_str().filter(|m| !m.is_empty()).map(str::to_string),
+                    approval_mode: adapter.approval_mode(),
+                    ..Options::default()
+                });
+                if let Some(id) = &self.id {
+                    let _ = self.hub.store.record_session_meta(id, &json!({ "gateway": gateway }));
+                    self.hub.broadcast(&self.hub.sessions_json());
+                }
+                if adapter.busy() {
+                    self.publish(vec![json!({
+                        "type": "info",
+                        "message": "the switch applies once the running turn ends",
+                    })]);
+                }
+                false
+            }
             name => {
                 if let Some(options) = adapter.restart_for(op) {
                     self.restart = Some(options);

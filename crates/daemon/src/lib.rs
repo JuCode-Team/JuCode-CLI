@@ -286,7 +286,13 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     let name = op["op"].as_str().unwrap_or_default();
     if matches!(
         name,
-        "pair_start" | "pair_link" | "device_list" | "device_revoke" | "relay_status" | "relay_set"
+        "pair_start"
+            | "pair_link"
+            | "device_list"
+            | "device_revoke"
+            | "relay_status"
+            | "relay_set"
+            | "restart_when_idle"
     ) && !hub.is_local(client)
     {
         reply(json!({ "type": "error", "message": "only the desktop can manage devices" }));
@@ -310,6 +316,12 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             let result = skills::handle(&name, &op);
             respond(&hub, client, &request, result);
         });
+        return;
+    }
+    // The gateway's groups come from the network.
+    if name == "gateway_catalog" {
+        let hub = Arc::clone(hub);
+        thread::spawn(move || respond(&hub, client, &request, Ok(gateway::catalog_json())));
         return;
     }
     // File and git reads can take a while; they must not hold up this
@@ -347,6 +359,10 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     }
     let result = match (name, session) {
         ("ping", _) => Ok(json!({ "type": "pong" })),
+        ("restart_when_idle", _) => {
+            hub.restart_when_idle();
+            Ok(Value::Null)
+        }
         ("workspaces", _) => Ok(projects::workspaces_json(hub)),
         ("workspaces_set" | "project_add" | "project_create" | "project_remove", _) => {
             projects::handle(hub, name, &op)

@@ -188,6 +188,9 @@ impl Store {
                     meta[flag] = json!(true);
                 }
             }
+            if let Some(group) = &record.group {
+                meta["group"] = json!(group);
+            }
             if meta.as_object().is_some_and(|fields| fields.len() > 2) {
                 sessions.push(meta);
             }
@@ -332,6 +335,10 @@ impl Store {
             entry["group"] = json!(group.trim());
             changed = true;
         }
+        if let Some(gateway) = changes["gateway"].as_bool() {
+            entry["gateway"] = json!(gateway);
+            changed = true;
+        }
         if changed {
             self.append(SESSIONS, entry)?;
         }
@@ -420,6 +427,9 @@ impl Store {
                         }
                         if let Some(group) = entry["group"].as_str() {
                             record.group = Some(group.to_string()).filter(|g| !g.is_empty());
+                        }
+                        if let Some(gateway) = entry["gateway"].as_bool() {
+                            record.gateway = gateway;
                         }
                     }
                 }
@@ -1018,6 +1028,23 @@ mod tests {
         assert_eq!(store.sessions()[0].group.as_deref(), Some("g-1"));
         store.record_session_meta("c", &json!({ "group": "" })).unwrap();
         assert_eq!(store.sessions()[0].group, None);
+    }
+
+    #[test]
+    fn group_and_gateway_changes_survive_a_restart() {
+        let store = store("compact-group");
+        let dir = store.dir.clone();
+        store
+            .record_engine_session("c", std::path::Path::new("/p"), None, Some("claude"), false)
+            .unwrap();
+        store.record_session_meta("c", &json!({ "group": "g-1" })).unwrap();
+        assert!(store.record_session_meta("c", &json!({ "gateway": true })).unwrap());
+        drop(store);
+        // Opening compacts the log.
+        let reopened = Store::open(dir).unwrap();
+        let record = &reopened.sessions()[0];
+        assert_eq!(record.group.as_deref(), Some("g-1"));
+        assert!(record.gateway);
     }
 
     #[test]

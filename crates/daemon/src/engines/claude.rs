@@ -1621,6 +1621,10 @@ impl Adapter for Claude {
     fn conversation(&self) -> Option<String> {
         (!self.conversation.is_empty()).then(|| self.conversation.clone())
     }
+
+    fn approval_mode(&self) -> Option<String> {
+        Some(from_claude_mode(self.mode).to_string())
+    }
 }
 
 /// A subscription's usage from a `rate_limit_info`: per window when the

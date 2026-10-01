@@ -39,8 +39,8 @@ struct State {
     keys: HashMap<String, String>,
     /// Session → the group it routes to.
     groups: HashMap<String, String>,
-    /// Group id → the models it serves, and when that was read.
-    catalog: Option<(Instant, HashMap<String, HashSet<String>>)>,
+    /// The gateway's groups (`/v1/open/groups`), and when they were read.
+    catalog: Option<(Instant, Vec<Value>)>,
 }
 
 fn state() -> MutexGuard<'static, State> {
@@ -132,9 +132,24 @@ fn read_default_groups() -> BTreeMap<String, String> {
 /// Group id → models, cached for `CATALOG_TTL`. None when unreadable: no
 /// group is then sent, and the gateway routes on its own.
 fn live_catalog(upstream: &Upstream) -> Option<HashMap<String, HashSet<String>>> {
-    if let Some((at, catalog)) = &state().catalog {
+    let groups = live_groups(upstream)?;
+    Some(
+        groups
+            .iter()
+            .filter_map(|group| {
+                let id = group["id"].as_str()?.to_string();
+                let models = group["models"].as_array()?.iter().filter_map(Value::as_str).map(str::to_string).collect();
+                Some((id, models))
+            })
+            .collect(),
+    )
+}
+
+/// The gateway's groups, cached for `CATALOG_TTL`.
+fn live_groups(upstream: &Upstream) -> Option<Vec<Value>> {
+    if let Some((at, groups)) = &state().catalog {
         if at.elapsed() < CATALOG_TTL {
-            return Some(catalog.clone());
+            return Some(groups.clone());
         }
     }
     let url = format!("{}/v1/open/groups", upstream.api.trim_end_matches('/'));
@@ -146,17 +161,34 @@ fn live_catalog(upstream: &Upstream) -> Option<HashMap<String, HashSet<String>>>
         .ok()?
         .into_json()
         .ok()?;
-    let catalog: HashMap<String, HashSet<String>> = value["groups"]
-        .as_array()?
-        .iter()
-        .filter_map(|group| {
-            let id = group["id"].as_str()?.to_string();
-            let models = group["models"].as_array()?.iter().filter_map(Value::as_str).map(str::to_string).collect();
-            Some((id, models))
+    let groups = value["groups"].as_array()?.clone();
+    state().catalog = Some((Instant::now(), groups.clone()));
+    Some(groups)
+}
+
+/// What a client that cannot read this machine's JuCode login (the remote
+/// page) needs to offer the gateway: the models the user chose to show
+/// (`jucode_models` in config.json) and the gateway's groups. Empty lists
+/// when not signed in or the gateway cannot be reached.
+pub fn catalog_json() -> Value {
+    let models: Vec<Value> = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|home| std::path::PathBuf::from(home).join(".jucode").join("config.json"))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|config| config["jucode_models"].as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|model| {
+            let name = model["name"].as_str()?;
+            Some(json!({ "name": name, "context_window": model["context_window"] }))
         })
         .collect();
-    state().catalog = Some((Instant::now(), catalog.clone()));
-    Some(catalog)
+    let groups = live_upstream()
+        .ok()
+        .and_then(|upstream| live_groups(&upstream))
+        .unwrap_or_default();
+    json!({ "type": "gateway_catalog", "models": models, "groups": groups })
 }
 
 fn agent() -> &'static ureq::Agent {
