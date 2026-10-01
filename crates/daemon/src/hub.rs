@@ -6,6 +6,7 @@ use crate::{
     agents::Agents,
     engines,
     relay::Relay,
+    schedules::{self, Schedule},
     session,
     store::{
         now, random_hex, token_hash, Device, Message, Question, Report, SessionRecord, Store, Timer,
@@ -47,6 +48,8 @@ pub struct Hub {
     /// a running slot: the engine still reports "ready" until it has read
     /// the message, and that must not free the slot early.
     claims: Mutex<HashMap<String, usize>>,
+    /// Every agent's scheduled tasks (see `schedules`).
+    pub(crate) schedules: Mutex<Vec<Schedule>>,
     /// When each session last received a message (ms), for routing.
     last_active: Mutex<HashMap<String, u64>>,
     /// Serializes message delivery (scheduler ticks, sends, tool calls).
@@ -83,7 +86,7 @@ struct Hosted {
     generation: u64,
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
@@ -96,8 +99,10 @@ impl Hub {
         version: &'static str,
         relay: Option<String>,
     ) -> Arc<Self> {
+        let schedules = Mutex::new(schedules::load(&agents));
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
+            schedules,
             turns: Mutex::new(HashMap::new()),
             titling: Mutex::new(HashSet::new()),
             relay: Relay::new(relay, &store),
@@ -606,6 +611,53 @@ impl Hub {
         json!({ "type": "agents", "agents": list })
     }
 
+    /// Deletes an agent none of whose sessions is running: its folder
+    /// (brief, memory, schedules), its timers and its open questions. Its
+    /// open sessions close; their records stay. Messages still waiting for
+    /// it become undeliverable on the next delivery pass.
+    pub fn delete_agent(&self, id: &str) -> Result<(), String> {
+        // No message reaches the agent (or starts a session of it) meanwhile.
+        let _guard = lock(&self.delivering);
+        if self.agents.get(id).is_none() {
+            return Err(format!("unknown agent {id}"));
+        }
+        let own: Vec<String> = self
+            .store
+            .sessions()
+            .into_iter()
+            .filter(|record| record.agent.as_deref() == Some(id))
+            .map(|record| record.id)
+            .collect();
+        if own.iter().any(|session| lock(&self.busy).contains(session)) {
+            return Err(format!(
+                "agent {id} is working; delete it once its sessions are idle"
+            ));
+        }
+        // Holding the schedules while the folder goes keeps a run that fires
+        // meanwhile from writing schedules.json back into it.
+        let mut schedules = lock(&self.schedules);
+        self.agents.delete(id)?;
+        schedules.retain(|schedule| schedule.agent != id);
+        drop(schedules);
+        for session in &own {
+            let _ = self.close_session(session);
+        }
+        for timer in self.store.active_timers() {
+            if timer.agent == id {
+                let _ = self.store.record_timer_done(&timer.id, "cancelled");
+            }
+        }
+        for question in self.store.open_questions() {
+            if question.agent == id {
+                let _ = self.store.record_answer(&question.id, "", "agent_deleted");
+            }
+        }
+        self.broadcast(&self.agents_json());
+        self.broadcast(&self.schedules_json(None));
+        self.broadcast(&self.questions_json());
+        Ok(())
+    }
+
     /// A fresh id with a readable prefix (`m-…`, `t-…`).
     pub fn new_id(&self, prefix: &str) -> String {
         format!(
@@ -637,10 +689,11 @@ impl Hub {
             .map_err(|error| error.to_string())
     }
 
-    /// One scheduler pass: due timers and overdue questions become messages,
-    /// then everything pending is delivered.
+    /// One scheduler pass: due timers, due schedules and overdue questions
+    /// become messages, then everything pending is delivered.
     pub fn tick(self: &Arc<Self>) {
         self.fire_due_timers();
+        self.fire_due_schedules();
         self.expire_questions();
         self.deliver_pending();
     }
@@ -881,6 +934,9 @@ impl Hub {
         self.store
             .record_delivered(&message.id, &session)
             .map_err(|error| error.to_string())?;
+        if let Some(schedule) = message.from.strip_prefix("schedule:") {
+            self.schedule_delivered(schedule, &session);
+        }
         self.broadcast(&json!({
             "type": "message_delivered",
             "id": message.id,
@@ -1128,6 +1184,7 @@ fn delivery_text(message: &Message) -> String {
     let origin = match message.from.split_once(':') {
         Some(("agent", id)) => format!("message from agent {id}"),
         Some(("timer", id)) => format!("timer {id} fired"),
+        Some(("schedule", id)) => format!("scheduled task {id}"),
         Some(("question", id)) => format!("answer to your question {id}"),
         _ => format!("message from {}", message.from),
     };

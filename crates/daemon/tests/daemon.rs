@@ -738,6 +738,273 @@ fn the_agent_page_reads_the_brief_and_changes_settings() {
     assert!(log.contains("undeliverable"), "{log}");
 }
 
+/// Runs schedule `id` now and returns the session its message reached once
+/// that run has finished.
+fn run_schedule(client: &mut Client, agent: &str, id: &str) -> (String, Vec<Value>) {
+    client.send(json!({ "op": "schedule_run", "schedule": id, "id": "run" }));
+    let mut replied = false;
+    let mut session: Option<String> = None;
+    let frames = client.until(|frame| {
+        if frame["id"] == "run" {
+            assert_eq!(frame["type"], "schedule_started", "{frame}");
+            assert_eq!(frame["schedule"], id);
+            replied = true;
+        }
+        if delivered_to(agent)(frame) {
+            assert_eq!(frame["from"], format!("schedule:{id}"));
+            session = frame["session"].as_str().map(str::to_string);
+        }
+        replied
+            && session
+                .as_deref()
+                .is_some_and(|session| ready(session)(frame))
+    });
+    (session.unwrap(), frames)
+}
+
+#[test]
+fn a_schedule_runs_now_into_a_new_session_or_the_last_one() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "tickets", "Works the ticket queue");
+    let reply = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": { "agent": "nobody", "name": "x", "prompt": "x", "repeat": "daily", "time": "11:00" } }),
+    );
+    assert_eq!(reply["type"], "error");
+    let reply = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": {
+            "agent": "tickets", "name": "工单处理", "prompt": "work the queue",
+            "repeat": "weekly", "time": "11:00", "days": [],
+        } }),
+    );
+    assert_eq!(reply["type"], "error", "a weekly schedule needs days");
+    let reply = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": {
+            "agent": "tickets", "name": "工单处理", "prompt": "work the queue",
+            "repeat": "daily", "time": "11:00",
+        } }),
+    );
+    assert_eq!(reply["type"], "schedule_saved", "{reply}");
+    let schedule = reply["schedule"].clone();
+    let id = schedule["id"].as_str().unwrap().to_string();
+    assert!(id.starts_with("sch-"));
+    assert_eq!(schedule["new_session"], true);
+    assert!(schedule["next_run_at"].as_u64().unwrap() > 0);
+    assert!(daemon.agents.join("tickets/schedules.json").exists());
+    let list = request(
+        &mut client,
+        json!({ "op": "schedule_list", "agent": "tickets" }),
+    );
+    assert_eq!(list["schedules"].as_array().unwrap().len(), 1);
+    // A client that connects now gets the list right away.
+    let mut late = Client::connect(&daemon);
+    late.until(|frame| frame["type"] == "schedules" && frame["schedules"][0]["id"] == id.as_str());
+
+    let (first, frames) = run_schedule(&mut client, "tickets", &id);
+    let reply = reply_text(&frames, &first);
+    assert!(reply.contains("定时任务「工单处理」"), "{reply}");
+    assert!(reply.contains("work the queue"), "{reply}");
+    let list = request(&mut client, json!({ "op": "schedule_list" }));
+    let listed = &list["schedules"][0];
+    assert_eq!(listed["last_session"], first.as_str());
+    assert!(listed["last_run_at"].as_u64().is_some());
+    assert_eq!(listed["next_run_at"], schedule["next_run_at"]);
+
+    // Continuing: the next run goes into the last run's session.
+    let reply = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": { "id": id, "new_session": false } }),
+    );
+    assert_eq!(reply["schedule"]["name"], "工单处理");
+    // Runs are told apart by the second they start in.
+    thread::sleep(Duration::from_millis(1100));
+    let (second, _) = run_schedule(&mut client, "tickets", &id);
+    assert_eq!(second, first);
+
+    request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": { "id": id, "new_session": true } }),
+    );
+    thread::sleep(Duration::from_millis(1100));
+    let (third, _) = run_schedule(&mut client, "tickets", &id);
+    assert_ne!(third, first);
+
+    // `id` alone names the schedule (and is echoed as the request id).
+    client.send(json!({ "op": "schedule_delete", "id": id }));
+    let frames = client.until(|frame| frame["type"] == "schedule_deleted");
+    assert_eq!(frames.last().unwrap()["id"], id.as_str());
+    let list = request(&mut client, json!({ "op": "schedule_list" }));
+    assert_eq!(list["schedules"], json!([]));
+}
+
+#[test]
+fn a_schedule_due_while_the_daemon_was_down_fires_once_on_start() {
+    let _guard = setup();
+    let root = temp_dir("schedule-down");
+    let agents = jucode_daemon::Agents::open(root.join("agents")).unwrap();
+    agents
+        .create(
+            "nightly",
+            "nightly",
+            &temp_dir("agent-nightly"),
+            "Runs at night",
+        )
+        .unwrap();
+    // Due long ago: many runs were missed.
+    let saved = json!([{
+        "id": "sch-missed", "agent": "nightly", "name": "nightly", "prompt": "catch up",
+        "enabled": true, "repeat": "hourly", "time": "00:00", "days": [], "date": null,
+        "new_session": true, "created_at": 1, "last_run_at": null, "last_session": null,
+        "next_run_at": 1,
+    }]);
+    fs::write(
+        root.join("agents/nightly/schedules.json"),
+        saved.to_string(),
+    )
+    .unwrap();
+
+    let daemon = start_daemon_on(root.join("daemon"), root.join("agents"));
+    let mut client = Client::connect(&daemon);
+    let frames = client.until(delivered_to("nightly"));
+    assert_eq!(frames.last().unwrap()["from"], "schedule:sch-missed");
+    let list = request(&mut client, json!({ "op": "schedule_list" }));
+    let schedule = &list["schedules"][0];
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(schedule["next_run_at"].as_u64().unwrap() > now);
+    thread::sleep(Duration::from_millis(1500));
+    let fired = fs::read_to_string(daemon.state.join("messages.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("\"kind\":\"message\"") && line.contains("sch-missed"))
+        .count();
+    assert_eq!(fired, 1);
+}
+
+#[test]
+fn an_agent_is_deleted_only_while_idle_and_takes_its_schedules_along() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "doomed", "Goes away");
+    create_agent(&mut client, "stays", "Stays");
+    request(
+        &mut client,
+        json!({ "op": "agent_update", "agent": "doomed", "approval_mode": "full-access" }),
+    );
+    for agent in ["doomed", "stays"] {
+        let reply = request(
+            &mut client,
+            json!({ "op": "schedule_save", "schedule": {
+                "agent": agent, "name": "n", "prompt": "p", "repeat": "hourly", "time": "00:30",
+            } }),
+        );
+        assert_eq!(reply["type"], "schedule_saved", "{reply}");
+    }
+    let reply = request(
+        &mut client,
+        json!({ "op": "timer_list", "agent": "doomed" }),
+    );
+    assert_eq!(reply["timers"], json!([]));
+
+    client.send(json!({ "op": "message_send", "agent": "doomed", "body": "RUN: sleep 3" }));
+    let frames = client.until(delivered_to("doomed"));
+    let session = frames.last().unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let reply = request(
+        &mut client,
+        json!({ "op": "agent_delete", "agent": "doomed" }),
+    );
+    assert_eq!(reply["type"], "error", "refused while running: {reply}");
+    assert!(daemon.agents.join("doomed").exists());
+    client.until(ready(&session));
+
+    let reply = request(
+        &mut client,
+        json!({ "op": "agent_delete", "agent": "doomed" }),
+    );
+    assert_eq!(reply["type"], "agent_deleted", "{reply}");
+    assert_eq!(reply["agent"], "doomed");
+    assert!(!daemon.agents.join("doomed").exists());
+    let list = request(&mut client, json!({ "op": "schedule_list" }));
+    let owners: Vec<&Value> = list["schedules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|schedule| &schedule["agent"])
+        .collect();
+    assert_eq!(owners, vec!["stays"]);
+    let agents = request(&mut client, json!({ "op": "agent_list" }));
+    assert!(!agents["agents"].to_string().contains("doomed"));
+
+    // A message for the deleted agent is refused; its old sessions stay listed.
+    let reply = request(
+        &mut client,
+        json!({ "op": "message_send", "agent": "doomed", "body": "hi" }),
+    );
+    assert_eq!(reply["type"], "error");
+    let sessions = request(&mut client, json!({ "op": "session_list" }));
+    assert!(sessions["sessions"].to_string().contains(&session));
+}
+
+#[test]
+fn agent_memory_is_read_by_file_name_only() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "keeper", "Keeps notes");
+    fs::write(
+        daemon.agents.join("keeper/memory/deploy.md"),
+        "use make ship",
+    )
+    .unwrap();
+    fs::write(daemon.agents.join("keeper/secret.md"), "nope").unwrap();
+    let page = request(&mut client, json!({ "op": "agent_get", "agent": "keeper" }));
+    assert_eq!(page["memory"], json!(["memory/deploy.md"]));
+    let reply = request(
+        &mut client,
+        json!({ "op": "agent_memory_read", "agent": "keeper", "file": "deploy.md" }),
+    );
+    assert_eq!(reply["type"], "agent_memory", "{reply}");
+    assert_eq!(reply["content"], "use make ship");
+    assert_eq!(reply["file"], "deploy.md");
+    for bad in [
+        "../x",
+        "../secret.md",
+        "../../keeper/secret.md",
+        "missing.md",
+        "deploy",
+    ] {
+        let reply = request(
+            &mut client,
+            json!({ "op": "agent_memory_read", "agent": "keeper", "file": bad }),
+        );
+        assert_eq!(reply["type"], "error", "{bad}: {reply}");
+    }
+
+    // Renaming and rewriting the role.
+    let reply = request(
+        &mut client,
+        json!({ "op": "agent_update", "agent": "keeper", "name": " " }),
+    );
+    assert_eq!(reply["type"], "error");
+    let reply = request(
+        &mut client,
+        json!({ "op": "agent_update", "agent": "keeper", "name": "Keeper", "role": "Keeps better notes" }),
+    );
+    assert_eq!(reply["agent"]["name"], "Keeper");
+    let page = request(&mut client, json!({ "op": "agent_get", "agent": "keeper" }));
+    assert_eq!(page["brief"]["role.md"], "Keeps better notes\n");
+}
+
 /// One plain HTTP request; returns (status, headers and body as text).
 fn http(daemon: &Daemon, request: &str) -> (u16, String) {
     use std::io::{Read, Write};

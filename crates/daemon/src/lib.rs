@@ -15,6 +15,7 @@ pub mod install;
 pub mod noise;
 mod projects;
 mod relay;
+mod schedules;
 mod session;
 mod skills;
 mod store;
@@ -218,6 +219,7 @@ fn pump(
         hub.sessions_json(),
         projects::workspaces_json(hub),
         hub.agents_json(),
+        hub.schedules_json(None),
         hub.questions_json(),
         hub.actions_json(),
     ] {
@@ -502,6 +504,35 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             }),
             None => Err("agent_update requires agent".to_string()),
         },
+        ("agent_delete", _) => match op["agent"].as_str() {
+            Some(id) => hub
+                .delete_agent(id)
+                .map(|()| json!({ "type": "agent_deleted", "agent": id })),
+            None => Err("agent_delete requires agent".to_string()),
+        },
+        ("agent_memory_read", _) => match (op["agent"].as_str(), op["file"].as_str()) {
+            (Some(agent), Some(file)) => hub.agents.read_memory(agent, file).map(|content| {
+                json!({ "type": "agent_memory", "agent": agent, "file": file, "content": content })
+            }),
+            _ => Err("agent_memory_read requires agent and file".to_string()),
+        },
+        ("schedule_list", _) => Ok(hub.schedules_json(op["agent"].as_str())),
+        ("schedule_save", _) => hub
+            .save_schedule(&op["schedule"])
+            .map(|schedule| json!({ "type": "schedule_saved", "schedule": schedule.to_json() })),
+        // The schedule's id comes as `schedule`, or as `id`, which then also
+        // serves as the request id.
+        ("schedule_delete" | "schedule_run", _) => {
+            match op["schedule"].as_str().or(op["id"].as_str()) {
+                Some(id) if name == "schedule_delete" => hub
+                    .delete_schedule(id)
+                    .map(|()| json!({ "type": "schedule_deleted", "schedule": id, "id": id })),
+                Some(id) => hub
+                    .run_schedule(id)
+                    .map(|()| json!({ "type": "schedule_started", "schedule": id, "id": id })),
+                None => Err(format!("{name} requires schedule")),
+            }
+        }
         // An action can be decided after its session closed or the daemon
         // restarted: reopen the session so its engine can run the action.
         ("decide_action", Some(session)) => hub
@@ -510,7 +541,9 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             .map(|()| Value::Null),
         ("timer_list", _) => Ok(json!({
             "type": "timers",
-            "timers": hub.store.active_timers().iter().map(|timer| json!({
+            "timers": hub.store.active_timers().iter()
+                .filter(|timer| op["agent"].as_str().is_none_or(|agent| timer.agent == agent))
+                .map(|timer| json!({
                 "timer": timer.id,
                 "agent": timer.agent,
                 "session": timer.session,

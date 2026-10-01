@@ -116,7 +116,8 @@ Each WebSocket text message is one JSON frame. The daemon first sends:
 {"type":"workspaces","rev":1,"workspaces":[...]}
 ```
 
-followed by the current `agents`, `questions` and `actions` lists.
+followed by the current `agents`, `schedules`, `questions` and `actions`
+lists.
 
 A client that does not speak `protocol` 2 must disconnect.
 
@@ -160,10 +161,16 @@ every connected client.
 | `git_diff` | `path`, optional `file` | `git_diff` with `diff` (unified, untracked files included, first 1 MiB), `truncated` |
 | `agent_list` | — | `agents` |
 | `agent_create` | `agent` (the new agent's id), `name`, `cwd`, `role` | `agent_created`; every client also receives the new `agents` list |
-| `message_send` | `agent`, `body`, optional `session`, `reply_to`, `dedupe_key` | `message_accepted` with `message` and `duplicate` |
-| `timer_list` | — | `timers`: active timers of all agents |
-| `agent_get` | `agent` | `agent`: settings, `brief` (the four files), `memory` file names and the agent's `sessions` |
-| `agent_update` | `agent`, optional `name`, `enabled`, `approval_mode` | `agent_updated`; every client also receives the new `agents` list |
+| `message_send` | `agent`, `body`, optional `session`, `reply_to`, `dedupe_key` | `message_accepted` with `message` (the new message's id) and `duplicate` (a message with this `dedupe_key` was already recorded; nothing is sent). Routed as below; delivery is broadcast as `message_delivered` |
+| `timer_list` | optional `agent` | `timers: [{timer, agent, session, fire_at, body}]`: active timers (of all agents, or of `agent`), soonest first; `fire_at` in ms |
+| `agent_get` | `agent` | `agent`: `agent` (settings), `brief` (`{"role.md": text, "capabilities.md": …, "policy.md": …, "state.md": …}`), `memory` (file names, `["memory/deploy.md", …]`) and the agent's `sessions` (as in `session_list`) |
+| `agent_update` | `agent`, optional `name` (not empty), `role` (rewrites `role.md`), `enabled`, `approval_mode`, `sandbox`, `network`, `directories`, `command_rules` (see "Agents") | `agent_updated` with `agent`; every client also receives the new `agents` list |
+| `agent_delete` | `agent` | `agent_deleted` with `agent`; an error while any of its sessions is running. See "Agents" |
+| `agent_memory_read` | `agent`, `file` (`deploy.md`, or `memory/deploy.md` as `agent_get` lists it) | `agent_memory` with `agent`, `file`, `content`; an error for anything but an existing `memory/<name>.md` (letters, digits, `-`, `_`) |
+| `schedule_list` | optional `agent` | `schedules`: all scheduled tasks, or `agent`'s. See "Scheduled tasks" |
+| `schedule_save` | `schedule`: without `id` creates one (`agent`, `name`, `prompt`, `repeat`, `time`, and `days` / `date` as `repeat` needs; optional `enabled`, `new_session`, both default `true`); with `id` changes the fields present among `name`, `prompt`, `enabled`, `repeat`, `time`, `days`, `date`, `new_session` | `schedule_saved` with `schedule`; `next_run_at` is computed again |
+| `schedule_delete` | `schedule` (its id) | `schedule_deleted` with `schedule` |
+| `schedule_run` | `schedule` (its id) | `schedule_started` with `schedule`; runs it now, enabled or not (an error when its agent is disabled), without changing `next_run_at` |
 | `question_list` | — | `questions`: unanswered questions |
 | `question_answer` | `question`, `answer` | `question_answered`; the answer is delivered to the session that asked |
 | `report_list` | optional `limit` (50) | `reports`, newest first, with `read` |
@@ -269,14 +276,23 @@ notes and `agent.json`:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `name`, `cwd`, `enabled` | | Display name, working directory, whether it takes messages. |
+| `name`, `cwd`, `enabled` | | Display name, working directory, whether it takes messages (and runs its scheduled tasks). |
 | `approval_mode` | `auto` | `manual`, `auto-edit`, `auto` or `full-access`. |
 | `sandbox` | `workspace-write` (`full-access` on Windows) | Where its shell commands run; see below. |
 | `network` | `true` | Whether sandboxed commands may connect out. |
 | `directories` | `[]` | `[{"path": "/abs/dir", "mode": "ro" \| "rw"}]`: directories outside `cwd` it may read, or read and write. |
 | `command_rules` | `git add`/`git commit` allow, `git push` ask | `[{"prefix": "git push", "action": "allow" \| "ask" \| "forbid"}]`. |
 
-`agent_update` changes any of these fields.
+`agent_update` changes any of these fields except `cwd`, and rewrites
+`role.md` from `role`.
+
+`agent_delete` removes `~/.jucode/agents/<id>/` (brief, memory, settings,
+scheduled tasks), cancels the agent's active timers, closes its open
+questions and its open sessions. It is refused while one of its sessions is
+running. Its sessions stay in `session_list` with their `agent`; a message
+still waiting for it becomes undeliverable, and new messages to it are
+refused. Every client receives the new `agents`, `schedules` and `questions`
+lists.
 
 ### Sandbox
 
@@ -311,7 +327,8 @@ the other agents in its system prompt, and three tools:
 | `question` | Records a question for the user (`title`, `body`, `assumption`, `default`, `due_in_seconds`, `importance`) and returns at once. The answer, or the deadline passing (the agent then goes with `default`), is delivered to the session that asked. |
 | `report` | Records a report (`title`, `body`) for the user to read; wakes nobody. |
 
-Messages (from `message_send`, `message_agent` or a fired timer) are
+Messages (from `message_send`, `message_agent`, a fired timer or a scheduled
+task) are
 recorded in `messages.jsonl` before delivery and routed to a session:
 
 1. the `session` the message names;
@@ -325,9 +342,69 @@ message that would start a fifth waits. Messages are retried every second,
 including ones left over from before a restart, and a fired timer is
 delivered once (its id is the message's dedupe key). Every client receives
 `message_delivered` (`id`, `agent`, `from`, `session`) and an updated
-`agents` list when an agent starts or stops working, an updated `questions`
+`agents` list when an agent starts or stops working, an updated `schedules`
+list when a scheduled task changes or runs, an updated `questions`
 list when a question is asked or answered, `report_posted` for a new report,
 and an updated `actions` list when an action is deferred or decided.
+
+### Scheduled tasks
+
+A scheduled task sends its prompt to an agent at set local times. Each
+agent's tasks are saved in `~/.jucode/agents/<id>/schedules.json`.
+
+```json
+{
+  "id": "sch-1a2b3c4d5e6f7a8b",
+  "agent": "ops",
+  "name": "aicare 工单处理",
+  "prompt": "处理新工单 …",
+  "enabled": true,
+  "repeat": "weekly",
+  "time": "11:00",
+  "days": [1, 3, 5],
+  "date": null,
+  "new_session": true,
+  "created_at": 1790812800,
+  "last_run_at": null,
+  "last_session": null,
+  "next_run_at": 1790996400
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `repeat` | `once`, `hourly`, `daily`, `weekdays` (Monday to Friday) or `weekly`. |
+| `time` | Local `HH:MM`, 24-hour. `hourly` uses only the minute. |
+| `days` | `weekly` only, not empty: 0 = Sunday … 6 = Saturday. |
+| `date` | `once` only: local `YYYY-MM-DD`. |
+| `new_session` | `true`: each run starts a new session. `false`: a run continues `last_session`, or starts a new one when that session is gone or no longer the agent's. |
+| `created_at`, `last_run_at`, `next_run_at` | Unix **seconds** (other daemon times are milliseconds). `next_run_at` is null for a disabled task and for a `once` task whose time has passed. |
+| `last_session` | The session the last run was delivered to, filled in once it is delivered. |
+
+Times follow this machine's time zone, daylight saving included: a local
+time skipped by a clock change runs an hour later, one that occurs twice
+runs at the first.
+
+The scheduler checks every second. A due task (`next_run_at` ≤ now) is
+recorded as a message from `schedule:<id>` with dedupe key
+`schedule:<id>:<next_run_at>`, then `last_run_at` becomes now and
+`next_run_at` the next time after now. Runs missed while the daemon or the
+computer was off therefore fire once when it starts again, not once per
+missed time. A task of a disabled agent neither fires nor moves on; it fires
+once when the agent is enabled again. `schedule_run` uses the dedupe key
+`schedule:<id>:run:<unix seconds>`, so a second run within the same second is
+dropped.
+
+The agent receives the prompt after one line naming the task:
+`定时任务「<name>」：`, under the usual delivery line
+(`[scheduled task <id> · <message id>]`).
+
+Every client receives the full `schedules` list after any change, run or
+delivery.
+
+`schedule_delete` and `schedule_run` also take the task's id as `id` when
+`schedule` is absent; that `id` is then the request id too, echoed in the
+reply.
 
 ## Session ops
 

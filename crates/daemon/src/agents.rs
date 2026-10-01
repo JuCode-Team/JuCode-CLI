@@ -1,9 +1,11 @@
 //! Long-lived agents: `~/.jucode/agents/<id>/` holds an agent's brief
 //! (`role.md`, `capabilities.md`, `policy.md`, `state.md`), its `memory/`
-//! notes and `agent.json` (name, working directory, settings). The daemon
+//! notes, `agent.json` (name, working directory, settings) and
+//! `schedules.json` (its scheduled tasks, see `schedules`). The daemon
 //! reads the brief into every turn of the agent's sessions; the agent keeps
 //! it current with the `brief` tool.
 
+use crate::store::write_private;
 use jucode_agent_core::sandbox::{
     default_rules_json, directories_from_json, rules_from_json, rules_to_json, CommandRule,
     SandboxMode, SandboxPolicy,
@@ -190,7 +192,8 @@ impl Agents {
 
     /// Changes the settings present in `changes` (`name`, `enabled`,
     /// `approval_mode`, `sandbox`, `network`, `directories`,
-    /// `command_rules`), keeping the rest of `agent.json`.
+    /// `command_rules`), keeping the rest of `agent.json`; `role` rewrites
+    /// `role.md`.
     pub fn update(&self, id: &str, changes: &Value) -> Result<Agent, String> {
         if !valid_id(id) {
             return Err(format!("unknown agent {id}"));
@@ -198,11 +201,10 @@ impl Agents {
         let path = self.dir.join(id).join("agent.json");
         let text = fs::read_to_string(&path).map_err(|_| format!("unknown agent {id}"))?;
         let mut settings: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
-        if let Some(name) = changes["name"]
-            .as_str()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        {
+        if let Some(name) = changes["name"].as_str().map(str::trim) {
+            if name.is_empty() {
+                return Err("agent name must not be empty".to_string());
+            }
             settings["name"] = json!(name);
         }
         if let Some(enabled) = changes["enabled"].as_bool() {
@@ -233,7 +235,35 @@ impl Agents {
         }
         let text = serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())?;
         fs::write(&path, text + "\n").map_err(|error| error.to_string())?;
+        if let Some(role) = changes["role"].as_str() {
+            self.write_brief(id, "role.md", &format!("{}\n", role.trim()))?;
+        }
         self.get(id).ok_or_else(|| format!("unknown agent {id}"))
+    }
+
+    /// Removes the agent's folder: brief, memory, settings and schedules.
+    pub fn delete(&self, id: &str) -> Result<(), String> {
+        if !valid_id(id) {
+            return Err(format!("unknown agent {id}"));
+        }
+        fs::remove_dir_all(self.dir.join(id)).map_err(|error| error.to_string())
+    }
+
+    /// The saved scheduled tasks of agent `id` (`schedules.json`).
+    pub fn schedules(&self, id: &str) -> Vec<Value> {
+        fs::read_to_string(self.dir.join(id).join("schedules.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save_schedules(&self, id: &str, schedules: &[Value]) -> Result<(), String> {
+        let text = serde_json::to_string_pretty(schedules).map_err(|error| error.to_string())?;
+        write_private(
+            &self.dir.join(id).join("schedules.json"),
+            (text + "\n").as_bytes(),
+        )
+        .map_err(|error| error.to_string())
     }
 
     /// Reads a brief file (`role.md` … `state.md`) or `memory/<name>.md`.
@@ -252,6 +282,23 @@ impl Agents {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
         fs::write(path, content).map_err(|error| error.to_string())
+    }
+
+    /// An existing memory note by its file name (`deploy.md`; the
+    /// `memory/deploy.md` form `memory_files` lists also works).
+    pub fn read_memory(&self, id: &str, file: &str) -> Result<String, String> {
+        let name = file.strip_prefix("memory/").unwrap_or(file);
+        let file = format!("memory/{name}");
+        if self.get(id).is_none() {
+            return Err(format!("unknown agent {id}"));
+        }
+        if !valid_memory_file(&file) {
+            return Err(format!(
+                "invalid memory file '{name}': use a name like deploy.md"
+            ));
+        }
+        fs::read_to_string(self.dir.join(id).join(&file))
+            .map_err(|_| format!("agent {id} has no memory file {name}"))
     }
 
     /// `memory/<name>.md` files, sorted.
