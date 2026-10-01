@@ -118,7 +118,8 @@ jobs:
           done
 
       - name: Write third-party notices
-        run: node scripts/third-party-notices.mjs --cargo Cargo.toml --title "JuCode CLI: third-party software" --out jucode-third-party-notices.txt
+        run: |
+          node scripts/third-party-notices.mjs --cargo Cargo.toml --title "JuCode CLI: third-party software" --out jucode-third-party-notices.txt
 
       - name: Sync npm versions
         env:
