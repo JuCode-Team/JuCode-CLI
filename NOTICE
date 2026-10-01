@@ -3,3 +3,8 @@ Copyright 2026 Jucode Innovations INC.
 
 crates/llm-provider-kit contains code and data from oh-my-pi, used under the
 MIT License; see crates/llm-provider-kit/NOTICE.
+
+crates/agent-core/src/anthropic-skills.json indexes the skills in
+https://github.com/anthropics/skills (names, descriptions and license fields).
+Skills are downloaded from that repository when installed and remain under
+their own licenses.
