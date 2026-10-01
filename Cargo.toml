@@ -1,6 +1,8 @@
 [package]
 name = "jucode-cli"
 version.workspace = true
+license.workspace = true
+authors.workspace = true
 edition = "2021"
 
 [[bin]]
@@ -13,6 +15,8 @@ resolver = "2"
 
 [workspace.package]
 version = "0.3.0"
+license = "Apache-2.0"
+authors = ["Jucode Innovations INC."]
 
 [dependencies]
 jucode-agent-core = { path = "crates/agent-core" }

@@ -10,7 +10,8 @@
     "jucode": "bin/jucode.cjs"
   },
   "files": [
-    "bin/jucode.cjs"
+    "bin/jucode.cjs",
+    "NOTICE"
   ],
   "optionalDependencies": {
     "@jucode/cli-linux-x64": "0.3.0",

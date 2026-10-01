@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { releaseTargets, rootPackageDirectory } from "./release-targets.mjs";
@@ -49,6 +49,10 @@ for (const target of selectedTargets) {
 
 for (const directory of [...selectedTargets.map((target) => target.directory), rootPackageDirectory]) {
   const cwd = path.join(repoRoot, "npm", directory);
+  // Apache-2.0 §4: every published package carries the license and notices.
+  for (const file of ["LICENSE", "NOTICE"]) {
+    copyFileSync(path.join(repoRoot, file), path.join(cwd, file));
+  }
   if (process.platform === "win32") {
     execFileSync(
       process.env.comspec || "cmd.exe",

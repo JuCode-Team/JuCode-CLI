@@ -1,0 +1,5 @@
+JuCode CLI
+Copyright 2026 Jucode Innovations INC.
+
+crates/llm-provider-kit contains code and data from oh-my-pi, used under the
+MIT License; see crates/llm-provider-kit/NOTICE.

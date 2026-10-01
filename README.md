@@ -19,6 +19,18 @@ The project is intentionally small: the agent harness is designed to give the mo
 
 ## Installation
 
+Prebuilt binaries for macOS (Apple Silicon and Intel), Linux x64 and Windows x64
+are published on [GitHub Releases](https://github.com/JuCode-Team/JuCode-CLI/releases/latest)
+and on npm:
+
+```bash
+npm install -g @jucode/cli
+jucode
+```
+
+[JuCode Desktop](https://github.com/JuCode-Team/JuCode-Desktop) installs the CLI
+during its first-run setup.
+
 ### From source
 
 ```bash
@@ -188,12 +200,6 @@ You can also pipe the task through stdin:
 cat task.md | jucode --headless
 ```
 
-Headless defaults to the safest approval mode (`manual`), and any tool call that would need interactive approval is denied automatically instead of hanging the run. Opt in to unattended edits or shell commands explicitly:
-
-```bash
-jucode --headless --approval-mode full-access "Fix the failing test"
-```
-
 `full-access` runs the model's shell commands and file writes with your user
 permissions and no prompts — `bash` is not confined to the workspace, so only
 use it for tasks and repositories you trust.
@@ -282,3 +288,13 @@ Run a quick headless smoke task:
 ## Project status
 
 JuCode CLI is an active experimental coding-agent harness. The current direction is to keep the framework small, improve task completion reliability, and optimize context quality rather than adding broad agent abstractions.
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Copyright 2026 Jucode Innovations INC.
+
+`crates/llm-provider-kit` includes code and data from
+[oh-my-pi](https://github.com/can1357/oh-my-pi) under the MIT License; see
+[its NOTICE](crates/llm-provider-kit/NOTICE). The JuCode name and logo are
+trademarks of Jucode Innovations INC. and are not licensed for use by forks.

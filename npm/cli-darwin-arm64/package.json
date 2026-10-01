@@ -13,6 +13,7 @@
     "arm64"
   ],
   "files": [
-    "bin/jucode"
+    "bin/jucode",
+    "NOTICE"
   ]
 }
