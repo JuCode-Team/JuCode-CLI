@@ -364,7 +364,7 @@ impl TuiState {
                     self.append_thinking_delta(&delta);
                     true
                 }
-                AgentEvent::Retrying { attempt } => {
+                AgentEvent::Retrying { attempt, .. } => {
                     // The request is re-sent from scratch, so drop any partial
                     // streamed output to avoid duplicating it on the retry.
                     self.discard_partial_assistant();

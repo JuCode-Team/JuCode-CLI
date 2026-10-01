@@ -94,6 +94,9 @@ enum WorkerEvent {
     Delta(String),
     Retrying {
         attempt: usize,
+        max_attempts: usize,
+        reason: String,
+        delay_ms: u64,
     },
     ResponseItem(Value),
     ToolStart {
@@ -1463,8 +1466,18 @@ impl AgentCore {
                         events.push(AgentEvent::ReasoningDelta(delta))
                     }
                     WorkerEvent::Delta(delta) => events.push(AgentEvent::AssistantDelta(delta)),
-                    WorkerEvent::Retrying { attempt } => {
-                        events.push(AgentEvent::Retrying { attempt });
+                    WorkerEvent::Retrying {
+                        attempt,
+                        max_attempts,
+                        reason,
+                        delay_ms,
+                    } => {
+                        events.push(AgentEvent::Retrying {
+                            attempt,
+                            max_attempts,
+                            reason,
+                            delay_ms,
+                        });
                     }
                     WorkerEvent::ResponseItem(item) => {
                         self.session.append(EntryKind::ResponseItem { item });
@@ -1963,7 +1976,17 @@ impl AgentCore {
                     StreamEvent::Connected => WorkerEvent::Connected,
                     StreamEvent::ReasoningDelta(delta) => WorkerEvent::ReasoningDelta(delta),
                     StreamEvent::Delta(delta) => WorkerEvent::Delta(delta),
-                    StreamEvent::Retrying { attempt } => WorkerEvent::Retrying { attempt },
+                    StreamEvent::Retrying {
+                        attempt,
+                        max_attempts,
+                        reason,
+                        delay_ms,
+                    } => WorkerEvent::Retrying {
+                        attempt,
+                        max_attempts,
+                        reason,
+                        delay_ms,
+                    },
                     StreamEvent::ResponseItem(item) => WorkerEvent::ResponseItem(item),
                     StreamEvent::ToolStart { call_id, name } => {
                         WorkerEvent::ToolStart { call_id, name }

@@ -228,7 +228,18 @@ pub fn event_json(event: AgentEvent) -> Value {
         AgentEvent::AssistantDelta(delta) => {
             json!({ "type": "assistant_delta", "delta": delta })
         }
-        AgentEvent::Retrying { attempt } => json!({ "type": "retrying", "attempt": attempt }),
+        AgentEvent::Retrying {
+            attempt,
+            max_attempts,
+            reason,
+            delay_ms,
+        } => json!({
+            "type": "retrying",
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "reason": reason,
+            "delay_ms": delay_ms,
+        }),
         AgentEvent::ToolStart { call_id, name } => {
             json!({ "type": "tool_start", "call_id": call_id, "name": name })
         }

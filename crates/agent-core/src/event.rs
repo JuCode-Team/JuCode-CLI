@@ -129,8 +129,13 @@ pub enum AgentEvent {
     ReasoningDelta(String),
     AssistantStart,
     AssistantDelta(String),
+    /// A model request failed with `reason` and is re-sent after `delay_ms`
+    /// as attempt `attempt` of `max_attempts`.
     Retrying {
         attempt: usize,
+        max_attempts: usize,
+        reason: String,
+        delay_ms: u64,
     },
     ToolStart {
         call_id: String,

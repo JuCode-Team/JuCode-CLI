@@ -274,6 +274,9 @@ pub enum StreamEvent {
     Delta(String),
     Retrying {
         attempt: usize,
+        max_attempts: usize,
+        reason: String,
+        delay_ms: u64,
     },
     ResponseItem(Value),
     ToolStart {
@@ -2348,9 +2351,19 @@ fn retry_attempts_from_env(configured: usize) -> usize {
 fn map_transport_event(event: TransportEvent) -> Result<StreamEvent, String> {
     Ok(match event {
         TransportEvent::Connected => StreamEvent::Connected,
-        TransportEvent::Retrying { attempt } => {
-            crate::log_warn!("llm", "retrying request", attempt = attempt);
-            StreamEvent::Retrying { attempt }
+        TransportEvent::Retrying {
+            attempt,
+            max_attempts,
+            reason,
+            delay_ms,
+        } => {
+            crate::log_warn!("llm", "retrying request", attempt = attempt, reason = reason);
+            StreamEvent::Retrying {
+                attempt,
+                max_attempts,
+                reason,
+                delay_ms,
+            }
         }
         TransportEvent::Wire(wire) => wire_to_stream(wire),
     })
@@ -2984,7 +2997,12 @@ mod tests {
         stats.record(StreamEvent::Delta("first ".to_string()));
         stats.record(StreamEvent::CallStart);
         stats.record(StreamEvent::Delta("dup".to_string()));
-        stats.record(StreamEvent::Retrying { attempt: 2 });
+        stats.record(StreamEvent::Retrying {
+            attempt: 2,
+            max_attempts: 3,
+            reason: "HTTP 503".to_string(),
+            delay_ms: 500,
+        });
         stats.record(StreamEvent::Delta("second".to_string()));
 
         assert_eq!(stats.output_text, "first second");
