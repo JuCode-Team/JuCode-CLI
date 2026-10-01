@@ -22,7 +22,7 @@ jobs:
           - runner: windows-latest
             rust_target: x86_64-pc-windows-msvc
             binary_name: jucode.exe
-          - runner: ubuntu-latest
+          - runner: ubuntu-22.04
             rust_target: x86_64-unknown-linux-gnu
             binary_name: jucode
 
