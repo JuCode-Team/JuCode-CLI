@@ -223,7 +223,7 @@ USAGE:
                                          ACP-capable editors like Zed
     jucode providers                     print built-in providers as JSON
     jucode token                         print a JuCode access token as JSON (refreshed when needed)
-    jucode update                        update an npm-installed jucode
+    jucode update                        update jucode to the latest release
     jucode version                       print the version
 
 OPTIONS:
@@ -361,26 +361,36 @@ fn queue_headless_denial(event: &AgentEvent, pending_denials: &mut Vec<(String, 
     }
 }
 
-/// `jucode update`: npm installs self-update through npm; other channels get
-/// the release URL instead of a partial fix.
+/// `jucode update`: npm installs update through npm, the copy JuCode Desktop
+/// manages updates with the app, and a release binary replaces itself.
 fn run_update() -> i32 {
     use jucode_agent_core::update;
-    if update::install_channel() != update::InstallChannel::Npm {
-        eprintln!("{}", update::non_npm_update_hint());
-        return 1;
+    let current = env!("CARGO_PKG_VERSION");
+    let channel = update::install_channel();
+    if channel == update::InstallChannel::Desktop {
+        println!("this jucode is managed by JuCode Desktop and updates with the app ({current})");
+        return 0;
     }
-    match update::latest_cli_version() {
-        Ok(latest) if !update::is_newer_version(env!("CARGO_PKG_VERSION"), &latest) => {
-            println!(
-                "already up to date ({}; latest {latest})",
-                env!("CARGO_PKG_VERSION")
-            );
+    let release = match update::latest_release(std::time::Duration::from_secs(10)) {
+        Ok(release) => Some(release),
+        Err(error) => {
+            eprintln!("version check failed ({error})");
+            None
+        }
+    };
+    if let Some(release) = &release {
+        if !update::is_newer_version(current, &release.version) {
+            println!("already up to date ({current}; latest {})", release.version);
             return 0;
         }
-        Ok(latest) => println!("updating to {latest}..."),
-        Err(error) => eprintln!("version check failed ({error}); trying npm anyway"),
+        println!("updating to {}...", release.version);
     }
-    match update::run_npm_update() {
+    let result = match (channel, &release) {
+        (update::InstallChannel::Npm, _) => update::run_npm_update(),
+        (_, Some(release)) => update::self_update(release),
+        (_, None) => Err("cannot update without the release information".to_string()),
+    };
+    match result {
         Ok(message) => {
             println!("{message}");
             0

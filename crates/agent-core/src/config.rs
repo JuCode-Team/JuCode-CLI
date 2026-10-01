@@ -540,7 +540,7 @@ impl Config {
             fs::create_dir_all(parent)?;
         }
 
-        let value = json!({
+        let mut value = json!({
             "provider": self.provider,
             "protocol": self.protocol,
             "model": self.model,
@@ -577,6 +577,17 @@ impl Config {
             "web_search_engine": self.web_search_engine,
             "web_fetch_engine": self.web_fetch_engine,
         });
+        // Keys this version does not know stay as they are: JuCode Desktop's
+        // own settings, and a newer CLI's when an older one saves.
+        if let Ok(Value::Object(mut saved)) = fs::read_to_string(&self.path)
+            .map_err(|_| ())
+            .and_then(|text| serde_json::from_str::<Value>(&text).map_err(|_| ()))
+        {
+            if let Value::Object(known) = value {
+                saved.extend(known);
+                value = Value::Object(saved);
+            }
+        }
         write_atomically(
             &self.path,
             &format!("{}\n", serde_json::to_string_pretty(&value)?),
@@ -1575,7 +1586,15 @@ fn ensure_system_prompt_file() -> io::Result<()> {
     fs::write(path, format!("{DEFAULT_SYSTEM_PROMPT}\n"))
 }
 
-fn jucode_dir() -> io::Result<PathBuf> {
+/// The JuCode gateway's API base from the saved config, read without
+/// rewriting the file (the default when there is none).
+pub(crate) fn saved_jucode_api_url() -> String {
+    Config::load_existing()
+        .map(|config| config.jucode_api_url)
+        .unwrap_or_else(|_| "https://api.jucode.net".to_string())
+}
+
+pub(crate) fn jucode_dir() -> io::Result<PathBuf> {
     let home = env::var_os("USERPROFILE")
         .or_else(|| env::var_os("HOME"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
@@ -2181,6 +2200,28 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(entries, ["config.json".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_save_keeps_keys_it_does_not_know() {
+        let dir = std::env::temp_dir().join(format!(
+            "jucode-config-keep-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        fs::write(&path, "{\"model\":\"gpt-5.5\",\"asr\":{\"engine\":\"whisper\"}}\n").unwrap();
+        let mut config = Config::from_value(&fs::read_to_string(&path).unwrap(), path.clone()).unwrap();
+        config.model = "gpt-6-sol".to_string();
+        config.save().unwrap();
+
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["model"], "gpt-6-sol");
+        assert_eq!(saved["asr"]["engine"], "whisper");
         let _ = fs::remove_dir_all(&dir);
     }
 

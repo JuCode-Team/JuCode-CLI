@@ -127,12 +127,21 @@ jobs:
       - name: Pack npm packages
         run: npm run release:pack -- --target x86_64-unknown-linux-gnu --target x86_64-pc-windows-msvc
 
+      # Release assets are named by target triple (as the macOS workflow
+      # does), so installers and the update service can pick one per platform.
+      - name: Name binaries by target for the release
+        shell: bash
+        run: |
+          cp artifacts-normalized/x86_64-unknown-linux-gnu/jucode jucode-x86_64-unknown-linux-gnu
+          cp artifacts-normalized/x86_64-pc-windows-msvc/jucode.exe jucode-x86_64-pc-windows-msvc.exe
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.release_meta.outputs.tag }}
           files: |
-            artifacts-normalized/**/jucode*
+            jucode-x86_64-unknown-linux-gnu
+            jucode-x86_64-pc-windows-msvc.exe
             dist/npm/*.tgz
 
       - name: Publish npm packages

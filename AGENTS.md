@@ -31,7 +31,7 @@ This project implements a standard MCP client (stdio and streamable HTTP transpo
 
 ## Recurring Defects
 
-- `Config::load_or_create` rewrites `config.json` (and drops keys it does not know, such as the desktop's); code that runs per request or concurrently reads it with `Config::load_existing`.
+- `Config::load_or_create` rewrites `config.json` (keys it does not know are kept, but concurrent writers race on the file); code that runs per request or concurrently reads it with `Config::load_existing`.
 - Do not enable `ureq`'s `try_proxy_from_env`: it reads `ALL_PROXY` first, has no SOCKS support built in and ignores `NO_PROXY`, so a common shell proxy setup fails every request.
 
 ## TUI Guidelines
