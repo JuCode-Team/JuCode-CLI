@@ -105,10 +105,13 @@ fn print_status(reply: &Value) {
 
 /// Connects as a local client and waits for the daemon's hello.
 fn open(listen: &str) -> Result<Socket, String> {
-    let store =
-        jucode_daemon::Store::open(jucode_daemon::state_dir().map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
-    let token = store.token().map_err(|error| error.to_string())?;
+    // Read the token file directly: the running daemon holds the store.
+    let path = jucode_daemon::state_dir()
+        .map_err(|error| error.to_string())?
+        .join("token");
+    let token = std::fs::read_to_string(&path)
+        .map_err(|error| format!("no daemon token at {} ({error})", path.display()))?;
+    let token = token.trim();
     let (mut socket, _) = connect(format!("ws://{listen}/?token={token}")).map_err(|error| {
         format!("no daemon at {listen} ({error}); start it with `jucode daemon`")
     })?;
