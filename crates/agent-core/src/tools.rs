@@ -553,11 +553,12 @@ fn str_replace_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         Ok(path) => path,
         Err(error) => return json!({ "error": error }),
     };
-    if !state.has_read(&path) {
-        return json!({
-            "path": path.display().to_string(),
-            "error": "edit requires reading this file first so oldText matches bytes on disk"
-        });
+    if let Some(error) = unread_or_stale_error(
+        state,
+        &path,
+        "edit requires reading this file first so oldText matches bytes on disk",
+    ) {
+        return error;
     }
     let original = match fs::read_to_string(&path) {
         Ok(content) => content,
@@ -656,11 +657,12 @@ fn hashline_edit_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         Ok(path) => path,
         Err(error) => return json!({ "error": error }),
     };
-    if !state.has_read(&path) {
-        return json!({
-            "path": path.display().to_string(),
-            "error": "hashline_edit requires reading this file first and copying LINE#HASH anchors from read().hashlines"
-        });
+    if let Some(error) = unread_or_stale_error(
+        state,
+        &path,
+        "hashline_edit requires reading this file first and copying LINE#HASH anchors from read().hashlines",
+    ) {
+        return error;
     }
 
     let original = match fs::read_to_string(&path) {
@@ -708,11 +710,14 @@ fn write_file(args: &Value, cwd: &Path, state: &ToolState) -> Value {
         Err(error) => return json!({ "error": error }),
     };
     let exists = path.exists();
-    if exists && !state.has_read(&path) {
-        return json!({
-            "path": path.display().to_string(),
-            "error": "write requires reading an existing file first before overwriting it; new files can be written without a prior read"
-        });
+    if exists {
+        if let Some(error) = unread_or_stale_error(
+            state,
+            &path,
+            "write requires reading an existing file first before overwriting it; new files can be written without a prior read",
+        ) {
+            return error;
+        }
     }
     let original = if exists {
         fs::read_to_string(&path).unwrap_or_default()
@@ -2433,18 +2438,48 @@ fn normalize_path_key(path: &Path) -> String {
     }
 }
 
+fn file_fingerprint(path: &Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let bytes = fs::read(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// The error for an edit to a file this agent has not read, or whose content
+/// changed since it last read it; None when the edit may proceed.
+fn unread_or_stale_error(state: &ToolState, path: &Path, not_read: &str) -> Option<Value> {
+    let error = match state.read_check(path) {
+        ReadCheck::Fresh => return None,
+        ReadCheck::NotRead => not_read,
+        ReadCheck::Stale => "file changed on disk since you last read it (another agent, the user, or a command modified it); read it again and redo the edit against the current content",
+    };
+    Some(json!({ "path": path.display().to_string(), "error": error }))
+}
+
 /// Per-engine tool state. One per engine (shared with its subagents), so
-/// several engines in one process never see each other's:
-/// - files read (or written) since the engine started: editing an existing
-///   file requires having read it first;
-/// - background shell sessions started by `bash`: `write_stdin` may only
-///   reach the engine's own.
+/// several engines in one process never see each other's background shell
+/// sessions started by `bash`: `write_stdin` may only reach the engine's own.
+///
+/// `reads` is per agent (`for_subagent` starts a fresh one): the content
+/// fingerprint of each file as this agent last read or wrote it. Editing an
+/// existing file requires having read it, and fails once anyone else (another
+/// agent, the user, a command) has changed it since — so parallel agents in
+/// one tree cannot silently overwrite each other.
 #[derive(Clone, Default)]
-pub struct ToolState(Arc<Mutex<ToolStateInner>>);
+pub struct ToolState {
+    inner: Arc<Mutex<ToolStateInner>>,
+    reads: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+enum ReadCheck {
+    Fresh,
+    NotRead,
+    Stale,
+}
 
 #[derive(Default)]
 struct ToolStateInner {
-    reads: HashSet<String>,
     shells: HashSet<u64>,
     /// When set, shell commands run in this OS sandbox and file writes are
     /// checked against it.
@@ -2476,23 +2511,26 @@ impl Drop for ToolStateInner {
 
 impl ToolState {
     pub fn set_sandbox(&self, sandbox: Option<crate::sandbox::SandboxPolicy>) {
-        if let Ok(mut inner) = self.0.lock() {
+        if let Ok(mut inner) = self.inner.lock() {
             inner.sandbox = sandbox;
         }
     }
 
     pub fn sandbox(&self) -> Option<crate::sandbox::SandboxPolicy> {
-        self.0.lock().ok().and_then(|inner| inner.sandbox.clone())
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.sandbox.clone())
     }
 
     pub fn set_web(&self, web: Option<crate::web::WebTools>) {
-        if let Ok(mut inner) = self.0.lock() {
+        if let Ok(mut inner) = self.inner.lock() {
             inner.web = web;
         }
     }
 
     pub fn web(&self) -> Option<crate::web::WebTools> {
-        self.0.lock().ok().and_then(|inner| inner.web.clone())
+        self.inner.lock().ok().and_then(|inner| inner.web.clone())
     }
 
     /// web_search runs through the gateway, so it needs a JuCode session.
@@ -2500,27 +2538,47 @@ impl ToolState {
         self.web().is_some_and(|web| web.signed_in)
     }
 
-    fn mark_read(&self, path: &Path) {
-        if let Ok(mut inner) = self.0.lock() {
-            inner.reads.insert(normalize_path_key(path));
+    /// The same engine state with an empty read record, for a subagent: it
+    /// must read files itself before editing them.
+    pub(crate) fn for_subagent(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            reads: Arc::default(),
         }
     }
 
-    fn has_read(&self, path: &Path) -> bool {
-        self.0
+    fn mark_read(&self, path: &Path) {
+        let key = normalize_path_key(path);
+        let fingerprint = file_fingerprint(path);
+        if let Ok(mut reads) = self.reads.lock() {
+            match fingerprint {
+                Some(fingerprint) => reads.insert(key, fingerprint),
+                None => reads.remove(&key),
+            };
+        }
+    }
+
+    fn read_check(&self, path: &Path) -> ReadCheck {
+        let recorded = self
+            .reads
             .lock()
-            .map(|inner| inner.reads.contains(&normalize_path_key(path)))
-            .unwrap_or(false)
+            .ok()
+            .and_then(|reads| reads.get(&normalize_path_key(path)).copied());
+        match recorded {
+            None => ReadCheck::NotRead,
+            Some(recorded) if file_fingerprint(path) == Some(recorded) => ReadCheck::Fresh,
+            Some(_) => ReadCheck::Stale,
+        }
     }
 
     fn own_shell(&self, session_id: u64) {
-        if let Ok(mut inner) = self.0.lock() {
+        if let Ok(mut inner) = self.inner.lock() {
             inner.shells.insert(session_id);
         }
     }
 
     fn owns_shell(&self, session_id: u64) -> bool {
-        self.0
+        self.inner
             .lock()
             .map(|inner| inner.shells.contains(&session_id))
             .unwrap_or(false)
@@ -4110,11 +4168,84 @@ mod tests {
         );
         let value = serde_json::from_str::<Value>(&result).unwrap();
 
+        // The file changed after the read, so the stale-read gate rejects the
+        // edit before the anchors are even checked.
         assert!(value["error"]
             .as_str()
             .unwrap()
-            .contains("[E_STALE_ANCHOR]"));
+            .contains("changed on disk since you last read it"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nchanged\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_rejects_file_changed_since_read() {
+        let dir = test_dir("write-stale");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "original\n").unwrap();
+        run_tool("read", &json!({ "path": path }).to_string(), &dir);
+        fs::write(&path, "someone else's change\n").unwrap();
+
+        let result = run_tool(
+            "write",
+            &json!({ "path": path, "content": "mine\n" }).to_string(),
+            &dir,
+        );
+        let value = serde_json::from_str::<Value>(&result).unwrap();
+        assert!(value["error"]
+            .as_str()
+            .unwrap()
+            .contains("changed on disk since you last read it"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "someone else's change\n"
+        );
+
+        // Reading again picks up the current content and unblocks the write.
+        run_tool("read", &json!({ "path": path }).to_string(), &dir);
+        let result = run_tool(
+            "write",
+            &json!({ "path": path, "content": "mine\n" }).to_string(),
+            &dir,
+        );
+        assert!(serde_json::from_str::<Value>(&result).unwrap()["error"].is_null());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "mine\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn subagent_tool_state_must_read_before_editing() {
+        let dir = test_dir("subagent-reads");
+        let path = dir.join("sample.txt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "original\n").unwrap();
+        let parent = ToolState::default();
+        run_tool_with_events(
+            "read",
+            &json!({ "path": path }).to_string(),
+            &dir,
+            &[],
+            &parent,
+            |_| Ok(()),
+        );
+
+        let child = parent.for_subagent();
+        let result = run_tool_with_events(
+            "write",
+            &json!({ "path": path, "content": "child\n" }).to_string(),
+            &dir,
+            &[],
+            &child,
+            |_| Ok(()),
+        );
+        assert!(
+            serde_json::from_str::<Value>(&result.output).unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("requires reading an existing file first")
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original\n");
         let _ = fs::remove_dir_all(dir);
     }
 

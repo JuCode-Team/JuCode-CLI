@@ -749,6 +749,7 @@ impl AgentCore {
             "/permissions" => self.permissions_command_events(args.trim()),
             "/sandbox" => self.sandbox_command_events(args.trim()),
             "/effort" => self.effort_command_events(args.trim()),
+            "/subagents" => self.subagents_command_events(args.trim()),
             "/mcp" => self.mcp_command_events(args.trim()),
             "/context" => self.context_events(),
             "/stats" => self.stats_events(),
@@ -1789,6 +1790,11 @@ impl AgentCore {
             }
         }
 
+        // Desktop edits subagent_models in config.json while engines run. An
+        // unreadable file keeps the list this engine already has.
+        if let Ok(models) = crate::config::read_subagent_models_at(self.config.path()) {
+            self.config.subagent_models = models;
+        }
         let (goal_tool_tx, goal_tool_rx) = mpsc::channel();
         self.goal_tool_receiver = Some(goal_tool_rx);
         let (approval_tx, approval_rx) = mpsc::channel();
@@ -1799,12 +1805,8 @@ impl AgentCore {
             provider: self.config.provider.clone(),
             protocol: self.config.protocol.clone(),
             reasoning_effort: self.effective_reasoning_effort(),
-            model_reasoning_efforts: self
-                .config
-                .models
-                .iter()
-                .map(|m| (m.name.clone(), m.reasoning_efforts.clone()))
-                .collect(),
+            models: self.config.models.clone(),
+            subagent_models: self.config.subagent_models.clone(),
             system_prompt,
             prompt_cache_key: self.session.session_id().to_string(),
             mcp: self.mcp.clone(),
@@ -2036,7 +2038,8 @@ impl AgentCore {
             provider: self.config.provider.clone(),
             protocol: self.config.protocol.clone(),
             reasoning_effort,
-            model_reasoning_efforts: Vec::new(),
+            models: Vec::new(),
+            subagent_models: Vec::new(),
             system_prompt: String::new(),
             prompt_cache_key: self.session.session_id().to_string(),
             mcp: McpManager::default(),
@@ -2088,7 +2091,8 @@ impl AgentCore {
             } else {
                 self.config.compact().1
             },
-            model_reasoning_efforts: Vec::new(),
+            models: Vec::new(),
+            subagent_models: Vec::new(),
             system_prompt: String::new(),
             prompt_cache_key: self.session.session_id().to_string(),
             mcp: McpManager::default(),
@@ -2505,6 +2509,101 @@ impl AgentCore {
 
     /// `/effort [level]` — with no argument cycle to the next effort the
     /// current model supports; with one, set it explicitly.
+    /// `/subagents`: list, add (or re-describe), or remove the models
+    /// `spawn_agent` may choose. The main model is always available.
+    fn subagents_command_events(&mut self, args: &str) -> Vec<AgentEvent> {
+        const USAGE: &str = "usage: /subagents [add <model> <when to use>|remove <model>]";
+        let (action, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+        let (model, description) = rest
+            .trim()
+            .split_once(char::is_whitespace)
+            .map_or((rest.trim(), ""), |(model, description)| {
+                (model, description.trim())
+            });
+        match (action, model) {
+            ("", _) => {
+                self.reload_model_list();
+                vec![AgentEvent::Info(self.subagent_models_lines())]
+            }
+            ("add", model) if !model.is_empty() => {
+                self.reload_model_list();
+                if !self.config.models.iter().any(|entry| entry.name == model) {
+                    return vec![AgentEvent::Error(format!(
+                        "unknown model: {model} (see /model for configured models)"
+                    ))];
+                }
+                let entry = crate::config::SubagentModel {
+                    name: model.to_string(),
+                    description: description.to_string(),
+                };
+                let result = self.change_config(|config| {
+                    match config
+                        .subagent_models
+                        .iter_mut()
+                        .find(|existing| existing.name == entry.name)
+                    {
+                        Some(existing) => *existing = entry.clone(),
+                        None => config.subagent_models.push(entry.clone()),
+                    }
+                });
+                match result {
+                    Ok(()) => vec![AgentEvent::Status(format!("subagents may use {model}"))],
+                    Err(error) => {
+                        vec![AgentEvent::Error(format!("failed to save config: {error}"))]
+                    }
+                }
+            }
+            ("remove", model) if !model.is_empty() && description.is_empty() => {
+                if !self
+                    .config
+                    .subagent_models
+                    .iter()
+                    .any(|entry| entry.name == model)
+                {
+                    return vec![AgentEvent::Error(format!(
+                        "{model} is not a subagent model"
+                    ))];
+                }
+                match self.change_config(|config| {
+                    config.subagent_models.retain(|entry| entry.name != model)
+                }) {
+                    Ok(()) => vec![AgentEvent::Status(format!(
+                        "subagents no longer use {model}"
+                    ))],
+                    Err(error) => {
+                        vec![AgentEvent::Error(format!("failed to save config: {error}"))]
+                    }
+                }
+            }
+            _ => vec![AgentEvent::Error(USAGE.to_string())],
+        }
+    }
+
+    fn subagent_models_lines(&self) -> String {
+        let mut lines = vec![format!(
+            "subagent models (the main model {} is always available):",
+            self.config.model
+        )];
+        if self.config.subagent_models.is_empty() {
+            lines.push("  none — subagents run on the main model".to_string());
+        }
+        for entry in &self.config.subagent_models {
+            let configured = self.config.models.iter().any(|m| m.name == entry.name);
+            let mut line = format!("  {}", entry.name);
+            if !entry.description.is_empty() {
+                line.push_str(&format!(" — {}", entry.description));
+            }
+            if !configured {
+                line.push_str(" (not in the current model list; ignored)");
+            }
+            lines.push(line);
+        }
+        lines.push(
+            "usage: /subagents add <model> <when to use> | /subagents remove <model>".to_string(),
+        );
+        lines.join("\n")
+    }
+
     fn effort_command_events(&mut self, arg: &str) -> Vec<AgentEvent> {
         let model = self.config.model.clone();
         let efforts = self.reasoning_efforts_for_model(&model);
@@ -4161,7 +4260,8 @@ pub fn title_completion(system: &str, user: &str) -> Result<String, String> {
         provider: config.provider.clone(),
         protocol: config.protocol.clone(),
         reasoning_effort,
-        model_reasoning_efforts: Vec::new(),
+        models: Vec::new(),
+        subagent_models: Vec::new(),
         system_prompt: String::new(),
         prompt_cache_key: String::new(),
         mcp: McpManager::default(),

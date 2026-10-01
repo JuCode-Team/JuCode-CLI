@@ -67,6 +67,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         advanced: false,
     },
     CommandSpec {
+        name: "/subagents",
+        aliases: &[],
+        args: "[add <model> <when to use>|remove <model>]",
+        description: "Choose the models subagents may use",
+        advanced: false,
+    },
+    CommandSpec {
         name: "/tree",
         aliases: &[],
         args: "",

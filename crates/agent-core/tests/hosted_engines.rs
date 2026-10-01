@@ -346,3 +346,37 @@ fn a_plain_engine_is_sandboxed_by_default_and_sandbox_switches_it() {
     pump(&mut core, is_ready);
     assert_eq!(fs::read_to_string(dir.join(".git/config")).unwrap(), "b");
 }
+
+#[test]
+fn subagents_command_saves_the_models_subagents_may_use() {
+    let _guard = setup();
+    let mut core = open(&temp_dir("subagents"), ApprovalMode::Manual);
+    let config_path = std::path::PathBuf::from(env::var("HOME").unwrap())
+        .join(".jucode")
+        .join("config.json");
+    let saved = || -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap()
+    };
+
+    let (_, events) = core.handle_command("/subagents add no-such-model search");
+    assert!(
+        matches!(&events[..], [AgentEvent::Error(error)] if error.contains("unknown model")),
+        "{events:?}"
+    );
+
+    let (_, events) = core.handle_command("/subagents add fake-model wide code search");
+    assert!(matches!(&events[..], [AgentEvent::Status(_)]), "{events:?}");
+    assert_eq!(
+        saved()["subagent_models"],
+        serde_json::json!([{ "name": "fake-model", "description": "wide code search" }])
+    );
+
+    let (_, events) = core.handle_command("/subagents");
+    assert!(
+        matches!(&events[..], [AgentEvent::Info(info)] if info.contains("fake-model — wide code search")),
+        "{events:?}"
+    );
+
+    core.handle_command("/subagents remove fake-model");
+    assert_eq!(saved()["subagent_models"], serde_json::json!([]));
+}

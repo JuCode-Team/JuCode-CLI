@@ -200,6 +200,10 @@ pub struct Config {
     /// `model`.
     pub title_model: String,
     pub models: Vec<ModelConfig>,
+    /// Models the main agent may pick for `spawn_agent` (`subagent_models`),
+    /// each with a note on when to use it. Empty: subagents run on the main
+    /// agent's own model only.
+    pub subagent_models: Vec<SubagentModel>,
     /// The JuCode gateway models the user chose to show (`jucode_models`),
     /// out of everything their account can reach. Becomes `models` whenever
     /// the provider is jucode; empty until the first login.
@@ -298,6 +302,13 @@ pub struct McpOAuthTokens {
     pub access_expires_at: u64,
 }
 
+/// One `subagent_models` entry: a model `spawn_agent` may use and when to use it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentModel {
+    pub name: String,
+    pub description: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub name: String,
@@ -358,6 +369,7 @@ impl Config {
                 safety_reasoning_effort: DEFAULT_COMPACT_REASONING_EFFORT.to_string(),
                 title_model: String::new(),
                 models: models_for_provider("jucode"),
+                subagent_models: Vec::new(),
                 jucode_models: Vec::new(),
                 jucode_groups: BTreeMap::new(),
                 base_url: "https://api.jucode.net/v1".to_string(),
@@ -463,6 +475,7 @@ impl Config {
             safety_model,
             safety_reasoning_effort,
             title_model: read_string(&value, "title_model", ""),
+            subagent_models: read_subagent_models(&value),
             models,
             jucode_models: value
                 .get("jucode_models")
@@ -551,6 +564,10 @@ impl Config {
             "safety_reasoning_effort": self.safety_reasoning_effort,
             "title_model": self.title_model,
             "models": self.models.iter().map(model_config_value).collect::<Vec<_>>(),
+            "subagent_models": self.subagent_models.iter().map(|model| json!({
+                "name": model.name,
+                "description": model.description,
+            })).collect::<Vec<_>>(),
             "jucode_models": self.jucode_models.iter().map(model_config_value).collect::<Vec<_>>(),
             "jucode_groups": self.jucode_groups,
             "base_url": normalize_base_url(&self.base_url),
@@ -1046,6 +1063,40 @@ fn read_reasoning_effort(
             .cloned()
             .unwrap_or_else(|| "medium".to_string())
     }
+}
+
+/// `subagent_models` as saved in `path` right now: Desktop edits it while
+/// engines run, so each turn reads the current list.
+pub(crate) fn read_subagent_models_at(path: &Path) -> io::Result<Vec<SubagentModel>> {
+    let content = fs::read_to_string(path)?;
+    let value = serde_json::from_str::<Value>(&content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(read_subagent_models(&value))
+}
+
+fn read_subagent_models(value: &Value) -> Vec<SubagentModel> {
+    let Some(entries) = value.get("subagent_models").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut models: Vec<SubagentModel> = Vec::new();
+    for entry in entries {
+        let Some(name) = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        if models.iter().any(|model| model.name == name) {
+            continue;
+        }
+        models.push(SubagentModel {
+            name: name.to_string(),
+            description: read_string(entry, "description", "").trim().to_string(),
+        });
+    }
+    models
 }
 
 fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
@@ -1767,6 +1818,7 @@ mod tests {
             safety_model: "compact-model".to_string(),
             safety_reasoning_effort: "low".to_string(),
             title_model: String::new(),
+            subagent_models: Vec::new(),
             models: vec![
                 ModelConfig {
                     name: "chat-model".to_string(),
@@ -1974,6 +2026,28 @@ mod tests {
         assert_eq!(
             config.jucode_groups,
             BTreeMap::from([("claude-opus-5-5".to_string(), "g1".to_string())])
+        );
+    }
+
+    #[test]
+    fn subagent_models_skip_blank_and_duplicate_names() {
+        let config = Config::from_value(
+            r#"{"subagent_models":[{"name":" fast ","description":" search "},{"name":""},{"name":"fast"},{"name":"deep"}]}"#,
+            PathBuf::from("config.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            config.subagent_models,
+            vec![
+                SubagentModel {
+                    name: "fast".to_string(),
+                    description: "search".to_string(),
+                },
+                SubagentModel {
+                    name: "deep".to_string(),
+                    description: String::new(),
+                },
+            ]
         );
     }
 

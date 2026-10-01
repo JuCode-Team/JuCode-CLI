@@ -1,6 +1,6 @@
 use crate::providers::CLIENT_NAME;
 use crate::{
-    config::{is_shell_tool, ApprovalMode},
+    config::{is_shell_tool, ApprovalMode, ModelConfig, SubagentModel},
     hooks::Hooks,
     hunks::{self, HunkView},
     mcp::McpManager,
@@ -39,9 +39,6 @@ fn protocol_for(provider: &str, protocol: &str, model: &str) -> Protocol {
 }
 
 const MAX_SUBAGENT_OUTPUT_BYTES: usize = 16 * 1024;
-const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 180;
-const DEFAULT_SUBAGENT_MAX_TOOL_CALLS: u64 = 12;
-const DEFAULT_SUBAGENT_MAX_OUTPUT_TOKENS: u64 = 4096;
 const MAX_EMPTY_RESPONSE_CONTINUATIONS: usize = 2;
 /// Read cap for the `auto` mode safety-classifier call so a slow or stuck
 /// classification falls back to the interactive prompt quickly.
@@ -74,9 +71,12 @@ pub struct OpenAiClient {
     transport: TransportClient,
     pub model: String,
     reasoning_effort: String,
-    /// Supported reasoning-effort tiers per model name (low→high), used to default
-    /// a spawned subagent to the cheapest tier of its model.
-    model_reasoning_efforts: Vec<(String, Vec<String>)>,
+    /// Reasoning-effort tiers `model` supports (low→high). A subagent on this
+    /// model must pick one of them and defaults to the first.
+    reasoning_efforts: Vec<String>,
+    /// Models `spawn_agent` may choose besides `model` (config
+    /// `subagent_models`), resolved against the configured model list.
+    subagent_models: Vec<SubagentModelSpec>,
     system_prompt: String,
     prompt_cache_key: String,
     mcp: McpManager,
@@ -118,6 +118,17 @@ pub struct OpenAiClient {
     safety: Option<SafetySpec>,
 }
 
+/// A `subagent_models` entry resolved at client build: what the tool
+/// description advertises and what a child on that model runs with.
+#[derive(Clone)]
+struct SubagentModelSpec {
+    name: String,
+    description: String,
+    reasoning_efforts: Vec<String>,
+    max_output_tokens: u64,
+    protocol: Protocol,
+}
+
 /// The safety classifier's model spec, resolved from config at client build.
 #[derive(Clone)]
 struct SafetySpec {
@@ -133,9 +144,12 @@ pub struct OpenAiClientConfig<'a> {
     pub provider: String,
     pub protocol: String,
     pub reasoning_effort: String,
-    /// Supported reasoning-effort tiers per model name (low→high). Pass an empty
-    /// vec for clients that never spawn subagents.
-    pub model_reasoning_efforts: Vec<(String, Vec<String>)>,
+    /// Configured models, used to look up tiers and limits for `model` and
+    /// `subagent_models`. Pass an empty vec for clients that never spawn
+    /// subagents.
+    pub models: Vec<ModelConfig>,
+    /// Models `spawn_agent` may choose (config `subagent_models`).
+    pub subagent_models: Vec<SubagentModel>,
     pub system_prompt: String,
     pub prompt_cache_key: String,
     pub mcp: McpManager,
@@ -401,6 +415,35 @@ impl OpenAiClient {
                 config.provider
             ));
         }
+        let reasoning_efforts = config
+            .models
+            .iter()
+            .find(|model| model.name == config.model)
+            .map(|model| model.reasoning_efforts.clone())
+            .unwrap_or_default();
+        let subagent_models = config
+            .subagent_models
+            .iter()
+            .filter(|entry| entry.name != config.model)
+            .filter_map(|entry| {
+                let Some(model) = config.models.iter().find(|model| model.name == entry.name)
+                else {
+                    crate::log_warn!(
+                        "subagent",
+                        "model not configured, skipped",
+                        model = entry.name.clone()
+                    );
+                    return None;
+                };
+                Some(SubagentModelSpec {
+                    name: model.name.clone(),
+                    description: entry.description.clone(),
+                    reasoning_efforts: model.reasoning_efforts.clone(),
+                    max_output_tokens: model.max_output_tokens,
+                    protocol: protocol_for(&config.provider, &config.protocol, &model.name),
+                })
+            })
+            .collect();
         let safety = config.safety_model.map(|model| SafetySpec {
             protocol: protocol_for(&config.provider, &config.protocol, &model),
             reasoning_effort: config.safety_reasoning_effort,
@@ -411,7 +454,8 @@ impl OpenAiClient {
             transport,
             model: config.model,
             reasoning_effort: config.reasoning_effort,
-            model_reasoning_efforts: config.model_reasoning_efforts,
+            reasoning_efforts,
+            subagent_models,
             system_prompt: config.system_prompt,
             prompt_cache_key: config.prompt_cache_key,
             mcp: config.mcp,
@@ -892,7 +936,11 @@ impl OpenAiClient {
             })
             .collect::<Vec<_>>();
         if self.allow_subagents && self.subagent_manager.is_some() {
-            definitions.extend(subagent_definitions());
+            definitions.extend(subagent_definitions(
+                &self.model,
+                &self.reasoning_efforts,
+                &self.subagent_models,
+            ));
         }
         definitions.extend(self.mcp.definitions());
         if let Some(host) = &self.host {
@@ -1056,57 +1104,104 @@ impl OpenAiClient {
             .map_err(|error| format!("invalid JSON arguments: {error}"))?;
         let task_name = required_str(&args, "task_name")?;
         let message = required_str(&args, "message")?;
-        let model = args
+        let requested_model = args
             .get("model")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(&self.model)
-            .to_string();
+            .filter(|value| !value.is_empty());
+        // The child's model: our own, or one of the configured subagent models.
+        let (model, efforts, model_max_output_tokens, protocol) = match requested_model {
+            None => (
+                self.model.clone(),
+                self.reasoning_efforts.clone(),
+                self.max_output_tokens,
+                self.provider_kind,
+            ),
+            Some(name) if name == self.model => (
+                self.model.clone(),
+                self.reasoning_efforts.clone(),
+                self.max_output_tokens,
+                self.provider_kind,
+            ),
+            Some(name) => {
+                let spec = self
+                    .subagent_models
+                    .iter()
+                    .find(|spec| spec.name == name)
+                    .ok_or_else(|| {
+                        format!(
+                            "model \"{name}\" is not allowed for subagents; allowed: {}",
+                            allowed_subagent_models(&self.model, &self.subagent_models)
+                        )
+                    })?;
+                (
+                    spec.name.clone(),
+                    spec.reasoning_efforts.clone(),
+                    spec.max_output_tokens,
+                    spec.protocol,
+                )
+            }
+        };
         let reasoning_effort = match args
             .get("reasoning_effort")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            Some(explicit) => explicit.to_string(),
+            Some(explicit) if efforts.is_empty() || efforts.iter().any(|e| e == explicit) => {
+                explicit.to_string()
+            }
+            Some(explicit) => {
+                return Err(format!(
+                    "reasoning_effort \"{explicit}\" is not supported by {model}; use one of: {}",
+                    efforts.join(", ")
+                ))
+            }
             // Default a subagent to the cheapest supported tier of its model
             // (subagents don't share the parent prompt cache, so this is free
             // savings). Fall back to the parent effort when tiers are unknown.
-            None => self
-                .model_reasoning_efforts
-                .iter()
-                .find(|(name, _)| name == &model)
-                .and_then(|(_, efforts)| efforts.first().cloned())
+            None => efforts
+                .first()
+                .cloned()
                 .unwrap_or_else(|| self.reasoning_effort.clone()),
         };
+        // Budgets are opt-in: without them the child runs like the parent.
         let max_tool_calls = args
             .get("max_tool_calls")
             .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_SUBAGENT_MAX_TOOL_CALLS)
-            .clamp(1, DEFAULT_SUBAGENT_MAX_TOOL_CALLS);
-        let timeout_secs = args
+            .map(|value| value.max(1));
+        let timeout = args
             .get("timeout_secs")
             .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_SUBAGENT_TIMEOUT_SECS)
-            .clamp(10, DEFAULT_SUBAGENT_TIMEOUT_SECS);
+            .map(|value| Duration::from_secs(value.max(10)));
         let max_output_tokens = args
             .get("max_output_tokens")
             .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_SUBAGENT_MAX_OUTPUT_TOKENS)
-            .clamp(
-                512,
-                self.max_output_tokens
-                    .clamp(512, DEFAULT_SUBAGENT_MAX_OUTPUT_TOKENS),
-            );
+            .map_or(model_max_output_tokens, |value| {
+                value.clamp(512, model_max_output_tokens.max(512))
+            });
         let fork_turns = args
             .get("fork_turns")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or("1")
+            .unwrap_or("none")
             .to_string();
         validate_fork_turns(&fork_turns)?;
+        let isolate = match args
+            .get("isolation")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("none")
+        {
+            "none" | "" => false,
+            "worktree" => true,
+            other => {
+                return Err(format!(
+                    "isolation must be \"none\" or \"worktree\", got \"{other}\""
+                ))
+            }
+        };
         let child_depth = self.agent_depth.saturating_add(1);
         let slot = manager.reserve_spawn(SubagentSpawn {
             parent_path: self.agent_path.clone(),
@@ -1118,33 +1213,40 @@ impl OpenAiClient {
         })?;
         let child_input =
             build_subagent_input(input, pending_call_ids, &fork_turns, &slot.path, message)?;
-        // Isolated workspace: file writes go to a per-agent worktree (or fresh
-        // dir), never straight into the parent's cwd. Prepared after the slot
+        // Opt-in isolated workspace: file writes go to a per-agent worktree (or
+        // fresh dir) instead of the parent's cwd. Prepared after the slot
         // reservation so a failure is recorded on the agent, not swallowed.
-        let workspace = match prepare_workspace(cwd, task_name) {
-            Ok(workspace) => workspace,
-            Err(error) => {
-                let message = format!("failed to prepare isolated workspace: {error}");
-                manager.finish_err(&slot.path, message.clone(), SubagentRunResult::default());
-                return Err(message);
+        let workspace = if isolate {
+            match prepare_workspace(cwd, task_name) {
+                Ok(workspace) => Some(workspace),
+                Err(error) => {
+                    let message = format!("failed to prepare isolated workspace: {error}");
+                    manager.finish_err(&slot.path, message.clone(), SubagentRunResult::default());
+                    return Err(message);
+                }
             }
+        } else {
+            None
         };
-        let workdir_display = workspace.root.display().to_string();
+        let child_cwd = workspace
+            .as_ref()
+            .map_or_else(|| cwd.to_path_buf(), |workspace| workspace.root.clone());
+        let workdir_display = child_cwd.display().to_string();
         manager.set_workdir(&slot.path, &workdir_display);
         let started = Instant::now();
         let child_manager = manager.clone();
         let child_path = slot.path.clone();
-        let child_cwd = workspace.root.clone();
         let child = OpenAiClient {
             api_key: self.api_key.clone(),
             transport: self.transport.clone(),
             model: model.clone(),
             reasoning_effort,
-            model_reasoning_efforts: self.model_reasoning_efforts.clone(),
+            reasoning_efforts: efforts,
+            subagent_models: self.subagent_models.clone(),
             system_prompt: subagent_system_prompt(
                 &self.system_prompt,
                 &child_path,
-                &workspace.root,
+                workspace.as_ref().map(|workspace| workspace.root.as_path()),
             ),
             prompt_cache_key: self.prompt_cache_key.clone(),
             mcp: self.mcp.clone(),
@@ -1152,11 +1254,14 @@ impl OpenAiClient {
             max_output_tokens,
             retry_attempts: self.retry_attempts,
             connect_timeout: self.connect_timeout,
-            read_timeout: self.read_timeout.min(Duration::from_secs(timeout_secs)),
+            read_timeout: timeout
+                .map_or(self.read_timeout, |timeout| self.read_timeout.min(timeout)),
             allow_subagents: child_depth < MAX_SUBAGENT_DEPTH,
-            max_tool_calls: Some(max_tool_calls),
-            deadline: Some(started + Duration::from_secs(timeout_secs)),
-            provider_kind: self.provider_kind,
+            max_tool_calls,
+            deadline: timeout.map(|timeout| started + timeout),
+            // Each model speaks its own wire protocol (on the JuCode gateway
+            // Claude uses Anthropic Messages, the rest Responses).
+            provider_kind: protocol,
             goal_tool_tx: None,
             // The child shares the parent's approval channel and inherits the
             // parent's mode as of spawn time; a later /permissions switch does
@@ -1168,9 +1273,16 @@ impl OpenAiClient {
             subagent_manager: Some(manager.clone()),
             agent_path: child_path.clone(),
             agent_depth: child_depth,
-            write_root: Some(workspace.root.clone()),
+            // Without isolation the child shares the parent's write boundary
+            // (none at top level, the parent's workspace when nested).
+            write_root: workspace
+                .as_ref()
+                .map(|workspace| workspace.root.clone())
+                .or_else(|| self.write_root.clone()),
             extra_read_roots: self.extra_read_roots.clone(),
-            tool_state: self.tool_state.clone(),
+            // Own read record: the child must read what it edits, and its
+            // edits fail on files changed since (by the parent or siblings).
+            tool_state: self.tool_state.for_subagent(),
             host: None,
             hooks: self.hooks.clone(),
             safety: self.safety.clone(),
@@ -1207,10 +1319,14 @@ impl OpenAiClient {
                 output_tokens: stats.output_tokens,
                 elapsed_ms,
                 model,
-                workdir: workspace.root.display().to_string(),
+                workdir: child_cwd.display().to_string(),
                 // Harvest: the parent sees exactly which workspace files the
-                // agent created or modified without scanning itself.
-                files_changed: crate::subagents::changed_files(&workspace),
+                // agent created or modified without scanning itself. Shared-cwd
+                // agents write in place, so there is nothing to harvest.
+                files_changed: workspace
+                    .as_ref()
+                    .map(crate::subagents::changed_files)
+                    .unwrap_or_default(),
             };
             match result {
                 Ok(()) => child_manager.finish_ok(&child_path, run_result),
@@ -1602,12 +1718,56 @@ fn safety_verdict_allows(text: &str) -> bool {
     matches!(outcome.as_deref(), Some("allow"))
 }
 
-fn subagent_definitions() -> Vec<Value> {
-    vec![
-        json!({
+fn allowed_subagent_models(own: &str, specs: &[SubagentModelSpec]) -> String {
+    std::iter::once(own)
+        .chain(
+            specs
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .filter(|name| *name != own),
+        )
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn efforts_label(efforts: &[String]) -> String {
+    if efforts.is_empty() {
+        "reasoning effort: model default".to_string()
+    } else {
+        format!("reasoning effort: {}", efforts.join(" | "))
+    }
+}
+
+/// The spawn_agent `model`/`reasoning_effort` guidance: which models the agent
+/// may pick, their tiers, and when to use each (config `subagent_models`).
+fn subagent_model_guide(own: &str, own_efforts: &[String], specs: &[SubagentModelSpec]) -> String {
+    let mut guide = format!(
+        "\n\nModels (omit model to use your own):\n- {own} (your model; {})",
+        efforts_label(own_efforts)
+    );
+    for spec in specs.iter().filter(|spec| spec.name != own) {
+        guide.push_str(&format!(
+            "\n- {} ({})",
+            spec.name,
+            efforts_label(&spec.reasoning_efforts)
+        ));
+        if !spec.description.is_empty() {
+            guide.push_str(&format!(": {}", spec.description));
+        }
+    }
+    guide
+}
+
+fn subagent_definitions(
+    own_model: &str,
+    own_efforts: &[String],
+    models: &[SubagentModelSpec],
+) -> Vec<Value> {
+    let choosable = models.iter().any(|spec| spec.name != own_model);
+    let mut spawn = json!({
             "type": "function",
             "name": "spawn_agent",
-            "description": format!("Start a lightweight background subagent for an independent bounded task. The agent runs in an isolated per-agent workspace under .jucode/agents/ (a detached git worktree inside a repository, otherwise a fresh directory): its file writes stay there and never modify your cwd directly. The spawn result and wait/list results include the workdir and files_changed for harvesting. The agent inherits tools, system prompt, and skills and returns immediately. Keep at most {MAX_LIVE_SUBAGENTS} live agents; nesting is capped at depth {MAX_SUBAGENT_DEPTH}."),
+            "description": format!("Start a background subagent for an independent task. By default it starts with a fresh context (only your message) and works in your cwd, so its file writes land directly in your tree; give it a self-contained task. Set isolation to \"worktree\" to run it in a per-agent workspace under .jucode/agents/ (a detached git worktree inside a repository, otherwise a fresh directory) whose changes you harvest via workdir and files_changed — use this when several agents write in parallel. The agent inherits tools, system prompt, and skills and returns immediately. Keep at most {MAX_LIVE_SUBAGENTS} live agents; nesting is capped at depth {MAX_SUBAGENT_DEPTH}.{}", subagent_model_guide(own_model, own_efforts, models)),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1621,33 +1781,51 @@ fn subagent_definitions() -> Vec<Value> {
                     },
                     "fork_turns": {
                         "type": "string",
-                        "description": "Context to fork into the subagent: 1 (default), all, none, or a positive integer string for the last N user turns."
+                        "description": "Context to fork into the subagent: none (default, fresh context), all, or a positive integer string for the last N user turns."
                     },
-                    "model": {
+                    "isolation": {
                         "type": "string",
-                        "description": "Optional model override. Defaults to the parent model."
+                        "enum": ["none", "worktree"],
+                        "description": "Workspace: none (default) shares your cwd; worktree gives the agent an isolated workspace whose writes you harvest."
                     },
                     "reasoning_effort": {
                         "type": "string",
-                        "description": "Optional reasoning effort override. Defaults to the parent effort."
+                        "description": "Optional reasoning effort: one of the chosen model's tiers listed above. Defaults to its lowest tier."
                     },
                     "max_tool_calls": {
                         "type": "number",
-                        "description": "Optional tool-call budget. Defaults to 12 and is capped at 12."
+                        "description": "Optional tool-call budget. Unlimited by default."
                     },
                     "timeout_secs": {
                         "type": "number",
-                        "description": "Optional wall-clock timeout. Defaults to 180 seconds and is capped at 180."
+                        "description": "Optional wall-clock timeout in seconds (minimum 10). No timeout by default."
                     },
                     "max_output_tokens": {
                         "type": "number",
-                        "description": "Optional output token cap. Defaults to 4096 and is capped at 4096."
+                        "description": "Optional per-response output token cap. Defaults to and is capped at the chosen model's limit."
                     }
                 },
                 "required": ["task_name", "message"],
                 "additionalProperties": false
             }
-        }),
+    });
+    if choosable {
+        let names = std::iter::once(own_model)
+            .chain(
+                models
+                    .iter()
+                    .map(|spec| spec.name.as_str())
+                    .filter(|name| *name != own_model),
+            )
+            .collect::<Vec<_>>();
+        spawn["parameters"]["properties"]["model"] = json!({
+            "type": "string",
+            "enum": names,
+            "description": "Optional model for the subagent, chosen from the models listed above. Defaults to your model."
+        });
+    }
+    vec![
+        spawn,
         json!({
             "type": "function",
             "name": "wait_agent",
@@ -1938,10 +2116,20 @@ fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
     Ok(value)
 }
 
-fn subagent_system_prompt(parent_system: &str, path: &str, workspace_root: &Path) -> String {
+fn subagent_system_prompt(
+    parent_system: &str,
+    path: &str,
+    workspace_root: Option<&Path>,
+) -> String {
+    let workspace = match workspace_root {
+        Some(root) => format!(
+            " Your working directory is an isolated workspace at {}; all file writes must stay inside it (writes outside are rejected) and the parent harvests your changes from there.",
+            root.display()
+        ),
+        None => " You share the parent's working directory; other agents may be editing it too, so change only the files your task needs.".to_string(),
+    };
     format!(
-        "{parent_system}\n\n<subagent_context>\nYou are JuCode subagent {path}. Work only on the task delegated by the parent. Keep work bounded: inspect only what is needed, avoid broad refactors, and stop when you have enough evidence. Your working directory is an isolated workspace at {root}; all file writes must stay inside it (writes outside are rejected) and the parent harvests your changes from there. Return a concise self-contained answer with Summary, Evidence, Files/commands checked, and Risks or unknowns. Do not ask follow-up questions unless the task is impossible without missing information.\n</subagent_context>",
-        root = workspace_root.display()
+        "{parent_system}\n\n<subagent_context>\nYou are JuCode subagent {path}. Work only on the task delegated by the parent. Keep work bounded: inspect only what is needed, avoid broad refactors, and stop when you have enough evidence.{workspace} Return a concise self-contained answer with Summary, Evidence, Files/commands checked, and Risks or unknowns. Do not ask follow-up questions unless the task is impossible without missing information.\n</subagent_context>"
     )
 }
 
@@ -2366,12 +2554,17 @@ mod tests {
     }
 
     fn test_client() -> OpenAiClient {
-        OpenAiClient::from_config(OpenAiClientConfig {
+        OpenAiClient::from_config(test_client_config()).unwrap()
+    }
+
+    fn test_client_config() -> OpenAiClientConfig<'static> {
+        OpenAiClientConfig {
             model: "test-model".to_string(),
             provider: "test-provider".to_string(),
             protocol: "responses".to_string(),
             reasoning_effort: "medium".to_string(),
-            model_reasoning_efforts: Vec::new(),
+            models: Vec::new(),
+            subagent_models: Vec::new(),
             system_prompt: "system".to_string(),
             prompt_cache_key: "cache-key".to_string(),
             mcp: McpManager::default(),
@@ -2394,8 +2587,107 @@ mod tests {
             host: None,
             subagent_manager: None,
             hooks: Hooks::default(),
-        })
-        .unwrap()
+        }
+    }
+
+    fn model(name: &str, efforts: &[&str], max_output_tokens: u64) -> ModelConfig {
+        ModelConfig {
+            name: name.to_string(),
+            context_window: 200_000,
+            max_output_tokens,
+            reasoning_efforts: efforts.iter().map(|e| e.to_string()).collect(),
+            input_cost: 0.0,
+            cached_input_cost: 0.0,
+            output_cost: 0.0,
+        }
+    }
+
+    /// A gateway client on gpt-main that may also spawn claude-helper; an
+    /// unconfigured entry is dropped at build.
+    fn subagent_model_client() -> OpenAiClient {
+        let mut config = test_client_config();
+        config.provider = "jucode".to_string();
+        config.model = "gpt-main".to_string();
+        config.models = vec![
+            model("gpt-main", &["low", "medium", "high"], 8000),
+            model("claude-helper", &["low", "high"], 4000),
+        ];
+        config.subagent_models = vec![
+            SubagentModel {
+                name: "claude-helper".to_string(),
+                description: "broad code search".to_string(),
+            },
+            SubagentModel {
+                name: "not-configured".to_string(),
+                description: String::new(),
+            },
+        ];
+        config.subagent_manager = Some(SubagentManager::default());
+        OpenAiClient::from_config(config).unwrap()
+    }
+
+    #[test]
+    fn subagent_models_resolve_against_configured_models() {
+        let client = subagent_model_client();
+        assert_eq!(client.reasoning_efforts, vec!["low", "medium", "high"]);
+        assert_eq!(client.subagent_models.len(), 1);
+        let spec = &client.subagent_models[0];
+        assert_eq!(spec.name, "claude-helper");
+        assert_eq!(spec.max_output_tokens, 4000);
+        // Claude on the gateway speaks Anthropic Messages, not the parent's Responses.
+        assert_eq!(spec.protocol, Protocol::resolve("", "claude-helper"));
+        assert_ne!(spec.protocol, client.provider_kind);
+    }
+
+    #[test]
+    fn spawn_agent_definition_lists_choosable_models_and_guidance() {
+        let client = subagent_model_client();
+        let spawn = client
+            .tool_definitions()
+            .into_iter()
+            .find(|definition| definition["name"] == "spawn_agent")
+            .unwrap();
+        let description = spawn["description"].as_str().unwrap();
+        assert!(
+            description.contains("- gpt-main (your model; reasoning effort: low | medium | high)")
+        );
+        assert!(description
+            .contains("- claude-helper (reasoning effort: low | high): broad code search"));
+        assert!(!description.contains("not-configured"));
+        assert_eq!(
+            spawn["parameters"]["properties"]["model"]["enum"],
+            json!(["gpt-main", "claude-helper"])
+        );
+
+        // Without subagent_models the model parameter is not offered at all.
+        let mut config = test_client_config();
+        config.subagent_manager = Some(SubagentManager::default());
+        let spawn = OpenAiClient::from_config(config)
+            .unwrap()
+            .tool_definitions()
+            .into_iter()
+            .find(|definition| definition["name"] == "spawn_agent")
+            .unwrap();
+        assert!(spawn["parameters"]["properties"]["model"].is_null());
+    }
+
+    #[test]
+    fn spawn_agent_rejects_unlisted_model_and_unsupported_effort() {
+        let client = subagent_model_client();
+        let spawn = |arguments: Value| {
+            client.spawn_agent(&arguments.to_string(), Path::new("."), &[], &HashSet::new())
+        };
+        let error =
+            spawn(json!({ "task_name": "a", "message": "m", "model": "gpt-other" })).unwrap_err();
+        assert!(error.contains("not allowed for subagents; allowed: gpt-main, claude-helper"));
+        let error = spawn(json!({
+            "task_name": "b",
+            "message": "m",
+            "model": "claude-helper",
+            "reasoning_effort": "medium"
+        }))
+        .unwrap_err();
+        assert!(error.contains("not supported by claude-helper; use one of: low, high"));
     }
 
     fn approval_test_client(
