@@ -14,12 +14,21 @@ use serde_json::{json, Value};
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 pub const BRIEF_FILES: [&str; 4] = ["role.md", "capabilities.md", "policy.md", "state.md"];
 
+/// Handoff notes kept per agent (`handoffs.json`), newest first.
+const HANDOFFS_KEPT: usize = 20;
+/// How many of them a session's prompt carries.
+const HANDOFFS_IN_PROMPT: usize = 3;
+
 pub struct Agents {
     dir: PathBuf,
+    /// Held by `delete` and by writers that run on their own threads
+    /// (handoff notes), so a note never lands in a folder being removed.
+    removing: Mutex<()>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +56,10 @@ pub struct Agent {
     /// Seeds the generated avatar; agents from before it have none and
     /// clients use the id.
     pub avatar_seed: Option<String>,
+    /// The desktop workspace it is listed in; None for agents from before
+    /// workspaces had their own (clients put those in the default one). It
+    /// runs whichever workspace is open.
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,6 +93,9 @@ impl Agent {
         }
         if let Some(seed) = &self.avatar_seed {
             value["avatar_seed"] = json!(seed);
+        }
+        if let Some(workspace) = &self.workspace {
+            value["workspace"] = json!(workspace);
         }
         value
     }
@@ -120,7 +136,10 @@ fn directories(value: &Value, strict: bool) -> Result<Vec<Directory>, String> {
 impl Agents {
     pub fn open(dir: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            removing: Mutex::new(()),
+        })
     }
 
     pub fn list(&self) -> Vec<Agent> {
@@ -160,11 +179,13 @@ impl Agents {
             icon: value.get("icon").filter(|icon| !icon.is_null()).cloned(),
             color: value["color"].as_str().map(str::to_string),
             avatar_seed: value["avatar_seed"].as_str().map(str::to_string),
+            workspace: value["workspace"].as_str().map(str::to_string),
         })
     }
 
     /// Creates an agent working in `cwd`, with `role` as its first brief.
-    /// `appearance` may carry `icon`, `color` and `avatar_seed`; without a
+    /// `appearance` may carry `icon`, `color`, `avatar_seed` and the
+    /// `workspace` it is listed in; without a
     /// seed it gets a random one.
     pub fn create(
         &self,
@@ -204,11 +225,13 @@ impl Agents {
             icon: None,
             color: None,
             avatar_seed: None,
+            workspace: None,
         };
         let mut settings = agent.to_json();
         settings.as_object_mut().map(|map| map.remove("id"));
         settings["avatar_seed"] = json!(random_hex(8).map_err(|error| error.to_string())?);
         set_appearance(&mut settings, appearance)?;
+        set_workspace(&mut settings, appearance);
         let write = || -> io::Result<()> {
             fs::create_dir_all(dir.join("memory"))?;
             fs::write(
@@ -227,7 +250,7 @@ impl Agents {
 
     /// Changes the settings present in `changes` (`name`, `enabled`,
     /// `approval_mode`, `sandbox`, `network`, `directories`,
-    /// `command_rules`, `icon`, `color`, `avatar_seed`), keeping the rest of
+    /// `command_rules`, `icon`, `color`, `avatar_seed`, `workspace`), keeping the rest of
     /// `agent.json`; `role` rewrites `role.md`.
     pub fn update(&self, id: &str, changes: &Value) -> Result<Agent, String> {
         if !valid_id(id) {
@@ -269,6 +292,7 @@ impl Agents {
             settings["command_rules"] = changes["command_rules"].clone();
         }
         set_appearance(&mut settings, changes)?;
+        set_workspace(&mut settings, changes);
         let text = serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())?;
         fs::write(&path, text + "\n").map_err(|error| error.to_string())?;
         if let Some(role) = changes["role"].as_str() {
@@ -282,6 +306,10 @@ impl Agents {
         if !valid_id(id) {
             return Err(format!("unknown agent {id}"));
         }
+        let _guard = self
+            .removing
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         fs::remove_dir_all(self.dir.join(id)).map_err(|error| error.to_string())
     }
 
@@ -297,6 +325,54 @@ impl Agents {
         let text = serde_json::to_string_pretty(schedules).map_err(|error| error.to_string())?;
         write_private(
             &self.dir.join(id).join("schedules.json"),
+            (text + "\n").as_bytes(),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// Agent `id`'s handoff notes, newest first: `{session, title, at, text}`
+    /// (`at` in ms), one per session, rewritten as the session goes on.
+    pub fn handoffs(&self, id: &str) -> Vec<Value> {
+        fs::read_to_string(self.dir.join(id).join("handoffs.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    /// The handoff note `session` left, if any.
+    pub fn handoff(&self, id: &str, session: &str) -> Option<String> {
+        self.handoffs(id)
+            .into_iter()
+            .find(|note| note["session"] == session)
+            .and_then(|note| note["text"].as_str().map(str::to_string))
+    }
+
+    /// Replaces `session`'s note and moves it to the front.
+    pub fn save_handoff(
+        &self,
+        id: &str,
+        session: &str,
+        title: &str,
+        text: &str,
+        at: u64,
+    ) -> Result<(), String> {
+        let _guard = self
+            .removing
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if self.get(id).is_none() {
+            return Err(format!("unknown agent {id}"));
+        }
+        let mut notes = self.handoffs(id);
+        notes.retain(|note| note["session"] != session);
+        notes.insert(
+            0,
+            json!({ "session": session, "title": title, "at": at, "text": text }),
+        );
+        notes.truncate(HANDOFFS_KEPT);
+        let text = serde_json::to_string_pretty(&notes).map_err(|error| error.to_string())?;
+        write_private(
+            &self.dir.join(id).join("handoffs.json"),
             (text + "\n").as_bytes(),
         )
         .map_err(|error| error.to_string())
@@ -363,18 +439,22 @@ impl Agents {
 
     /// System prompt text for a session of agent `id`: who it is, its brief,
     /// its memory index and the other agents it can message.
-    pub fn prompt(&self, id: &str) -> String {
+    /// The agent's part of the system prompt for `session`: its brief, the
+    /// handoff notes of its latest other sessions, and the other agents.
+    pub fn prompt(&self, id: &str, session: &str) -> String {
         let Some(agent) = self.get(id) else {
             return String::new();
         };
         let mut prompt = format!(
             "<agent id=\"{}\" name=\"{}\">\n\
-             You are a long-lived agent: your sessions come and go, but your brief below persists and is \
-             yours to keep current with the `brief` tool. Record what the next session needs in state.md \
-             (progress, open threads) and durable knowledge in memory/<topic>.md. Nobody may be watching: \
-             work on without waiting. When only the user can decide, `question` them and continue under \
-             your assumption; when something is done or blocked, `report` it. Use `timer` to come back to \
-             something later and `message_agent` to hand work to another agent.\n",
+             You are a long-lived agent: each task runs in its own session, but your brief below persists \
+             and is yours to keep current with the `brief` tool. Record what the next session needs in \
+             state.md (progress, open threads) and durable knowledge in memory/<topic>.md; what your latest \
+             other sessions concluded is in <recent_handoffs>. Nobody may be watching: work on without \
+             waiting. When only the user can decide, `question` them and continue under your assumption; \
+             when something is done or blocked, `report` it. Use `timer` to come back to something once, \
+             `schedule` to propose recurring work (the user switches it on), and `message_agent` to hand \
+             work to another agent.\n",
             agent.id, agent.name
         );
         for file in BRIEF_FILES {
@@ -391,6 +471,26 @@ impl Agents {
                 memory.join(", ")
             }
         ));
+        let notes: Vec<String> = self
+            .handoffs(id)
+            .into_iter()
+            .filter(|note| note["session"] != session)
+            .take(HANDOFFS_IN_PROMPT)
+            .map(|note| {
+                format!(
+                    "<handoff session=\"{}\" title=\"{}\">\n{}\n</handoff>",
+                    note["session"].as_str().unwrap_or_default(),
+                    note["title"].as_str().unwrap_or_default(),
+                    note["text"].as_str().unwrap_or_default().trim()
+                )
+            })
+            .collect();
+        if !notes.is_empty() {
+            prompt.push_str(&format!(
+                "<recent_handoffs>\n{}\n</recent_handoffs>\n",
+                notes.join("\n")
+            ));
+        }
         let others: Vec<String> = self
             .list()
             .into_iter()
@@ -426,6 +526,18 @@ impl Agents {
                 BRIEF_FILES.join(", ")
             ))
         }
+    }
+}
+
+/// Takes `workspace` from `changes` when present: a workspace id, or `null`
+/// to leave it to the default workspace.
+fn set_workspace(settings: &mut Value, changes: &Value) {
+    match changes.get("workspace") {
+        Some(Value::String(id)) if !id.trim().is_empty() => settings["workspace"] = json!(id.trim()),
+        Some(Value::Null) => {
+            settings.as_object_mut().map(|map| map.remove("workspace"));
+        }
+        _ => {}
     }
 }
 
@@ -599,6 +711,23 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_is_listed_in_a_workspace_that_can_change() {
+        let (agents, work) = agents("workspace");
+        let old = agents.create("old", "Old", &work, "role", &Value::Null).unwrap();
+        assert_eq!(old.workspace, None);
+        assert!(old.to_json().get("workspace").is_none());
+        let ops = agents
+            .create("ops", "Ops", &work, "role", &json!({ "workspace": "ws-1" }))
+            .unwrap();
+        assert_eq!(ops.to_json()["workspace"], "ws-1");
+        let moved = agents.update("ops", &json!({ "workspace": "ws-2" })).unwrap();
+        assert_eq!(moved.workspace.as_deref(), Some("ws-2"));
+        // Other changes leave it; null hands it back to the default workspace.
+        assert_eq!(agents.update("ops", &json!({ "name": "Ops 2" })).unwrap().workspace.as_deref(), Some("ws-2"));
+        assert_eq!(agents.update("ops", &json!({ "workspace": null })).unwrap().workspace, None);
+    }
+
+    #[test]
     fn appearance_is_checked_saved_and_cleared() {
         let (agents, work) = agents("appearance");
         let created = agents
@@ -683,7 +812,21 @@ mod tests {
             .write_brief("ops", "state.md", "waiting on CI")
             .unwrap();
         agents.write_brief("ops", "memory/ci.md", "x").unwrap();
-        let prompt = agents.prompt("ops");
+        agents
+            .save_handoff("ops", "s1", "Fix CI", "CI green again", 1)
+            .unwrap();
+        agents
+            .save_handoff("ops", "s2", "Deploy", "deployed v2", 2)
+            .unwrap();
+        let prompt = agents.prompt("ops", "s2");
+        assert!(prompt
+            .contains("<handoff session=\"s1\" title=\"Fix CI\">\nCI green again\n</handoff>"));
+        assert!(
+            !prompt.contains("deployed v2"),
+            "a session's own note stays out of its prompt"
+        );
+        assert_eq!(agents.handoff("ops", "s2").as_deref(), Some("deployed v2"));
+        assert_eq!(agents.handoffs("ops")[0]["session"], "s2");
         assert!(prompt.contains("<role>\nKeeps deploys green\n</role>"));
         assert!(prompt.contains("<state>\nwaiting on CI\n</state>"));
         assert!(prompt.contains("memory/ci.md"));

@@ -557,6 +557,39 @@ impl Store {
             .collect()
     }
 
+    /// The newest `limit` messages (to `agent`, when given), newest first,
+    /// each with where it went: `pending`, `delivered` (with its session) or
+    /// `undeliverable` (with the reason).
+    pub fn message_log(&self, agent: Option<&str>, limit: usize) -> Vec<Value> {
+        let entries = self.read(MESSAGES);
+        let settled: HashMap<&str, &Value> = entries
+            .iter()
+            .filter(|entry| entry["kind"] == "delivered" || entry["kind"] == "undeliverable")
+            .filter_map(|entry| Some((entry["id"].as_str()?, entry)))
+            .collect();
+        entries
+            .iter()
+            .rev()
+            .filter(|entry| entry["kind"] == "message")
+            .filter(|entry| agent.is_none_or(|agent| entry["to"] == agent))
+            .take(limit)
+            .map(|entry| {
+                let outcome = entry["id"].as_str().and_then(|id| settled.get(id));
+                json!({
+                    "id": entry["id"],
+                    "agent": entry["to"],
+                    "from": entry["from"],
+                    "body": entry["body"],
+                    "at": entry["at"],
+                    "status": outcome.map_or(json!("pending"), |o| o["kind"].clone()),
+                    "session": outcome.map_or(Value::Null, |o| o["session"].clone()),
+                    "reason": outcome.map_or(Value::Null, |o| o["reason"].clone()),
+                    "settled_at": outcome.map_or(Value::Null, |o| o["at"].clone()),
+                })
+            })
+            .collect()
+    }
+
     /// The session a delivered message went to.
     pub fn delivered_session(&self, id: &str) -> Option<String> {
         self.read(MESSAGES)
@@ -1051,12 +1084,18 @@ mod tests {
             .record_engine_session("c", std::path::Path::new("/p"), None, Some("codex"), true)
             .unwrap();
         assert_eq!(store.sessions()[0].group, None);
-        assert!(store.record_session_meta("c", &json!({ "group": " g-1 " })).unwrap());
+        assert!(store
+            .record_session_meta("c", &json!({ "group": " g-1 " }))
+            .unwrap());
         assert_eq!(store.sessions()[0].group.as_deref(), Some("g-1"));
         // Other changes leave it; an empty group goes back to automatic.
-        store.record_session_meta("c", &json!({ "title": "t" })).unwrap();
+        store
+            .record_session_meta("c", &json!({ "title": "t" }))
+            .unwrap();
         assert_eq!(store.sessions()[0].group.as_deref(), Some("g-1"));
-        store.record_session_meta("c", &json!({ "group": "" })).unwrap();
+        store
+            .record_session_meta("c", &json!({ "group": "" }))
+            .unwrap();
         assert_eq!(store.sessions()[0].group, None);
     }
 
@@ -1067,8 +1106,12 @@ mod tests {
         store
             .record_engine_session("c", std::path::Path::new("/p"), None, Some("claude"), false)
             .unwrap();
-        store.record_session_meta("c", &json!({ "group": "g-1" })).unwrap();
-        assert!(store.record_session_meta("c", &json!({ "gateway": true })).unwrap());
+        store
+            .record_session_meta("c", &json!({ "group": "g-1" }))
+            .unwrap();
+        assert!(store
+            .record_session_meta("c", &json!({ "gateway": true }))
+            .unwrap());
         drop(store);
         // Opening compacts the log.
         let reopened = Store::open(dir).unwrap();
@@ -1125,6 +1168,20 @@ mod tests {
         let pending: Vec<String> = store.pending_messages().into_iter().map(|m| m.id).collect();
         assert_eq!(pending, vec!["m4"]);
         assert_eq!(store.delivered_session("m1").as_deref(), Some("s1"));
+        let log = store.message_log(Some("ops"), 2);
+        assert_eq!(log.len(), 2);
+        assert_eq!(
+            (log[0]["id"].as_str(), log[0]["status"].as_str()),
+            (Some("m4"), Some("pending"))
+        );
+        assert_eq!(log[1]["status"], "undeliverable");
+        assert_eq!(log[1]["reason"], "agent gone");
+        let all = store.message_log(None, 10);
+        assert_eq!(
+            (all[2]["status"].as_str(), all[2]["session"].as_str()),
+            (Some("delivered"), Some("s1"))
+        );
+        assert!(store.message_log(Some("other"), 10).is_empty());
     }
 
     #[test]

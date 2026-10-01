@@ -1,6 +1,6 @@
 //! Tools a long-lived agent's sessions get from the daemon, added to the
-//! engine through `HostExtensions`: `message_agent`, `timer`, `brief`,
-//! `question` and `report`.
+//! engine through `HostExtensions`: `message_agent`, `timer`, `schedule`,
+//! `brief`, `question` and `report`.
 
 use crate::{
     hub::Hub,
@@ -13,19 +13,34 @@ use std::sync::Arc;
 pub fn extensions(hub: Arc<Hub>, agent: String, session: String) -> HostExtensions {
     let prompt_hub = Arc::clone(&hub);
     let prompt_agent = agent.clone();
+    let prompt_session = session.clone();
     HostExtensions {
         tools: definitions(),
         run_tool: Arc::new(move |name, arguments| {
             let result = serde_json::from_str::<Value>(arguments)
                 .map_err(|error| format!("invalid JSON arguments: {error}"))
+                .map(without_empty)
                 .and_then(|args| run(&hub, &agent, &session, name, &args));
             match result {
                 Ok(output) => (output.to_string(), false),
                 Err(error) => (json!({ "error": error }).to_string(), true),
             }
         }),
-        prompt: Arc::new(move || prompt_hub.agents.prompt(&prompt_agent)),
+        prompt: Arc::new(move || prompt_hub.agents.prompt(&prompt_agent, &prompt_session)),
     }
+}
+
+/// Some models fill every optional field with `""` or `[]` (a create
+/// arriving with `"id": ""`); those mean "not given", same as leaving it out.
+fn without_empty(mut args: Value) -> Value {
+    if let Some(map) = args.as_object_mut() {
+        map.retain(|_, value| {
+            !(value.is_null()
+                || value.as_str().is_some_and(|text| text.trim().is_empty())
+                || value.as_array().is_some_and(Vec::is_empty))
+        });
+    }
+    args
 }
 
 fn run(
@@ -101,6 +116,23 @@ fn run(
                 Ok(json!({ "cancelled": id }))
             }
             _ => Err("timer action must be set, list or cancel".to_string()),
+        },
+        "schedule" => match text("action").as_deref() {
+            Some("list") => Ok(hub.schedules_json(Some(agent))["schedules"].clone()),
+            Some("create") if args["id"].is_null() => hub
+                .propose_schedule(agent, args)
+                .map(|schedule| json!({ "proposed": schedule.to_json(), "note": "switched off until the user turns it on" })),
+            Some("create") => Err("create takes no id; use update".to_string()),
+            Some("update") if args["id"].is_string() => hub
+                .propose_schedule(agent, args)
+                .map(|schedule| json!({ "proposed": schedule.to_json(), "note": "switched off until the user turns it on again" })),
+            Some("update") => Err("update requires id".to_string()),
+            Some("delete") => {
+                let id = text("id").ok_or("delete requires id")?;
+                hub.delete_schedule_by(&id, Some(agent))?;
+                Ok(json!({ "deleted": id }))
+            }
+            _ => Err("schedule action must be list, create, update or delete".to_string()),
         },
         "brief" => match text("action").as_deref() {
             Some("read") => {
@@ -221,6 +253,26 @@ fn definitions() -> Vec<Value> {
                     "body": { "type": "string", "description": "What to do when it fires." },
                     "new_session": { "type": "boolean" },
                     "timer": { "type": "string", "description": "Timer id, for cancel." }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "schedule",
+            "description": "Propose recurring work for yourself: a task that runs `prompt` at set local times, each run in a new session told what the last run concluded. What you create or update stays switched off until the user turns it on in the app, so tell them why in a `report`. Use `timer` for a one-off return instead. `list` shows your scheduled tasks; `delete` removes one of yours.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "create", "update", "delete"] },
+                    "id": { "type": "string", "description": "Schedule id, for update and delete." },
+                    "name": { "type": "string", "description": "Short name, e.g. 每日巡检." },
+                    "prompt": { "type": "string", "description": "The self-contained message each run receives." },
+                    "repeat": { "type": "string", "enum": ["once", "hourly", "daily", "weekdays", "weekly"] },
+                    "time": { "type": "string", "description": "Local HH:MM (24-hour); hourly uses only the minute." },
+                    "days": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 6 }, "description": "weekly: 0 is Sunday." },
+                    "date": { "type": "string", "description": "once: YYYY-MM-DD." }
                 },
                 "required": ["action"],
                 "additionalProperties": false

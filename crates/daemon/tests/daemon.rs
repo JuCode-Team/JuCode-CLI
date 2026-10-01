@@ -389,7 +389,7 @@ fn reply_text(frames: &[Value], session: &str) -> String {
 }
 
 #[test]
-fn a_user_message_to_an_agent_opens_a_session_and_follow_ups_continue_it() {
+fn each_user_task_gets_a_new_session_that_reads_the_last_handoff() {
     let _guard = setup();
     let daemon = start_daemon();
     let mut client = Client::connect(&daemon);
@@ -407,9 +407,173 @@ fn a_user_message_to_an_agent_opens_a_session_and_follow_ups_continue_it() {
     assert!(reply.contains("<agent id=\"route\""), "{reply}");
     assert!(reply.contains("Keeps the build green"), "{reply}");
 
-    client.send(json!({ "op": "message_send", "agent": "route", "body": "and another thing" }));
+    // The turn's end has the title model write the session's handoff note
+    // (the test model echoes what it was asked).
+    let notes = daemon.agents.join("route/handoffs.json");
+    let mut written = String::new();
+    for _ in 0..50 {
+        written = std::fs::read_to_string(&notes).unwrap_or_default();
+        if written.contains(session.as_str()) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(written.contains("user said: Session:"), "{written}");
+    let listed = request(&mut client, json!({ "op": "handoff_list", "agent": "route" }));
+    assert_eq!(listed["handoffs"][0]["session"], session.as_str());
+
+    // A new task is a new session, told what the last one concluded.
+    client.send(json!({ "op": "message_send", "agent": "route", "body": "SYSTEM" }));
+    let frames = client.until(delivered_to("route"));
+    let next = frames.last().unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(next, session);
+    let frames = client.until(ready(&next));
+    let reply = reply_text(&frames, &next);
+    assert!(
+        reply.contains(&format!("<handoff session=\"{session}\"")),
+        "{reply}"
+    );
+
+    // A reply names its session and continues it.
+    client.send(json!({ "op": "message_send", "agent": "route", "body": "and another thing", "session": session }));
     let frames = client.until(delivered_to("route"));
     assert_eq!(frames.last().unwrap()["session"], session.as_str());
+
+    // Hidden from a session list, it stays on its agent's page.
+    client.send(json!({ "op": "session_meta", "session": session, "hidden": true }));
+    // Ops of one client run in order: the list comes after the change.
+    let listed = request(&mut client, json!({ "op": "session_list" }));
+    assert!(listed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["session"] == session.as_str() && s["agent"] == "route"));
+}
+
+#[test]
+fn an_agent_proposes_a_schedule_that_stays_off_until_the_user_turns_it_on() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "planner", "Plans the week");
+    create_agent(&mut client, "other", "Someone else");
+    let theirs = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": {
+            "agent": "other", "name": "theirs", "prompt": "x", "repeat": "daily", "time": "08:00",
+        } }),
+    );
+    let theirs = theirs["schedule"]["id"].as_str().unwrap().to_string();
+
+    let call = |body: Value| format!("CALL schedule {body}");
+    client.send(
+        json!({ "op": "message_send", "agent": "planner", "body": call(json!({
+        // Filled the way some models fill every optional field.
+        "action": "create", "id": "", "date": "", "days": [],
+        "name": "每日巡检", "prompt": "check the deploys",
+        "repeat": "daily", "time": "09:30",
+    })) }),
+    );
+    let proposed = client.until(|frame| {
+        frame["type"] == "schedules"
+            && frame["schedules"]
+                .as_array()
+                .is_some_and(|list| list.iter().any(|s| s["agent"] == "planner"))
+    });
+    let list = proposed.last().unwrap()["schedules"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let mine = list.iter().find(|s| s["agent"] == "planner").unwrap();
+    assert_eq!(mine["name"], "每日巡检");
+    assert_eq!(mine["enabled"], false);
+    assert_eq!(mine["by_agent"], true);
+    assert!(mine["next_run_at"].is_null());
+    let mine = mine["id"].as_str().unwrap().to_string();
+
+    // Another agent's task is out of reach.
+    client.send(json!({ "op": "message_send", "agent": "planner", "body": call(json!({ "action": "delete", "id": theirs })) }));
+    let frames = client.until(|frame| {
+        frame["type"] == "tool_output" && frame["name"] == "schedule" && frame["is_error"] == true
+    });
+    assert!(
+        frames
+            .last()
+            .unwrap()
+            .to_string()
+            .contains("unknown schedule"),
+        "{:?}",
+        frames.last()
+    );
+
+    // The user turns it on; an agent's later change switches it off again.
+    let reply = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": { "id": mine, "enabled": true } }),
+    );
+    assert_eq!(reply["schedule"]["enabled"], true);
+    assert!(reply["schedule"]["next_run_at"].as_u64().is_some());
+    client.send(
+        json!({ "op": "message_send", "agent": "planner", "body": call(json!({
+        "action": "update", "id": mine, "time": "10:00", "enabled": true,
+    })) }),
+    );
+    client.until(|frame| {
+        frame["type"] == "schedules"
+            && frame["schedules"].as_array().is_some_and(|list| {
+                list.iter()
+                    .any(|s| s["id"] == mine.as_str() && s["time"] == "10:00")
+            })
+    });
+    let list = request(
+        &mut client,
+        json!({ "op": "schedule_list", "agent": "planner" }),
+    );
+    assert_eq!(list["schedules"][0]["enabled"], false);
+}
+
+#[test]
+fn a_new_session_message_starts_a_conversation_and_the_log_shows_both() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "fresh", "Starts over when asked");
+    client.send(json!({ "op": "message_send", "agent": "fresh", "body": "first" }));
+    let frames = client.until(delivered_to("fresh"));
+    let first = frames.last().unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client.until(ready(&first));
+
+    client.send(
+        json!({ "op": "message_send", "agent": "fresh", "body": "second", "new_session": true }),
+    );
+    let frames = client.until(delivered_to("fresh"));
+    let second = frames.last().unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(first, second);
+
+    client.send(json!({ "op": "message_list", "agent": "fresh" }));
+    let frames = client.until(|frame| frame["type"] == "messages");
+    let log = frames.last().unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(log.len(), 2);
+    assert_eq!(
+        (log[0]["body"].as_str(), log[0]["session"].as_str()),
+        (Some("second"), Some(second.as_str()))
+    );
+    assert_eq!(
+        (log[1]["status"].as_str(), log[1]["from"].as_str()),
+        (Some("delivered"), Some("user"))
+    );
 }
 
 #[test]

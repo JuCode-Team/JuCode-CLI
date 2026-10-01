@@ -32,8 +32,12 @@ pub struct Schedule {
     pub days: Vec<u8>,
     /// `once`: local `YYYY-MM-DD`.
     pub date: Option<String>,
-    /// Each run starts a new session; false continues the last run's.
+    /// Each run starts a new session (carrying the last run's handoff
+    /// note); false continues the last run's.
     pub new_session: bool,
+    /// The agent proposed it (with its `schedule` tool); it starts switched
+    /// off until the user turns it on.
+    pub by_agent: bool,
     pub created_at: u64,
     pub last_run_at: Option<u64>,
     /// The session the last run was delivered to.
@@ -54,6 +58,7 @@ impl Schedule {
             days: Vec::new(),
             date: None,
             new_session: true,
+            by_agent: false,
             created_at,
             last_run_at: None,
             last_session: None,
@@ -73,6 +78,7 @@ impl Schedule {
             "days": self.days,
             "date": self.date,
             "new_session": self.new_session,
+            "by_agent": self.by_agent,
             "created_at": self.created_at,
             "last_run_at": self.last_run_at,
             "last_session": self.last_session,
@@ -84,6 +90,7 @@ impl Schedule {
     /// due while the daemon was down still fires.
     fn from_json(value: &Value) -> Option<Self> {
         let mut schedule = Self {
+            by_agent: value["by_agent"] == true,
             last_run_at: value["last_run_at"].as_u64(),
             last_session: value["last_session"].as_str().map(str::to_string),
             next_run_at: value["next_run_at"].as_u64(),
@@ -242,11 +249,33 @@ impl Hub {
 
     /// Creates a schedule (no `id`) or changes one; its agent stays.
     pub fn save_schedule(&self, changes: &Value) -> Result<Schedule, String> {
+        self.save_schedule_by(changes, None)
+    }
+
+    /// An agent's own `schedule` tool: it may create and change only its
+    /// own tasks, and whatever it saves is switched off until the user
+    /// turns it on.
+    pub fn propose_schedule(&self, agent: &str, fields: &Value) -> Result<Schedule, String> {
+        let mut changes = json!({ "agent": agent, "enabled": false });
+        for key in ["id", "name", "prompt", "repeat", "time", "days", "date"] {
+            if !fields[key].is_null() {
+                changes[key] = fields[key].clone();
+            }
+        }
+        self.save_schedule_by(&changes, Some(agent))
+    }
+
+    fn save_schedule_by(
+        &self,
+        changes: &Value,
+        by_agent: Option<&str>,
+    ) -> Result<Schedule, String> {
         let mut list = lock(&self.schedules);
         let mut schedule = match changes["id"].as_str() {
             Some(id) => list
                 .iter()
                 .find(|schedule| schedule.id == id)
+                .filter(|schedule| by_agent.is_none_or(|agent| schedule.agent == agent))
                 .cloned()
                 .ok_or_else(|| format!("unknown schedule {id}"))?,
             None => {
@@ -255,7 +284,9 @@ impl Hub {
                     return Err(format!("unknown agent '{agent}'"));
                 }
                 let id = random_hex(8).map_err(|error| error.to_string())?;
-                Schedule::new(format!("sch-{id}"), agent.to_string(), seconds())
+                let mut schedule = Schedule::new(format!("sch-{id}"), agent.to_string(), seconds());
+                schedule.by_agent = by_agent.is_some();
+                schedule
             }
         };
         schedule.apply(changes)?;
@@ -273,10 +304,16 @@ impl Hub {
     }
 
     pub fn delete_schedule(&self, id: &str) -> Result<(), String> {
+        self.delete_schedule_by(id, None)
+    }
+
+    /// Deletes a schedule; `by_agent` may delete only its own.
+    pub fn delete_schedule_by(&self, id: &str, by_agent: Option<&str>) -> Result<(), String> {
         let mut list = lock(&self.schedules);
         let agent = list
             .iter()
             .find(|schedule| schedule.id == id)
+            .filter(|schedule| by_agent.is_none_or(|agent| schedule.agent == agent))
             .map(|schedule| schedule.agent.clone())
             .ok_or_else(|| format!("unknown schedule {id}"))?;
         let mut updated = list.clone();
@@ -376,7 +413,8 @@ impl Hub {
     }
 
     /// Records the message for one run: into the last run's session when
-    /// the schedule continues it and the agent still owns it, else a new one.
+    /// the schedule continues it and the agent still owns it, else a new one
+    /// told what the last run concluded.
     fn record_schedule_run(&self, schedule: &Schedule, dedupe_key: String) -> Result<(), String> {
         let session = schedule
             .last_session
@@ -387,12 +425,27 @@ impl Hub {
                     record.id == *session && record.agent.as_deref() == Some(&schedule.agent)
                 })
             });
+        let mut body = format!("定时任务「{}」：\n{}", schedule.name, schedule.prompt);
+        if session.is_none() {
+            let last = schedule
+                .last_session
+                .as_deref()
+                .and_then(|last| self.agents.handoff(&schedule.agent, last));
+            if let (Some(note), Some(at)) = (last, schedule.last_run_at) {
+                let at = Local
+                    .timestamp_opt(at as i64, 0)
+                    .single()
+                    .map(|at| at.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_default();
+                body.push_str(&format!("\n\n上次运行（{at}）的交接：\n{note}"));
+            }
+        }
         self.store
             .record_message(&Message {
                 id: self.new_id("m"),
                 to: schedule.agent.clone(),
                 from: format!("schedule:{}", schedule.id),
-                body: format!("定时任务「{}」：\n{}", schedule.name, schedule.prompt),
+                body,
                 session,
                 reply_to: None,
                 dedupe_key: Some(dedupe_key),

@@ -451,22 +451,39 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             let text = |key: &str| op[key].as_str().map(str::to_string);
             match (text("agent"), text("body")) {
                 (Some(to), Some(body)) => {
-                    let id = hub.new_id("m");
-                    hub.send_message(store::Message {
-                        id: id.clone(),
-                        to,
-                        from: "user".to_string(),
-                        body,
-                        session: text("session"),
-                        reply_to: text("reply_to"),
-                        dedupe_key: text("dedupe_key"),
-                        at: now(),
+                    // `new_session`: start a fresh conversation instead of
+                    // continuing the latest one.
+                    let session = if op["new_session"] == true {
+                        hub.create_session(None, Some(&to), false).map(Some)
+                    } else {
+                        Ok(text("session"))
+                    };
+                    session.and_then(|session| {
+                        let id = hub.new_id("m");
+                        hub.send_message(store::Message {
+                            id: id.clone(),
+                            to,
+                            from: "user".to_string(),
+                            body,
+                            session,
+                            reply_to: text("reply_to"),
+                            dedupe_key: text("dedupe_key"),
+                            at: now(),
+                        })
+                        .map(|fresh| json!({ "type": "message_accepted", "message": id, "duplicate": !fresh }))
                     })
-                    .map(|fresh| json!({ "type": "message_accepted", "message": id, "duplicate": !fresh }))
                 }
                 _ => Err("message_send requires agent and body".to_string()),
             }
         }
+        ("message_list", _) => Ok(json!({
+            "type": "messages",
+            "messages": hub.store.message_log(op["agent"].as_str(), op["limit"].as_u64().unwrap_or(50) as usize),
+        })),
+        ("handoff_list", _) => match op["agent"].as_str() {
+            Some(agent) => Ok(json!({ "type": "handoffs", "agent": agent, "handoffs": hub.agents.handoffs(agent) })),
+            None => Err("handoff_list requires agent".to_string()),
+        },
         ("usage_local", _) => Ok(hub.usage.local_json(
             op["days"].as_u64().unwrap_or(30),
             op["tz_offset"].as_i64().unwrap_or(0),

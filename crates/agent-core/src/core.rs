@@ -3471,7 +3471,11 @@ impl AgentCore {
                         let detail = format_resume_detail(&summary);
                         SessionListItemView {
                             active,
-                            label: summary.label,
+                            label: if summary.label.is_empty() {
+                                "(no messages yet)".to_string()
+                            } else {
+                                summary.label
+                            },
                             detail,
                             id,
                         }

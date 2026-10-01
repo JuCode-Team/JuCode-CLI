@@ -197,21 +197,17 @@ impl SessionStore {
         }
     }
 
-    pub fn latest_user_message(&self) -> Option<&str> {
+    /// The session's name: its first prompt, shortened; empty before there
+    /// is one (never the id).
+    pub fn session_label(&self) -> String {
         self.branch()
             .into_iter()
-            .rev()
             .find_map(|entry| match &entry.kind {
                 EntryKind::User { content } => Some(content.as_str()),
                 _ => None,
             })
-    }
-
-    pub fn session_label(&self) -> String {
-        self.latest_user_message()
             .map(|message| truncate_with_limit(message, SESSION_LABEL_MAX_CHARS))
-            .filter(|label| !label.is_empty())
-            .unwrap_or_else(|| self.session_id.clone())
+            .unwrap_or_default()
     }
 
     pub fn resume_summary_input(&self) -> String {
@@ -1204,9 +1200,10 @@ impl SessionStore {
             .get("label")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|value| !value.is_empty())
+            // Older files fell back to the id; that is no name.
+            .filter(|value| *value != id)
             .map(str::to_string)
-            .unwrap_or_else(|| id.clone());
+            .unwrap_or_default();
         let resume_summary = value
             .get("resume_summary")
             .and_then(Value::as_str)
@@ -2470,7 +2467,9 @@ mod tests {
         let loaded = SessionStore::load_for_cwd(&profile, &cwd, &session_id).unwrap();
 
         assert!(summary.contains("\"entries_count\": 2"));
-        assert!(!summary.contains("first prompt"));
+        // Named by its first prompt; the entries stay out of the summary.
+        assert!(summary.contains("\"label\": \"first prompt\""));
+        assert!(!summary.contains("second prompt"));
         assert!(journal
             .lines()
             .any(|line| line.contains("\"type\":\"entry\"")));

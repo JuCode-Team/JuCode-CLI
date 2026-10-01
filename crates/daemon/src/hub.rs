@@ -51,8 +51,6 @@ pub struct Hub {
     claims: Mutex<HashMap<String, usize>>,
     /// Every agent's scheduled tasks (see `schedules`).
     pub(crate) schedules: Mutex<Vec<Schedule>>,
-    /// When each session last received a message (ms), for routing.
-    last_active: Mutex<HashMap<String, u64>>,
     /// Serializes message delivery (scheduler ticks, sends, tool calls).
     delivering: Mutex<()>,
     next_id: AtomicU64,
@@ -68,6 +66,8 @@ pub struct Hub {
     turns: Mutex<HashMap<String, Turns>>,
     /// Sessions whose title is being written now.
     titling: Mutex<HashSet<String>>,
+    /// Agent sessions whose handoff note is being written now.
+    handing_off: Mutex<HashSet<String>>,
     /// This hub, for the threads it starts.
     me: Weak<Hub>,
     /// Each turn's token usage (see `usage`).
@@ -108,6 +108,7 @@ impl Hub {
             schedules,
             turns: Mutex::new(HashMap::new()),
             titling: Mutex::new(HashSet::new()),
+            handing_off: Mutex::new(HashSet::new()),
             relay: Relay::new(relay, &store),
             usage: Usage::new(&store),
             store,
@@ -117,7 +118,6 @@ impl Hub {
             busy: Mutex::new(HashSet::new()),
             restart_pending: AtomicBool::new(false),
             claims: Mutex::new(HashMap::new()),
-            last_active: Mutex::new(HashMap::new()),
             delivering: Mutex::new(()),
             next_id: AtomicU64::new(0),
             next_generation: AtomicU64::new(0),
@@ -609,7 +609,13 @@ impl Hub {
                 let mut value = agent.to_json();
                 value["summary"] = json!(self.agents.summary(&agent.id));
                 value["sessions"] = json!(sessions.len());
-                value["busy"] = json!(sessions.iter().any(|id| busy.contains(*id)));
+                let running: Vec<&str> = sessions
+                    .iter()
+                    .copied()
+                    .filter(|id| busy.contains(*id))
+                    .collect();
+                value["busy"] = json!(!running.is_empty());
+                value["running"] = json!(running);
                 value
             })
             .collect();
@@ -899,21 +905,9 @@ impl Hub {
                 return Ok(Some(session));
             }
         }
-        if message.from != "user" {
-            return Ok(None);
-        }
-        // The user continues the conversation they had with this agent most
-        // recently.
-        let last_active = lock(&self.last_active);
-        Ok(own
-            .iter()
-            .max_by_key(|record| {
-                last_active
-                    .get(&record.id)
-                    .copied()
-                    .unwrap_or(record.created_at)
-            })
-            .map(|record| record.id.clone()))
+        // Anything else is a new task, in a new session; what earlier
+        // sessions concluded reaches it through their handoff notes.
+        Ok(None)
     }
 
     fn deliver(self: &Arc<Self>, message: &Message, target: Option<String>) -> Result<(), String> {
@@ -935,7 +929,6 @@ impl Hub {
             self.release_claim(&session);
             return Err(error);
         }
-        lock(&self.last_active).insert(session.clone(), now());
         self.store
             .record_delivered(&message.id, &session)
             .map_err(|error| error.to_string())?;
@@ -971,13 +964,74 @@ impl Hub {
         if event["type"] == "user_message" {
             self.note_user_message(session, event["content"].as_str().unwrap_or_default());
         }
-        let due = lock(&self.turns)
-            .entry(session.to_string())
-            .or_default()
-            .observe(event);
+        let (due, ended) = {
+            let mut turns = lock(&self.turns);
+            let turns = turns.entry(session.to_string()).or_default();
+            let before = turns.done();
+            (turns.observe(event), turns.done() != before)
+        };
         if due {
             self.retitle(session);
         }
+        if ended {
+            self.write_handoff(session);
+        }
+    }
+
+    /// An agent session's turn ended: the title model rewrites its handoff
+    /// note in the background (see `titles`). One at a time per session; a
+    /// turn that ends meanwhile is covered by the next.
+    fn write_handoff(&self, session: &str) {
+        let Some(record) = self
+            .store
+            .sessions()
+            .into_iter()
+            .find(|record| record.id == session)
+        else {
+            return;
+        };
+        let Some(agent) = record.agent.clone() else {
+            return;
+        };
+        let Some(hub) = self.me.upgrade() else {
+            return;
+        };
+        if !lock(&self.handing_off).insert(session.to_string()) {
+            return;
+        }
+        let title = record.title.clone().unwrap_or_default();
+        let previous = self.agents.handoff(&agent, session);
+        let Some(prompt) = lock(&self.turns)
+            .get(session)
+            .map(|turns| turns.handoff_prompt(&title, previous.as_deref()))
+        else {
+            lock(&self.handing_off).remove(session);
+            return;
+        };
+        let id = session.to_string();
+        thread::spawn(move || {
+            let reply = jucode_agent_core::title_completion(titles::HANDOFF_SYSTEM, &prompt);
+            lock(&hub.handing_off).remove(&id);
+            let note = match reply {
+                Ok(reply) => titles::clean_handoff(&reply),
+                Err(error) => {
+                    jucode_agent_core::log_warn!("daemon", "handoff note failed", error = error);
+                    None
+                }
+            };
+            let Some(note) = note else { return };
+            // The title as it is now: the model may have renamed it meanwhile.
+            let title = hub
+                .store
+                .sessions()
+                .into_iter()
+                .find(|record| record.id == id)
+                .and_then(|record| record.title)
+                .unwrap_or(title);
+            if let Err(error) = hub.agents.save_handoff(&agent, &id, &title, &note, now()) {
+                jucode_agent_core::log_warn!("daemon", "handoff note not saved", error = error);
+            }
+        });
     }
 
     /// Asks the title model for a title in the background, unless a client
@@ -1051,17 +1105,9 @@ impl Hub {
         if !lock(&self.untitled).remove(session) {
             return;
         }
-        let title: String = content
-            .trim()
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .chars()
-            .take(40)
-            .collect();
-        if title.is_empty() {
+        let Some(title) = title_from(content) else {
             return;
-        }
+        };
         let untouched = self
             .store
             .sessions()
@@ -1083,10 +1129,13 @@ impl Hub {
         let sessions = lock(&self.sessions);
         let list: Vec<Value> = records
             .into_iter()
-            .filter(|record| !record.hidden)
+            // An agent's session stays on its agent's page even when a
+            // client hid it from a session list (desktops listed them there
+            // before they moved to the workbench).
+            .filter(|record| !record.hidden || record.agent.is_some())
             .map(|record| {
                 let hosted = sessions.get(&record.id);
-                let cwd = hosted.map(|h| h.cwd.clone()).unwrap_or(record.cwd);
+                let cwd = hosted.map_or_else(|| record.cwd.clone(), |h| h.cwd.clone());
                 let summary = saved.get(&record.id);
                 json!({
                     "session": record.id,
@@ -1094,7 +1143,7 @@ impl Hub {
                     "cwd": cwd.display().to_string(),
                     "created_at": record.created_at,
                     "updated_at": summary.map_or(record.created_at, |s| s.updated_at * 1000),
-                    "title": record.title.or_else(|| summary.map(|s| s.label.clone())),
+                    "title": shown_title(&record, summary.map(|s| s.label.as_str())),
                     "archived": record.archived,
                     "group": record.group,
                     "gateway": record.gateway,
@@ -1123,7 +1172,10 @@ impl Hub {
         let item = |id: String, label: String, updated_at: u64, entries: Value, engine: &str| {
             let record = records.get(&id);
             json!({
-                "title": record.and_then(|r| r.title.clone()).unwrap_or(label),
+                "title": match record {
+                    Some(record) => shown_title(record, Some(&label)),
+                    None => title_from(&label),
+                },
                 "updated_at": updated_at,
                 "entries": entries,
                 "archived": record.is_some_and(|r| r.archived),
@@ -1194,6 +1246,48 @@ fn report_json(report: &Report) -> Value {
     })
 }
 
+/// A session's title as clients see it: its own, else its first prompt; never
+/// an id or a delivery header (which older daemons wrote as the title).
+fn shown_title(record: &SessionRecord, label: Option<&str>) -> Option<String> {
+    record
+        .title
+        .clone()
+        .filter(|title| !(record.title_auto && DELIVERY_HEADERS.iter().any(|header| title.starts_with(header))))
+        .or_else(|| label.and_then(title_from))
+}
+
+/// How `delivery_text` starts the line naming where a message came from.
+const DELIVERY_HEADERS: [&str; 4] = [
+    "[message from ",
+    "[timer ",
+    "[scheduled task ",
+    "[answer to your question ",
+];
+
+/// `text` without the delivery header line `delivery_text` put first: what
+/// was actually asked, for titles and handoff notes.
+pub(crate) fn without_delivery_header(text: &str) -> &str {
+    let text = text.trim_start();
+    if DELIVERY_HEADERS.iter().any(|header| text.starts_with(header)) {
+        return text.split_once('\n').map_or("", |(_, rest)| rest);
+    }
+    text
+}
+
+/// A title from what was asked: its first line, at most 40 characters.
+pub(crate) fn title_from(text: &str) -> Option<String> {
+    let title: String = without_delivery_header(text)
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(40)
+        .collect();
+    let title = title.trim().trim_end_matches([':', '：']).trim().to_string();
+    (!title.is_empty()).then_some(title)
+}
+
 fn delivery_text(message: &Message) -> String {
     if message.from == "user" {
         return message.body.clone();
@@ -1213,6 +1307,44 @@ mod tests {
     use super::*;
     use crate::{store::now, Agents};
     use std::{fs, sync::mpsc};
+
+    #[test]
+    fn titles_come_from_what_was_asked_never_a_delivery_header() {
+        let scheduled = delivery_text(&Message {
+            id: "m-1".into(),
+            to: "ops".into(),
+            from: "schedule:sch-1".into(),
+            body: "定时任务「每日巡检」：\n检查部署".into(),
+            session: None,
+            reply_to: None,
+            dedupe_key: None,
+            at: 0,
+        });
+        assert_eq!(title_from(&scheduled).as_deref(), Some("定时任务「每日巡检」"));
+        assert_eq!(without_delivery_header(&scheduled), "定时任务「每日巡检」：\n检查部署");
+        assert_eq!(title_from("  修复登录跳转\n细节").as_deref(), Some("修复登录跳转"));
+        assert_eq!(title_from("[timer t-1 fired · m-2]\n"), None);
+
+        // An older daemon's header title gives way to the first prompt.
+        let record = SessionRecord {
+            id: "s1".into(),
+            cwd: "/tmp".into(),
+            agent: Some("ops".into()),
+            created_at: 0,
+            closed: false,
+            title: Some("[scheduled task sch-1 · m-".into()),
+            title_auto: true,
+            archived: false,
+            hidden: false,
+            engine: None,
+            gateway: false,
+            group: None,
+        };
+        assert_eq!(shown_title(&record, Some(&scheduled)).as_deref(), Some("定时任务「每日巡检」"));
+        assert_eq!(shown_title(&record, Some("")), None);
+        let named = SessionRecord { title: Some("我的标题".into()), title_auto: false, ..record };
+        assert_eq!(shown_title(&named, None).as_deref(), Some("我的标题"));
+    }
 
     #[test]
     fn a_finishing_engine_leaves_its_successor_hosted() {

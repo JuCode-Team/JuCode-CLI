@@ -859,7 +859,12 @@ fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("jucode");
-    let temp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    // Unique per call, not just per process: threads of one process (a
+    // daemon's title and handoff writers) save the config at the same time,
+    // and a shared temp file is renamed away under the other one.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = path.with_file_name(format!(".{file_name}.{}.{n}.tmp", std::process::id()));
     fs::write(&temp, contents)?;
     if let Err(error) = fs::rename(&temp, path) {
         let _ = fs::remove_file(&temp);
