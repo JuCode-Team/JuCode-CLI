@@ -1,0 +1,216 @@
+{
+  "name": "anthropic",
+  "repository": "https://github.com/anthropics/skills",
+  "revision": "3b3fad96af16a10759d930941b4520ba0c40edae",
+  "skills": [
+    {
+      "id": "academy-guide",
+      "name": "Academy Guide",
+      "description": "Recommends relevant Claude Academy courses, tutorials, and use cases.",
+      "tags": [
+        "education",
+        "guidance"
+      ],
+      "license": "Apache-2.0",
+      "redistributable": true
+    },
+    {
+      "id": "algorithmic-art",
+      "name": "Algorithmic Art",
+      "description": "Creates generative art with deterministic randomness and interactive parameters.",
+      "tags": [
+        "creative",
+        "design"
+      ],
+      "license": "Apache-2.0",
+      "redistributable": true
+    },
+    {
+      "id": "brand-guidelines",
+      "name": "Brand Guidelines",
+      "description": "Applies Anthropic brand colors, typography, and visual identity to artifacts.",
+      "tags": [
+        "creative",
+        "brand"
+      ],
+      "license": "Apache-2.0",
+      "redistributable": true
+    },
+    {
+      "id": "canvas-design",
+      "name": "Canvas Design",
+      "description": "Creates polished static visual designs in PNG and PDF formats.",
+      "tags": [
+        "creative",
+        "design"
+      ],
+      "license": "Apache-2.0",
+      "redistributable": true
+    },
+    {
+      "id": "claude-api",
+      "name": "Claude API",
+      "description": "Provides current Claude API and SDK guidance for building applications.",
+      "tags": [
+        "development",
+        "api"
+      ],
+      "license": "Apache-2.0",
+      "redistributable": true
+    },
+    {
+      "id": "discernment-nudge",
+      "name": "Discernment Nudge",
+      "description": "Adds concise follow-up questions that help check facts and probe reasoning.",
+      "tags": [
+        "communication",
+        "reasoning"
+      ],
+      "license": "Apache-2.0",
+      "redistributable": true
+    },
+    {
+      "id": "doc-coauthoring",
+      "name": "Document Coauthoring",
+      "description": "Guides a structured workflow for collaboratively drafting documentation.",
+      "tags": [
+        "documents",
+        "communication"
+      ],
+      "license": "Apache-2.0",
+      "redistributable": true
+    },
+    {
+      "id": "docx",
+      "name": "Word Documents",
+      "description": "Creates, reads, edits, and validates Word documents and templates.",
+      "tags": [
+        "documents",
+        "source-available"
+      ],
+      "license": "Anthropic source-available",
+      "redistributable": false
+    },
+    {
+      "id": "frontend-design",
+      "name": "Frontend Design",
+      "description": "Guides distinctive, intentional visual design for web interfaces.",
+      "tags": [
+        "development",
+        "design"
+      ],
+      "license": "Apache-2.0",
+      "redistributable": true
+    },
+    {
+      "id": "internal-comms",
+      "name": "Internal Communications",
+      "description": "Provides patterns for status updates, newsletters, FAQs, and internal writing.",
+      "tags": [
+        "enterprise",
+        "communication"
+      ],
+      "license": "Apache-2.0",
+      "redistributable": true
+    },
+    {
+      "id": "mcp-builder",
+      "name": "MCP Builder",
+      "description": "Guides creation of reliable Model Context Protocol servers.",
+      "tags": [
+        "development",
+        "mcp"
+      ],
+      "license": "Apache-2.0",
+      "redistributable": true
+    },
+    {
+      "id": "pdf",
+      "name": "PDF Documents",
+      "description": "Creates, reads, edits, combines, and validates PDF documents.",
+      "tags": [
+        "documents",
+        "source-available"
+      ],
+      "license": "Anthropic source-available",
+      "redistributable": false
+    },
+    {
+      "id": "pptx",
+      "name": "PowerPoint Presentations",
+      "description": "Creates, edits, renders, and validates PowerPoint presentations.",
+      "tags": [
+        "documents",
+        "source-available"
+      ],
+      "license": "Anthropic source-available",
+      "redistributable": false
+    },
+    {
+      "id": "skill-creator",
+      "name": "Skill Creator",
+      "description": "Guides creation and improvement of reusable Agent Skills.",
+      "tags": [
+        "development",
+        "skills"
+      ],
+      "license": "Apache-2.0",
+      "redistributable": true
+    },
+    {
+      "id": "slack-gif-creator",
+      "name": "Slack GIF Creator",
+      "description": "Creates compact animated GIFs optimized for Slack.",
+      "tags": [
+        "creative",
+        "communication"
+      ],
+      "license": "Apache-2.0",
+      "redistributable": true
+    },
+    {
+      "id": "theme-factory",
+      "name": "Theme Factory",
+      "description": "Applies cohesive color and typography themes to generated artifacts.",
+      "tags": [
+        "creative",
+        "design"
+      ],
+      "license": "Apache-2.0",
+      "redistributable": true
+    },
+    {
+      "id": "web-artifacts-builder",
+      "name": "Web Artifacts Builder",
+      "description": "Builds complex interactive web artifacts with modern frontend tooling.",
+      "tags": [
+        "development",
+        "web"
+      ],
+      "license": "Apache-2.0",
+      "redistributable": true
+    },
+    {
+      "id": "webapp-testing",
+      "name": "Web App Testing",
+      "description": "Tests local web applications with browser automation and screenshots.",
+      "tags": [
+        "development",
+        "testing"
+      ],
+      "license": "Apache-2.0",
+      "redistributable": true
+    },
+    {
+      "id": "xlsx",
+      "name": "Excel Spreadsheets",
+      "description": "Creates, edits, recalculates, and analyzes spreadsheet workbooks.",
+      "tags": [
+        "documents",
+        "source-available"
+      ],
+      "license": "Anthropic source-available",
+      "redistributable": false
+    }
+  ]
+}

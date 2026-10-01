@@ -900,18 +900,20 @@ impl AgentCore {
         };
         let extra = match self.fetch_extra_skill_source() {
             Ok(Some(source)) => {
-                let mut lines = source
+                let (offered, excluded): (Vec<_>, Vec<_>) = source
                     .skills
+                    .iter()
+                    .partition(|skill| skill.redistributable);
+                let mut lines = offered
                     .iter()
                     .map(|skill| skill.id.clone())
                     .collect::<Vec<_>>();
-                if !source.excluded.is_empty() {
+                if !excluded.is_empty() {
                     lines.push(format!(
                         "Not offered: {}",
-                        source
-                            .excluded
+                        excluded
                             .iter()
-                            .map(|skill| format!("{} ({})", skill.id, skill.reason))
+                            .map(|skill| format!("{} ({})", skill.id, not_offered_reason(skill)))
                             .collect::<Vec<_>>()
                             .join(", ")
                     ));
@@ -944,7 +946,9 @@ impl AgentCore {
     }
 
     fn install_marketplace_skill_events(&mut self, id: &str, verb: &str) -> Vec<AgentEvent> {
-        if verb == "updated" && !skills::skill_installed(self.config.profile_dir(), id) {
+        let profile = self.config.profile_dir().to_path_buf();
+        let skills_dir = profile.join("skills");
+        if verb == "updated" && !skills::skill_installed(&skills_dir, id) {
             return vec![AgentEvent::Error(format!(
                 "installed skill not found: {id}"
             ))];
@@ -952,7 +956,9 @@ impl AgentCore {
         let marketplace = self.fetch_marketplace();
         if let Ok(marketplace) = &marketplace {
             if let Some(skill) = marketplace.skills.iter().find(|skill| skill.id == id) {
-                return match skills::install_marketplace_skill(self.config.profile_dir(), skill) {
+                let installed = skills::install_marketplace_skill(&skills_dir, skill)
+                    .and_then(|_| skills::set_skill_enabled(&profile, &skill.id, true));
+                return match installed {
                     Ok(()) => vec![
                         AgentEvent::Status(format!(
                             "{verb} skill {} from JuCode marketplace",
@@ -970,11 +976,17 @@ impl AgentCore {
         match self.fetch_extra_skill_source() {
             Ok(Some(source)) => {
                 if let Some(skill) = source.skills.iter().find(|skill| skill.id == id) {
-                    return match skills::install_extra_skill(
-                        self.config.profile_dir(),
-                        &source,
-                        skill,
-                    ) {
+                    if !skill.redistributable {
+                        return vec![AgentEvent::Error(format!(
+                            "skill {} is not offered by {}: {}",
+                            skill.id,
+                            source.name,
+                            not_offered_reason(skill)
+                        ))];
+                    }
+                    let installed = skills::install_source_skill(&skills_dir, &source, skill)
+                        .and_then(|_| skills::set_skill_enabled(&profile, &skill.id, true));
+                    return match installed {
                         Ok(()) => vec![
                             AgentEvent::Status(format!(
                                 "{verb} skill {} from {}",
@@ -987,12 +999,6 @@ impl AgentCore {
                             skill.id, source.name
                         ))],
                     };
-                }
-                if let Some(excluded) = source.excluded.iter().find(|skill| skill.id == id) {
-                    return vec![AgentEvent::Error(format!(
-                        "skill {} is not offered by {}: {}",
-                        excluded.id, source.name, excluded.reason
-                    ))];
                 }
             }
             Ok(None) => {}
@@ -1026,7 +1032,7 @@ impl AgentCore {
     }
 
     fn set_skill_enabled_events(&mut self, id: &str, enabled: bool) -> Vec<AgentEvent> {
-        if !skills::skill_installed(self.config.profile_dir(), id) {
+        if !skills::skill_installed(&self.config.profile_dir().join("skills"), id) {
             return vec![AgentEvent::Error(format!(
                 "installed skill not found: {id}"
             ))];
@@ -1074,7 +1080,7 @@ impl AgentCore {
         skills::fetch_marketplace(&self.config.jucode_api_url, self.auth.jucode_access_token())
     }
 
-    fn fetch_extra_skill_source(&self) -> Result<Option<skills::ExtraSkillSource>, String> {
+    fn fetch_extra_skill_source(&self) -> Result<Option<skills::SkillSource>, String> {
         skills::fetch_extra_skill_source(
             self.config
                 .extra_skills_source
@@ -3716,6 +3722,10 @@ fn mask_key(value: Option<&str>) -> String {
         Some(_) => "(set)".to_string(),
         None => "(not set)".to_string(),
     }
+}
+
+fn not_offered_reason(skill: &skills::SourceSkill) -> String {
+    format!("{}; not redistributed by JuCode", skill.license)
 }
 
 /// Splits a command line into its command token and argument text, tolerating

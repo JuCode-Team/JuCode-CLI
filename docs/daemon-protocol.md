@@ -166,6 +166,8 @@ every connected client.
 | `question_answer` | `question`, `answer` | `question_answered`; the answer is delivered to the session that asked |
 | `report_list` | optional `limit` (50) | `reports`, newest first, with `read` |
 | `report_read` | `report` | `report_read` |
+| `skills_catalog` | optional `backend` (`jucode`, default, or `claude`) | `skills_catalog` with `skills: [{id, name, description, tags, source, isDefault, installed, license, redistributable, homepage}]`, `warnings` and `installDir` (local clients only). See "Skills" |
+| `skill_install` | `source` (`jucode` or `anthropic`), `skill` (its `id` in the catalog), optional `backend` | `skill_installed` with `path` (local clients only) |
 
 `decide_action` (a session op) also works for a session that is closed or
 was hosted before a restart: the daemon reopens it first.
@@ -185,6 +187,24 @@ folders anywhere under the home directory (for picking a new project).
 Credentials (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.jucode/auth.json`,
 `~/.jucode/daemon`) are never readable. Paths are resolved (symlinks
 followed) before the check.
+
+## Skills
+
+`skills_catalog` lists the JuCode marketplace (`/v1/skills/marketplace` on
+the configured JuCode API, with the JuCode login's token when there is one)
+and the bundled index of github.com/anthropics/skills. When the marketplace
+cannot be reached its error is one of `warnings` and only the Anthropic
+skills are listed. `source` is `jucode` or `anthropic`; `redistributable` is
+false for Anthropic's source-available document skills.
+
+`backend` picks the directory: `claude` installs into `~/.claude/skills`,
+anything else into `~/.jucode/skills`. `installed` means
+`<installDir>/<id>/SKILL.md` exists. `skill_install` looks the skill up again
+in its source, then downloads it: a JuCode skill's inline content or
+checksummed package, or an Anthropic skill's whole directory at the index's
+pinned commit. The new install replaces an old one only once complete. Both
+ops are refused for paired devices: an installed skill is instructions and
+scripts that later sessions run.
 
 ## Other engines
 

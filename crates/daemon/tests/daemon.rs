@@ -1807,3 +1807,150 @@ fn only_the_desktop_starts_acp_agents_which_run_like_any_session() {
         "{frames:#?}"
     );
 }
+
+/// A one-route HTTP server standing in for the JuCode API: every request
+/// gets `body` as JSON.
+fn fake_jucode_api(body: Value) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(&stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|read| read > 2) {
+                line.clear();
+            }
+            let body = body.to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    format!("http://{address}")
+}
+
+fn set_jucode_api_url(url: &str) {
+    let path = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".jucode/config.json");
+    let mut config: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    config["jucode_api_url"] = json!(url);
+    fs::write(&path, config.to_string()).unwrap();
+}
+
+#[test]
+fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
+    let _guard = setup();
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    set_jucode_api_url(&fake_jucode_api(json!({
+        "skills": [{
+            "id": "review",
+            "name": "Review",
+            "description": "Review code",
+            "content": "Be strict.",
+            "tags": ["code"]
+        }],
+        "default_skill_ids": ["review"]
+    })));
+    let daemon = start_daemon();
+    let mut desktop = Client::connect(&daemon);
+    let entry = |catalog: &Value, source: &str, id: &str| {
+        catalog["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|skill| skill["source"] == source && skill["id"] == id)
+            .unwrap_or_else(|| panic!("{source}:{id} in {catalog}"))
+            .clone()
+    };
+
+    let catalog = request(
+        &mut desktop,
+        json!({ "op": "skills_catalog", "backend": "jucode" }),
+    );
+    assert_eq!(catalog["type"], "skills_catalog", "{catalog}");
+    assert_eq!(catalog["warnings"], json!([]));
+    let jucode_dir = home.join(".jucode/skills");
+    assert_eq!(catalog["installDir"], json!(jucode_dir));
+    let review = entry(&catalog, "jucode", "review");
+    assert_eq!(
+        (&review["isDefault"], &review["installed"], &review["tags"]),
+        (&json!(true), &json!(false), &json!(["code"]))
+    );
+    let pdf = entry(&catalog, "anthropic", "pdf");
+    assert_eq!(pdf["redistributable"], false);
+    assert!(pdf["homepage"]
+        .as_str()
+        .unwrap()
+        .starts_with("https://github.com/anthropics/skills/tree/"));
+
+    let installed = request(
+        &mut desktop,
+        json!({ "op": "skill_install", "source": "jucode", "skill": "review", "backend": "jucode" }),
+    );
+    assert_eq!(installed["type"], "skill_installed", "{installed}");
+    assert_eq!(installed["path"], json!(jucode_dir.join("review")));
+    assert!(fs::read_to_string(jucode_dir.join("review/SKILL.md"))
+        .unwrap()
+        .contains("Be strict."));
+    let catalog = request(
+        &mut desktop,
+        json!({ "op": "skills_catalog", "backend": "jucode" }),
+    );
+    assert_eq!(entry(&catalog, "jucode", "review")["installed"], true);
+
+    // Claude Code sessions read their own directory.
+    let catalog = request(
+        &mut desktop,
+        json!({ "op": "skills_catalog", "backend": "claude" }),
+    );
+    assert_eq!(catalog["installDir"], json!(home.join(".claude/skills")));
+    assert_eq!(entry(&catalog, "jucode", "review")["installed"], false);
+    for op in [
+        json!({ "op": "skill_install", "source": "elsewhere", "skill": "review" }),
+        json!({ "op": "skill_install", "source": "jucode", "skill": "missing" }),
+        json!({ "op": "skill_install", "source": "anthropic", "skill": "../escape" }),
+    ] {
+        assert_eq!(request(&mut desktop, op)["type"], "error");
+    }
+
+    // A paired device cannot browse or install.
+    desktop.send(json!({ "op": "pair_start", "id": 1 }));
+    let code = desktop.until(|f| f["id"] == 1).pop().unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, response) = http(&daemon, &pair_request(&code));
+    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let mut phone = Client::connect_with(&daemon, body["token"].as_str().unwrap());
+    for op in ["skills_catalog", "skill_install"] {
+        let refused = request(
+            &mut phone,
+            json!({ "op": op, "source": "jucode", "skill": "review" }),
+        );
+        assert_eq!(refused["type"], "error", "{refused}");
+    }
+
+    // Without the JuCode marketplace the Anthropic catalog still lists.
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    set_jucode_api_url(&format!("http://{}", closed.local_addr().unwrap()));
+    drop(closed);
+    let catalog = request(
+        &mut desktop,
+        json!({ "op": "skills_catalog", "backend": "jucode" }),
+    );
+    assert_eq!(
+        catalog["warnings"].as_array().unwrap().len(),
+        1,
+        "{catalog}"
+    );
+    entry(&catalog, "anthropic", "frontend-design");
+    assert!(catalog["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|skill| skill["source"] == "anthropic"));
+    let _ = fs::remove_dir_all(jucode_dir.join("review"));
+}

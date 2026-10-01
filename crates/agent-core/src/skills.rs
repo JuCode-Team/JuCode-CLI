@@ -5,38 +5,53 @@ use std::{
     fs,
     io::{self, Cursor, Read},
     path::{Component, Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tar::Archive;
 use zip::ZipArchive;
 
+/// Limit for one download: a package, a single skill file.
 const MAX_PACKAGE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_TREE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_PACKAGE_FILES: usize = 4096;
 const SKILL_STATE_FILE: &str = "skills-state.json";
 pub const ANTHROPIC_SKILLS_URL: &str = "https://github.com/anthropics/skills";
-const ANTHROPIC_SKILLS_INDEX: &str = include_str!("anthropic-skills-index.json");
+const ANTHROPIC_SKILLS_INDEX: &str = include_str!("anthropic-skills.json");
 
+/// A skill in a GitHub repository's `skills/<id>/` directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExtraSkill {
+pub struct SourceSkill {
     pub id: String,
-    pub path: String,
-    pub sha256: Option<String>,
+    pub name: String,
+    pub description: String,
+    pub tags: Vec<String>,
+    pub license: String,
+    /// False for source-available skills whose terms forbid redistribution.
+    pub redistributable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExcludedSkill {
-    pub id: String,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExtraSkillSource {
+pub struct SkillSource {
     pub name: String,
     pub repository: String,
+    /// A commit SHA; empty follows the default branch.
     pub revision: String,
-    pub skills: Vec<ExtraSkill>,
-    pub excluded: Vec<ExcludedSkill>,
+    pub skills: Vec<SourceSkill>,
+}
+
+impl SkillSource {
+    pub fn homepage(&self, id: &str) -> String {
+        format!("{}/tree/{}/skills/{id}", self.repository, self.git_ref())
+    }
+
+    fn git_ref(&self) -> &str {
+        if self.revision.is_empty() {
+            "HEAD"
+        } else {
+            &self.revision
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +76,7 @@ pub struct Marketplace {
 
 pub fn fetch_marketplace(api_url: &str, api_key: Option<&str>) -> Result<Marketplace, String> {
     let url = format!("{}/v1/skills/marketplace", api_url.trim_end_matches('/'));
-    let mut request = ureq::get(&url).timeout(std::time::Duration::from_secs(30));
+    let mut request = ureq::get(&url).timeout(Duration::from_secs(30));
     if let Some(key) = api_key.filter(|key| !key.trim().is_empty()) {
         request = request.set("Authorization", &format!("Bearer {key}"));
     }
@@ -72,15 +87,37 @@ pub fn fetch_marketplace(api_url: &str, api_key: Option<&str>) -> Result<Marketp
     parse_marketplace(&value)
 }
 
-pub fn fetch_extra_skill_source(spec: &str) -> Result<Option<ExtraSkillSource>, String> {
+/// The marketplace for the configured JuCode API. The endpoint is public, so
+/// without a JuCode login it is asked without a token.
+pub fn fetch_jucode_marketplace() -> Result<Marketplace, String> {
+    let config = crate::config::Config::load_or_create().map_err(|error| error.to_string())?;
+    let auth = crate::oauth::ensure_session(&config.jucode_api_url, config.encrypt_secrets).ok();
+    fetch_marketplace(
+        &config.jucode_api_url,
+        auth.as_ref().and_then(|auth| auth.jucode_access_token()),
+    )
+}
+
+/// Where JuCode loads installed user skills from: `~/.jucode/skills`.
+pub fn profile_skills_dir() -> io::Result<PathBuf> {
+    Ok(crate::config::profile_dir()?.join("skills"))
+}
+
+/// The bundled index of github.com/anthropics/skills, pinned to a reviewed
+/// commit so listing needs no GitHub request.
+pub fn anthropic_source() -> Result<SkillSource, String> {
+    let value = serde_json::from_str(ANTHROPIC_SKILLS_INDEX)
+        .map_err(|error| format!("invalid bundled Anthropic skills index: {error}"))?;
+    parse_source_index(&value)
+}
+
+pub fn fetch_extra_skill_source(spec: &str) -> Result<Option<SkillSource>, String> {
     let spec = spec.trim();
     if spec.is_empty() {
         return Ok(None);
     }
     if spec == "anthropic" || normalize_repository_url(spec) == ANTHROPIC_SKILLS_URL {
-        let value = serde_json::from_str(ANTHROPIC_SKILLS_INDEX)
-            .map_err(|error| format!("invalid bundled Anthropic skills index: {error}"))?;
-        return parse_extra_skill_index(&value).map(Some);
+        return anthropic_source().map(Some);
     }
 
     let (owner, repository) = github_repository_parts(spec)?;
@@ -88,7 +125,7 @@ pub fn fetch_extra_skill_source(spec: &str) -> Result<Option<ExtraSkillSource>, 
     let response = ureq::get(&api_url)
         .set("Accept", "application/vnd.github+json")
         .set("User-Agent", "jucode-cli")
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(Duration::from_secs(30))
         .call()
         .map_err(|error| error.to_string())?;
     let value = response
@@ -98,52 +135,7 @@ pub fn fetch_extra_skill_source(spec: &str) -> Result<Option<ExtraSkillSource>, 
         .map(Some)
 }
 
-pub fn install_extra_skill(
-    profile_dir: &Path,
-    source: &ExtraSkillSource,
-    skill: &ExtraSkill,
-) -> io::Result<()> {
-    validate_source_skill(skill)?;
-    let (owner, repository) = github_repository_parts(&source.repository)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let revision = if source.revision.is_empty() {
-        "HEAD"
-    } else {
-        validate_revision(&source.revision)?;
-        source.revision.as_str()
-    };
-    let url = format!(
-        "https://raw.githubusercontent.com/{owner}/{repository}/{revision}/{}",
-        skill.path
-    );
-    let bytes = download_skill_package(&url)?;
-    if let Some(expected) = skill.sha256.as_deref() {
-        verify_sha256(&bytes, expected)?;
-    }
-    let content = String::from_utf8(bytes)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SKILL.md is not UTF-8"))?;
-    if !content.trim_start().starts_with("---") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "downloaded SKILL.md is missing frontmatter",
-        ));
-    }
-    let marketplace_skill = MarketplaceSkill {
-        id: skill.id.clone(),
-        name: skill.id.clone(),
-        description: format!("Skill from {}", source.name),
-        content,
-        package_url: None,
-        package_sha256: None,
-        package_type: None,
-        tags: Vec::new(),
-        enabled: true,
-        updated_at: String::new(),
-    };
-    install_marketplace_skill(profile_dir, &marketplace_skill)
-}
-
-pub fn parse_extra_skill_index(value: &Value) -> Result<ExtraSkillSource, String> {
+fn parse_source_index(value: &Value) -> Result<SkillSource, String> {
     let name = read_string(value, "name").ok_or_else(|| "source index missing name".to_string())?;
     let repository = read_string(value, "repository")
         .ok_or_else(|| "source index missing repository".to_string())?;
@@ -156,58 +148,41 @@ pub fn parse_extra_skill_index(value: &Value) -> Result<ExtraSkillSource, String
         .get("skills")
         .and_then(Value::as_array)
         .ok_or_else(|| "source index missing skills".to_string())?;
-    let mut skills = Vec::with_capacity(skill_values.len());
+    let mut skills: Vec<SourceSkill> = Vec::with_capacity(skill_values.len());
     for item in skill_values {
         let id = read_string(item, "id").ok_or_else(|| "source skill missing id".to_string())?;
-        let path =
-            read_string(item, "path").ok_or_else(|| format!("source skill {id} missing path"))?;
-        let skill = ExtraSkill {
-            id,
-            path,
-            sha256: read_string(item, "sha256"),
+        validate_skill_id(&id).map_err(|error| error.to_string())?;
+        let field = |key: &str| {
+            read_string(item, key).ok_or_else(|| format!("source skill {id} missing {key}"))
         };
-        validate_source_skill(&skill).map_err(|error| error.to_string())?;
-        if skills
-            .iter()
-            .any(|existing: &ExtraSkill| existing.id == skill.id)
-        {
+        let skill = SourceSkill {
+            name: field("name")?,
+            description: field("description")?,
+            tags: read_strings(item, "tags"),
+            license: field("license")?,
+            redistributable: item
+                .get("redistributable")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| format!("source skill {id} missing redistributable"))?,
+            id,
+        };
+        if skills.iter().any(|existing| existing.id == skill.id) {
             return Err(format!("duplicate source skill id: {}", skill.id));
         }
         skills.push(skill);
     }
-    let excluded = value
-        .get("excluded")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|item| {
-            let id =
-                read_string(item, "id").ok_or_else(|| "excluded skill missing id".to_string())?;
-            validate_skill_id(&id).map_err(|error| error.to_string())?;
-            let reason = read_string(item, "reason")
-                .ok_or_else(|| format!("excluded skill {id} missing reason"))?;
-            Ok(ExcludedSkill { id, reason })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    if excluded
-        .iter()
-        .any(|item| skills.iter().any(|skill| skill.id == item.id))
-    {
-        return Err("a source skill cannot be both available and excluded".to_string());
-    }
-    Ok(ExtraSkillSource {
+    Ok(SkillSource {
         name,
         repository: normalize_repository_url(&repository),
         revision,
         skills,
-        excluded,
     })
 }
 
 pub fn parse_github_skills_directory(
     value: &Value,
     repository: &str,
-) -> Result<ExtraSkillSource, String> {
+) -> Result<SkillSource, String> {
     github_repository_parts(repository)?;
     let entries = value
         .as_array()
@@ -221,24 +196,172 @@ pub fn parse_github_skills_directory(
             continue;
         };
         validate_skill_id(id).map_err(|error| error.to_string())?;
-        skills.push(ExtraSkill {
+        skills.push(SourceSkill {
             id: id.to_string(),
-            path: format!("skills/{id}/SKILL.md"),
-            sha256: None,
+            name: id.to_string(),
+            description: String::new(),
+            tags: Vec::new(),
+            license: String::new(),
+            redistributable: true,
         });
     }
     skills.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok(ExtraSkillSource {
+    Ok(SkillSource {
         name: github_repository_parts(repository)?.1,
         repository: normalize_repository_url(repository),
         revision: String::new(),
         skills,
-        excluded: Vec::new(),
     })
 }
 
-pub fn install_marketplace_skill(profile_dir: &Path, skill: &MarketplaceSkill) -> io::Result<()> {
-    let dir = profile_dir.join("skills").join(safe_skill_dir(&skill.id));
+/// Installs the whole `skills/<id>/` directory of `source` into
+/// `skills_dir/<id>`, replacing an earlier install only once every file has
+/// downloaded.
+pub fn install_source_skill(
+    skills_dir: &Path,
+    source: &SkillSource,
+    skill: &SourceSkill,
+) -> io::Result<PathBuf> {
+    install_github_skill(skills_dir, source, skill, &download)
+}
+
+fn install_github_skill(
+    skills_dir: &Path,
+    source: &SkillSource,
+    skill: &SourceSkill,
+    fetch: &dyn Fn(&str, usize) -> io::Result<Vec<u8>>,
+) -> io::Result<PathBuf> {
+    validate_skill_id(&skill.id)?;
+    let (owner, repository) = github_repository_parts(&source.repository)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if !source.revision.is_empty() {
+        validate_revision(&source.revision)?;
+    }
+    let git_ref = source.git_ref();
+    let tree = fetch(
+        &format!(
+            "https://api.github.com/repos/{owner}/{repository}/git/trees/{git_ref}?recursive=1"
+        ),
+        MAX_TREE_BYTES,
+    )?;
+    let tree = serde_json::from_slice::<Value>(&tree)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if tree.get("truncated").and_then(Value::as_bool) == Some(true) {
+        return Err(invalid_data(format!(
+            "GitHub returned a truncated tree for {}",
+            source.repository
+        )));
+    }
+
+    let prefix = format!("skills/{}/", skill.id);
+    let mut files = Vec::new();
+    let mut declared_bytes = 0_u64;
+    for entry in tree
+        .get("tree")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_data("GitHub tree response missing tree".to_string()))?
+    {
+        let path = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(relative) = path.strip_prefix(&prefix) else {
+            continue;
+        };
+        let relative = safe_path_components(Path::new(relative))
+            .ok_or_else(|| invalid_data(format!("unsafe path in GitHub tree: {path}")))?;
+        let mode = entry
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match entry.get("type").and_then(Value::as_str) {
+            Some("tree") => continue,
+            Some("blob") if mode == "100644" || mode == "100755" => {}
+            _ => {
+                return Err(invalid_data(format!(
+                    "unsupported GitHub tree entry: {path}"
+                )))
+            }
+        }
+        let size = entry
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| invalid_data(format!("GitHub tree entry has no size: {path}")))?;
+        if size > MAX_PACKAGE_BYTES as u64 {
+            return Err(invalid_data(format!(
+                "skill file exceeds {MAX_PACKAGE_BYTES} byte limit: {path}"
+            )));
+        }
+        declared_bytes = declared_bytes.saturating_add(size);
+        if declared_bytes > MAX_EXTRACTED_BYTES {
+            return Err(invalid_data(format!(
+                "skill exceeds {MAX_EXTRACTED_BYTES} byte limit"
+            )));
+        }
+        files.push((path.to_string(), relative, mode == "100755"));
+        if files.len() > MAX_PACKAGE_FILES {
+            return Err(invalid_data(format!(
+                "skill exceeds {MAX_PACKAGE_FILES} file limit"
+            )));
+        }
+    }
+    if files.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "skill files not found in {}: {}",
+                source.repository, skill.id
+            ),
+        ));
+    }
+
+    let dir = skills_dir.join(&skill.id);
+    let staging = staging_dir(&dir, "download");
+    recreate_dir(&staging)?;
+    let downloaded = (|| {
+        let mut actual_bytes = 0_u64;
+        for (path, relative, executable) in files {
+            let url = format!(
+                "https://raw.githubusercontent.com/{owner}/{repository}/{git_ref}/{}",
+                encode_url_path(&path)
+            );
+            let bytes = fetch(&url, MAX_PACKAGE_BYTES)?;
+            actual_bytes = actual_bytes.saturating_add(bytes.len() as u64);
+            if actual_bytes > MAX_EXTRACTED_BYTES {
+                return Err(invalid_data(format!(
+                    "skill exceeds {MAX_EXTRACTED_BYTES} byte limit"
+                )));
+            }
+            let out = staging.join(relative);
+            if let Some(parent) = out.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&out, bytes)?;
+            set_mode(&out, Some(if executable { 0o755 } else { 0o644 }))?;
+        }
+        if !staging.join("SKILL.md").is_file() {
+            return Err(invalid_data(format!(
+                "skill {} does not contain SKILL.md",
+                skill.id
+            )));
+        }
+        Ok(())
+    })();
+    if let Err(error) = downloaded {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    atomic_replace_dir(&staging, &dir)?;
+    Ok(dir)
+}
+
+/// Installs a marketplace skill into `skills_dir`; its enabled state (a
+/// JuCode profile's `skills-state.json`) is the caller's.
+pub fn install_marketplace_skill(
+    skills_dir: &Path,
+    skill: &MarketplaceSkill,
+) -> io::Result<PathBuf> {
+    let dir = skills_dir.join(safe_skill_dir(&skill.id));
     if let Some(url) = skill
         .package_url
         .as_deref()
@@ -248,15 +371,15 @@ pub fn install_marketplace_skill(profile_dir: &Path, skill: &MarketplaceSkill) -
     } else {
         install_inline_skill(&dir, skill)?;
     }
-    set_skill_enabled(profile_dir, &skill.id, true)?;
-    Ok(())
+    Ok(dir)
 }
 
 pub fn install_default_skills(profile_dir: &Path, marketplace: &Marketplace) -> io::Result<usize> {
     let mut installed = 0;
     for id in &marketplace.default_skill_ids {
         if let Some(skill) = marketplace.skills.iter().find(|skill| &skill.id == id) {
-            install_marketplace_skill(profile_dir, skill)?;
+            install_marketplace_skill(&profile_dir.join("skills"), skill)?;
+            set_skill_enabled(profile_dir, &skill.id, true)?;
             installed += 1;
         }
     }
@@ -322,12 +445,11 @@ pub fn installed_skill_ids(profile_dir: &Path) -> io::Result<Vec<String>> {
     Ok(installed)
 }
 
-pub fn skill_installed(profile_dir: &Path, id: &str) -> bool {
-    profile_dir
-        .join("skills")
+pub fn skill_installed(skills_dir: &Path, id: &str) -> bool {
+    skills_dir
         .join(safe_skill_dir(id))
         .join("SKILL.md")
-        .exists()
+        .is_file()
 }
 
 pub fn parse_marketplace(value: &Value) -> Result<Marketplace, String> {
@@ -340,22 +462,9 @@ pub fn parse_marketplace(value: &Value) -> Result<Marketplace, String> {
         .filter_map(parse_skill)
         .filter(|skill| skill.enabled)
         .collect::<Vec<_>>();
-    let default_skill_ids = value
-        .get("default_skill_ids")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     Ok(Marketplace {
         skills,
-        default_skill_ids,
+        default_skill_ids: read_strings(value, "default_skill_ids"),
     })
 }
 
@@ -368,19 +477,6 @@ fn parse_skill(value: &Value) -> Option<MarketplaceSkill> {
     if content.is_empty() && package_url.is_none() {
         return None;
     }
-    let tags = value
-        .get("tags")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|tag| !tag.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     let enabled = value
         .get("enabled")
         .and_then(Value::as_bool)
@@ -398,7 +494,7 @@ fn parse_skill(value: &Value) -> Option<MarketplaceSkill> {
         package_url,
         package_sha256: read_string(value, "package_sha256"),
         package_type: read_string(value, "package_type"),
-        tags,
+        tags: read_strings(value, "tags"),
         enabled,
         updated_at,
     })
@@ -411,6 +507,19 @@ fn read_string(value: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn read_strings(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn install_inline_skill(dir: &Path, skill: &MarketplaceSkill) -> io::Result<()> {
@@ -430,7 +539,7 @@ fn install_skill_package(dir: &Path, skill: &MarketplaceSkill, url: &str) -> io:
             "marketplace package is missing required package_sha256",
         )
     })?;
-    let bytes = download_skill_package(url)?;
+    let bytes = download(url, MAX_PACKAGE_BYTES)?;
     verify_sha256(&bytes, expected)?;
     let temp_dir = staging_dir(dir, "extract");
     recreate_dir(&temp_dir)?;
@@ -478,31 +587,33 @@ fn install_skill_package(dir: &Path, skill: &MarketplaceSkill, url: &str) -> io:
     atomic_replace_dir(&staging, dir)
 }
 
-fn download_skill_package(url: &str) -> io::Result<Vec<u8>> {
+fn download(url: &str, limit: usize) -> io::Result<Vec<u8>> {
     if let Some(path) = url.strip_prefix("file://") {
-        return read_bounded(fs::File::open(path)?);
+        return read_bounded(fs::File::open(path)?, limit);
     }
     if !url.contains("://") {
-        return read_bounded(fs::File::open(url)?);
+        return read_bounded(fs::File::open(url)?, limit);
     }
     let response = ureq::get(url)
-        .timeout(std::time::Duration::from_secs(60))
+        .set("User-Agent", "jucode")
+        .timeout(Duration::from_secs(60))
         .call()
         .map_err(|error| io::Error::other(error.to_string()))?;
-    read_bounded(response.into_reader())
+    read_bounded(response.into_reader(), limit)
 }
 
-fn read_bounded(reader: impl Read) -> io::Result<Vec<u8>> {
-    let mut reader = reader.take((MAX_PACKAGE_BYTES + 1) as u64);
+fn read_bounded(reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
+    let mut reader = reader.take((limit + 1) as u64);
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_PACKAGE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("skill package exceeds {MAX_PACKAGE_BYTES} byte limit"),
-        ));
+    if bytes.len() > limit {
+        return Err(invalid_data(format!("download exceeds {limit} byte limit")));
     }
     Ok(bytes)
+}
+
+fn invalid_data(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 fn verify_sha256(bytes: &[u8], expected: &str) -> io::Result<()> {
@@ -559,7 +670,7 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> io::Result<()> {
                 format!("extracted skill exceeds {MAX_EXTRACTED_BYTES} byte limit"),
             ));
         }
-        let path = safe_archive_path(file.name()).ok_or_else(|| {
+        let path = safe_path_components(Path::new(file.name())).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsafe path in skill package: {}", file.name()),
@@ -575,23 +686,23 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> io::Result<()> {
         }
         let mut output = fs::File::create(&out)?;
         io::copy(&mut file, &mut output)?;
-        apply_zip_permissions(&file, &out)?;
+        set_mode(&out, file.unix_mode())?;
     }
     Ok(())
 }
 
 #[cfg(unix)]
-fn apply_zip_permissions(file: &zip::read::ZipFile<'_>, path: &Path) -> io::Result<()> {
+fn set_mode(path: &Path, mode: Option<u32>) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    if let Some(mode) = file.unix_mode() {
+    if let Some(mode) = mode {
         fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn apply_zip_permissions(_file: &zip::read::ZipFile<'_>, _path: &Path) -> io::Result<()> {
+fn set_mode(_path: &Path, _mode: Option<u32>) -> io::Result<()> {
     Ok(())
 }
 
@@ -635,10 +746,6 @@ fn extract_tar_gz(bytes: &[u8], dest: &Path) -> io::Result<()> {
         entry.unpack(out)?;
     }
     Ok(())
-}
-
-fn safe_archive_path(path: &str) -> Option<PathBuf> {
-    safe_path_components(Path::new(path))
 }
 
 fn safe_path_components(path: &Path) -> Option<PathBuf> {
@@ -812,28 +919,6 @@ fn normalized_content(skill: &MarketplaceSkill) -> String {
     }
 }
 
-fn validate_source_skill(skill: &ExtraSkill) -> io::Result<()> {
-    validate_skill_id(&skill.id)?;
-    let expected = format!("skills/{}/SKILL.md", skill.id);
-    if skill.path != expected
-        || safe_archive_path(&skill.path).as_deref() != Some(Path::new(&expected))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unsafe source path for skill {}: {}", skill.id, skill.path),
-        ));
-    }
-    if let Some(hash) = skill.sha256.as_deref() {
-        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid sha256 for source skill {}", skill.id),
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn validate_skill_id(id: &str) -> io::Result<()> {
     if id.is_empty()
         || id.starts_with('-')
@@ -859,6 +944,18 @@ fn validate_revision(revision: &str) -> io::Result<&str> {
             "source revision must be a 40-character Git commit SHA",
         ))
     }
+}
+
+fn encode_url_path(path: &str) -> String {
+    let mut output = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            output.push(byte as char);
+        } else {
+            output.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    output
 }
 
 fn normalize_repository_url(url: &str) -> String {
@@ -941,48 +1038,55 @@ mod tests {
     }
 
     #[test]
-    fn parses_bundled_anthropic_index_and_excludes_document_skills() {
-        let value = serde_json::from_str(ANTHROPIC_SKILLS_INDEX).unwrap();
-        let source = parse_extra_skill_index(&value).unwrap();
+    fn bundled_anthropic_index_is_pinned_and_marks_document_skills() {
+        let source = anthropic_source().unwrap();
 
         assert_eq!(source.name, "anthropic");
         assert_eq!(source.repository, ANTHROPIC_SKILLS_URL);
         assert_eq!(source.revision.len(), 40);
-        assert!(source.skills.iter().any(|skill| skill.id == "mcp-builder"));
-        for id in ["docx", "pdf", "pptx", "xlsx"] {
-            assert!(!source.skills.iter().any(|skill| skill.id == id));
-            assert!(source.excluded.iter().any(|skill| skill.id == id));
-        }
+        let skill = |id: &str| source.skills.iter().find(|skill| skill.id == id).unwrap();
+        assert!(skill("mcp-builder").redistributable);
+        assert!(!skill("mcp-builder").description.is_empty());
+        let restricted = source
+            .skills
+            .iter()
+            .filter(|skill| !skill.redistributable)
+            .map(|skill| skill.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(restricted, ["docx", "pdf", "pptx", "xlsx"]);
+        assert_eq!(
+            source.homepage("pdf"),
+            format!("{ANTHROPIC_SKILLS_URL}/tree/{}/skills/pdf", source.revision)
+        );
     }
 
     #[test]
-    fn source_index_rejects_unsafe_ids_paths_and_hashes() {
+    fn source_index_rejects_unsafe_ids_and_incomplete_entries() {
         let base = json!({
             "name": "test",
             "repository": "https://github.com/example/skills",
             "revision": "0123456789abcdef0123456789abcdef01234567",
-            "skills": [{ "id": "safe-skill", "path": "skills/safe-skill/SKILL.md" }]
+            "skills": [{
+                "id": "safe-skill", "name": "Safe", "description": "Safe skill",
+                "license": "MIT", "redistributable": true
+            }]
         });
-        assert!(parse_extra_skill_index(&base).is_ok());
+        assert!(parse_source_index(&base).is_ok());
 
-        for (id, path) in [
-            ("../escape", "skills/../escape/SKILL.md"),
-            ("safe-skill", "../SKILL.md"),
-            ("safe-skill", "skills/other/SKILL.md"),
-            ("UPPER", "skills/UPPER/SKILL.md"),
-        ] {
+        for id in ["../escape", "nested/escape", "UPPER", "-dash"] {
             let mut unsafe_index = base.clone();
             unsafe_index["skills"][0]["id"] = json!(id);
-            unsafe_index["skills"][0]["path"] = json!(path);
-            assert!(
-                parse_extra_skill_index(&unsafe_index).is_err(),
-                "{id}: {path}"
-            );
+            assert!(parse_source_index(&unsafe_index).is_err(), "{id}");
         }
-
-        let mut bad_hash = base;
-        bad_hash["skills"][0]["sha256"] = json!("not-a-sha");
-        assert!(parse_extra_skill_index(&bad_hash).is_err());
+        let mut no_license_flag = base.clone();
+        no_license_flag["skills"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("redistributable");
+        assert!(parse_source_index(&no_license_flag).is_err());
+        let mut branch = base;
+        branch["revision"] = json!("main");
+        assert!(parse_source_index(&branch).is_err());
     }
 
     #[test]
@@ -997,13 +1101,109 @@ mod tests {
         .unwrap();
         assert_eq!(source.name, "skills");
         assert_eq!(source.skills.len(), 1);
-        assert_eq!(source.skills[0].path, "skills/review/SKILL.md");
+        assert_eq!(source.skills[0].id, "review");
+        assert_eq!(
+            source.homepage("review"),
+            "https://github.com/example/skills/tree/HEAD/skills/review"
+        );
 
         assert!(parse_github_skills_directory(
             &json!([{ "name": "../escape", "type": "dir" }]),
             "https://github.com/example/skills",
         )
         .is_err());
+    }
+
+    #[test]
+    fn installs_the_whole_github_skill_directory_at_the_pinned_revision() {
+        let root = test_dir("jucode-github-skill-test");
+        let source = github_source();
+        let tree = json!({ "truncated": false, "tree": [
+            { "path": "skills/demo", "type": "tree", "mode": "040000" },
+            { "path": "skills/demo/SKILL.md", "type": "blob", "mode": "100644", "size": 30 },
+            { "path": "skills/demo/scripts", "type": "tree", "mode": "040000" },
+            { "path": "skills/demo/scripts/run me.sh", "type": "blob", "mode": "100755", "size": 9 },
+            { "path": "skills/other/SKILL.md", "type": "blob", "mode": "100644", "size": 5 }
+        ]});
+        let revision = source.revision.clone();
+        let fetched = std::cell::RefCell::new(Vec::new());
+        let fetch = |url: &str, _limit: usize| -> io::Result<Vec<u8>> {
+            fetched.borrow_mut().push(url.to_string());
+            let raw = format!("https://raw.githubusercontent.com/example/skills/{revision}/");
+            match url.strip_prefix(&raw) {
+                None => Ok(tree.to_string().into_bytes()),
+                Some("skills/demo/SKILL.md") => Ok(b"---\nname: demo\n---\n".to_vec()),
+                Some("skills/demo/scripts/run%20me.sh") => Ok(b"echo ok\n".to_vec()),
+                Some(other) => panic!("unexpected download {other}"),
+            }
+        };
+
+        let dir = install_github_skill(&root, &source, &source.skills[0], &fetch).unwrap();
+
+        assert_eq!(dir, root.join("demo"));
+        assert_eq!(
+            fetched.borrow()[0],
+            format!("https://api.github.com/repos/example/skills/git/trees/{revision}?recursive=1")
+        );
+        assert_eq!(fetched.borrow().len(), 3);
+        assert!(skill_installed(&root, "demo"));
+        assert_eq!(
+            fs::read_to_string(dir.join("scripts/run me.sh")).unwrap(),
+            "echo ok\n"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(dir.join("scripts/run me.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn github_install_rejects_escaping_paths_and_keeps_the_existing_skill() {
+        let root = test_dir("jucode-github-escape-test");
+        let installed = root.join("demo");
+        fs::create_dir_all(&installed).unwrap();
+        fs::write(installed.join("SKILL.md"), "old content").unwrap();
+        let source = github_source();
+        for (path, kind) in [
+            ("skills/demo/../../escape", "blob"),
+            ("skills/demo/link", "commit"),
+        ] {
+            let tree = json!({ "tree": [
+                { "path": "skills/demo/SKILL.md", "type": "blob", "mode": "100644", "size": 3 },
+                { "path": path, "type": kind, "mode": "100644", "size": 3 }
+            ]});
+            let fetch = |_: &str, _: usize| Ok(tree.to_string().into_bytes());
+
+            let error = install_github_skill(&root, &source, &source.skills[0], &fetch)
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains(path), "{error}");
+        }
+        let no_skill_file = json!({ "tree": [
+            { "path": "skills/demo/README.md", "type": "blob", "mode": "100644", "size": 3 }
+        ]});
+        let fetch = |url: &str, _: usize| {
+            Ok(if url.contains("api.github.com") {
+                no_skill_file.to_string().into_bytes()
+            } else {
+                b"doc".to_vec()
+            })
+        };
+        let error = install_github_skill(&root, &source, &source.skills[0], &fetch).unwrap_err();
+        assert!(error.to_string().contains("SKILL.md"), "{error}");
+        assert_eq!(
+            fs::read_to_string(installed.join("SKILL.md")).unwrap(),
+            "old content"
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1022,10 +1222,10 @@ mod tests {
             updated_at: String::new(),
         };
 
-        install_marketplace_skill(&root, &skill).unwrap();
+        let dir = install_marketplace_skill(&root.join("skills"), &skill).unwrap();
 
-        let content =
-            fs::read_to_string(root.join("skills").join("code-review").join("SKILL.md")).unwrap();
+        assert_eq!(dir, root.join("skills").join("code-review"));
+        let content = fs::read_to_string(dir.join("SKILL.md")).unwrap();
         assert!(content.contains("name: Code Review"));
         assert!(content.contains("Be strict."));
         let _ = fs::remove_dir_all(root);
@@ -1060,7 +1260,7 @@ mod tests {
             updated_at: String::new(),
         };
 
-        install_marketplace_skill(&root, &skill).unwrap();
+        install_marketplace_skill(&root.join("skills"), &skill).unwrap();
 
         assert!(root.join("skills/packaged/SKILL.md").exists());
         assert_eq!(
@@ -1106,7 +1306,7 @@ mod tests {
             updated_at: String::new(),
         };
 
-        let error = install_marketplace_skill(&root, &skill).unwrap_err();
+        let error = install_marketplace_skill(&root.join("skills"), &skill).unwrap_err();
 
         assert!(error.to_string().contains("package_sha256"));
         assert_eq!(
@@ -1147,7 +1347,7 @@ mod tests {
             updated_at: String::new(),
         };
 
-        let error = install_marketplace_skill(&root, &skill).unwrap_err();
+        let error = install_marketplace_skill(&root.join("skills"), &skill).unwrap_err();
 
         assert!(error.to_string().contains("unsafe path"));
         assert_eq!(
@@ -1169,7 +1369,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(skill_installed(&root, "review"));
+        assert!(skill_installed(&root.join("skills"), "review"));
         assert!(is_skill_path_enabled(&root, &installed.join("SKILL.md")).unwrap());
         set_skill_enabled(&root, "review", false).unwrap();
         assert!(!is_skill_path_enabled(&root, &installed.join("SKILL.md")).unwrap());
@@ -1177,15 +1377,35 @@ mod tests {
         set_skill_enabled(&root, "review", true).unwrap();
         assert!(is_skill_path_enabled(&root, &installed.join("SKILL.md")).unwrap());
         assert!(uninstall_skill(&root, "review").unwrap());
-        assert!(!skill_installed(&root, "review"));
+        assert!(!skill_installed(&root.join("skills"), "review"));
         assert!(!uninstall_skill(&root, "review").unwrap());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn package_download_has_a_hard_size_limit() {
-        let error = read_bounded(Cursor::new(vec![0_u8; MAX_PACKAGE_BYTES + 1])).unwrap_err();
+        let error = read_bounded(
+            Cursor::new(vec![0_u8; MAX_PACKAGE_BYTES + 1]),
+            MAX_PACKAGE_BYTES,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("byte limit"));
+    }
+
+    fn github_source() -> SkillSource {
+        SkillSource {
+            name: "example".to_string(),
+            repository: "https://github.com/example/skills".to_string(),
+            revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            skills: vec![SourceSkill {
+                id: "demo".to_string(),
+                name: "Demo".to_string(),
+                description: "Demo skill".to_string(),
+                tags: Vec::new(),
+                license: "MIT".to_string(),
+                redistributable: true,
+            }],
+        }
     }
 
     fn test_dir(prefix: &str) -> PathBuf {

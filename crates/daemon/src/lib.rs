@@ -15,6 +15,7 @@ pub mod noise;
 mod projects;
 mod relay;
 mod session;
+mod skills;
 mod store;
 mod titles;
 
@@ -285,6 +286,21 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     // An MCP server is a command to run or a place to send credentials.
     if matches!(name, "mcp_set" | "mcp_remove" | "mcp_toggle") && !hub.is_local(client) {
         reply(json!({ "type": "error", "message": "only the desktop can change MCP servers" }));
+        return;
+    }
+    // Installed skills are instructions and scripts every later session may
+    // run, so only the desktop installs them. Both ops wait on the network.
+    if matches!(name, "skills_catalog" | "skill_install") {
+        if !hub.is_local(client) {
+            reply(json!({ "type": "error", "message": "only the desktop can install skills" }));
+            return;
+        }
+        let hub = Arc::clone(hub);
+        let name = name.to_string();
+        thread::spawn(move || {
+            let result = skills::handle(&name, &op);
+            respond(&hub, client, &request, result);
+        });
         return;
     }
     // File and git reads can take a while; they must not hold up this
