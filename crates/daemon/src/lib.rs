@@ -293,20 +293,24 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         });
         return;
     }
-    // An ACP agent is a command line to run: only the desktop names one.
-    if matches!(name, "session_create" | "session_open") && op["engine"] == "acp" {
-        if !hub.is_local(client) {
-            reply(json!({ "type": "error", "message": "only the desktop can start ACP agents" }));
+    // A program to run (an ACP agent, an engine binary, its environment):
+    // only the desktop names one.
+    if matches!(name, "session_create" | "session_open") {
+        let options = engines::Options::from_json(&op["options"]);
+        let acp = op["engine"] == "acp";
+        if (acp || options.runs_programs()) && !hub.is_local(client) {
+            reply(
+                json!({ "type": "error", "message": "only the desktop can choose what an engine runs" }),
+            );
             return;
         }
-        let options = engines::Options::from_json(&op["options"]);
-        if let Err(message) = options.check_env().and_then(|()| {
-            options
-                .command
-                .as_ref()
-                .map(|_| ())
-                .ok_or_else(|| "an ACP session needs options.command".to_string())
-        }) {
+        let checked = options
+            .check_env()
+            .and_then(|()| match acp && options.command.is_none() {
+                true => Err("an ACP session needs options.command".to_string()),
+                false => Ok(()),
+            });
+        if let Err(message) = checked {
             reply(json!({ "type": "error", "message": message }));
             return;
         }

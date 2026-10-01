@@ -23,8 +23,12 @@ use std::{
     process::Command,
 };
 
-pub fn command() -> Command {
-    let mut command = Command::new(resolve("codex", "CODEX_BIN", &[]));
+pub fn command(options: &Options) -> Command {
+    let program = match &options.bin {
+        Some(bin) => PathBuf::from(bin),
+        None => resolve("codex", "CODEX_BIN", &[]),
+    };
+    let mut command = Command::new(program);
     command.arg("app-server");
     command
 }

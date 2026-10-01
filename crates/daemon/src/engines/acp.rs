@@ -32,7 +32,6 @@ pub fn command(options: &Options) -> Command {
     };
     let mut command = Command::new(program);
     command.args(&options.args);
-    command.envs(options.env.iter().map(|(name, value)| (name, value)));
     command
 }
 

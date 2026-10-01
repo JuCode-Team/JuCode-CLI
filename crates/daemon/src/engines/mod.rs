@@ -66,9 +66,12 @@ pub struct Options {
     pub resume: Option<String>,
     /// Claude: resume the conversation as it was at this message.
     pub resume_at: Option<String>,
-    /// ACP: the agent's command line and extra environment.
+    /// ACP: the agent's command line.
     pub command: Option<String>,
     pub args: Vec<String>,
+    /// Claude / Codex: the engine binary instead of the one on PATH.
+    pub bin: Option<String>,
+    /// Extra environment for the engine process.
     pub env: Vec<(String, String)>,
     /// Claude / Codex: talk to the JuCode gateway on the user's JuCode login
     /// instead of the provider in their own config (which stays untouched).
@@ -91,6 +94,7 @@ impl Options {
             resume: None,
             resume_at: text("resume_at"),
             command: text("command"),
+            bin: text("bin"),
             args: value["args"]
                 .as_array()
                 .into_iter()
@@ -105,6 +109,12 @@ impl Options {
                 .collect(),
             gateway: value["jucode_gateway"].as_bool(),
         }
+    }
+
+    /// Whether these options name a program or environment to run, which
+    /// only the desktop may do.
+    pub fn runs_programs(&self) -> bool {
+        self.command.is_some() || self.bin.is_some() || !self.env.is_empty()
     }
 
     /// Environment names an agent may be given: plain names, never ones that
@@ -171,9 +181,10 @@ fn adapter(kind: Kind, cwd: &Path, options: &Options) -> Box<dyn Adapter> {
 fn command(kind: Kind, id: &str, options: &Options) -> Result<Command, String> {
     let mut command = match kind {
         Kind::Claude => claude::command(id, options),
-        Kind::Codex => codex::command(),
+        Kind::Codex => codex::command(options),
         Kind::Acp => acp::command(options),
     };
+    command.envs(options.env.iter().map(|(name, value)| (name, value)));
     if options.gateway == Some(true) {
         let (api, token) = jucode_agent_core::jucode_gateway_credentials()?;
         match kind {
@@ -542,6 +553,11 @@ impl Session<'_> {
             if !busy {
                 if let Some(mut next) = self.restart.take() {
                     next.resume = adapter.conversation().or(next.resume);
+                    // What the process runs as stays: its binary, environment
+                    // and gateway.
+                    next.bin = options.bin.clone();
+                    next.env = options.env.clone();
+                    next.gateway = next.gateway.or(options.gateway);
                     process.stop();
                     let id = self.id.clone().unwrap_or_default();
                     match command(self.kind, &id, &next)

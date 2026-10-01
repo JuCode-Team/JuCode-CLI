@@ -1715,6 +1715,11 @@ fn only_the_desktop_starts_acp_agents_which_run_like_any_session() {
         json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": options }),
     );
     assert_eq!(refused["type"], "error", "{refused}");
+    let refused = request(
+        &mut phone,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": { "bin": script } }),
+    );
+    assert_eq!(refused["type"], "error", "{refused}");
     let bad_env = request(
         &mut desktop,
         json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": { "command": script, "env": { "DYLD_INSERT_LIBRARIES": "x" } } }),

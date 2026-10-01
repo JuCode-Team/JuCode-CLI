@@ -56,11 +56,14 @@ pub fn use_gateway(command: &mut Command, api: &str, token: &str) -> Result<(), 
 }
 
 pub fn command(id: &str, options: &Options) -> Command {
-    let program = resolve(
-        "claude",
-        "CLAUDE_BIN",
-        &[home().join(".claude").join("local").join("claude")],
-    );
+    let program = match &options.bin {
+        Some(bin) => PathBuf::from(bin),
+        None => resolve(
+            "claude",
+            "CLAUDE_BIN",
+            &[home().join(".claude").join("local").join("claude")],
+        ),
+    };
     let mut command = Command::new(program);
     command.args([
         "--print",
@@ -1993,6 +1996,21 @@ mod tests {
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(!args.contains(&"--permission-prompt-tool".to_string()));
         assert!(args.windows(2).any(|w| w == ["--resume", "abc"]));
+    }
+
+    #[test]
+    fn the_desktop_may_name_the_binary_and_its_environment() {
+        let options = Options::from_json(&json!({
+            "bin": "/opt/claude/bin/claude",
+            "env": { "CLAUDE_CONFIG_DIR": "/tmp/c" },
+        }));
+        assert!(options.runs_programs());
+        let command = super::super::command(super::super::Kind::Claude, "x", &options).unwrap();
+        assert_eq!(command.get_program(), "/opt/claude/bin/claude");
+        assert!(command
+            .get_envs()
+            .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == Some("/tmp/c".as_ref())));
+        assert!(!Options::from_json(&json!({ "model": "m" })).runs_programs());
     }
 
     #[test]

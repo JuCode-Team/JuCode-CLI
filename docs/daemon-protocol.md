@@ -201,12 +201,15 @@ clients need nothing engine-specific. `options`:
 | `model` | Model to start with |
 | `resume_at` | Claude Code: resume the conversation as it was at this assistant message uuid |
 | `jucode_gateway` | Claude Code / Codex: `true` runs this session through the JuCode gateway on the user's JuCode login; `false` on the provider in the user's own Claude Code / Codex config. The endpoint and key go to this process only (Claude: `--settings` file; Codex: `-c` overrides and an env var), never to the user's config files. Omitted on `session_open`: as the session last ran |
-| `command`, `args`, `env` | ACP: the agent's command line and extra environment variables (plain names; no `DYLD_*`/`LD_*`) |
+| `command`, `args` | ACP: the agent's command line |
+| `bin` | Claude Code / Codex: the engine binary to run instead of the one found on `PATH` |
+| `env` | Extra environment variables for the engine process (plain names; no `DYLD_*`/`LD_*`) |
 
 `engine: "acp"` runs an Agent Client Protocol agent (`jucode acp`,
 `gemini --experimental-acp`, ...) from `options.command`. Only local
-clients may start or reopen one, since that names a program to run; paired
-devices watch and drive it like any session. ACP agents keep no
+clients may start or reopen one, or pass `bin` or `env` for any engine,
+since that names a program to run; paired devices watch and drive such
+sessions like any other. ACP agents keep no
 conversation the daemon can resume, so reopening an ACP session starts a
 new conversation under the same session id.
 
