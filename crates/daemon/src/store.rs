@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -249,7 +249,11 @@ impl Store {
         let _guard = self.lock();
         let mut settings = self.settings();
         settings[key] = value;
-        fs::write(self.dir.join(SETTINGS), format!("{settings:#}\n"))
+        // A torn settings.json reads as no settings at all.
+        write_private(
+            &self.dir.join(SETTINGS),
+            format!("{settings:#}\n").as_bytes(),
+        )
     }
 
     fn settings(&self) -> Value {
@@ -813,24 +817,31 @@ impl Store {
     fn append_locked(&self, file: &'static str, value: Value) -> io::Result<()> {
         let mut out = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(self.dir.join(file))?;
-        out.write_all(format!("{value}\n").as_bytes())?;
+        // A line torn by a crash has no newline: without one first, this
+        // record would join it and both would be skipped as unparseable.
+        let mut line = format!("{value}\n");
+        if ends_torn(&mut out)? {
+            line.insert(0, '\n');
+        }
+        out.write_all(line.as_bytes())?;
         if let Some(entries) = self.cached().get_mut(file) {
             Arc::make_mut(entries).push(value);
         }
         Ok(())
     }
 
-    /// Every parseable line; a torn last line from a crash is skipped.
+    /// Every parseable line; a torn last line from a crash is skipped (read
+    /// lossily: one cut mid-character must not make the whole file unreadable).
     fn read(&self, file: &'static str) -> Arc<Vec<Value>> {
         let mut logs = self.cached();
         if let Some(entries) = logs.get(file) {
             return Arc::clone(entries);
         }
         let entries: Arc<Vec<Value>> = Arc::new(
-            fs::read_to_string(self.dir.join(file))
-                .unwrap_or_default()
+            String::from_utf8_lossy(&fs::read(self.dir.join(file)).unwrap_or_default())
                 .lines()
                 .filter_map(|line| serde_json::from_str(line).ok())
                 .collect(),
@@ -881,6 +892,18 @@ pub fn bytes_hash(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// Whether a non-empty log's last byte is not a newline.
+fn ends_torn(file: &mut fs::File) -> io::Result<bool> {
+    use std::io::{Seek, SeekFrom};
+    if file.metadata()?.len() == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
 }
 
 /// Writes a file only the owner can read, atomically: a reader sees the old
@@ -953,6 +976,30 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn a_line_torn_by_a_crash_does_not_take_the_next_record_with_it() {
+        let dir =
+            std::env::temp_dir().join(format!("jucode-daemon-store-torn-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(SESSIONS),
+            "{\"kind\":\"open\",\"session\":\"a\",\"cwd\":\"/p\",\"agent\":null,\"at\":1}\n{\"kind\":\"op",
+        )
+        .unwrap();
+        let store = Store::open(dir).unwrap();
+        store.record_session("b", Path::new("/p"), None).unwrap();
+        let ids: Vec<String> = store.sessions().into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, ["a", "b"]);
+        drop(store);
+        let reopened = Store::open(
+            std::env::temp_dir().join(format!("jucode-daemon-store-torn-{}", std::process::id())),
+        )
+        .unwrap();
+        let ids: Vec<String> = reopened.sessions().into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, ["a", "b"]);
     }
 
     #[test]

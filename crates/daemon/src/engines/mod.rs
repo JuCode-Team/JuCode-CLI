@@ -855,9 +855,17 @@ pub fn find_program(name: &str, extra: &[PathBuf]) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(exe))
 }
 
+/// The user's home where Claude Code and Codex keep their sessions. On
+/// Windows that is USERPROFILE: a `HOME` from Git Bash or MSYS would point
+/// the lookups at another directory.
 pub fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    let (first, second) = if cfg!(windows) {
+        ("USERPROFILE", "HOME")
+    } else {
+        ("HOME", "USERPROFILE")
+    };
+    std::env::var_os(first)
+        .or_else(|| std::env::var_os(second))
         .map(PathBuf::from)
         .unwrap_or_default()
 }

@@ -1829,6 +1829,15 @@ pub fn saved(cwd: &Path) -> Vec<(String, String, u64)> {
     saved_in(&home(), cwd)
 }
 
+/// Whether Claude Code saved conversation `id` for `cwd` (it has at least one
+/// turn and can be resumed). Unlike `saved`, not limited to the newest ones.
+pub fn is_saved(cwd: &Path, id: &str) -> bool {
+    is_conversation_id(id)
+        && project_dir(&home(), cwd)
+            .join(format!("{id}.jsonl"))
+            .is_file()
+}
+
 fn saved_in(home: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
     let Ok(entries) = fs::read_dir(project_dir(home, cwd)) else {
         return vec![];

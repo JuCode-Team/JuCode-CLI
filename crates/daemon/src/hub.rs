@@ -397,9 +397,7 @@ impl Hub {
                 // Codex resumes through its protocol, which also sends the
                 // history back.
                 let saved = match kind {
-                    engines::Kind::Claude => engines::claude::saved(&record.cwd)
-                        .iter()
-                        .any(|(saved, _, _)| saved == id),
+                    engines::Kind::Claude => engines::claude::is_saved(&record.cwd, id),
                     engines::Kind::Codex => true,
                     engines::Kind::Acp => false,
                 };

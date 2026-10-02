@@ -173,6 +173,14 @@ fn canonical_dir(path: &Path) -> Result<PathBuf, String> {
     if !real.is_dir() {
         return Err(format!("not a directory: {}", real.display()));
     }
+    // Windows canonicalizes to `\\?\C:\...`; the desktop and the engines
+    // know the folder as `C:\...`, and sessions are matched by that string.
+    #[cfg(windows)]
+    if let Some(plain) = real.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        if !plain.starts_with("UNC\\") {
+            return Ok(PathBuf::from(plain));
+        }
+    }
     Ok(real)
 }
 
