@@ -252,6 +252,10 @@ pub struct Codex {
     busy: bool,
     /// Input sent before the thread opened.
     queued: Vec<Value>,
+    /// A `thread/rollback` is on its way: input sent meanwhile waits for it,
+    /// or the new turn could start on the history before the rollback.
+    rolling_back: bool,
+    after_rollback: Vec<Value>,
     open_params: Value,
     /// Synthetic call id → the server request id awaiting our answer.
     approvals: HashMap<String, Value>,
@@ -287,6 +291,8 @@ impl Codex {
             active_turn: None,
             busy: false,
             queued: Vec::new(),
+            rolling_back: false,
+            after_rollback: Vec::new(),
             open_params: Value::Null,
             approvals: HashMap::new(),
             approval_seq: 0,
@@ -473,6 +479,32 @@ impl Codex {
         let Some((method, tag)) = self.pending.remove(&id) else {
             return Output::default();
         };
+        if method == "thread/rollback" {
+            self.rolling_back = false;
+            let input = std::mem::take(&mut self.after_rollback);
+            if !error.is_null() {
+                let mut events = vec![error_event(
+                    &format!("Codex could not rewind: {}", text(&error["message"])),
+                    &Value::Null,
+                )];
+                // Sent on the history it was meant to replace, it would repeat a turn.
+                if !input.is_empty() {
+                    events.push(error_event(
+                        "the message waiting for the rewind was not sent",
+                        &Value::Null,
+                    ));
+                }
+                return Output::events(events);
+            }
+            return Output {
+                events: Vec::new(),
+                frames: if input.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![self.turn_start(input)]
+                },
+            };
+        }
         if !error.is_null() {
             let message = match text(&error["message"]) {
                 "" => format!("JSON-RPC error {}", error["code"]),
@@ -1072,6 +1104,10 @@ impl Adapter for Codex {
                     self.queued.extend(input);
                     return Ok(Output::default());
                 }
+                if self.rolling_back {
+                    self.after_rollback.extend(input);
+                    return Ok(Output::default());
+                }
                 vec![self.turn_start(input)]
             }
             "approve" => {
@@ -1151,11 +1187,14 @@ impl Adapter for Codex {
                         vec![self.request(method, params, "")]
                     }
                     ("/rewind", Some(thread)) => match arg.parse::<u64>() {
-                        Ok(turns) if turns > 0 => vec![self.request(
-                            "thread/rollback",
-                            json!({ "threadId": thread, "numTurns": turns }),
-                            "",
-                        )],
+                        Ok(turns) if turns > 0 => {
+                            self.rolling_back = true;
+                            vec![self.request(
+                                "thread/rollback",
+                                json!({ "threadId": thread, "numTurns": turns }),
+                                "",
+                            )]
+                        }
                         _ => vec![],
                     },
                     ("/review", Some(thread)) => {
@@ -1367,6 +1406,25 @@ mod tests {
             ]
         );
         c
+    }
+
+    #[test]
+    fn a_message_sent_during_a_rewind_waits_for_it() {
+        let mut c = opened();
+        let rollback = sent(
+            &c.encode(&json!({ "op": "command", "input": "/rewind 1" }))
+                .unwrap()
+                .frames,
+        );
+        assert_eq!(rollback[0]["method"], "thread/rollback");
+        let held = c
+            .encode(&json!({ "op": "user_message", "content": "again" }))
+            .unwrap();
+        assert!(held.frames.is_empty());
+        let id = rollback[0]["id"].clone();
+        let done = sent(&frame(&mut c, json!({ "id": id, "result": {} })).frames);
+        assert_eq!(done[0]["method"], "turn/start");
+        assert_eq!(done[0]["params"]["input"][0]["text"], "again");
     }
 
     #[test]

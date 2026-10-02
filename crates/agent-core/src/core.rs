@@ -583,6 +583,20 @@ impl AgentCore {
     }
 
     /// Splits attachment paths into valid ones (kept) and a warning event per
+    /// Runs a turn on the conversation as it stands, with no new user message:
+    /// after a turn that failed (a dropped connection), the model picks up
+    /// where it stopped, so a retry leaves no "continue" in the history.
+    pub fn continue_turn(&mut self) -> Vec<AgentEvent> {
+        if self.running {
+            return vec![AgentEvent::Error("a turn is already running".to_string())];
+        }
+        if self.session.user_turns().is_empty() {
+            return vec![AgentEvent::Error("nothing to continue".to_string())];
+        }
+        self.overflow_retried = false;
+        self.start_turn_from_existing_context()
+    }
+
     /// unattachable path. Reads no file contents.
     fn validate_image_attachments(&self, images: Vec<String>) -> (Vec<String>, Vec<AgentEvent>) {
         let mut valid = Vec::new();
