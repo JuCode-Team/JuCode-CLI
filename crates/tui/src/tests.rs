@@ -1488,6 +1488,7 @@ fn model_picker_enter_includes_selected_effort() {
         vec![
             ModelOptionView {
                 model: "gpt-5.2".to_string(),
+                label: None,
                 active: false,
                 context_window: 400_000,
                 max_output_tokens: 128_000,
@@ -1495,6 +1496,7 @@ fn model_picker_enter_includes_selected_effort() {
             },
             ModelOptionView {
                 model: "gpt-5.3-codex".to_string(),
+                label: None,
                 active: true,
                 context_window: 400_000,
                 max_output_tokens: 128_000,
@@ -1527,6 +1529,7 @@ fn model_picker_renders_effort_hint() {
     let picker = PickerState::model(
         vec![ModelOptionView {
             model: "gpt-5.2".to_string(),
+            label: None,
             active: true,
             context_window: 400_000,
             max_output_tokens: 128_000,
@@ -1678,6 +1681,7 @@ fn model_picker_tab_cycles_effort() {
     let models = vec![
         ModelOptionView {
             model: "gpt-5.5".to_string(),
+            label: None,
             active: true,
             context_window: 200_000,
             max_output_tokens: 32_000,
@@ -1685,6 +1689,7 @@ fn model_picker_tab_cycles_effort() {
         },
         ModelOptionView {
             model: "gpt-5.4-mini".to_string(),
+            label: None,
             active: false,
             context_window: 200_000,
             max_output_tokens: 32_000,

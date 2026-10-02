@@ -279,6 +279,7 @@ impl TuiState {
                 AgentEvent::ModelStatus {
                     provider,
                     model,
+                    model_label: _,
                     reasoning_effort,
                     context_window,
                     context_limit: _,

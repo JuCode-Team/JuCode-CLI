@@ -165,7 +165,7 @@ impl PickerState {
                 parent_id: None,
                 depth: 0,
                 prefix: String::new(),
-                label: model.model,
+                label: model.label.unwrap_or(model.model),
                 active: model.active,
                 has_children: false,
                 detail: format!(

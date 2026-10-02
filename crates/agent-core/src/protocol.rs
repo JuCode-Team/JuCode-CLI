@@ -184,6 +184,7 @@ pub fn event_json(event: AgentEvent) -> Value {
         AgentEvent::ModelStatus {
             provider,
             model,
+            model_label,
             reasoning_effort,
             context_window,
             context_limit,
@@ -194,6 +195,7 @@ pub fn event_json(event: AgentEvent) -> Value {
             "type": "model_status",
             "provider": provider,
             "model": model,
+            "model_label": model_label,
             "reasoning_effort": reasoning_effort,
             "context_window": context_window,
             "context_limit": context_limit,
@@ -357,6 +359,7 @@ pub fn event_json(event: AgentEvent) -> Value {
             "models": models.into_iter().map(|model| {
                 json!({
                     "model": model.model,
+                    "label": model.label,
                     "active": model.active,
                     "context_window": model.context_window,
                     "max_output_tokens": model.max_output_tokens,

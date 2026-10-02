@@ -2624,6 +2624,8 @@ mod tests {
             input_cost: 0.0,
             cached_input_cost: 0.0,
             output_cost: 0.0,
+            display_name: None,
+            group_windows: BTreeMap::new(),
         }
     }
 

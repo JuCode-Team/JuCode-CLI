@@ -56,6 +56,11 @@ pub struct OAuthModel {
     pub max_context_window: Option<u64>,
     pub max_output_tokens: Option<u64>,
     pub reasoning_efforts: Option<Vec<String>>,
+    /// What pickers show; None: the id.
+    pub display_name: Option<String>,
+    /// The window range through each of the user's groups (group id →
+    /// smallest, largest).
+    pub group_windows: std::collections::BTreeMap<String, (u64, u64)>,
 }
 
 pub fn login(web_url: &str, api_url: &str) -> Result<OAuthLoginResult, String> {
@@ -432,6 +437,13 @@ fn parse_model(item: &Value) -> Option<OAuthModel> {
                     .collect::<Vec<_>>()
             })
             .filter(|values| !values.is_empty()),
+        display_name: item
+            .get("display_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(str::to_string),
+        group_windows: crate::config::read_group_windows(item.get("group_context_windows")),
     })
 }
 
@@ -487,7 +499,13 @@ mod tests {
                 "context_window": 272000,
                 "max_context_window": 1050000,
                 "max_output_tokens": 128000,
-                "reasoning_efforts": ["low", "medium"]
+                "reasoning_efforts": ["low", "medium"],
+                "display_name": " GPT-5.5 ",
+                "group_context_windows": {
+                    "g-small": { "context_window": 272000, "max_context_window": 272000 },
+                    "g-big": { "context_window": 1050000 },
+                    "g-unset": { "context_window": 0 }
+                }
             }]
         });
 
@@ -498,7 +516,13 @@ mod tests {
                 context_window: Some(272_000),
                 max_context_window: Some(1_050_000),
                 max_output_tokens: Some(128_000),
-                reasoning_efforts: Some(vec!["low".to_string(), "medium".to_string()])
+                reasoning_efforts: Some(vec!["low".to_string(), "medium".to_string()]),
+                display_name: Some("GPT-5.5".to_string()),
+                group_windows: [
+                    ("g-big".to_string(), (1_050_000, 1_050_000)),
+                    ("g-small".to_string(), (272_000, 272_000)),
+                ]
+                .into(),
             }]
         );
     }
@@ -514,7 +538,9 @@ mod tests {
                 context_window: None,
                 max_context_window: None,
                 max_output_tokens: None,
-                reasoning_efforts: None
+                reasoning_efforts: None,
+                display_name: None,
+                group_windows: Default::default(),
             }]
         );
     }

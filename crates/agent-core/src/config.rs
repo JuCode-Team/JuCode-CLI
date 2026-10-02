@@ -329,6 +329,11 @@ pub struct ModelConfig {
     pub input_cost: f64,
     pub cached_input_cost: f64,
     pub output_cost: f64,
+    /// What pickers show (e.g. "GPT-6.1 Sol"); None: the name.
+    pub display_name: Option<String>,
+    /// JuCode: the window range through each group (group id → smallest,
+    /// largest), when a group's channel gives the model another window.
+    pub group_windows: BTreeMap<String, (u64, u64)>,
 }
 
 impl ModelConfig {
@@ -495,19 +500,7 @@ impl Config {
                 .get("jucode_models")
                 .map(|list| read_model_configs(&json!({ "models": list }), "jucode"))
                 .unwrap_or_default(),
-            jucode_groups: value
-                .get("jucode_groups")
-                .and_then(Value::as_object)
-                .map(|groups| {
-                    groups
-                        .iter()
-                        .filter_map(|(model, group)| {
-                            let group = group.as_str()?.trim();
-                            (!group.is_empty()).then(|| (model.clone(), group.to_string()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
+            jucode_groups: read_jucode_groups(&value),
             context_window_overrides: read_context_window_overrides(&value),
             base_url: normalize_base_url(&read_string(&value, "base_url", &default_base_url)),
             provider,
@@ -687,6 +680,7 @@ impl Config {
             .find(|entry| entry.name == model)
             .cloned()
             .unwrap_or_else(|| default_model_config(model));
+        let config = apply_group_window(config, &self.jucode_groups);
         apply_context_window_override(config, &self.context_window_overrides)
     }
 
@@ -1208,6 +1202,13 @@ fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
             input_cost: read_f64(model, "input_cost", 0.0),
             cached_input_cost: read_f64(model, "cached_input_cost", 0.0),
             output_cost: read_f64(model, "output_cost", 0.0),
+            display_name: model
+                .get("display_name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|label| !label.is_empty())
+                .map(str::to_string),
+            group_windows: read_group_windows(model.get("group_context_windows")),
         });
     }
 
@@ -1376,7 +1377,7 @@ fn mcp_server_config_value(server: &McpServerConfig) -> Value {
 }
 
 fn model_config_value(model: &ModelConfig) -> Value {
-    json!({
+    let mut value = json!({
         "name": model.name,
         "context_window": model.context_window,
         "max_context_window": model.max_context_window,
@@ -1385,7 +1386,52 @@ fn model_config_value(model: &ModelConfig) -> Value {
         "input_cost": model.input_cost,
         "cached_input_cost": model.cached_input_cost,
         "output_cost": model.output_cost,
-    })
+    });
+    if let Some(label) = &model.display_name {
+        value["display_name"] = json!(label);
+    }
+    if !model.group_windows.is_empty() {
+        value["group_context_windows"] = group_windows_value(&model.group_windows);
+    }
+    value
+}
+
+/// `group_context_windows` as /v1/models sends it and config.json keeps it:
+/// `{group id: {context_window, max_context_window}}`.
+pub(crate) fn read_group_windows(value: Option<&Value>) -> BTreeMap<String, (u64, u64)> {
+    value
+        .and_then(Value::as_object)
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(|(group, range)| {
+                    let window = range
+                        .get("context_window")
+                        .and_then(Value::as_u64)
+                        .filter(|w| *w > 0)?;
+                    let max = range
+                        .get("max_context_window")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(window)
+                        .max(window);
+                    Some((group.clone(), (window, max)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn group_windows_value(groups: &BTreeMap<String, (u64, u64)>) -> Value {
+    groups
+        .iter()
+        .map(|(group, (window, max))| {
+            (
+                group.clone(),
+                json!({ "context_window": window, "max_context_window": max }),
+            )
+        })
+        .collect::<Map<String, Value>>()
+        .into()
 }
 
 fn default_reasoning_efforts() -> Vec<String> {
@@ -1459,6 +1505,8 @@ fn model_config_from_catalog(model: &llm_provider_kit::omp::CatalogModel) -> Mod
         input_cost: model.input_cost,
         cached_input_cost: model.cached_input_cost,
         output_cost: model.output_cost,
+        display_name: Some(model.name.clone()).filter(|name| !name.is_empty() && *name != model.id),
+        group_windows: BTreeMap::new(),
     }
 }
 
@@ -1476,19 +1524,40 @@ fn model_config_from_template(model: &llm_provider_kit::ModelTemplate) -> ModelC
         input_cost: 0.0,
         cached_input_cost: 0.0,
         output_cost: 0.0,
+        display_name: None,
+        group_windows: BTreeMap::new(),
     }
 }
 
 /// The JuCode models the user chose to show (empty before the first login).
+/// Only reads config.json: the daemon asks on every model menu.
 pub fn jucode_visible_models() -> Vec<ModelConfig> {
-    Config::load_or_create()
+    Config::load_existing()
         .map(|c| {
             c.jucode_models
                 .into_iter()
+                .map(|m| apply_group_window(m, &c.jucode_groups))
                 .map(|m| apply_context_window_override(m, &c.context_window_overrides))
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The window range through the group the user pinned for `config.name`
+/// (`jucode_groups`), when the gateway gave one for that group; otherwise
+/// the range over all of the user's groups.
+pub(crate) fn apply_group_window(
+    mut config: ModelConfig,
+    groups: &BTreeMap<String, String>,
+) -> ModelConfig {
+    if let Some(&(window, max)) = groups
+        .get(&config.name)
+        .and_then(|group| config.group_windows.get(group))
+    {
+        config.context_window = window;
+        config.max_context_window = max;
+    }
+    config
 }
 
 /// Applies the user's hand-set window for `config.name`, if any. A gateway
@@ -1523,6 +1592,31 @@ fn read_context_window_overrides(value: &Value) -> BTreeMap<String, u64> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn read_jucode_groups(value: &Value) -> BTreeMap<String, String> {
+    value
+        .get("jucode_groups")
+        .and_then(Value::as_object)
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(|(model, group)| {
+                    let group = group.as_str()?.trim();
+                    (!group.is_empty()).then(|| (model.clone(), group.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `jucode_groups` as saved now: Desktop changes a model's group while
+/// engines run, and the window follows the group (see `apply_group_window`).
+pub(crate) fn read_jucode_groups_at(path: &Path) -> io::Result<BTreeMap<String, String>> {
+    let content = fs::read_to_string(path)?;
+    let value = serde_json::from_str::<Value>(&content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(read_jucode_groups(&value))
 }
 
 pub(crate) fn read_context_window_overrides_at(path: &Path) -> io::Result<BTreeMap<String, u64>> {
@@ -1614,6 +1708,8 @@ fn default_model_config(name: &str) -> ModelConfig {
             input_cost: 0.0,
             cached_input_cost: 0.0,
             output_cost: 0.0,
+            display_name: None,
+            group_windows: BTreeMap::new(),
         })
 }
 
@@ -1839,6 +1935,8 @@ mod tests {
             input_cost: 0.0,
             cached_input_cost: 0.0,
             output_cost: 0.0,
+            display_name: None,
+            group_windows: BTreeMap::new(),
         };
         let overrides = BTreeMap::from([("gpt-6-sol".to_string(), 2_000_000)]);
         // Raised toward, but never past, the largest account window.
@@ -1850,6 +1948,42 @@ mod tests {
         // No override: the gateway's smallest window stands.
         let untouched = apply_context_window_override(model(272_000, 1_050_000), &BTreeMap::new());
         assert_eq!(untouched.context_window, 272_000);
+    }
+
+    #[test]
+    fn the_window_follows_the_pinned_group_and_survives_config_json() {
+        let model = ModelConfig {
+            name: "gpt-6-sol".to_string(),
+            context_window: 272_000,
+            max_context_window: 1_050_000,
+            max_output_tokens: 0,
+            reasoning_efforts: vec![],
+            input_cost: 0.0,
+            cached_input_cost: 0.0,
+            output_cost: 0.0,
+            display_name: Some("GPT-6 Sol".to_string()),
+            group_windows: BTreeMap::from([("g-big".to_string(), (1_050_000, 1_050_000))]),
+        };
+        // Saved and read back with its label and group windows.
+        let read = read_model_configs(&json!({ "models": [model_config_value(&model)] }), "jucode");
+        assert_eq!(read[0].display_name.as_deref(), Some("GPT-6 Sol"));
+        assert_eq!(read[0].group_windows, model.group_windows);
+        // Pinned to the big group: its window. Unpinned or another group:
+        // the range over all groups.
+        let pinned = BTreeMap::from([("gpt-6-sol".to_string(), "g-big".to_string())]);
+        assert_eq!(
+            apply_group_window(model.clone(), &pinned).context_window,
+            1_050_000
+        );
+        let other = BTreeMap::from([("gpt-6-sol".to_string(), "g-other".to_string())]);
+        assert_eq!(
+            apply_group_window(model.clone(), &other).context_window,
+            272_000
+        );
+        assert_eq!(
+            apply_group_window(model, &BTreeMap::new()).context_window,
+            272_000
+        );
     }
 
     #[test]
@@ -1874,6 +2008,8 @@ mod tests {
             input_cost: 2.0,
             cached_input_cost: 0.5,
             output_cost: 8.0,
+            display_name: None,
+            group_windows: BTreeMap::new(),
         };
         // 1M non-cached input @2 + 1M cached @0.5 + 1M output @8 = 10.5
         let cost = model.cost_for(2_000_000, 1_000_000, 1_000_000);
@@ -2026,6 +2162,8 @@ mod tests {
                     input_cost: 0.0,
                     cached_input_cost: 0.0,
                     output_cost: 0.0,
+                    display_name: None,
+                    group_windows: BTreeMap::new(),
                 },
                 ModelConfig {
                     name: "compact-model".to_string(),
@@ -2036,6 +2174,8 @@ mod tests {
                     input_cost: 0.0,
                     cached_input_cost: 0.0,
                     output_cost: 0.0,
+                    display_name: None,
+                    group_windows: BTreeMap::new(),
                 },
             ],
             base_url: "https://api.openai.com/v1".to_string(),

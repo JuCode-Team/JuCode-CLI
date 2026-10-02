@@ -197,38 +197,18 @@ fn live_groups(upstream: &Upstream) -> Option<Vec<Value>> {
 /// (`jucode_models` in config.json) and the gateway's groups. Empty lists
 /// when not signed in or the gateway cannot be reached.
 pub fn catalog_json() -> Value {
-    let models: Vec<Value> = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(|home| {
-            std::path::PathBuf::from(home)
-                .join(".jucode")
-                .join("config.json")
+    // The window the engine budgets with: through the pinned group, and a
+    // hand-set override (capped at the gateway's largest) over the gateway's.
+    let models: Vec<Value> = jucode_agent_core::jucode_visible_models()
+        .into_iter()
+        .map(|model| {
+            json!({
+                "name": model.name,
+                "display_name": model.display_name,
+                "context_window": model.context_window,
+            })
         })
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .map(|config| {
-            // The window the engine budgets with: a hand-set override
-            // (capped at the gateway's largest) wins over the gateway's.
-            let overrides = config["context_window_overrides"].clone();
-            config["jucode_models"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|model| {
-                    let name = model["name"].as_str()?;
-                    let mut window = model["context_window"].as_u64().unwrap_or(0);
-                    if let Some(set) = overrides[name].as_u64().filter(|w| *w > 0) {
-                        window = match model["max_context_window"].as_u64().unwrap_or(0) {
-                            0 => set,
-                            max => set.min(max),
-                        };
-                    }
-                    Some(json!({ "name": name, "context_window": window }))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+        .collect();
     let groups = live_upstream()
         .ok()
         .and_then(|upstream| live_groups(&upstream))

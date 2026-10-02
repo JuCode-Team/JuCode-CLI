@@ -440,6 +440,7 @@ impl AgentCore {
         AgentEvent::ModelStatus {
             provider: self.config.provider.clone(),
             model: self.config.model.clone(),
+            model_label: model_config.display_name.clone(),
             reasoning_effort: self.effective_reasoning_effort(),
             context_window: model_config.context_window,
             context_limit: self.effective_context_limit(),
@@ -582,7 +583,6 @@ impl AgentCore {
         events
     }
 
-    /// Splits attachment paths into valid ones (kept) and a warning event per
     /// Runs a turn on the conversation as it stands, with no new user message:
     /// after a turn that failed (a dropped connection), the model picks up
     /// where it stopped, so a retry leaves no "continue" in the history.
@@ -597,6 +597,7 @@ impl AgentCore {
         self.start_turn_from_existing_context()
     }
 
+    /// Splits attachment paths into valid ones (kept) and a warning event per
     /// unattachable path. Reads no file contents.
     fn validate_image_attachments(&self, images: Vec<String>) -> (Vec<String>, Vec<AgentEvent>) {
         let mut valid = Vec::new();
@@ -1919,6 +1920,10 @@ impl AgentCore {
         // Same for the hand-set context windows (model settings in Desktop).
         if let Ok(overrides) = crate::config::read_context_window_overrides_at(self.config.path()) {
             self.config.context_window_overrides = overrides;
+        }
+        // And the group picked per model, which the window follows.
+        if let Ok(groups) = crate::config::read_jucode_groups_at(self.config.path()) {
+            self.config.jucode_groups = groups;
         }
         let (goal_tool_tx, goal_tool_rx) = mpsc::channel();
         self.goal_tool_receiver = Some(goal_tool_rx);
@@ -3928,6 +3933,7 @@ impl AgentCore {
                 let active = model_config.name == self.config.model;
                 ModelOptionView {
                     model: model_config.name.clone(),
+                    label: model_config.display_name.clone(),
                     active,
                     // The window this engine budgets with: the user's
                     // override when set, else the gateway's.
@@ -4068,6 +4074,8 @@ fn jucode_model_config(model: &OAuthModel) -> ModelConfig {
         input_cost: 0.0,
         cached_input_cost: 0.0,
         output_cost: 0.0,
+        display_name: model.display_name.clone(),
+        group_windows: model.group_windows.clone(),
     }
 }
 
@@ -4664,6 +4672,8 @@ mod model_config_tests {
             max_context_window: None,
             max_output_tokens: None,
             reasoning_efforts: None,
+            display_name: None,
+            group_windows: Default::default(),
         }
     }
 
@@ -4742,6 +4752,8 @@ mod model_config_tests {
             max_context_window: None,
             max_output_tokens: Some(64_000),
             reasoning_efforts: Some(vec!["low".to_string(), "high".to_string()]),
+            display_name: None,
+            group_windows: Default::default(),
         };
         let config = jucode_model_config(&model);
         assert_eq!(config.reasoning_efforts, vec!["low", "high"]);

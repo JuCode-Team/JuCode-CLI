@@ -19,6 +19,8 @@ pub struct SessionListItemView {
 #[derive(Debug, Clone)]
 pub struct ModelOptionView {
     pub model: String,
+    /// What the gateway calls it for people; None: the id.
+    pub label: Option<String>,
     pub active: bool,
     pub context_window: u64,
     pub max_output_tokens: u64,
@@ -101,6 +103,7 @@ pub enum AgentEvent {
     ModelStatus {
         provider: String,
         model: String,
+        model_label: Option<String>,
         reasoning_effort: String,
         context_window: u64,
         context_limit: u64,

@@ -185,6 +185,7 @@ fn main() -> io::Result<()> {
                     .map(|m| {
                         json!({
                             "name": m.name,
+                            "display_name": m.display_name,
                             "context_window": m.context_window,
                             "max_context_window": m.max_context_window,
                             "max_output_tokens": m.max_output_tokens,
