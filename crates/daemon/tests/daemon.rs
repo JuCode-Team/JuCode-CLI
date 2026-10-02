@@ -2019,10 +2019,11 @@ fn full_access_restarts_claude_on_the_same_conversation_and_reopening_resumes_it
     client.send(json!({ "op": "user_message", "session": session, "content": "first" }));
     client.until(turn_done(&session));
 
+    // A message right behind the switch runs in the new mode.
     client.send(json!({ "op": "set_approval_mode", "session": session, "mode": "full-access" }));
-    client.until(|f| {
-        f["session"] == session.as_str() && f["type"] == "approval_mode" && f["mode"] == "full-auto"
-    });
+    client.send(json!({ "op": "user_message", "session": session, "content": "which mode" }));
+    let frames = client.until(turn_done(&session));
+    assert_eq!(claude_reply(&frames, &session), "mode: bypassPermissions");
     let restarted = starts(&log).pop().unwrap();
     assert!(
         restarted.contains(&"--dangerously-skip-permissions".to_string()),
@@ -2046,7 +2047,12 @@ fn full_access_restarts_claude_on_the_same_conversation_and_reopening_resumes_it
     let frames = client.until(|f| f["session"] == session.as_str() && f["type"] == "transcript");
     assert_eq!(
         frames.last().unwrap()["items"],
-        json!([{ "role": "user", "content": "first" }, { "role": "assistant", "content": "ok: first" }])
+        json!([
+            { "role": "user", "content": "first" },
+            { "role": "assistant", "content": "ok: first" },
+            { "role": "user", "content": "which mode" },
+            { "role": "assistant", "content": "mode: bypassPermissions" },
+        ])
     );
     assert!(starts(&log)
         .pop()

@@ -586,6 +586,12 @@ impl Session<'_> {
                             process.stop();
                             return;
                         }
+                        // The ops after a mode or gateway switch go to the
+                        // new process (a message right after "full access"
+                        // must not run in the old mode).
+                        if self.restart.is_some() && !adapter.busy() {
+                            break;
+                        }
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {

@@ -63,7 +63,7 @@ while True:
                 break
         allowed = answer["response"]["response"]["behavior"] == "allow"
         out({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "hi" if allowed else "denied", "is_error": not allowed}]}, "tool_use_result": {"stdout": "hi"} if allowed else {}})
-    reply = "ok: " + text
+    reply = "mode: " + mode if text == "which mode" else "ok: " + text
     out({"type": "stream_event", "event": {"type": "message_start", "message": {"usage": {"input_tokens": 5}}}})
     out({"type": "assistant", "uuid": "u-1", "message": {"content": [{"type": "text", "text": reply}]}})
     save("assistant", reply)
