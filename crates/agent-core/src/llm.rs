@@ -931,6 +931,9 @@ impl OpenAiClient {
     }
 
     fn tool_definitions(&self) -> Vec<Value> {
+        if let Some(host) = self.host.as_ref().filter(|host| host.exclusive) {
+            return host.tools.clone();
+        }
         let mut definitions = tools::definitions()
             .into_iter()
             .filter(|definition| {
@@ -1038,7 +1041,16 @@ impl OpenAiClient {
                 );
             }
         }
-        let result = if let Some(result) = self.run_goal_tool(&request.name, &request.arguments) {
+        let exclusive = self
+            .host
+            .as_ref()
+            .is_some_and(|host| host.exclusive && !host.has_tool(&request.name));
+        let result = if exclusive {
+            json_tool_result(
+                json!({ "error": format!("unknown tool: {}", request.name) }),
+                true,
+            )
+        } else if let Some(result) = self.run_goal_tool(&request.name, &request.arguments) {
             result
         } else if let Some(result) = self.run_subagent_tool(
             &request.name,

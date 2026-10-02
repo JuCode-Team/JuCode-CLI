@@ -17,6 +17,9 @@ pub struct HostExtensions {
     /// Appended to the system prompt at the start of every turn, so the
     /// host can reflect state that changed since the last turn.
     pub prompt: Arc<dyn Fn() -> String + Send + Sync>,
+    /// The session gets these tools only: no built-in, subagent or MCP
+    /// tools (the daemon's dispatcher routes work and must not do it).
+    pub exclusive: bool,
 }
 
 impl HostExtensions {

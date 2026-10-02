@@ -148,6 +148,8 @@ impl Agents {
             .flatten()
             .flatten()
             .filter_map(|entry| self.get(&entry.file_name().to_string_lossy()))
+            // The dispatcher is reached through dispatches, never listed.
+            .filter(|agent| agent.id != crate::dispatch::AGENT)
             .collect();
         agents.sort_by(|a, b| a.id.cmp(&b.id));
         agents

@@ -38,6 +38,8 @@ pub const MAX_RUNNING: usize = 4;
 pub struct Hub {
     pub store: Store,
     pub agents: Agents,
+    pub dispatch: crate::dispatch::Dispatches,
+    pub push: crate::push::Push,
     pub version: &'static str,
     pub relay: Relay,
     sessions: Mutex<HashMap<String, Hosted>>,
@@ -111,6 +113,8 @@ impl Hub {
             handing_off: Mutex::new(HashSet::new()),
             relay: Relay::new(relay, &store),
             usage: Usage::new(&store),
+            dispatch: crate::dispatch::Dispatches::load(store.dir()),
+            push: crate::push::Push::load(store.dir()),
             store,
             agents,
             version,
@@ -132,6 +136,11 @@ impl Hub {
         let id = self.next_client.fetch_add(1, Ordering::SeqCst);
         lock(&self.clients).insert(id, Client { outbox, device });
         id
+    }
+
+    /// The paired device a connection authenticated as (None: local).
+    pub fn device_of(&self, client: u64) -> Option<String> {
+        lock(&self.clients).get(&client)?.device.clone()
     }
 
     /// Whether the connection is a local client (not a paired device).
@@ -206,6 +215,7 @@ impl Hub {
             .map_err(|error| error.to_string())?;
         // Dropping the outbox ends that connection's loop.
         lock(&self.clients).retain(|_, client| client.device.as_deref() != Some(id));
+        self.push.forget_device(id);
         Ok(())
     }
 
@@ -440,7 +450,7 @@ impl Hub {
         Ok(())
     }
 
-    fn host(&self, id: String, ops: Sender<Value>, cwd: PathBuf, generation: u64) {
+    pub(crate) fn host(&self, id: String, ops: Sender<Value>, cwd: PathBuf, generation: u64) {
         lock(&self.sessions).insert(
             id,
             Hosted {
@@ -577,6 +587,37 @@ impl Hub {
         };
         if changed {
             self.broadcast(&self.agents_json());
+        }
+    }
+
+    /// A session is running a turn or has messages waiting.
+    pub fn is_busy(&self, session: &str) -> bool {
+        lock(&self.busy).contains(session)
+    }
+
+    /// The end of a session's latest reply, as far as this daemon saw it.
+    pub fn last_reply(&self, session: &str) -> Option<String> {
+        let turns = lock(&self.turns);
+        let tail = turns.get(session)?.tail().trim();
+        (!tail.is_empty()).then(|| tail.to_string())
+    }
+
+    /// Sends `content` to a session as the user's next message, holding its
+    /// running slot like a delivered message (see `deliver`).
+    pub fn send_to_session(&self, session: &str, content: &str) -> Result<(), String> {
+        *lock(&self.claims).entry(session.to_string()).or_default() += 1;
+        lock(&self.busy).insert(session.to_string());
+        self.forward(
+            session,
+            json!({ "op": "user_message", "content": content, "claimed": true }),
+        )
+        .inspect_err(|_| self.release_claim(session))
+    }
+
+    /// Notifies the paired phones (see `push`).
+    pub fn notify(&self, title: &str, body: &str, tag: &str) {
+        if let Some(hub) = self.me.upgrade() {
+            crate::push::notify(&hub, title, body, tag);
         }
     }
 
@@ -974,6 +1015,9 @@ impl Hub {
         if ended {
             self.write_handoff(session);
         }
+        if let Some(hub) = self.me.upgrade() {
+            crate::dispatch::observe(&hub, session, event);
+        }
     }
 
     /// An agent session's turn ended: the title model rewrites its handoff
@@ -1260,11 +1304,12 @@ fn shown_title(record: &SessionRecord, label: Option<&str>) -> Option<String> {
 }
 
 /// How `delivery_text` starts the line naming where a message came from.
-const DELIVERY_HEADERS: [&str; 4] = [
+const DELIVERY_HEADERS: [&str; 5] = [
     "[message from ",
     "[timer ",
     "[scheduled task ",
     "[answer to your question ",
+    "[task ",
 ];
 
 /// `text` without the delivery header line `delivery_text` put first: what
@@ -1307,6 +1352,7 @@ fn delivery_text(message: &Message) -> String {
         Some(("timer", id)) => format!("timer {id} fired"),
         Some(("schedule", id)) => format!("scheduled task {id}"),
         Some(("question", id)) => format!("answer to your question {id}"),
+        Some(("task", id)) => format!("task {id} update"),
         _ => format!("message from {}", message.from),
     };
     format!("[{origin} · {}]\n{}", message.id, message.body)

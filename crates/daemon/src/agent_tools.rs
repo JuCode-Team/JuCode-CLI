@@ -11,6 +11,9 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 pub fn extensions(hub: Arc<Hub>, agent: String, session: String) -> HostExtensions {
+    if agent == crate::dispatch::AGENT {
+        return dispatcher(hub, session);
+    }
     let prompt_hub = Arc::clone(&hub);
     let prompt_agent = agent.clone();
     let prompt_session = session.clone();
@@ -27,6 +30,42 @@ pub fn extensions(hub: Arc<Hub>, agent: String, session: String) -> HostExtensio
             }
         }),
         prompt: Arc::new(move || prompt_hub.agents.prompt(&prompt_agent, &prompt_session)),
+        exclusive: false,
+    }
+}
+
+/// The dispatcher's tools (see `dispatch`), plus `question`.
+fn dispatcher(hub: Arc<Hub>, session: String) -> HostExtensions {
+    let prompt_hub = Arc::clone(&hub);
+    let prompt_session = session.clone();
+    let mut tools = crate::dispatch::definitions();
+    tools.extend(
+        definitions()
+            .into_iter()
+            .filter(|tool| tool["name"] == "question"),
+    );
+    HostExtensions {
+        tools,
+        run_tool: Arc::new(move |name, arguments| {
+            let result = serde_json::from_str::<Value>(arguments)
+                .map_err(|error| format!("invalid JSON arguments: {error}"))
+                .map(without_empty)
+                .and_then(
+                    |args| match crate::dispatch::run(&hub, &session, name, &args) {
+                        Some(result) => result,
+                        None if name == "question" => {
+                            run(&hub, crate::dispatch::AGENT, &session, name, &args)
+                        }
+                        None => Err(format!("unknown tool {name}")),
+                    },
+                );
+            match result {
+                Ok(output) => (output.to_string(), false),
+                Err(error) => (json!({ "error": error }).to_string(), true),
+            }
+        }),
+        prompt: Arc::new(move || crate::dispatch::prompt(&prompt_hub, &prompt_session)),
+        exclusive: true,
     }
 }
 

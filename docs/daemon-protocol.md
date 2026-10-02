@@ -409,6 +409,47 @@ delivery.
 `schedule` is absent; that `id` is then the request id too, echoed in the
 reply.
 
+## Dispatch
+
+A dispatch hands the daemon a batch of requests without a project or
+session. A reserved agent, `dispatch` (never listed), splits it into tasks,
+sends each to a session in one of the user's projects, and reports back.
+Each dispatch is one session of that agent; `id` is that session.
+`agent_create` refuses the id `dispatch`. A session runs one dispatch task at
+a time: a session that is busy, or running another dispatch's task, is not
+given one.
+
+| Op | Reply | |
+| --- | --- | --- |
+| `{"op":"dispatch_send","text":"…","plan":false,"approval_mode":"auto"}` | `dispatch_started` | `approval_mode`: `manual`, `auto-edit`, `auto` or `full-access`; every task runs in it. With `plan`, no task starts before `dispatch_confirm`. |
+| `{"op":"dispatch_confirm","dispatch":"…","approve":true,"note":"…"}` | `dispatch_confirmed` | Only while the dispatch is `awaiting`. |
+| `{"op":"dispatch_list"}` | `dispatches` | |
+
+`dispatches` is also sent on connect and broadcast on every change:
+
+```json
+{"type":"dispatches","dispatches":[{
+  "id":"s…","text":"…","plan":true,"mode":"auto","status":"running",
+  "tasks":[{"id":1,"title":"…","project":"/path","session":"s…","engine":"jucode",
+            "status":"running","reply":"…"}],
+  "summary":"","created_at":0,"updated_at":0}]}
+```
+
+Dispatch `status`: `planning`, `awaiting` (plan mode, waiting for the user),
+`running`, `done`, `cancelled`, `failed` (the dispatcher's turn failed).
+Task `status`: `planned`, `sent`, `running`,
+`waiting` (an approval in its session waits for the user), `done`, `failed`.
+`reply` is the end of the task session's last reply.
+
+## Notifications
+
+A paired device's browser registers its Web Push subscription with
+`{"op":"push_subscribe","subscription":{"endpoint":"…","keys":{"p256dh":"…","auth":"…"}}}`
+(only paired devices; dropped when the device is revoked) and removes it with
+`{"op":"push_unsubscribe","endpoint":"…"}`. The daemon notifies when a
+dispatch's plan waits for the user, a task waits for an approval, and a
+dispatch is done, through the relay (relay-protocol.md, Web Push).
+
 ## Session ops
 
 Every op from `docs/serve-protocol.md` (`user_message`, `command`, `steer`,

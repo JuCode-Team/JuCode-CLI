@@ -227,6 +227,43 @@ impl Relay {
     }
 }
 
+impl Relay {
+    /// Asks the relay to deliver a Web Push notification (see `push`):
+    /// signed with the host key, which the relay only accepts from a host
+    /// connected to it. Returns the relay's HTTP status (410: the
+    /// subscription is gone).
+    pub fn push(&self, subscription: &Value, payload: &Value) -> Result<u16, String> {
+        let url = self.url.as_deref().ok_or("the relay is disabled")?;
+        let identity = self.identity()?;
+        let body = json!({
+            "pub": URL_SAFE_NO_PAD.encode(identity.signing.verifying_key().as_bytes()),
+            "ts": crate::store::now(),
+            "subscription": { "endpoint": subscription["endpoint"], "keys": subscription["keys"] },
+            "payload": payload,
+        })
+        .to_string();
+        let mut signed = PUSH_CONTEXT.to_vec();
+        signed.extend_from_slice(body.as_bytes());
+        let signature = identity.signing.sign(&signed);
+        let response = ureq::post(&format!("{}/relay/v1/push", app_origin(url)))
+            .timeout(Duration::from_secs(20))
+            .set("Content-Type", "application/json")
+            .set(
+                "X-JuCode-Signature",
+                &URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+            )
+            .send_string(&body);
+        match response {
+            Ok(response) => Ok(response.status()),
+            Err(ureq::Error::Status(code, _)) => Ok(code),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+/// What a push request's signature covers, before its body.
+const PUSH_CONTEXT: &[u8] = b"jucode-relay-push-v1:";
+
 /// `wss://host[:port]/relay/v1` → `https://host[:port]`.
 fn app_origin(url: &str) -> String {
     let (scheme, rest) = url.split_once("://").unwrap_or(("wss", url));

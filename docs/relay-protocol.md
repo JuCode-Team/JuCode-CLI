@@ -111,6 +111,25 @@ plus jitter.
 `GET /relay/v1/healthz` → `200 ok`.
 Logs: connects/disconnects with host id and stream counts; never payloads.
 
+### Web Push
+
+The relay sends Web Push notifications for connected hosts; it keeps no
+subscriptions and stores nothing it passes on.
+
+- `GET /relay/v1/push/key` → `{"key":"<VAPID public key, base64url>"}`: the
+  `applicationServerKey` a browser subscribes with.
+- `POST /relay/v1/push`, body
+  `{"pub":"<host Ed25519 public key>","ts":<ms>,"subscription":{"endpoint","keys":{"p256dh","auth"}},"payload":{…}}`,
+  header `X-JuCode-Signature`: base64url Ed25519 signature over
+  `"jucode-relay-push-v1:" + body`. Accepted only from a host connected now,
+  within 5 minutes of `ts`, at most 60 per host per minute, for endpoints of
+  the browser push services, payload at most 3 KB. Replies `204` sent, `410`
+  the subscription is gone (forget it), `401`/`403`/`400`/`429`/`502`
+  otherwise.
+
+The relay runs with `-vapid-file` (keys created on first start); without it
+these endpoints are not served.
+
 ## 4. Noise session (client ⇄ daemon, inside one stream)
 
 `Noise_IK_25519_ChaChaPoly_SHA256`, prologue = ASCII `jucode-relay-v1`.

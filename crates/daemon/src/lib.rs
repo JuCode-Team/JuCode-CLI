@@ -6,6 +6,7 @@
 
 mod agent_tools;
 mod agents;
+mod dispatch;
 mod engines;
 mod files;
 mod gateway;
@@ -14,6 +15,7 @@ mod hub;
 pub mod install;
 pub mod noise;
 mod projects;
+mod push;
 mod relay;
 mod schedules;
 mod session;
@@ -232,6 +234,7 @@ fn pump(
         hub.schedules_json(None),
         hub.questions_json(),
         hub.actions_json(),
+        hub.dispatch.json(),
     ] {
         link.send(&frame.to_string())?;
     }
@@ -432,6 +435,34 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             })
             .map(|session| json!({ "type": "session_created", "session": session })),
         ("agent_list", _) => Ok(hub.agents_json()),
+        ("dispatch_send", _) => dispatch::start(
+            hub,
+            op["text"].as_str().unwrap_or_default(),
+            op["plan"] == true,
+            op["approval_mode"].as_str().unwrap_or("auto"),
+        ),
+        ("dispatch_confirm", _) => dispatch::confirm(
+            hub,
+            op["dispatch"].as_str().unwrap_or_default(),
+            op["approve"] == true,
+            op["note"].as_str().unwrap_or_default(),
+        ),
+        ("dispatch_list", _) => Ok(hub.dispatch.json()),
+        // A phone's browser asks to be notified (see `push`).
+        ("push_subscribe", _) => match hub.device_of(client) {
+            Some(device) => hub
+                .push
+                .subscribe(&device, &op["subscription"])
+                .map(|()| json!({ "type": "push_subscribed" })),
+            None => Err("only a paired device subscribes to notifications".to_string()),
+        },
+        ("push_unsubscribe", _) => hub
+            .push
+            .unsubscribe(op["endpoint"].as_str().unwrap_or_default())
+            .map(|()| json!({ "type": "push_unsubscribed" })),
+        ("agent_create", _) if op["agent"] == dispatch::AGENT => {
+            Err(format!("the agent id {} is reserved", dispatch::AGENT))
+        }
         ("agent_create", _) => {
             let text = |key: &str| op[key].as_str().unwrap_or_default();
             hub.agents

@@ -91,6 +91,11 @@ impl Turns {
         }
     }
 
+    /// The end of the latest reply.
+    pub fn tail(&self) -> &str {
+        &self.tail
+    }
+
     /// Turns ended so far.
     pub fn done(&self) -> u32 {
         self.done

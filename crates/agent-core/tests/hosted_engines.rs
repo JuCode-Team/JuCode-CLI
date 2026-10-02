@@ -220,6 +220,7 @@ fn host_tools_run_in_the_host_and_host_prompt_reaches_the_model() {
             ("noted".to_string(), false)
         }),
         prompt: Arc::new(|| "<host-marker>brief goes here</host-marker>".to_string()),
+        exclusive: false,
     });
 
     core.submit_user_message(r#"CALL note_down {"text":"hi"}"#.to_string());
@@ -237,6 +238,34 @@ fn host_tools_run_in_the_host_and_host_prompt_reaches_the_model() {
     core.submit_user_message("SYSTEM".to_string());
     let events = pump(&mut core, is_ready);
     assert!(assistant_text(&events).contains("<host-marker>brief goes here</host-marker>"));
+}
+
+#[test]
+fn an_exclusive_host_leaves_the_engine_no_tools_of_its_own() {
+    use jucode_agent_core::host::HostExtensions;
+    use std::sync::Arc;
+    let _guard = setup();
+    let dir = temp_dir("exclusive");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    core.set_host_extensions(HostExtensions {
+        tools: vec![serde_json::json!({
+            "type": "function",
+            "name": "note_down",
+            "description": "Record a note.",
+            "parameters": { "type": "object", "properties": {} }
+        })],
+        run_tool: Arc::new(|_, _| ("noted".to_string(), false)),
+        prompt: Arc::new(String::new),
+        exclusive: true,
+    });
+    core.submit_user_message(r#"CALL bash {"command":"touch made-by-bash"}"#.to_string());
+    let events = pump(&mut core, is_ready);
+    assert!(!dir.join("made-by-bash").exists());
+    assert!(
+        assistant_text(&events).contains("unknown tool"),
+        "{}",
+        assistant_text(&events)
+    );
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
