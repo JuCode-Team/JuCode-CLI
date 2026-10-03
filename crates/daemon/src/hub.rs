@@ -1304,6 +1304,8 @@ fn shown_title(record: &SessionRecord, label: Option<&str>) -> Option<String> {
 }
 
 /// How `delivery_text` starts the line naming where a message came from.
+/// Clients show a message with one of these headers as a notice, not as
+/// something the user wrote (JuCode-Desktop `src/lib/delivery.ts`).
 const DELIVERY_HEADERS: [&str; 5] = [
     "[message from ",
     "[timer ",

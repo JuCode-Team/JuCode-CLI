@@ -75,19 +75,23 @@ pub fn action_digest(name: &str, arguments: &str, cwd: &std::path::Path) -> Stri
 }
 
 /// The message that wakes the session once a deferred action is decided.
+/// Clients recognise the header line and show it as a notice, not a user
+/// message (JuCode-Desktop `src/lib/delivery.ts`): keep the two in step.
 pub fn decision_message(action: &DeferredAction, outcome: Option<(&str, bool)>) -> String {
+    let call = if action.summary.is_empty() {
+        format!("`{}`", action.name)
+    } else {
+        format!("`{}` ({})", action.name, action.summary)
+    };
     match outcome {
         None => format!(
-            "[deferred action {} declined]\nThe user declined `{}` ({}). Do not retry it; continue with a different approach or ask how to proceed.",
-            action.id, action.name, action.summary
+            "[deferred action {} declined]\nThe user declined {call}. Do not retry it; continue with a different approach or ask how to proceed.",
+            action.id
         ),
         Some((output, is_error)) => format!(
-            "[deferred action {} approved and executed{}]\n`{}` ({})\nresult:\n{}",
+            "[deferred action {} approved and executed{}]\n{call}\nresult:\n{output}",
             action.id,
             if is_error { ", failed" } else { "" },
-            action.name,
-            action.summary,
-            output
         ),
     }
 }
@@ -113,6 +117,30 @@ mod tests {
         };
         assert_eq!(DeferredAction::from_json(&action.to_json()), Some(action));
         assert_eq!(DeferredAction::from_json(&json!({ "id": "x" })), None);
+    }
+
+    #[test]
+    fn decision_message_leaves_out_an_empty_summary() {
+        let mut action = DeferredAction {
+            id: "act-1".to_string(),
+            session_id: "s1".to_string(),
+            cwd: PathBuf::from("/work"),
+            call_id: "call_1".to_string(),
+            name: "write_stdin".to_string(),
+            arguments: r#"{"session_id":3,"chars":""}"#.to_string(),
+            summary: String::new(),
+            subagent_id: None,
+            digest: String::new(),
+            created_at: 0,
+        };
+        assert_eq!(
+            decision_message(&action, Some(("{}", true))),
+            "[deferred action act-1 approved and executed, failed]\n`write_stdin`\nresult:\n{}"
+        );
+        action.summary = "make".to_string();
+        assert!(decision_message(&action, None).starts_with(
+            "[deferred action act-1 declined]\nThe user declined `write_stdin` (make). "
+        ));
     }
 
     #[test]
