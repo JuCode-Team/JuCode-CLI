@@ -78,6 +78,35 @@ impl Push {
     }
 }
 
+/// `push_test`: a test notification to `device`'s browsers, sent now, with
+/// each push service's answer (passed on by the relay): the phone can tell
+/// whether a notification left, and through which service.
+pub fn test(hub: &Arc<Hub>, device: &str) -> Value {
+    let list: Vec<Value> = lock(&hub.push.subscriptions)
+        .iter()
+        .filter(|s| s["device"] == device)
+        .cloned()
+        .collect();
+    let payload = json!({
+        "title": "JuCode",
+        "body": "测试通知：这台设备能收到电脑发来的通知。",
+        "tag": "push-test",
+        "url": "/remote",
+    });
+    let results: Vec<Value> = list
+        .iter()
+        .map(|subscription| {
+            let endpoint = subscription["endpoint"].as_str().unwrap_or_default();
+            let service = endpoint.split('/').nth(2).unwrap_or_default();
+            match hub.relay.push(subscription, &payload) {
+                Ok(status) => json!({ "service": service, "status": status }),
+                Err(error) => json!({ "service": service, "error": error }),
+            }
+        })
+        .collect();
+    json!({ "type": "push_tested", "results": results })
+}
+
 /// Notifies every subscribed browser, in the background. `tag` groups the
 /// notifications of one thing (a later one replaces it); a browser whose
 /// subscription expired is forgotten.

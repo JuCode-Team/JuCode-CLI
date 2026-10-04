@@ -338,6 +338,18 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         return;
     }
     // The gateway's groups come from the network.
+    // A test notification waits for the push service; other frames go on.
+    if name == "push_test" {
+        let hub = Arc::clone(hub);
+        thread::spawn(move || {
+            let result = match hub.device_of(client) {
+                Some(device) => Ok(push::test(&hub, &device)),
+                None => Err("only a paired device tests its notifications".to_string()),
+            };
+            respond(&hub, client, &request, result);
+        });
+        return;
+    }
     if name == "gateway_catalog" {
         let hub = Arc::clone(hub);
         thread::spawn(move || respond(&hub, client, &request, Ok(gateway::catalog_json())));
