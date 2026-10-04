@@ -140,7 +140,7 @@ every connected client.
 | `session_create` | `cwd`, optional `engine` (`jucode`, default, `claude`, `codex` or `acp`) and `options` | `session_created` with `session`; the session's startup events follow. See "Other engines" |
 | `session_open` | `session`, optional `cwd`, `engine`, `options` | `session_opened`; with `cwd`, also opens a session saved there that the daemon never hosted. Reopens a closed session (or one from before a restart), resuming its transcript and its undecided deferred actions |
 | `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped |
-| `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
+| `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `approval_mode_pending`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
 | `actions_list` | — | `actions`: undecided deferred actions across all sessions |
 | `pair_start` | — | `pairing` with `code` and `expires_at` (local clients only) |
 | `device_list` | — | `devices`: paired, unrevoked devices (local clients only) |
@@ -513,7 +513,10 @@ A paired device's browser registers its Web Push subscription with
 `{"op":"push_unsubscribe","endpoint":"…"}`. The daemon notifies when a
 dispatch's plan waits for the user, a task waits for an approval, a
 dispatch is done, and an open requirement turns to `review` or `approval`,
-through the relay (relay-protocol.md, Web Push). A notification's `url` is
+through the relay (relay-protocol.md, Web Push). `{"op":"push_test"}` (paired devices
+only) sends a test notification to that device's browsers now and replies
+`push_tested` with `results: [{service, status}]` (or `error`): the push
+service's host and its answer, as the relay passed it on. A notification's `url` is
 the remote page, with `?requirement=R-1` for a requirement.
 
 ## Session ops
@@ -522,6 +525,15 @@ Every op from `docs/serve-protocol.md` (`user_message`, `command`, `steer`,
 `interrupt`, `approve`, `set_approval_mode`, `decide_action`, `mcp_*`) is
 accepted with a `session` field and forwarded to that session's engine. Its
 events carry the same `session` field.
+
+`set_approval_mode` applies at once where the engine allows it: a JuCode
+session's running turn (and its subagents) gates its next tool call by the
+new mode, and calls waiting for a decision the new mode no longer needs run.
+Codex takes the mode with each turn, and Claude Code goes in or out of full
+access only by restarting; switched while a turn runs, they send
+`{"type":"approval_mode_pending","mode":"…"}` and apply it when the turn
+ends (`mode: null` then; a client can `interrupt` to apply it sooner). A
+switch to full access answers the turn's open and later approvals at once.
 
 `set_gateway` (`gateway`: bool, optional `model`) moves a Claude Code or Codex
 session between this machine's own login and the JuCode gateway: the engine

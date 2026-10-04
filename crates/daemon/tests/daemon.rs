@@ -2568,3 +2568,44 @@ fn a_file_uploads_in_chunks_outside_the_daemon_state() {
     assert_eq!(fs::read_to_string(&path).unwrap(), "# one\ntwo\n");
     assert!(path.starts_with(daemon.state.parent().unwrap().join("uploads")));
 }
+
+#[test]
+fn a_mode_codex_takes_per_turn_waits_and_full_access_answers_the_open_approval() {
+    let _guard = setup();
+    fake_codex();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-codex-mode");
+    fs::create_dir_all(&dir).unwrap();
+    let mut desktop = Client::connect(&daemon);
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "codex" }),
+    );
+    let session = created["session"].as_str().unwrap().to_string();
+    desktop.send(json!({ "op": "watch", "session": session }));
+    desktop.until(|f| f["session"] == session.as_str() && f["type"] == "attended");
+
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "use a tool" }));
+    desktop.until(|f| f["session"] == session.as_str() && f["type"] == "approval_request");
+    // Mid-turn the switch waits for the turn; full access needs no decision,
+    // so the open approval is allowed and the turn goes on.
+    desktop.send(json!({ "op": "set_approval_mode", "session": session, "mode": "full-access" }));
+    let frames = desktop.until(turn_done(&session));
+    assert!(frames
+        .iter()
+        .any(|f| f["type"] == "approval_mode_pending" && f["mode"] == "full-access"));
+    assert!(frames
+        .iter()
+        .any(|f| f["type"] == "tool_output" && f["is_error"] == false));
+    desktop.until(|f| {
+        f["session"] == session.as_str()
+            && f["type"] == "approval_mode_pending"
+            && f["mode"].is_null()
+    });
+
+    // Between turns it applies at once: nothing waits.
+    desktop.send(json!({ "op": "set_approval_mode", "session": session, "mode": "manual" }));
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "hello" }));
+    let frames = desktop.until(turn_done(&session));
+    assert!(!frames.iter().any(|f| f["type"] == "approval_mode_pending"));
+}

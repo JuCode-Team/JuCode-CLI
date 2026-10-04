@@ -172,6 +172,10 @@ pub trait Adapter: Send {
     fn approval_mode(&self) -> Option<String> {
         None
     }
+    /// A mode switch reaches the running turn (else it applies to the next).
+    fn mode_applies_live(&self) -> bool {
+        true
+    }
 }
 
 fn adapter(kind: Kind, cwd: &Path, options: &Options) -> Box<dyn Adapter> {
@@ -348,6 +352,7 @@ const STATE_EVENTS: &[&str] = &[
     "model_status",
     "command_list",
     "approval_mode",
+    "approval_mode_pending",
     "mcp_servers",
     "plan",
     "rate_limit",
@@ -492,6 +497,7 @@ pub fn spawn(
             cwd,
             snapshot: Snapshot::default(),
             restart: None,
+            pending_mode: None,
             gateway_key,
         };
         session.snapshot.seed(transcript);
@@ -538,6 +544,9 @@ struct Session<'a> {
     snapshot: Snapshot,
     /// Options to restart with once the running turn ends.
     restart: Option<Options>,
+    /// A mode the user picked that waits for the running turn to end (the
+    /// engine cannot switch it mid-turn); clients say so, and can interrupt.
+    pending_mode: Option<String>,
     /// The engine's local gateway key (gateway sessions).
     gateway_key: Option<String>,
 }
@@ -623,7 +632,9 @@ impl Session<'_> {
                                 self.named(id);
                             }
                         }
-                        self.publish(output.events);
+                        let events =
+                            self.allow_while_opening(&mut process, adapter.as_mut(), output.events);
+                        self.publish(events);
                     }
                     Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {
                         let reason = process.exit_reason();
@@ -638,6 +649,11 @@ impl Session<'_> {
             let busy = adapter.busy();
             if let Some(id) = &self.id {
                 self.hub.set_busy(id, busy);
+            }
+            if !busy && self.pending_mode.take().is_some() {
+                self.publish(vec![
+                    json!({ "type": "approval_mode_pending", "mode": null }),
+                ]);
             }
             if !busy {
                 if let Some(mut next) = self.restart.take() {
@@ -735,12 +751,12 @@ impl Session<'_> {
                 if let Some(options) = adapter.restart_for(op) {
                     self.restart = Some(options);
                     if adapter.busy() {
-                        self.publish(vec![json!({
-                            "type": "info",
-                            "message": "the new mode applies once the running turn ends",
-                        })]);
+                        self.wait_for_turn(process, adapter, op);
                     }
                     return false;
+                }
+                if name == "set_approval_mode" && adapter.busy() && !adapter.mode_applies_live() {
+                    self.wait_for_turn(process, adapter, op);
                 }
                 if name == "approve" {
                     if let Some(call) = op["call_id"].as_str() {
@@ -779,6 +795,65 @@ impl Session<'_> {
         let early = std::mem::take(&mut self.early);
         for event in early {
             self.hub.broadcast(&self.tagged(event));
+        }
+    }
+
+    /// `op` (a mode switch) cannot reach the running turn: clients are told
+    /// it waits for the turn to end. A switch to full access answers the
+    /// turn's open approvals at once (and later ones, see
+    /// `allow_while_opening`), since nothing would ask under it.
+    fn wait_for_turn(&mut self, process: &mut Process, adapter: &mut dyn Adapter, op: &Value) {
+        let mode = op["mode"].as_str().unwrap_or_default().to_string();
+        self.pending_mode = Some(mode.clone());
+        self.publish(vec![
+            json!({ "type": "approval_mode_pending", "mode": mode }),
+        ]);
+        if full_access(&mode) {
+            let open: Vec<String> = self
+                .snapshot
+                .approvals
+                .iter()
+                .map(|(call, _)| call.clone())
+                .collect();
+            for call in open {
+                self.allow(process, adapter, &call);
+            }
+        }
+    }
+
+    /// While a switch to full access waits for the turn, the turn's approval
+    /// requests are allowed rather than shown.
+    fn allow_while_opening(
+        &mut self,
+        process: &mut Process,
+        adapter: &mut dyn Adapter,
+        events: Vec<Value>,
+    ) -> Vec<Value> {
+        if !self.pending_mode.as_deref().is_some_and(full_access) {
+            return events;
+        }
+        let mut kept = Vec::with_capacity(events.len());
+        for event in events {
+            match event["call_id"].as_str() {
+                Some(call) if event["type"] == "approval_request" => {
+                    let call = call.to_string();
+                    self.allow(process, adapter, &call);
+                }
+                _ => kept.push(event),
+            }
+        }
+        kept
+    }
+
+    fn allow(&mut self, process: &mut Process, adapter: &mut dyn Adapter, call: &str) {
+        let op = json!({ "op": "approve", "call_id": call, "decision": "allow" });
+        match adapter.encode(&op) {
+            Ok(output) => {
+                self.snapshot.answered(call);
+                process.write(output.frames);
+                self.publish(output.events);
+            }
+            Err(message) => self.publish(vec![json!({ "type": "error", "message": message })]),
         }
     }
 
@@ -891,6 +966,11 @@ pub fn new_uuid() -> Result<String, String> {
         &hex[16..20],
         &hex[20..32]
     ))
+}
+
+/// Full access, in any of the names clients and engines use.
+fn full_access(mode: &str) -> bool {
+    matches!(mode, "full-access" | "full-auto" | "bypassPermissions")
 }
 
 #[cfg(test)]

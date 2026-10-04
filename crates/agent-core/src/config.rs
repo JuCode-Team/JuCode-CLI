@@ -138,6 +138,38 @@ impl ApprovalMode {
     }
 }
 
+/// A session's approval mode as its core and its running clients (the
+/// turn, subagents) all see it: a switch applies to the next tool call,
+/// mid-turn too, tightening as well as loosening.
+#[derive(Debug, Clone, Default)]
+pub struct LiveApprovalMode(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl LiveApprovalMode {
+    const MODES: [ApprovalMode; 4] = [
+        ApprovalMode::Manual,
+        ApprovalMode::AutoEdit,
+        ApprovalMode::Auto,
+        ApprovalMode::FullAccess,
+    ];
+
+    pub fn new(mode: ApprovalMode) -> Self {
+        let live = Self::default();
+        live.set(mode);
+        live
+    }
+
+    pub fn get(&self) -> ApprovalMode {
+        let index = self.0.load(std::sync::atomic::Ordering::SeqCst) as usize;
+        Self::MODES.get(index).copied().unwrap_or_default()
+    }
+
+    pub fn set(&self, mode: ApprovalMode) {
+        let index = Self::MODES.iter().position(|m| *m == mode).unwrap_or(0);
+        self.0
+            .store(index as u8, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Whether a tool name belongs to an MCP server (`mcp__<server>__<tool>`).
 pub(crate) fn is_mcp_tool(name: &str) -> bool {
     name.starts_with("mcp__")

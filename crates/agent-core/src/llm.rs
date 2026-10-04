@@ -1,6 +1,6 @@
 use crate::providers::CLIENT_NAME;
 use crate::{
-    config::{is_shell_tool, ApprovalMode, ModelConfig, SubagentModel},
+    config::{is_shell_tool, ApprovalMode, LiveApprovalMode, ModelConfig, SubagentModel},
     hooks::Hooks,
     hunks::{self, HunkView},
     mcp::McpManager,
@@ -91,10 +91,9 @@ pub struct OpenAiClient {
     provider_kind: Protocol,
     goal_tool_tx: Option<Sender<GoalToolRequest>>,
     approval_tx: Option<Sender<ApprovalRequest>>,
-    /// Which tool classes this client gates on the approval channel. Captured
-    /// at client construction (turn start / subagent spawn) and never changed
-    /// mid-run; loosening a running turn happens core-side instead.
-    approval_mode: ApprovalMode,
+    /// Which tool classes this client gates on the approval channel: the
+    /// session's live mode, so a switch applies to the next call mid-turn.
+    approval_mode: LiveApprovalMode,
     /// Canonical edit-tool names offered to the model (config `edit_tools`).
     /// Edit tools not in this list are removed from the tool definitions and
     /// rejected with a clear error if the model calls them anyway.
@@ -162,7 +161,7 @@ pub struct OpenAiClientConfig<'a> {
     pub read_timeout: Duration,
     pub goal_tool_tx: Option<Sender<GoalToolRequest>>,
     pub approval_tx: Option<Sender<ApprovalRequest>>,
-    pub approval_mode: ApprovalMode,
+    pub approval_mode: LiveApprovalMode,
     /// Model the `auto` mode safety classifier runs on (same provider/base_url
     /// as the main model). Pass None to disable classification.
     pub safety_model: Option<String>,
@@ -635,7 +634,7 @@ impl OpenAiClient {
                 // deny, malformed output, classifier failure — still asks.
                 // A command rule that says "ask" always reaches a person.
                 let classified_allow = gate != SandboxGate::Ask
-                    && self.approval_mode.classifies_shell()
+                    && self.approval_mode.get().classifies_shell()
                     && is_shell_tool(&request.name)
                     && self.classify_shell_command(
                         &request,
@@ -1284,12 +1283,9 @@ impl OpenAiClient {
             // Claude uses Anthropic Messages, the rest Responses).
             provider_kind: protocol,
             goal_tool_tx: None,
-            // The child shares the parent's approval channel and inherits the
-            // parent's mode as of spawn time; a later /permissions switch does
-            // not retarget live subagents (their requests can still be
-            // auto-approved core-side if the live mode is looser).
+            // The child shares the parent's approval channel and live mode.
             approval_tx: self.approval_tx.clone(),
-            approval_mode: self.approval_mode,
+            approval_mode: self.approval_mode.clone(),
             enabled_edit_tools: self.enabled_edit_tools.clone(),
             subagent_manager: Some(manager.clone()),
             agent_path: child_path.clone(),
@@ -1521,7 +1517,16 @@ impl OpenAiClient {
     /// How the sandbox and the command rules treat a shell call; `Mode`
     /// defers to the approval mode as without a sandbox.
     fn sandbox_gate(&self, request: &ToolCallRequest) -> SandboxGate {
-        if !is_shell_tool(&request.name) || request.name == "write_stdin" {
+        if request.name == "write_stdin" {
+            // Polling writes nothing: it only reads a shell this engine
+            // already started through its own gate.
+            return if approval_summary(&request.name, &request.arguments).is_empty() {
+                SandboxGate::Run
+            } else {
+                SandboxGate::Mode
+            };
+        }
+        if !is_shell_tool(&request.name) {
             return SandboxGate::Mode;
         }
         let Some(sandbox) = self.tool_state.sandbox() else {
@@ -1541,7 +1546,7 @@ impl OpenAiClient {
             // Inside the sandbox a command needs no approval; only the
             // strictest mode still asks for every command.
             _ if sandbox.is_sandboxed() && !escalated => {
-                if self.approval_mode == ApprovalMode::Manual {
+                if self.approval_mode.get() == ApprovalMode::Manual {
                     SandboxGate::Ask
                 } else {
                     SandboxGate::Run
@@ -1558,9 +1563,12 @@ impl OpenAiClient {
         // MCP tools consult the server's readOnlyHint annotation; a tool
         // without a cached hint falls through to the conservative name check.
         if let Some(read_only_hint) = self.mcp.tool_read_only_hint(name) {
-            return self.approval_mode.requires_approval_for_mcp(read_only_hint);
+            return self
+                .approval_mode
+                .get()
+                .requires_approval_for_mcp(read_only_hint);
         }
-        self.approval_mode.requires_approval(name)
+        self.approval_mode.get().requires_approval(name)
     }
 
     /// `auto` mode: send the shell command to the safety classifier — a
@@ -2613,7 +2621,7 @@ mod tests {
             read_timeout: Duration::from_secs(1),
             goal_tool_tx: None,
             approval_tx: None,
-            approval_mode: ApprovalMode::default(),
+            approval_mode: LiveApprovalMode::default(),
             safety_model: None,
             safety_reasoning_effort: String::new(),
             model_headers: HashMap::new(),
@@ -2734,7 +2742,7 @@ mod tests {
         approval_tx: Option<Sender<ApprovalRequest>>,
     ) -> OpenAiClient {
         let mut client = test_client();
-        client.approval_mode = mode;
+        client.approval_mode = LiveApprovalMode::new(mode);
         client.approval_tx = approval_tx;
         client
     }
@@ -2817,6 +2825,31 @@ mod tests {
     }
 
     #[test]
+    fn polling_a_shell_needs_no_approval_but_input_does() {
+        let (tx, _rx) = mpsc::channel();
+        let client = approval_test_client(ApprovalMode::Auto, Some(tx));
+        let call = |arguments: Value| ToolCallRequest {
+            call_id: "c".to_string(),
+            name: "write_stdin".to_string(),
+            arguments: arguments.to_string(),
+        };
+        assert_eq!(
+            client.sandbox_gate(&call(
+                json!({ "session_id": 5, "text": "", "yield_time_ms": 1000 })
+            )),
+            SandboxGate::Run
+        );
+        assert_eq!(
+            client.sandbox_gate(&call(json!({ "session_id": 5 }))),
+            SandboxGate::Run
+        );
+        assert_eq!(
+            client.sandbox_gate(&call(json!({ "session_id": 5, "text": "y\n" }))),
+            SandboxGate::Mode
+        );
+    }
+
+    #[test]
     fn needs_approval_follows_mode_per_tool_class() {
         let (tx, _rx) = mpsc::channel();
         let cases = [
@@ -2844,6 +2877,19 @@ mod tests {
                 mode.as_str()
             );
         }
+    }
+
+    #[test]
+    fn a_mode_switch_reaches_a_running_client_both_ways() {
+        let (tx, _rx) = mpsc::channel();
+        let client = approval_test_client(ApprovalMode::FullAccess, Some(tx));
+        let subagent = client.approval_mode.clone();
+        assert!(!client.needs_approval("bash"));
+        subagent.set(ApprovalMode::Manual);
+        assert!(client.needs_approval("bash"));
+        client.approval_mode.set(ApprovalMode::AutoEdit);
+        assert!(!client.needs_approval("write"));
+        assert_eq!(subagent.get(), ApprovalMode::AutoEdit);
     }
 
     #[test]

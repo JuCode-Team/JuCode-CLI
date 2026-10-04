@@ -1250,6 +1250,11 @@ impl Adapter for Codex {
         self.busy
     }
 
+    /// Codex takes the approval policy with each turn.
+    fn mode_applies_live(&self) -> bool {
+        false
+    }
+
     fn restart_for(&self, _op: &Value) -> Option<Options> {
         None
     }

@@ -3,7 +3,7 @@ use crate::{
     actions::{action_digest, decision_message, DeferredAction},
     config::{
         models_for_provider, profile_dir, ApprovalMode, AuthStore, Config, JucodeTokens,
-        ModelConfig,
+        LiveApprovalMode, ModelConfig,
     },
     event::{
         AgentEvent, CommandView, GoalView, LoginProviderView, ModelOptionView, PlanItem,
@@ -157,8 +157,9 @@ pub struct AgentCore {
     /// loosen the approval mode, never tighten it.
     approved_tools: HashSet<String>,
     /// Session approval mode; starts from config and is switched by /permissions
-    /// or the serve `set_approval_mode` op (session-only, not persisted).
-    approval_mode: ApprovalMode,
+    /// or the serve `set_approval_mode` op (session-only, not persisted). The
+    /// running turn and its subagents share it, so a switch applies at once.
+    approval_mode: LiveApprovalMode,
     /// False when no client is watching: gated calls become deferred actions
     /// instead of blocking the turn on a prompt.
     attended: bool,
@@ -293,7 +294,7 @@ impl AgentCore {
             approval_receiver: None,
             pending_approvals: HashMap::new(),
             approved_tools: HashSet::new(),
-            approval_mode,
+            approval_mode: LiveApprovalMode::new(approval_mode),
             attended: true,
             deferred_actions: HashMap::new(),
             action_decisions: HashMap::new(),
@@ -1949,7 +1950,7 @@ impl AgentCore {
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: Some(goal_tool_tx),
             approval_tx: Some(approval_tx),
-            approval_mode: self.approval_mode,
+            approval_mode: self.approval_mode.clone(),
             safety_model: Some(self.config.safety().0).filter(|model| !model.trim().is_empty()),
             safety_reasoning_effort: self.config.safety().1,
             model_headers: self.model_headers(),
@@ -2193,7 +2194,7 @@ impl AgentCore {
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: None,
             approval_tx: None,
-            approval_mode: self.approval_mode,
+            approval_mode: self.approval_mode.clone(),
             safety_model: None,
             safety_reasoning_effort: String::new(),
             model_headers: self.model_headers(),
@@ -2246,7 +2247,7 @@ impl AgentCore {
             read_timeout: Duration::from_secs(self.config.read_timeout_seconds),
             goal_tool_tx: None,
             approval_tx: None,
-            approval_mode: self.approval_mode,
+            approval_mode: self.approval_mode.clone(),
             safety_model: None,
             safety_reasoning_effort: String::new(),
             model_headers: self.model_headers(),
@@ -2316,7 +2317,7 @@ impl AgentCore {
         let mut events = Vec::new();
         while let Ok(request) = rx.try_recv() {
             if self.approved_tools.contains(&request.name)
-                || !self.approval_mode.requires_approval(&request.name)
+                || !self.approval_mode.get().requires_approval(&request.name)
             {
                 let _ = request.response_tx.send(ApprovalDecision::allow_all());
                 continue;
@@ -2549,14 +2550,26 @@ impl AgentCore {
 
     fn approval_mode_event(&self) -> AgentEvent {
         AgentEvent::ApprovalMode {
-            mode: self.approval_mode.as_str().to_string(),
+            mode: self.approval_mode.get().as_str().to_string(),
         }
     }
 
     /// Switch the session approval mode (also used by the serve
     /// `set_approval_mode` op and the `--approval-mode` flag).
     pub fn set_approval_mode(&mut self, mode: ApprovalMode) -> Vec<AgentEvent> {
-        self.approval_mode = mode;
+        self.approval_mode.set(mode);
+        // Calls parked for a decision the new mode no longer needs run now.
+        let freed: Vec<String> = self
+            .pending_approvals
+            .iter()
+            .filter(|(_, pending)| !mode.requires_approval(&pending.name))
+            .map(|(call, _)| call.clone())
+            .collect();
+        for call in freed {
+            if let Some(pending) = self.pending_approvals.remove(&call) {
+                let _ = pending.response_tx.send(ApprovalDecision::allow_all());
+            }
+        }
         vec![
             AgentEvent::Status(format!("approval mode: {}", mode.as_str())),
             self.approval_mode_event(),
@@ -2634,9 +2647,9 @@ impl AgentCore {
                      auto-edit   - file edits run freely; shell commands still ask\n\
                      auto        - a safety model auto-approves safe shell commands; the rest ask\n\
                      full-access - everything runs without asking\n\
-                     Switch with /permissions <mode>; a change applies to new turns and can\n\
-                     only loosen (never tighten) gating of an in-flight turn.",
-                    self.approval_mode.as_str()
+                     Switch with /permissions <mode>; a change applies at once, to the\n\
+                     running turn too.",
+                    self.approval_mode.get().as_str()
                 )),
                 self.approval_mode_event(),
             ];
@@ -4455,7 +4468,7 @@ pub fn title_completion(system: &str, user: &str) -> Result<String, String> {
         read_timeout: Duration::from_secs(config.read_timeout_seconds),
         goal_tool_tx: None,
         approval_tx: None,
-        approval_mode: config.approval_mode,
+        approval_mode: LiveApprovalMode::new(config.approval_mode),
         safety_model: None,
         safety_reasoning_effort: String::new(),
         model_headers: model_headers(&config),
