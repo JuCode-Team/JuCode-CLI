@@ -268,7 +268,7 @@ pub fn definitions() -> Vec<Value> {
                             "properties": {
                                 "title": { "type": "string", "description": "A short name for the task, in the user's language." },
                                 "project": { "type": "string", "description": "The project path it runs in (from workspace_overview). Leave out when continuing a session." },
-                                "session": { "type": "string", "description": "An existing session to continue. Leave out to start a new one." },
+                                "session": { "type": "string", "description": "An existing session to continue. Leave out (or empty) to start a new one." },
                                 "engine": { "type": "string", "enum": ["jucode", "claude", "codex"], "description": "For a new session: the coding agent to run. Default jucode." }
                             },
                             "required": ["title"]
@@ -402,7 +402,9 @@ fn plan(hub: &Hub, session: &str, args: &Value) -> Result<Value, String> {
         if title.is_empty() {
             return Err(format!("task {} has no title", index + 1));
         }
-        let (project, existing, engine) = match task["session"].as_str() {
+        // Models fill optional fields with "": that starts a new session.
+        let existing_id = task["session"].as_str().filter(|id| !id.trim().is_empty());
+        let (project, existing, engine) = match existing_id {
             Some(id) => {
                 let record = records
                     .iter()
@@ -846,6 +848,22 @@ mod tests {
         let refused = start_task(&hub, "d1", &json!({ "task": 1, "prompt": "go" })).unwrap_err();
         assert!(refused.contains("not confirmed"), "{refused}");
         assert!(finish(&hub, "d1", &json!({ "summary": "done" })).is_err());
+    }
+
+    #[test]
+    fn an_empty_session_starts_a_new_one() {
+        let (hub, project) = hub("empty");
+        let _dispatcher = dispatch(&hub, true, "auto");
+        let path = project.display().to_string();
+        plan(
+            &hub,
+            "d1",
+            &json!({ "tasks": [{ "title": "t", "project": path, "session": "", "engine": "claude" }] }),
+        )
+        .unwrap();
+        let task = &hub.dispatch.get("d1").unwrap()["tasks"][0];
+        assert!(task["session"].is_null(), "{task}");
+        assert_eq!(task["engine"], "claude");
     }
 
     #[test]

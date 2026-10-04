@@ -202,8 +202,11 @@ fn run(
                 assumption: text("assumption").unwrap_or_default(),
                 default_action: text("default").unwrap_or_default(),
                 importance,
+                // Models fill optional fields with 0; that means no deadline,
+                // not an answer due this instant.
                 due_at: args["due_in_seconds"]
                     .as_u64()
+                    .filter(|seconds| *seconds > 0)
                     .map(|seconds| now() + seconds * 1000),
                 asked_at: now(),
             };
@@ -243,7 +246,7 @@ fn definitions() -> Vec<Value> {
                     "body": { "type": "string", "description": "Context and the options you see." },
                     "assumption": { "type": "string", "description": "What you assume while waiting." },
                     "default": { "type": "string", "description": "What you will do if nobody answers in time." },
-                    "due_in_seconds": { "type": "integer", "minimum": 0, "description": "Deadline; omit to wait indefinitely." },
+                    "due_in_seconds": { "type": "integer", "minimum": 0, "description": "Deadline; omit (or 0) to wait indefinitely." },
                     "importance": { "type": "string", "enum": ["low", "normal", "high"] }
                 },
                 "required": ["title"],
