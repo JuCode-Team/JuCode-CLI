@@ -100,7 +100,15 @@ impl Dispatches {
 }
 
 /// `dispatch_send`: starts a dispatch of `text`.
-pub fn start(hub: &Arc<Hub>, text: &str, plan: bool, mode: &str) -> Result<Value, String> {
+/// `requirement`: the requirement the dispatch works on; its tasks' sessions
+/// are linked to it.
+pub fn start(
+    hub: &Arc<Hub>,
+    text: &str,
+    plan: bool,
+    mode: &str,
+    requirement: Option<&str>,
+) -> Result<Value, String> {
     let text = text.trim();
     if text.is_empty() {
         return Err("dispatch_send requires text".to_string());
@@ -115,6 +123,7 @@ pub fn start(hub: &Arc<Hub>, text: &str, plan: bool, mode: &str) -> Result<Value
         "text": text,
         "plan": plan,
         "mode": mode,
+        "requirement": requirement,
         "status": "planning",
         "tasks": [],
         "summary": "",
@@ -552,6 +561,11 @@ fn start_task(hub: &Arc<Hub>, session: &str, args: &Value) -> Result<Value, Stri
         })
     };
     mark("sent", "")?;
+    if let Some(requirement) = d["requirement"].as_str() {
+        if let Err(error) = crate::requirements::link(hub, requirement, &target) {
+            jucode_agent_core::log_warn!("daemon", "dispatch task not linked", error = error);
+        }
+    }
     if let Err(error) = hub.send_to_session(&target, &prompt) {
         let _ = mark("failed", &error);
         hub.broadcast(&hub.dispatch.json());

@@ -2403,3 +2403,168 @@ fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
         .all(|skill| skill["source"] == "anthropic"));
     let _ = fs::remove_dir_all(jucode_dir.join("review"));
 }
+
+/// Requirement `id` in a `requirements` frame.
+fn requirement<'a>(frame: &'a Value, id: &str) -> Option<&'a Value> {
+    (frame["type"] == "requirements")
+        .then(|| frame["requirements"].as_array())
+        .flatten()
+        .and_then(|list| list.iter().find(|r| r["id"] == id))
+}
+
+#[test]
+fn a_requirement_follows_its_sessions_and_continues_in_them() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-requirement");
+    let mut client = Client::connect(&daemon);
+    let png = format!("data:image/png;base64,{}", STANDARD.encode(b"png bytes"));
+    let shot = request(
+        &mut client,
+        json!({ "op": "upload", "name": "shot.png", "data": STANDARD.encode(b"png bytes"), "last": true }),
+    );
+    let shot = shot["path"].as_str().unwrap().to_string();
+    // Only an upload is taken in, nothing else on the computer.
+    let outside = request(
+        &mut client,
+        json!({ "op": "requirement_create", "text": "steal", "images": [daemon.state.join("token")] }),
+    );
+    assert_eq!(outside["type"], "error");
+
+    let created = request(
+        &mut client,
+        json!({ "op": "requirement_create", "text": "export sessions as markdown", "projects": [dir], "images": [shot] }),
+    );
+    let r = &created["requirement"];
+    let id = r["id"].as_str().unwrap().to_string();
+    assert!(id.starts_with("R-"));
+    assert_eq!(r["state"], "idea");
+    assert_eq!(r["title"], "export sessions as markdown");
+    let image = request(
+        &mut client,
+        json!({ "op": "requirement_image", "requirement": id, "index": 0 }),
+    );
+    assert_eq!(image["data"], png);
+    let prompt = request(
+        &mut client,
+        json!({ "op": "requirement_prompt", "requirement": id, "lang": "en" }),
+    );
+    assert!(prompt["text"].as_str().unwrap().starts_with(&format!(
+        "{id}: export sessions as markdown\n\nIn my words:"
+    )));
+
+    // Started from the phone: a new session in its project, linked to it.
+    let started = request(
+        &mut client,
+        json!({ "op": "requirement_reply", "requirement": id, "lang": "en" }),
+    );
+    let first = started["session"].as_str().unwrap().to_string();
+    let frames = client.until(|f| requirement(f, &id).is_some_and(|r| r["status"] == "review"));
+    let shown = requirement(frames.last().unwrap(), &id).unwrap();
+    assert_eq!(shown["state"], "open");
+    assert_eq!(shown["sessions"], json!([first]));
+    assert_eq!(shown["session_states"][&first], "idle");
+    assert!(shown["last_reply"].as_str().unwrap().contains("user said:"));
+
+    // Feedback goes to the latest session; asked for, a new one starts.
+    let again = request(
+        &mut client,
+        json!({ "op": "requirement_reply", "requirement": id, "text": "and the images" }),
+    );
+    assert_eq!(again["session"], first);
+    client.until(|f| {
+        requirement(f, &id).is_some_and(|r| {
+            r["status"] == "review"
+                && r["last_reply"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("and the images")
+        })
+    });
+    let fresh = request(
+        &mut client,
+        json!({ "op": "requirement_reply", "requirement": id, "text": "start over", "new_session": true }),
+    );
+    let second = fresh["session"].as_str().unwrap().to_string();
+    assert_ne!(second, first);
+    let frames = client.until(|f| {
+        requirement(f, &id)
+            .is_some_and(|r| r["status"] == "review" && r["sessions"] == json!([first, second]))
+    });
+    assert!(
+        requirement(frames.last().unwrap(), &id).unwrap()["last_reply"]
+            .as_str()
+            .unwrap()
+            .contains("start over")
+    );
+
+    // A session works on one requirement at a time.
+    let other = request(
+        &mut client,
+        json!({ "op": "requirement_create", "text": "second" }),
+    );
+    let other = other["requirement"]["id"].as_str().unwrap().to_string();
+    request(
+        &mut client,
+        json!({ "op": "requirement_link", "requirement": other, "session": second }),
+    );
+    let listed = request(&mut client, json!({ "op": "requirement_list" }));
+    assert_eq!(
+        requirement(&listed, &id).unwrap()["sessions"],
+        json!([first])
+    );
+    assert_eq!(
+        requirement(&listed, &other).unwrap()["sessions"],
+        json!([second])
+    );
+    assert_eq!(requirement(&listed, &other).unwrap()["state"], "open");
+
+    let done = request(
+        &mut client,
+        json!({ "op": "requirement_update", "requirement": id, "state": "done" }),
+    );
+    assert_eq!(done["requirement"]["state"], "done");
+    let bad = request(
+        &mut client,
+        json!({ "op": "requirement_update", "requirement": id, "state": "gone" }),
+    );
+    assert_eq!(bad["type"], "error");
+    request(
+        &mut client,
+        json!({ "op": "requirement_delete", "requirement": id }),
+    );
+    let listed = request(&mut client, json!({ "op": "requirement_list" }));
+    assert!(requirement(&listed, &id).is_none());
+    let kept = daemon.state.parent().unwrap().join("uploads/requirements");
+    assert!(!kept.join(&id).exists());
+}
+
+#[test]
+fn a_file_uploads_in_chunks_outside_the_daemon_state() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    let part = request(
+        &mut client,
+        json!({ "op": "upload", "name": "notes.md", "data": STANDARD.encode(b"# one\n") }),
+    );
+    assert_eq!(part["type"], "upload_part");
+    let upload = part["upload"].as_str().unwrap().to_string();
+    let stale = request(
+        &mut client,
+        json!({ "op": "upload", "upload": upload, "offset": 0, "data": STANDARD.encode(b"x") }),
+    );
+    assert_eq!(stale["type"], "error");
+    let done = request(
+        &mut client,
+        json!({ "op": "upload", "upload": upload, "offset": 6, "data": STANDARD.encode(b"two\n"), "last": true }),
+    );
+    assert_eq!(done["type"], "uploaded");
+    assert_eq!(done["size"], 10);
+    assert_eq!(done["image"], false);
+    let path = PathBuf::from(done["path"].as_str().unwrap());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "# one\ntwo\n");
+    assert!(path.starts_with(daemon.state.parent().unwrap().join("uploads")));
+}

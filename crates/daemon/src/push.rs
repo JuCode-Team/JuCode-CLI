@@ -82,6 +82,11 @@ impl Push {
 /// notifications of one thing (a later one replaces it); a browser whose
 /// subscription expired is forgotten.
 pub fn notify(hub: &Arc<Hub>, title: &str, body: &str, tag: &str) {
+    notify_at(hub, title, body, tag, "/remote");
+}
+
+/// `notify` whose notification opens `url` on the remote page.
+pub fn notify_at(hub: &Arc<Hub>, title: &str, body: &str, tag: &str, url: &str) {
     let list = lock(&hub.push.subscriptions).clone();
     for subscription in list {
         let hub = Arc::clone(hub);
@@ -89,7 +94,7 @@ pub fn notify(hub: &Arc<Hub>, title: &str, body: &str, tag: &str) {
             "title": title,
             "body": clip(body, 300),
             "tag": tag,
-            "url": "/remote",
+            "url": url,
         });
         // 410: the relay says the push service dropped the subscription.
         thread::spawn(move || match hub.relay.push(&subscription, &payload) {

@@ -441,14 +441,80 @@ Task `status`: `planned`, `sent`, `running`,
 `waiting` (an approval in its session waits for the user), `done`, `failed`.
 `reply` is the end of the task session's last reply.
 
+## Uploads
+
+A client sends a file to this computer (the remote page has no file system
+the engines can read) in chunks of base64 over its connection, waiting for
+each reply before the next chunk. Through the relay a file is ordinary
+frames, end to end encrypted; the relay stores nothing.
+
+| Op | Reply | |
+| --- | --- | --- |
+| `{"op":"upload","name":"photo.jpg","data":"<base64>","last":false}` | `upload_part` with `upload` (its id) and `size` | Starts a file. |
+| `{"op":"upload","upload":"u-…","offset":262144,"data":"<base64>","last":true}` | `uploaded` with `upload`, `path`, `name`, `size`, `image` | `offset` must be the size received so far. The reply to the `last` chunk carries the file's path. |
+
+A chunk is at most 4 MB decoded, a file at most 100 MB. Files land in
+`~/.jucode/uploads/<date>/<id>-<name>` (outside the daemon's state directory,
+so the jucode sandbox lets tools read them) and are written as `<path>.part`
+until the last chunk; parts left over and files older than 30 days are
+removed when the daemon starts. A message names them as the desktop does
+its attachments: images in `user_message`'s `images`, other files as paths
+in its text.
+
+## Requirements
+
+A requirement is what the user means to get done: their words (`text`),
+screenshots, the projects it concerns, and the sessions that work on it. A
+session works on one requirement at a time. After each turn of a linked
+session, the title model rewrites the requirement's `progress` from the
+previous record and the session's first and latest requests and the end of
+its reply, so a new session starts from where the last one stopped. The
+requirement's id comes as `requirement` (`id` is the request's).
+
+| Op | Reply | |
+| --- | --- | --- |
+| `{"op":"requirement_list"}` | `requirements` | |
+| `{"op":"requirement_create","text":"…","projects":["/path"],"images":["/…/.jucode/uploads/…/u-…-shot.png"],"source":"phone","session":"s…"}` | `requirement_created` with `requirement` | All but `text` optional. `session`: noted in that session (its project, when `projects` is empty). `images`: up to 4 uploaded images (see "Uploads"; any other path is refused), moved to `~/.jucode/uploads/requirements/<id>/`. |
+| `{"op":"requirement_update","requirement":"R-1","text":"…","projects":[…],"state":"done"}` | `requirement_saved` | Any of the fields. `state`: `idea`, `open`, `done`, `parked`. |
+| `{"op":"requirement_delete","requirement":"R-1"}` | `requirement_deleted` | Its sessions stay. |
+| `{"op":"requirement_link","requirement":"R-1","session":"s…"}` | `requirement_linked` | The session leaves any other requirement; the requirement becomes `open`. |
+| `{"op":"requirement_unlink","requirement":"R-1","session":"s…"}` | `requirement_unlinked` | |
+| `{"op":"requirement_image","requirement":"R-1","index":0}` | `requirement_image` with `data` (a data URL) | |
+| `{"op":"requirement_prompt","requirement":"R-1","text":"…","lang":"en"}` | `requirement_prompt` with `text` | The first message of a session that starts on it: words, progress, `text` (the user's feedback, optional) and how to work on it. `lang`: `zh` (default) or `en`. |
+| `{"op":"requirement_reply","requirement":"R-1","text":"…","new_session":false,"cwd":"/path","engine":"claude","lang":"zh"}` | `requirement_replied` with `session` | Sends `text` to its latest session (reopened if closed). With `new_session`, or no session yet, starts one in `cwd` on `engine` (defaults: the latest session's, else its first project on jucode) with `requirement_prompt`'s text, and links it. |
+
+`dispatch_send` also takes `requirement`: its tasks' sessions are linked to it.
+
+`requirements` is also sent on connect and broadcast on every change:
+
+```json
+{"type":"requirements","requirements":[{
+  "id":"R-1","text":"…","title":"…","title_auto":false,"images":["/abs/1.png"],
+  "projects":["/path"],"state":"open","sessions":["s…"],
+  "progress":{"goal":"…","decided":[],"done":[],"doing":[],"blocked":[],"next":[],"files":[]},
+  "progress_at":0,"source":"desktop","source_session":null,
+  "status":"review","session_states":{"s…":"idle"},"last_reply":"…",
+  "created_at":0,"updated_at":0}]}
+```
+
+Words longer than 40 characters get a title from the title model
+(`title_auto`). `status` is `state`, except while `open`: `approval` (a
+session waits for an approval), `failed` (the latest session's turn
+failed), `running`, else `review` (the user's turn: the work is done or the
+agent asks something), or `open` with no session. `session_states`:
+`running`, `waiting`, `failed`, `idle`. `last_reply` (the end of the latest
+session's reply) comes with `review` and `failed`.
+
 ## Notifications
 
 A paired device's browser registers its Web Push subscription with
 `{"op":"push_subscribe","subscription":{"endpoint":"…","keys":{"p256dh":"…","auth":"…"}}}`
 (only paired devices; dropped when the device is revoked) and removes it with
 `{"op":"push_unsubscribe","endpoint":"…"}`. The daemon notifies when a
-dispatch's plan waits for the user, a task waits for an approval, and a
-dispatch is done, through the relay (relay-protocol.md, Web Push).
+dispatch's plan waits for the user, a task waits for an approval, a
+dispatch is done, and an open requirement turns to `review` or `approval`,
+through the relay (relay-protocol.md, Web Push). A notification's `url` is
+the remote page, with `?requirement=R-1` for a requirement.
 
 ## Session ops
 

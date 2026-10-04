@@ -39,6 +39,8 @@ pub struct Hub {
     pub store: Store,
     pub agents: Agents,
     pub dispatch: crate::dispatch::Dispatches,
+    pub requirements: crate::requirements::Requirements,
+    pub uploads: crate::uploads::Uploads,
     pub push: crate::push::Push,
     pub version: &'static str,
     pub relay: Relay,
@@ -105,6 +107,13 @@ impl Hub {
         relay: Option<String>,
     ) -> Arc<Self> {
         let schedules = Mutex::new(schedules::load(&agents));
+        // `~/.jucode`: uploads live beside the daemon's state, not in it.
+        let jucode_dir = store.dir().parent().unwrap_or(store.dir()).to_path_buf();
+        let uploads = crate::uploads::Uploads::load(&jucode_dir);
+        let requirements = crate::requirements::Requirements::load(
+            store.dir(),
+            uploads.dir().join("requirements"),
+        );
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
             schedules,
@@ -114,6 +123,8 @@ impl Hub {
             relay: Relay::new(relay, &store),
             usage: Usage::new(&store),
             dispatch: crate::dispatch::Dispatches::load(store.dir()),
+            requirements,
+            uploads,
             push: crate::push::Push::load(store.dir()),
             store,
             agents,
@@ -621,6 +632,28 @@ impl Hub {
         }
     }
 
+    /// `notify` whose notification opens `url` on the remote page.
+    pub fn notify_at(&self, title: &str, body: &str, tag: &str, url: &str) {
+        if let Some(hub) = self.me.upgrade() {
+            crate::push::notify_at(&hub, title, body, tag, url);
+        }
+    }
+
+    /// A session's conversation as the title model sees it for a note: its
+    /// first and latest requests and the end of its latest reply.
+    pub fn turn_excerpt(&self, session: &str) -> Option<String> {
+        let title = self
+            .store
+            .sessions()
+            .into_iter()
+            .find(|record| record.id == session)
+            .and_then(|record| record.title)
+            .unwrap_or_default();
+        lock(&self.turns)
+            .get(session)
+            .map(|turns| turns.handoff_prompt(&title, None))
+    }
+
     /// The session thread has handed a delivered message to its engine.
     pub fn release_claim(&self, session: &str) {
         let mut claims = lock(&self.claims);
@@ -1017,6 +1050,7 @@ impl Hub {
         }
         if let Some(hub) = self.me.upgrade() {
             crate::dispatch::observe(&hub, session, event);
+            crate::requirements::observe(&hub, session, event, ended);
         }
     }
 

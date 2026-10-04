@@ -17,11 +17,13 @@ pub mod noise;
 mod projects;
 mod push;
 mod relay;
+mod requirements;
 mod schedules;
 mod session;
 mod skills;
 mod store;
 mod titles;
+mod uploads;
 mod usage;
 
 pub use agents::Agents;
@@ -235,6 +237,7 @@ fn pump(
         hub.questions_json(),
         hub.actions_json(),
         hub.dispatch.json(),
+        hub.requirements.json(hub),
     ] {
         link.send(&frame.to_string())?;
     }
@@ -440,6 +443,7 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             op["text"].as_str().unwrap_or_default(),
             op["plan"] == true,
             op["approval_mode"].as_str().unwrap_or("auto"),
+            op["requirement"].as_str(),
         ),
         ("dispatch_confirm", _) => dispatch::confirm(
             hub,
@@ -448,6 +452,36 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             op["note"].as_str().unwrap_or_default(),
         ),
         ("dispatch_list", _) => Ok(hub.dispatch.json()),
+        // The requirement's id comes as `requirement` (`id` is the request's).
+        ("requirement_list", _) => Ok(hub.requirements.json(hub)),
+        ("requirement_create", _) => requirements::create(hub, &op),
+        ("requirement_update", _) => requirements::update(hub, &op),
+        ("requirement_delete", _) => {
+            requirements::delete(hub, op["requirement"].as_str().unwrap_or_default())
+        }
+        ("requirement_link" | "requirement_unlink", Some(session)) => {
+            let id = op["requirement"].as_str().unwrap_or_default();
+            if name == "requirement_link" {
+                requirements::link(hub, id, &session)
+                    .map(|()| json!({ "type": "requirement_linked", "requirement": id, "session": session }))
+            } else {
+                requirements::unlink(hub, id, &session)
+                    .map(|()| json!({ "type": "requirement_unlinked", "requirement": id, "session": session }))
+            }
+        }
+        ("requirement_image", _) => requirements::image(
+            hub,
+            op["requirement"].as_str().unwrap_or_default(),
+            op["index"].as_u64().unwrap_or(0) as usize,
+        ),
+        ("requirement_prompt", _) => requirements::prompt_json(
+            hub,
+            op["requirement"].as_str().unwrap_or_default(),
+            op["text"].as_str().unwrap_or_default(),
+            op["lang"].as_str().unwrap_or_default(),
+        ),
+        ("requirement_reply", _) => requirements::reply(hub, &op),
+        ("upload", _) => hub.uploads.receive(&op, || hub.new_id("u")),
         // A phone's browser asks to be notified (see `push`).
         ("push_subscribe", _) => match hub.device_of(client) {
             Some(device) => hub
