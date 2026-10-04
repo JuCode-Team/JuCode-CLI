@@ -1036,14 +1036,18 @@ impl Hub {
         if event["type"] == "user_message" {
             self.note_user_message(session, event["content"].as_str().unwrap_or_default());
         }
-        let (due, ended) = {
+        let (due, ended, failed) = {
             let mut turns = lock(&self.turns);
             let turns = turns.entry(session.to_string()).or_default();
             let before = turns.done();
-            (turns.observe(event), turns.done() != before)
+            let due = turns.observe(event);
+            (due, turns.done() != before, turns.take_failed())
         };
         if due {
             self.retitle(session);
+        }
+        if let Some(error) = failed {
+            self.report_failed_turn(session, &error);
         }
         if ended {
             self.write_handoff(session);
@@ -1051,6 +1055,39 @@ impl Hub {
         if let Some(hub) = self.me.upgrade() {
             crate::dispatch::observe(&hub, session, event);
             crate::requirements::observe(&hub, session, event, ended);
+        }
+    }
+
+    /// An agent session's turn ended on an error. Nobody may be watching
+    /// (a scheduled run), so it becomes a report and a notification instead
+    /// of only a line in the live view.
+    fn report_failed_turn(&self, session: &str, error: &str) {
+        let Some(record) = self
+            .store
+            .sessions()
+            .into_iter()
+            .find(|record| record.id == session)
+        else {
+            return;
+        };
+        let Some(agent) = record.agent else {
+            return;
+        };
+        let title = format!("运行中断：{}", record.title.as_deref().unwrap_or(session));
+        let report = Report {
+            id: self.new_id("r"),
+            agent,
+            session: session.to_string(),
+            body: format!("这一轮因错误中断，没有完成：\n{error}"),
+            title,
+            at: now(),
+            read: false,
+        };
+        match self.post_report(&report) {
+            Ok(()) => self.notify(&report.title, error, session),
+            Err(error) => {
+                jucode_agent_core::log_warn!("daemon", "failure report not saved", error = error)
+            }
         }
     }
 
@@ -1452,6 +1489,41 @@ mod tests {
             ..record
         };
         assert_eq!(shown_title(&named, None).as_deref(), Some("我的标题"));
+    }
+
+    #[test]
+    fn an_agent_turn_that_fails_becomes_a_report() {
+        let dir = std::env::temp_dir().join(format!(
+            "jucode-hub-failed-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let hub = Hub::new(
+            Store::open(dir.join("daemon")).unwrap(),
+            Agents::open(dir.join("agents")).unwrap(),
+            "test",
+            None,
+        );
+        hub.store
+            .record_engine_session("a1", &dir, Some("ops"), None, false)
+            .unwrap();
+        hub.store
+            .record_engine_session("u1", &dir, None, None, false)
+            .unwrap();
+        for session in ["a1", "u1"] {
+            hub.observe(
+                session,
+                &json!({ "type": "user_message", "content": "巡检" }),
+            );
+            hub.observe(session, &json!({ "type": "error", "message": "HTTP 502" }));
+            hub.observe(session, &json!({ "type": "status", "message": "ready" }));
+        }
+        let reports = hub.store.reports(10);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].session, "a1");
+        assert_eq!(reports[0].agent, "ops");
+        assert!(reports[0].body.contains("HTTP 502"));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

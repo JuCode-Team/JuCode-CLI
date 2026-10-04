@@ -42,12 +42,33 @@ pub struct Turns {
     tail: String,
     replying: bool,
     done: u32,
+    /// A turn has started and not yet ended.
+    running: bool,
+    /// The latest error of the running turn; cleared by output after it.
+    error: Option<String>,
+    /// The error that ended the latest turn, until taken.
+    failed: Option<String>,
 }
 
 impl Turns {
     /// Takes one session event; true when a turn just ended and the title is
     /// due for another look.
     pub fn observe(&mut self, event: &Value) -> bool {
+        match event["type"].as_str() {
+            Some("user_message") => {
+                self.running = true;
+                self.error = None;
+            }
+            Some("error") if self.running => {
+                self.error = Some(event["message"].as_str().unwrap_or_default().to_string());
+            }
+            Some("assistant_start" | "assistant_delta") => self.error = None,
+            Some("status") if event["message"] == "ready" && self.running => {
+                self.running = false;
+                self.failed = self.error.take();
+            }
+            _ => {}
+        }
         match event["type"].as_str() {
             Some("user_message") => {
                 // What was asked, without the line naming where it came from.
@@ -94,6 +115,11 @@ impl Turns {
     /// The end of the latest reply.
     pub fn tail(&self) -> &str {
         &self.tail
+    }
+
+    /// The error that ended the latest turn, once.
+    pub fn take_failed(&mut self) -> Option<String> {
+        self.failed.take()
     }
 
     /// Turns ended so far.
@@ -192,6 +218,27 @@ mod tests {
         );
         // A ready with no reply (startup, an interrupted empty turn) is no turn.
         assert!(!turns.observe(&json!({ "type": "status", "message": "ready" })));
+    }
+
+    #[test]
+    fn a_turn_that_ends_on_an_error_is_failed_once() {
+        let mut turns = Turns::default();
+        // An error outside a turn (a rejected op) fails nothing.
+        turns.observe(&json!({ "type": "error", "message": "nothing to continue" }));
+        turns.observe(&json!({ "type": "status", "message": "ready" }));
+        assert_eq!(turns.take_failed(), None);
+
+        turns.observe(&json!({ "type": "user_message", "content": "巡检" }));
+        turns.observe(&json!({ "type": "error", "message": "HTTP 502" }));
+        turns.observe(&json!({ "type": "status", "message": "ready" }));
+        assert_eq!(turns.take_failed().as_deref(), Some("HTTP 502"));
+        assert_eq!(turns.take_failed(), None);
+
+        // Output after an error means the turn went on.
+        turns.observe(&json!({ "type": "user_message", "content": "巡检" }));
+        turns.observe(&json!({ "type": "error", "message": "stray" }));
+        turn(&mut turns, "巡检", "完成");
+        assert_eq!(turns.take_failed(), None);
     }
 
     #[test]
