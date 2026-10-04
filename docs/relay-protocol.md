@@ -111,10 +111,11 @@ plus jitter.
 `GET /relay/v1/healthz` → `200 ok`.
 Logs: connects/disconnects with host id and stream counts; never payloads.
 
-### Web Push
+### Web Push and Getui
 
-The relay sends Web Push notifications for connected hosts; it keeps no
-subscriptions and stores nothing it passes on.
+The relay sends Web Push notifications, and 个推 (Getui) notifications to the
+JuCode Android app, for connected hosts; it keeps no subscriptions and stores
+nothing it passes on.
 
 - `GET /relay/v1/push/key` → `{"key":"<VAPID public key, base64url>"}`: the
   `applicationServerKey` a browser subscribes with.
@@ -126,8 +127,19 @@ subscriptions and stores nothing it passes on.
   the browser push services, payload at most 3 KB. Replies `204` sent, `410`
   the subscription is gone (forget it), `401`/`403`/`400`/`429`/`502`
   otherwise.
+- The same request with `"subscription":{"provider":"getui","client_id":"<cid>"}`
+  goes to the Android app through Getui REST API v2 (its own channel while the
+  app runs, the phone vendor's channel otherwise). `payload` is
+  `{"title","body","session"?}` (title required); tapping the notification
+  opens the app with `type=relay`, `host=<host id>` and `session`. Same checks
+  and replies; `410` when Getui does not know the client id, `501` when Getui
+  (or, for a Web Push subscription, VAPID) is not configured.
 
-The relay runs with `-vapid-file` (keys created on first start); without it
+The relay serves Web Push with `-vapid-file` (keys created on first start)
+and Getui with the environment variables `GETUI_APP_ID`, `GETUI_APP_KEY`,
+`GETUI_MASTER_SECRET` (and optionally `GETUI_VENDOR_OPTIONS`, a JSON object
+passed as `push_channel.android.ups.options`, e.g.
+`{"XM":{"/extra.channel_id":"…"},"OP":{"/channel_id":"…"}}`); with neither,
 these endpoints are not served.
 
 ## 4. Noise session (client ⇄ daemon, inside one stream)

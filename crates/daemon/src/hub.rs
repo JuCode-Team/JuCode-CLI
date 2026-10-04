@@ -42,6 +42,8 @@ pub struct Hub {
     pub requirements: crate::requirements::Requirements,
     pub uploads: crate::uploads::Uploads,
     pub push: crate::push::Push,
+    /// Remote terminals, each owned by the client that opened it.
+    pub terminals: crate::terminal::Terminals,
     pub version: &'static str,
     pub relay: Relay,
     sessions: Mutex<HashMap<String, Hosted>>,
@@ -126,6 +128,7 @@ impl Hub {
             requirements,
             uploads,
             push: crate::push::Push::load(store.dir()),
+            terminals: Default::default(),
             store,
             agents,
             version,
@@ -241,10 +244,11 @@ impl Hub {
         json!({ "type": "devices", "devices": list })
     }
 
-    /// Drops the client and its watches; sessions it was the last watcher of
-    /// become unattended.
+    /// Drops the client, its watches and its terminals; sessions it was the
+    /// last watcher of become unattended.
     pub fn remove_client(&self, client: u64) {
         lock(&self.clients).remove(&client);
+        self.terminals.close_client(client);
         let watched: Vec<String> = lock(&self.sessions)
             .iter()
             .filter(|(_, hosted)| hosted.watchers.contains(&client))

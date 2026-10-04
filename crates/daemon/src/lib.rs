@@ -22,6 +22,7 @@ mod schedules;
 mod session;
 mod skills;
 mod store;
+mod terminal;
 mod titles;
 mod uploads;
 mod usage;
@@ -366,6 +367,15 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         });
         return;
     }
+    // Input is written in the order it arrives, so these stay on this thread.
+    if matches!(
+        name,
+        "term_open" | "term_input" | "term_resize" | "term_close"
+    ) {
+        let result = terminal::handle(hub, client, name, &op);
+        respond(hub, client, &request, result);
+        return;
+    }
     // A program to run (an ACP agent, an engine binary, its environment):
     // only the desktop names one.
     if matches!(name, "session_create" | "session_open") {
@@ -494,7 +504,7 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         ),
         ("requirement_reply", _) => requirements::reply(hub, &op),
         ("upload", _) => hub.uploads.receive(&op, || hub.new_id("u")),
-        // A phone's browser asks to be notified (see `push`).
+        // A phone's browser or the Android app asks to be notified (see `push`).
         ("push_subscribe", _) => match hub.device_of(client) {
             Some(device) => hub
                 .push
@@ -504,7 +514,12 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         },
         ("push_unsubscribe", _) => hub
             .push
-            .unsubscribe(op["endpoint"].as_str().unwrap_or_default())
+            .unsubscribe(
+                op["endpoint"]
+                    .as_str()
+                    .or(op["client_id"].as_str())
+                    .unwrap_or_default(),
+            )
             .map(|()| json!({ "type": "push_unsubscribed" })),
         ("agent_create", _) if op["agent"] == dispatch::AGENT => {
             Err(format!("the agent id {} is reserved", dispatch::AGENT))

@@ -93,6 +93,15 @@ fn allowed(hub: &Hub, path: &Path, browse: bool) -> Result<PathBuf, String> {
     }
 }
 
+/// The real path of `path` (`~`: the home directory) when it lies inside a
+/// known directory.
+pub fn known_dir(hub: &Hub, path: &str) -> Result<PathBuf, String> {
+    match path {
+        "~" => allowed(hub, &home().unwrap_or_default(), false),
+        path => allowed(hub, Path::new(path), false),
+    }
+}
+
 fn known_dirs(hub: &Hub) -> Vec<PathBuf> {
     let mut dirs = projects::project_paths(hub);
     dirs.extend(hub.store.sessions().into_iter().map(|record| record.cwd));

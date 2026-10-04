@@ -461,6 +461,37 @@ removed when the daemon starts. A message names them as the desktop does
 its attachments: images in `user_message`'s `images`, other files as paths
 in its text.
 
+## Terminals
+
+A client (local or a paired device) may run the user's login shell on a pty
+on this computer. `term` is the terminal's id; `data` is base64 (standard
+alphabet) of raw bytes.
+
+| Op | Reply | |
+| --- | --- | --- |
+| `{"op":"term_open","cwd":"/path","cols":80,"rows":24}` | `term_opened` with `term` | `cwd` must lie in a known directory, as for `fs_*` (`~` is the home directory). `cols` and `rows` default to 80 × 24 and are kept within 2–1000. |
+| `{"op":"term_input","term":"t-…","data":"<base64>"}` | none | Written to the shell in order. |
+| `{"op":"term_resize","term":"t-…","cols":120,"rows":40}` | none | |
+| `{"op":"term_close","term":"t-…"}` | none | Kills the shell; `term_exit` follows. |
+
+Only the client that opened a terminal receives its events:
+
+- `{"type":"term_output","term":"t-…","data":"<base64>"}`: the shell's
+  output, sent after 10 ms without more output, at most 64 KiB before
+  encoding per frame. A frame may end inside a UTF-8 character or an
+  escape sequence.
+- `{"type":"term_exit","term":"t-…","code":3}`: the shell has exited and
+  been reaped; `code` is null when it was killed by a signal.
+
+A client may have 4 terminals open; a fifth `term_open` is an error. Ops on
+another client's terminal or an unknown one are errors. A terminal belongs to
+its connection: when the client disconnects its shells are killed (SIGHUP,
+then SIGKILL), and there is no reattaching. The shell is `$SHELL -l` (else
+`/bin/zsh` on macOS, `/bin/bash`, then `/bin/sh`), `%COMSPEC%` or
+PowerShell on Windows, with the daemon's environment plus
+`TERM=xterm-256color`, `COLORTERM=truecolor` and `LANG=en_US.UTF-8` when
+`LANG` is unset.
+
 ## Requirements
 
 A requirement is what the user means to get done: their words (`text`),
@@ -508,16 +539,20 @@ session's reply) comes with `review` and `failed`.
 ## Notifications
 
 A paired device's browser registers its Web Push subscription with
-`{"op":"push_subscribe","subscription":{"endpoint":"…","keys":{"p256dh":"…","auth":"…"}}}`
+`{"op":"push_subscribe","subscription":{"endpoint":"…","keys":{"p256dh":"…","auth":"…"}}}`,
+the JuCode Android app its 个推 (Getui) client id with
+`{"op":"push_subscribe","subscription":{"provider":"getui","client_id":"…"}}`
 (only paired devices; dropped when the device is revoked) and removes it with
-`{"op":"push_unsubscribe","endpoint":"…"}`. The daemon notifies when a
+`{"op":"push_unsubscribe","endpoint":"…"}` or `{"op":"push_unsubscribe","client_id":"…"}`.
+A client id registered again by another device moves to that device. The daemon notifies when a
 dispatch's plan waits for the user, a task waits for an approval, a
 dispatch is done, and an open requirement turns to `review` or `approval`,
 through the relay (relay-protocol.md, Web Push). `{"op":"push_test"}` (paired devices
 only) sends a test notification to that device's browsers now and replies
 `push_tested` with `results: [{service, status}]` (or `error`): the push
-service's host and its answer, as the relay passed it on. A notification's `url` is
-the remote page, with `?requirement=R-1` for a requirement.
+service's host (`getui` for the Android app) and its answer, as the relay passed it on. A notification's `url` is
+the remote page, with `?requirement=R-1` for a requirement; one about a session
+also carries `session`, which the Android app opens.
 
 ## Session ops
 

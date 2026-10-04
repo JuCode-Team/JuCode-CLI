@@ -228,17 +228,22 @@ impl Relay {
 }
 
 impl Relay {
-    /// Asks the relay to deliver a Web Push notification (see `push`):
-    /// signed with the host key, which the relay only accepts from a host
-    /// connected to it. Returns the relay's HTTP status (410: the
+    /// Asks the relay to deliver a Web Push or Getui notification (see
+    /// `push`): signed with the host key, which the relay only accepts from
+    /// a host connected to it. Returns the relay's HTTP status (410: the
     /// subscription is gone).
     pub fn push(&self, subscription: &Value, payload: &Value) -> Result<u16, String> {
         let url = self.url.as_deref().ok_or("the relay is disabled")?;
         let identity = self.identity()?;
+        let subscription = if subscription["provider"] == "getui" {
+            json!({ "provider": "getui", "client_id": subscription["client_id"] })
+        } else {
+            json!({ "endpoint": subscription["endpoint"], "keys": subscription["keys"] })
+        };
         let body = json!({
             "pub": URL_SAFE_NO_PAD.encode(identity.signing.verifying_key().as_bytes()),
             "ts": crate::store::now(),
-            "subscription": { "endpoint": subscription["endpoint"], "keys": subscription["keys"] },
+            "subscription": subscription,
             "payload": payload,
         })
         .to_string();
