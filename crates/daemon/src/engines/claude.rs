@@ -1758,7 +1758,7 @@ fn mcp_servers(servers: &Value) -> Value {
 
 /// An MCP elicitation form as approval questions: a choice for enums and
 /// booleans, free text (no options) otherwise. Asked by the field's title.
-fn elicitation_questions(schema: &Value) -> Value {
+pub(super) fn elicitation_questions(schema: &Value) -> Value {
     let fields = schema["properties"].as_object().into_iter().flatten();
     let questions: Vec<Value> = fields
         .map(|(key, field)| {
@@ -1780,12 +1780,9 @@ fn elicitation_questions(schema: &Value) -> Value {
 
 /// The accepted form's content: each answer under its field, typed as the
 /// schema asks.
-fn elicitation_content(request: &Value, answers: &Value) -> Value {
+pub(super) fn elicitation_content(schema: &Value, answers: &Value) -> Value {
     let mut content = serde_json::Map::new();
-    let fields = request["requested_schema"]["properties"]
-        .as_object()
-        .into_iter()
-        .flatten();
+    let fields = schema["properties"].as_object().into_iter().flatten();
     for (key, field) in fields {
         let question = match text(&field["title"]) {
             "" => key.as_str(),
@@ -2020,7 +2017,7 @@ impl Adapter for Claude {
                     let result = if op["decision"] == "deny" {
                         json!({ "action": "decline" })
                     } else {
-                        json!({ "action": "accept", "content": elicitation_content(&request, &op["answers"]) })
+                        json!({ "action": "accept", "content": elicitation_content(&request["requested_schema"], &op["answers"]) })
                     };
                     return Ok(Output {
                         events: Vec::new(),

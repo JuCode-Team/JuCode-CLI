@@ -11,7 +11,15 @@
 //!   (`item/commandExecution/requestApproval`,
 //!   `item/fileChange/requestApproval`) answered with `{decision}`.
 //! - Approval mode and the model picked with `/model` apply as overrides on
-//!   every later `turn/start`; there is no thread-level setter.
+//!   every later `turn/start`; there is no thread-level setter. Plan mode is
+//!   the experimental `collaborationMode`, auto mode the `auto_review`
+//!   approvals reviewer.
+//! - A message sent mid-turn waits here (`pending_messages`) and starts the
+//!   next turn, or joins the running one with `turn/steer`.
+//! - Subagents are threads of their own whose notifications share this
+//!   connection (their `threadId` differs): they feed the agent trace, never
+//!   the conversation. `thread/turns/list` reads one back.
+//! - A rewind is `thread/revert` to before a user message's turn.
 
 use super::{home, resolve, Adapter, Line, Options, Output};
 use serde_json::{json, Value};
@@ -56,11 +64,57 @@ fn text(value: &Value) -> &str {
     value.as_str().unwrap_or_default()
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// `mcp_servers` from `mcpServerStatus/list`: Codex's own servers, which can
+/// be reconnected and signed in to here but are switched in its config.
+fn mcp_servers(data: &Value) -> Value {
+    let servers: Vec<Value> = data
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|server| {
+            let status = text(&server["runtimeStatus"]);
+            let state = match status {
+                "connected" => "connected",
+                "failed" | "cancelled" | "authenticationRequired" => "failed",
+                "disabled" => "disabled",
+                _ => "connecting",
+            };
+            let tools: Vec<Value> = server["tools"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(name, tool)| json!({ "name": name, "description": tool["description"] }))
+                .collect();
+            let mut view = json!({
+                "name": server["name"],
+                "transport": if server["httpOrigin"].is_string() { "http" } else { "stdio" },
+                "state": state,
+                "tools": tools,
+                "can_toggle": false,
+                "needs_auth": status == "authenticationRequired",
+            });
+            if status == "authenticationRequired" {
+                view["error"] = json!("needs sign-in");
+            }
+            view
+        })
+        .collect();
+    json!({ "type": "mcp_servers", "servers": servers })
+}
+
 /// Client approval mode (jucode or Desktop names) → the Desktop engine mode
 /// Codex supports: `read-only`, `auto-edit` or `full-auto`.
 fn engine_mode(mode: &str) -> &'static str {
     match mode {
-        "auto-edit" | "auto" => "auto-edit",
+        "auto-edit" => "auto-edit",
+        "auto" => "auto",
+        "plan" => "plan",
         "full-auto" | "full-access" => "full-auto",
         _ => "read-only",
     }
@@ -69,7 +123,8 @@ fn engine_mode(mode: &str) -> &'static str {
 /// The approval policy and sandbox policy of an engine mode.
 fn policy(mode: &str) -> (&'static str, Value) {
     match mode {
-        "auto-edit" => (
+        // Auto: workspace writes, with a reviewer subagent deciding approvals.
+        "auto-edit" | "auto" => (
             "on-request",
             json!({ "type": "workspaceWrite", "writableRoots": [], "networkAccess": false, "excludeTmpdirEnvVar": false, "excludeSlashTmp": false }),
         ),
@@ -101,7 +156,7 @@ fn error_event(message: &str, info: &Value) -> Value {
         || lower.contains("authentication")
         || (lower.contains("token") && (lower.contains("invalid") || lower.contains("expired")));
     let hint = if unauthorized {
-        " (Codex needs to sign in again: run `codex login` in a terminal.)"
+        " (Codex needs to sign in again: send /login here, or run `codex login` in a terminal.)"
     } else {
         ""
     };
@@ -185,21 +240,23 @@ fn transcript(turns: &Value) -> Vec<Value> {
     {
         match text(&item["type"]) {
             "userMessage" => {
-                let content = item["content"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|c| c["type"] == "text")
-                    .map(|c| text(&c["text"]))
-                    .filter(|t| !t.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if !content.is_empty() {
-                    rows.push(json!({ "role": "user", "content": content }));
+                let (content, images) = user_input(&item["content"]);
+                if !content.is_empty() || !images.is_empty() {
+                    let mut row = json!({ "role": "user", "content": content });
+                    if !images.is_empty() {
+                        row["images"] = json!(images);
+                    }
+                    rows.push(row);
                 }
             }
-            "agentMessage" if !text(&item["text"]).is_empty() => {
+            "agentMessage" | "plan" if !text(&item["text"]).is_empty() => {
                 rows.push(json!({ "role": "assistant", "content": item["text"] }));
+            }
+            "reasoning" => {
+                let summary = item["summary"].as_array().into_iter().flatten().map(text).collect::<Vec<_>>().join("\n\n");
+                if !summary.is_empty() {
+                    rows.push(json!({ "role": "reasoning", "content": summary }));
+                }
             }
             "commandExecution" => rows.push(json!({ "role": "tool", "name": "bash", "output": command_output(item, "", "").to_string() })),
             "fileChange" => rows.push(json!({
@@ -214,6 +271,59 @@ fn transcript(turns: &Value) -> Vec<Value> {
         }
     }
     rows
+}
+
+/// A user message's text and its images (local paths).
+fn user_input(content: &Value) -> (String, Vec<String>) {
+    let blocks = content.as_array().map(Vec::as_slice).unwrap_or_default();
+    let text_part = blocks
+        .iter()
+        .filter(|c| c["type"] == "text")
+        .map(|c| text(&c["text"]))
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let images = blocks
+        .iter()
+        .filter(|c| c["type"] == "localImage")
+        .map(|c| text(&c["path"]).to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    (text_part, images)
+}
+
+/// A subagent's short name from its path (`/root/pong` → `pong`).
+fn agent_label(path: &str, thread: &str) -> String {
+    match path.rsplit('/').find(|part| !part.is_empty()) {
+        Some(name) if name != "root" => name.to_string(),
+        _ => thread.chars().take(8).collect(),
+    }
+}
+
+/// Codex's approval-request summary of the permissions it asks for.
+fn permissions_summary(params: &Value) -> String {
+    let wanted = &params["permissions"];
+    let mut parts = Vec::new();
+    if wanted["network"]["enabled"] == true {
+        parts.push("network access".to_string());
+    }
+    for (key, label) in [("read", "read"), ("write", "write")] {
+        let paths: Vec<&str> = wanted["fileSystem"][key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(text)
+            .collect();
+        if !paths.is_empty() {
+            parts.push(format!("{label}: {}", paths.join(", ")));
+        }
+    }
+    let reason = text(&params["reason"]);
+    [parts.join("\n"), reason.to_string()]
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 struct Item {
@@ -257,8 +367,9 @@ pub struct Codex {
     rolling_back: bool,
     after_rollback: Vec<Value>,
     open_params: Value,
-    /// Synthetic call id → the server request id awaiting our answer.
-    approvals: HashMap<String, Value>,
+    /// Synthetic call id → the server request awaiting our answer: its id,
+    /// method and params.
+    approvals: HashMap<String, (Value, String, Value)>,
     approval_seq: u64,
     items: HashMap<String, Item>,
     model: String,
@@ -276,6 +387,28 @@ pub struct Codex {
     saw_compaction_item: bool,
     /// Enabled skills from `skills/list`: name → (path, description).
     skills: Vec<(String, String, String)>,
+    /// The turn of each user message, oldest first: `/rewind N` reverts to
+    /// before the Nth from the end.
+    user_turns: Vec<String>,
+    /// Messages sent mid-turn: (text, input), started in order once the turn
+    /// ends, or steered into it.
+    waiting: Vec<(String, Vec<Value>)>,
+    /// Messages a `turn/steer` carries, until it is answered.
+    steering: Vec<(String, Vec<Value>)>,
+    /// Subagents (their threads), as agent trace entries.
+    agents: Vec<Value>,
+    /// Plan mode was sent on the last turn: leaving it is sent once too.
+    plan_sent: bool,
+    /// The service tier asked for (`priority` is fast mode); None: the
+    /// model's default.
+    service_tier: Option<String>,
+    /// Reasoning summaries are shown.
+    thinking: bool,
+    /// Warnings already shown (Codex repeats a config warning per thread).
+    warned: std::collections::HashSet<String>,
+    /// A client looked at the MCP servers: their changes are sent on.
+    mcp_watched: bool,
+    mcp_relist: bool,
 }
 
 impl Codex {
@@ -308,6 +441,16 @@ impl Codex {
             override_effort: None,
             saw_compaction_item: false,
             skills: Vec::new(),
+            user_turns: Vec::new(),
+            waiting: Vec::new(),
+            steering: Vec::new(),
+            agents: Vec::new(),
+            plan_sent: false,
+            service_tier: options.fast.then(|| "priority".to_string()),
+            thinking: options.thinking.unwrap_or(true),
+            warned: Default::default(),
+            mcp_watched: false,
+            mcp_relist: false,
         }
     }
 
@@ -333,8 +476,54 @@ impl Codex {
         if let Some(effort) = &self.override_effort {
             params["effort"] = json!(effort);
         }
+        params["approvalsReviewer"] = json!(if self.mode == "auto" {
+            "auto_review"
+        } else {
+            "user"
+        });
+        params["summary"] = json!(if self.thinking { "auto" } else { "none" });
+        if let Some(tier) = &self.service_tier {
+            params["serviceTier"] = json!(tier);
+        }
+        // Plan mode, and the turn after it, name the collaboration mode.
+        let plan = self.mode == "plan";
+        if plan || self.plan_sent {
+            let effort = (!self.effort.is_empty()).then(|| self.effort.clone());
+            params["collaborationMode"] = json!({
+                "mode": if plan { "plan" } else { "default" },
+                "settings": { "model": self.model, "reasoning_effort": effort, "developer_instructions": null },
+            });
+            self.plan_sent = plan;
+        }
         self.busy = true;
         self.request("turn/start", params, "")
+    }
+
+    /// The fast service tier: asked for, else the model's default.
+    fn fast(&self) -> bool {
+        let model_default = self
+            .catalog
+            .iter()
+            .find(|m| m["model"] == self.model.as_str())
+            .and_then(|m| m["defaultServiceTier"].as_str());
+        self.service_tier.as_deref().or(model_default) == Some("priority")
+    }
+
+    fn fast_available(&self) -> bool {
+        self.catalog
+            .iter()
+            .find(|m| m["model"] == self.model.as_str())
+            .and_then(|m| m["serviceTiers"].as_array())
+            .is_some_and(|tiers| tiers.iter().any(|t| t["id"] == "priority"))
+    }
+
+    fn pending_event(&self) -> Value {
+        let texts: Vec<&str> = self.waiting.iter().map(|(text, _)| text.as_str()).collect();
+        json!({ "type": "pending_messages", "messages": texts })
+    }
+
+    fn agent_runs(&self) -> Value {
+        json!({ "type": "agent_runs", "workflows": [], "agents": self.agents })
     }
 
     fn efforts(&self, model: &str) -> Vec<Value> {
@@ -360,6 +549,9 @@ impl Codex {
             "reasoning_efforts": self.efforts(&self.model),
             "context_window": self.context_window,
             "context_limit": 0,
+            "fast": self.fast(),
+            "fast_available": self.fast_available(),
+            "thinking_summaries": self.thinking,
             "state": if self.busy { "streaming" } else { "ready" },
         })
     }
@@ -385,6 +577,7 @@ impl Codex {
                 "[objective | clear | pause | resume]",
                 "Set or show the thread goal",
             ),
+            ("/login", "", "Sign Codex in to ChatGPT with a code"),
         ];
         let mut commands: Vec<Value> = builtin
             .iter()
@@ -454,9 +647,26 @@ impl Codex {
         self.previous_total = if resumed { None } else { Some((0, 0, 0, 0)) };
         let mut events = Vec::new();
         if resumed {
-            let rows = transcript(&result["thread"]["turns"]);
+            let turns = &result["thread"]["turns"];
+            let rows = transcript(turns);
             if !rows.is_empty() {
                 events.push(json!({ "type": "transcript", "items": rows }));
+            }
+            self.user_turns.clear();
+            self.agents.clear();
+            for turn in turns.as_array().into_iter().flatten() {
+                for item in turn["items"].as_array().into_iter().flatten() {
+                    match text(&item["type"]) {
+                        "userMessage" => self.user_turns.push(text(&turn["id"]).to_string()),
+                        "subAgentActivity" => {
+                            self.agent_activity(item);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !self.agents.is_empty() {
+                events.push(self.agent_runs());
             }
         }
         events.extend([
@@ -479,7 +689,64 @@ impl Codex {
         let Some((method, tag)) = self.pending.remove(&id) else {
             return Output::default();
         };
-        if method == "thread/rollback" {
+        if method == "turn/steer" {
+            let steered = std::mem::take(&mut self.steering);
+            if error.is_null() {
+                return Output::default();
+            }
+            // Not steerable (a review, a compaction, the turn just ended):
+            // they wait for the next turn after all.
+            self.waiting.splice(0..0, steered);
+            return Output::events(vec![
+                json!({ "type": "info", "message": format!("[codex] {}", text(&error["message"])) }),
+                self.pending_event(),
+            ]);
+        }
+        if method == "thread/turns/list" {
+            let rows = if error.is_null() {
+                transcript(&result["data"])
+            } else {
+                Vec::new()
+            };
+            let mut event =
+                json!({ "type": "subagent_transcript", "agent_id": tag, "items": rows });
+            if !error.is_null() {
+                event["error"] = json!(text(&error["message"]));
+            }
+            return Output::events(vec![event]);
+        }
+        if method == "mcpServerStatus/list" {
+            if !error.is_null() {
+                return Output::events(vec![
+                    json!({ "type": "info", "message": format!("[codex] {}", text(&error["message"])) }),
+                ]);
+            }
+            return Output::events(vec![mcp_servers(&result["data"])]);
+        }
+        if method == "mcpServer/oauth/login" {
+            return Output::events(vec![if error.is_null() {
+                json!({ "type": "mcp_login", "name": tag, "url": result["authorizationUrl"] })
+            } else {
+                json!({ "type": "info", "message": format!("[codex] {tag}: {}", text(&error["message"])) })
+            }]);
+        }
+        if method == "account/login/start" {
+            return Output::events(vec![if error.is_null() {
+                json!({ "type": "info", "message": format!("[codex] Sign in: open {} and enter the code {}", text(&result["verificationUrl"]), text(&result["userCode"])) })
+            } else {
+                json!({ "type": "info", "message": format!("[codex] sign-in failed: {}", text(&error["message"])) })
+            }]);
+        }
+        if method == "thread/name/set" || method == "config/mcpServer/reload" {
+            return if error.is_null() {
+                Output::default()
+            } else {
+                Output::events(vec![
+                    json!({ "type": "info", "message": format!("[codex] {}", text(&error["message"])) }),
+                ])
+            };
+        }
+        if method == "thread/revert" {
             self.rolling_back = false;
             let input = std::mem::take(&mut self.after_rollback);
             if !error.is_null() {
@@ -487,6 +754,9 @@ impl Codex {
                     &format!("Codex could not rewind: {}", text(&error["message"])),
                     &Value::Null,
                 )];
+                // Its turns are still there.
+                self.user_turns
+                    .extend(tag.split(',').filter(|t| !t.is_empty()).map(str::to_string));
                 // Sent on the history it was meant to replace, it would repeat a turn.
                 if !input.is_empty() {
                     events.push(error_event(
@@ -670,89 +940,237 @@ impl Codex {
     }
 
     fn on_server_request(&mut self, id: &Value, method: &str, params: &Value) -> Output {
-        let approval = matches!(
-            method,
-            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
-        );
+        let answer =
+            |result: Value| json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
+        let full = self.mode == "full-auto";
         // Full access never prompts; a turn started before the switch still may.
-        if approval && self.mode == "full-auto" {
-            return Output {
-                events: vec![],
-                frames: vec![
-                    json!({ "jsonrpc": "2.0", "id": id, "result": { "decision": "accept" } })
-                        .to_string(),
-                ],
-            };
-        }
-        if !approval {
-            return Output {
-                frames: vec![json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": format!("unsupported by client: {method}") } }).to_string()],
-                events: vec![json!({ "type": "info", "message": format!("[codex] unsupported request: {method}") })],
-            };
+        match method {
+            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" if full => {
+                return Output {
+                    events: vec![],
+                    frames: vec![answer(json!({ "decision": "accept" }))],
+                };
+            }
+            "item/permissions/requestApproval" if full => {
+                return Output {
+                    events: vec![],
+                    frames: vec![answer(
+                        json!({ "permissions": params["permissions"], "scope": "session" }),
+                    )],
+                };
+            }
+            "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "item/tool/requestUserInput"
+            | "mcpServer/elicitation/request" => {}
+            _ => {
+                return Output {
+                    frames: vec![json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": format!("unsupported by client: {method}") } }).to_string()],
+                    events: vec![json!({ "type": "info", "message": format!("[codex] unsupported request: {method}") })],
+                };
+            }
         }
         self.approval_seq += 1;
         let call = format!("approval-{}", self.approval_seq);
-        self.approvals.insert(call.clone(), id.clone());
+        self.approvals.insert(
+            call.clone(),
+            (id.clone(), method.to_string(), params.clone()),
+        );
+        // A subagent's request names it.
+        let subagent = self
+            .agents
+            .iter()
+            .find(|a| a["id"] == params["threadId"])
+            .map(|a| a["label"].clone())
+            .unwrap_or(Value::Null);
+        let mut event = json!({ "type": "approval_request", "call_id": call, "subagent_id": subagent, "hunks": null });
         let item = self.items.get(text(&params["itemId"]));
-        let (name, summary) = if method == "item/commandExecution/requestApproval" {
-            let command = match text(&params["command"]) {
-                "" => item.map(|i| i.command.clone()).unwrap_or_default(),
-                command => command.to_string(),
-            };
-            let summary = match text(&params["reason"]) {
-                "" => command,
-                reason => format!("{command}\n{reason}"),
-            };
-            ("bash", summary)
-        } else {
-            let summary = item
-                .map(|i| {
-                    i.changes
-                        .iter()
-                        .map(|c| {
-                            format!(
-                                "{} {}\n{}",
-                                match text(&c["kind"]["type"]) {
-                                    "" => "edit",
-                                    k => k,
-                                },
-                                text(&c["path"]),
-                                text(&c["diff"])
-                            )
+        match method {
+            "item/commandExecution/requestApproval" => {
+                let command = match text(&params["command"]) {
+                    "" => item.map(|i| i.command.clone()).unwrap_or_default(),
+                    command => command.to_string(),
+                };
+                event["name"] = json!("bash");
+                event["summary"] = json!(match text(&params["reason"]) {
+                    "" => command,
+                    reason => format!("{command}\n{reason}"),
+                });
+                // Codex can keep a rule for commands like this one.
+                if params["proposedExecpolicyAmendment"].is_array() {
+                    event["scopes"] = json!(["session", "rule"]);
+                }
+            }
+            "item/fileChange/requestApproval" => {
+                let summary = item
+                    .map(|i| {
+                        i.changes
+                            .iter()
+                            .map(|c| {
+                                format!(
+                                    "{} {}\n{}",
+                                    match text(&c["kind"]["type"]) {
+                                        "" => "edit",
+                                        k => k,
+                                    },
+                                    text(&c["path"]),
+                                    text(&c["diff"])
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| text(&params["reason"]).to_string());
+                event["name"] = json!("apply_patch");
+                event["summary"] = json!(summary);
+            }
+            "item/permissions/requestApproval" => {
+                event["name"] = json!("permissions");
+                event["summary"] = json!(permissions_summary(params));
+            }
+            "item/tool/requestUserInput" => {
+                let questions: Vec<Value> = params["questions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|q| {
+                        json!({
+                            "question": q["question"],
+                            "header": q["header"],
+                            "options": q["options"].as_array().cloned().unwrap_or_default(),
+                            "multiSelect": false,
                         })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| text(&params["reason"]).to_string());
-            ("apply_patch", summary)
-        };
-        Output::events(vec![
-            json!({ "type": "approval_request", "call_id": call, "name": name, "summary": summary, "subagent_id": null, "hunks": null }),
-        ])
+                    })
+                    .collect();
+                event["name"] = json!("ask_question");
+                event["summary"] = json!("");
+                event["questions"] = json!(questions);
+            }
+            _ => {
+                let server = text(&params["serverName"]);
+                event["name"] = json!("mcp_elicitation");
+                event["summary"] = json!(format!("{server}: {}", text(&params["message"])));
+                event["url"] = params["url"].clone();
+                event["questions"] =
+                    super::claude::elicitation_questions(&params["requestedSchema"]);
+            }
+        }
+        Output::events(vec![event])
     }
 
-    fn item_started(&mut self, item: &Value) -> Vec<Value> {
+    /// A subagent's activity on the parent thread: started, interacted with,
+    /// interrupted or done. Returns whether its entry changed.
+    fn agent_activity(&mut self, item: &Value) -> bool {
+        let thread = text(&item["agentThreadId"]).to_string();
+        if thread.is_empty() {
+            return false;
+        }
+        let status = match text(&item["kind"]) {
+            "completed" => "completed",
+            "interrupted" => "stopped",
+            _ => "running",
+        };
+        match self.agents.iter_mut().find(|a| a["id"] == thread.as_str()) {
+            Some(agent) => {
+                if agent["status"] != "failed" {
+                    agent["status"] = json!(status);
+                }
+            }
+            None => self.agents.push(json!({
+                "id": thread,
+                "label": agent_label(text(&item["agentPath"]), &thread),
+                "type": "subagent",
+                "tool_use_id": item["id"],
+                "status": status,
+                "started_at": now_ms(),
+                "tokens": 0,
+                "tool_calls": 0,
+            })),
+        }
+        true
+    }
+
+    /// A subagent thread's own notification: its progress in the agent
+    /// trace and the subagent strip, never in this conversation.
+    fn child_notification(&mut self, thread: &str, method: &str, params: &Value) -> Vec<Value> {
+        let Some(agent) = self.agents.iter_mut().find(|a| a["id"] == thread) else {
+            return vec![];
+        };
+        match method {
+            "turn/started" => agent["status"] = json!("running"),
+            "turn/completed" => {
+                let turn = &params["turn"];
+                agent["status"] = json!(if turn["status"] == "failed" {
+                    "failed"
+                } else {
+                    "completed"
+                });
+                if let Some(ms) = turn["durationMs"].as_u64() {
+                    agent["duration_ms"] = json!(agent["duration_ms"].as_u64().unwrap_or(0) + ms);
+                }
+            }
+            "thread/tokenUsage/updated" => {
+                agent["tokens"] = params["tokenUsage"]["total"]["totalTokens"].clone();
+            }
+            "item/completed" => {
+                let item = &params["item"];
+                match text(&item["type"]) {
+                    "agentMessage" => {
+                        let summary: String = text(&item["text"]).chars().take(200).collect();
+                        agent["result"] = json!(summary);
+                    }
+                    "commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall"
+                    | "webSearch" => {
+                        agent["tool_calls"] = json!(agent["tool_calls"].as_u64().unwrap_or(0) + 1);
+                    }
+                    _ => return vec![],
+                }
+            }
+            "item/started" => {
+                let item = &params["item"];
+                let message = match text(&item["type"]) {
+                    "commandExecution" => text(&item["command"]).to_string(),
+                    "fileChange" => "apply_patch".to_string(),
+                    "mcpToolCall" => format!("{}.{}", text(&item["server"]), text(&item["tool"])),
+                    _ => return vec![],
+                };
+                agent["summary"] = json!(message.chars().take(120).collect::<String>());
+            }
+            _ => return vec![],
+        }
+        let lifecycle = json!({
+            "type": "subagent_lifecycle",
+            "path": agent["id"],
+            "label": agent["label"],
+            "status": agent["status"],
+            "message": agent["summary"].as_str().unwrap_or_default(),
+        });
+        vec![lifecycle, self.agent_runs()]
+    }
+
+    fn item_started(&mut self, item: &Value, turn: &str) -> Vec<Value> {
         let id = text(&item["id"]).to_string();
         match text(&item["type"]) {
             // Every client sees the turn's input, not only the one that sent it.
             "userMessage" => {
-                let content = item["content"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|c| c["type"] == "text")
-                    .map(|c| text(&c["text"]))
-                    .filter(|t| !t.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if content.is_empty() {
+                if !turn.is_empty() {
+                    self.user_turns.push(turn.to_string());
+                }
+                let (content, images) = user_input(&item["content"]);
+                if content.is_empty() && images.is_empty() {
                     vec![]
                 } else {
-                    vec![json!({ "type": "user_message", "content": content })]
+                    let mut event = json!({ "type": "user_message", "content": content });
+                    if !images.is_empty() {
+                        event["images"] = json!(images);
+                    }
+                    vec![event]
                 }
             }
-            "agentMessage" => {
+            // Plan mode's plan, streamed like a reply.
+            "agentMessage" | "plan" => {
                 self.items.insert(id, Item::new("assistant"));
                 vec![json!({ "type": "assistant_start" })]
             }
@@ -805,8 +1223,70 @@ impl Codex {
                 self.saw_compaction_item = true;
                 vec![json!({ "type": "compaction_start" })]
             }
+            // A subagent starting: its card, and its entry in the trace.
+            "subAgentActivity" => {
+                let started = item["kind"] == "started";
+                self.agent_activity(item);
+                let mut events = Vec::new();
+                if started {
+                    let label = agent_label(text(&item["agentPath"]), text(&item["agentThreadId"]));
+                    events.push(
+                        json!({ "type": "tool_start", "call_id": id, "name": "spawn_agent" }),
+                    );
+                    events.push(json!({ "type": "tool_update", "call_id": id, "output": json!({ "description": label }).to_string() }));
+                    events.push(json!({ "type": "subagent_lifecycle", "path": item["agentThreadId"], "label": label, "status": "running", "message": "" }));
+                } else if let Some(agent) = self
+                    .agents
+                    .iter()
+                    .find(|a| a["id"] == item["agentThreadId"])
+                {
+                    events.push(json!({ "type": "subagent_lifecycle", "path": agent["id"], "label": agent["label"], "status": agent["status"], "message": "" }));
+                }
+                events.push(self.agent_runs());
+                events
+            }
+            "collabAgentToolCall" => {
+                let tool = text(&item["tool"]).to_string();
+                for receiver in item["receiverThreadIds"].as_array().into_iter().flatten() {
+                    if let Some(agent) = self.agents.iter_mut().find(|a| a["id"] == *receiver) {
+                        if !item["prompt"].is_null() {
+                            agent["prompt"] = item["prompt"].clone();
+                        }
+                        if !item["model"].is_null() {
+                            agent["model"] = item["model"].clone();
+                        }
+                    }
+                }
+                let name = format!("agent_{tool}");
+                self.items.insert(id.clone(), Item::new(&name));
+                let description = match text(&item["prompt"]) {
+                    "" => self.receivers(item),
+                    prompt => prompt.to_string(),
+                };
+                vec![
+                    json!({ "type": "tool_start", "call_id": id, "name": name }),
+                    json!({ "type": "tool_update", "call_id": id, "output": json!({ "description": description }).to_string() }),
+                ]
+            }
             _ => vec![],
         }
+    }
+
+    /// The subagents a collab call names, by label.
+    fn receivers(&self, item: &Value) -> String {
+        item["receiverThreadIds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|id| {
+                self.agents
+                    .iter()
+                    .find(|a| a["id"] == *id)
+                    .map(|a| text(&a["label"]).to_string())
+                    .unwrap_or_else(|| text(id).chars().take(8).collect())
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     fn item_completed(&mut self, item: &Value) -> Vec<Value> {
@@ -814,7 +1294,7 @@ impl Codex {
         let meta = self.items.remove(&id);
         let status = text(&item["status"]);
         match text(&item["type"]) {
-            "agentMessage" => {
+            "agentMessage" | "plan" => {
                 let full = text(&item["text"]);
                 let seen = meta.map_or(0, |m| m.streamed);
                 match full.get(seen..) {
@@ -887,6 +1367,38 @@ impl Codex {
                 json!({ "type": "tool_output", "call_id": id, "name": "web_search", "output": json!({ "query": item["query"] }).to_string(), "is_error": false }),
             ],
             "contextCompaction" => vec![json!({ "type": "compaction_end" })],
+            "subAgentActivity" if item["kind"] == "started" => {
+                let label = agent_label(text(&item["agentPath"]), text(&item["agentThreadId"]));
+                vec![
+                    json!({ "type": "tool_output", "call_id": id, "name": "spawn_agent", "output": json!({ "description": label }).to_string(), "is_error": false }),
+                ]
+            }
+            "collabAgentToolCall" => {
+                let name = meta
+                    .map(|m| m.name)
+                    .unwrap_or_else(|| format!("agent_{}", text(&item["tool"])));
+                let states: Vec<String> = item["agentsStates"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(thread, state)| {
+                        let label = self
+                            .agents
+                            .iter()
+                            .find(|a| a["id"] == thread.as_str())
+                            .map(|a| text(&a["label"]).to_string())
+                            .unwrap_or_else(|| thread.chars().take(8).collect());
+                        format!("{label}: {}", text(&state["status"]))
+                    })
+                    .collect();
+                let description = match states.is_empty() {
+                    true => self.receivers(item),
+                    false => states.join("\n"),
+                };
+                vec![
+                    json!({ "type": "tool_output", "call_id": id, "name": name, "output": json!({ "description": description }).to_string(), "is_error": status == "failed" }),
+                ]
+            }
             // A review's findings arrive whole when the review ends.
             "exitedReviewMode" if !text(&item["review"]).is_empty() => vec![
                 json!({ "type": "assistant_start" }),
@@ -897,6 +1409,13 @@ impl Codex {
     }
 
     fn on_notification(&mut self, method: &str, params: &Value) -> Vec<Value> {
+        // Another thread's notification (a subagent's) is never this
+        // conversation's: not its text, its usage or its turn ending.
+        if let (Some(thread), Some(own)) = (params["threadId"].as_str(), self.thread.as_deref()) {
+            if thread != own {
+                return self.child_notification(thread, method, params);
+            }
+        }
         match method {
             "account/rateLimits/updated" => plan_usage(&params["rateLimits"]).into_iter().collect(),
             "turn/started" => {
@@ -920,9 +1439,9 @@ impl Codex {
                 events.push(json!({ "type": "status", "message": "ready" }));
                 events
             }
-            "item/started" => self.item_started(&params["item"]),
+            "item/started" => self.item_started(&params["item"], text(&params["turnId"])),
             "item/completed" => self.item_completed(&params["item"]),
-            "item/agentMessage/delta" => {
+            "item/agentMessage/delta" | "item/plan/delta" => {
                 let delta = text(&params["delta"]);
                 if let Some(meta) = self.items.get_mut(text(&params["itemId"])) {
                     meta.streamed += delta.len();
@@ -1007,16 +1526,82 @@ impl Codex {
                 if message.is_empty() {
                     vec![]
                 } else if params["willRetry"] == true {
-                    vec![json!({ "type": "info", "message": format!("[codex] {message}") })]
+                    // "Reconnecting... 2/5"
+                    let (attempt, max) = message
+                        .rsplit(' ')
+                        .next()
+                        .and_then(|n| n.split_once('/'))
+                        .and_then(|(a, m)| Some((a.parse::<u64>().ok()?, m.parse::<u64>().ok()?)))
+                        .unwrap_or((0, 0));
+                    let reason = match text(&params["error"]["additionalDetails"]) {
+                        "" => message,
+                        details => details,
+                    };
+                    vec![
+                        json!({ "type": "retrying", "attempt": attempt, "max_attempts": max, "delay_ms": 0, "reason": reason }),
+                    ]
                 } else {
                     vec![error_event(message, &params["error"]["codexErrorInfo"])]
                 }
             }
-            "guardianWarning" if !text(&params["message"]).is_empty() => {
+            // Warnings the user should see (a config typo, a deprecation),
+            // each once: Codex repeats them per thread.
+            "warning" | "guardianWarning" | "configWarning" | "deprecationNotice" => {
+                let message = [text(&params["message"]), text(&params["summary"])]
+                    .into_iter()
+                    .find(|m| !m.is_empty())
+                    .unwrap_or_default();
+                let full = match text(&params["details"]) {
+                    "" => message.to_string(),
+                    details => format!("{message}\n{details}"),
+                };
+                if full.is_empty() || !self.warned.insert(message.to_string()) {
+                    return vec![];
+                }
+                vec![json!({ "type": "info", "message": format!("[codex] {full}") })]
+            }
+            "thread/name/updated" => match params["threadName"].as_str() {
+                Some(name) if !name.trim().is_empty() => {
+                    vec![json!({ "type": "session_title", "title": name })]
+                }
+                _ => vec![],
+            },
+            "item/fileChange/patchUpdated" => {
+                let id = text(&params["itemId"]).to_string();
+                let Some(meta) = self.items.get_mut(&id) else {
+                    return vec![];
+                };
+                meta.changes = params["changes"].as_array().cloned().unwrap_or_default();
+                let update = file_change_output(&meta.changes, None);
+                vec![json!({ "type": "tool_update", "call_id": id, "output": update })]
+            }
+            "item/mcpToolCall/progress" if !text(&params["message"]).is_empty() => {
                 vec![
-                    json!({ "type": "info", "message": format!("[codex] {}", text(&params["message"])) }),
+                    json!({ "type": "tool_update", "call_id": params["itemId"], "output": params["message"] }),
                 ]
             }
+            "mcpServer/startupStatus/updated" => {
+                self.mcp_relist = self.mcp_watched;
+                vec![]
+            }
+            "mcpServer/oauthLogin/completed" => {
+                self.mcp_relist = self.mcp_watched;
+                let name = text(&params["name"]);
+                vec![
+                    json!({ "type": "info", "message": if params["success"] == true {
+                    format!("[codex] {name}: signed in")
+                } else {
+                    format!("[codex] {name}: sign-in failed: {}", text(&params["error"]))
+                } }),
+                ]
+            }
+            "account/login/completed" => vec![
+                json!({ "type": "info", "message": if params["success"] == true {
+                "[codex] signed in".to_string()
+            } else {
+                format!("[codex] sign-in failed: {}", text(&params["error"]))
+            } }),
+            ],
             "thread/compacted" if !self.saw_compaction_item => {
                 vec![json!({ "type": "compaction_end" })]
             }
@@ -1028,28 +1613,23 @@ impl Codex {
                 ]
                 .into_iter()
                 .find(|t| !t.is_empty())
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .to_string();
                 let from = [text(&params["fromModel"]), text(&params["from"])]
                     .into_iter()
                     .find(|t| !t.is_empty())
                     .unwrap_or_default();
-                let change = if !from.is_empty() && !to.is_empty() {
-                    format!("{from} → {to}")
-                } else {
-                    format!("{to}{from}")
-                };
-                let description = [change.as_str(), text(&params["reason"])]
-                    .into_iter()
-                    .filter(|p| !p.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" · ");
-                if description.is_empty() {
-                    vec![]
-                } else {
-                    vec![
-                        json!({ "type": "info", "message": format!("[codex] model rerouted: {description}") }),
-                    ]
+                if to.is_empty() {
+                    return vec![];
                 }
+                let mut events = vec![
+                    json!({ "type": "model_fallback", "from": from, "to": to, "reason": text(&params["reason"]) }),
+                ];
+                if to != self.model {
+                    self.model = to;
+                    events.push(self.model_status());
+                }
+                events
             }
             "thread/goal/updated" if params["goal"].is_object() => {
                 vec![Self::goal_event(&params["goal"])]
@@ -1057,7 +1637,7 @@ impl Codex {
             "thread/goal/cleared" => vec![Self::goal_event(&Value::Null)],
             "serverRequest/resolved" => {
                 self.approvals
-                    .retain(|_, request| *request != params["requestId"]);
+                    .retain(|_, (request, _, _)| *request != params["requestId"]);
                 vec![]
             }
             _ => vec![],
@@ -1069,7 +1649,7 @@ impl Adapter for Codex {
     fn start(&mut self) -> Vec<String> {
         vec![self.request(
             "initialize",
-            json!({ "clientInfo": { "name": "jucode-daemon", "title": "JuCode", "version": env!("CARGO_PKG_VERSION") }, "capabilities": null }),
+            json!({ "clientInfo": { "name": "jucode-daemon", "title": "JuCode", "version": env!("CARGO_PKG_VERSION") }, "capabilities": { "experimentalApi": true } }),
             "",
         )]
     }
@@ -1082,14 +1662,29 @@ impl Adapter for Codex {
         };
         let id = &frame["id"];
         let has_id = id.is_u64() || id.is_string();
-        match frame["method"].as_str() {
+        let mut out = match frame["method"].as_str() {
             Some(method) if has_id => self.on_server_request(id, method, &frame["params"]),
             Some(method) => Output::events(self.on_notification(method, &frame["params"])),
             None => match id.as_u64() {
                 Some(id) => self.on_response(id, &frame["result"], &frame["error"]),
                 None => Output::default(),
             },
+        };
+        // The turn ended: the next message that waited for it starts.
+        if !self.busy && self.thread.is_some() && !self.rolling_back && !self.waiting.is_empty() {
+            let (_, input) = self.waiting.remove(0);
+            out.frames.push(self.turn_start(input));
+            out.events.push(self.pending_event());
         }
+        if std::mem::take(&mut self.mcp_relist) {
+            let thread = self.thread.clone();
+            out.frames.push(self.request(
+                "mcpServerStatus/list",
+                json!({ "detail": "toolsAndAuthOnly", "threadId": thread }),
+                "",
+            ));
+        }
+        out
     }
 
     fn encode(&mut self, op: &Value) -> Result<Output, String> {
@@ -1108,24 +1703,135 @@ impl Adapter for Codex {
                     self.after_rollback.extend(input);
                     return Ok(Output::default());
                 }
+                // Mid-turn it waits for the turn to end, or to be steered in.
+                if self.busy {
+                    self.waiting.push((text(&op["content"]).to_string(), input));
+                    return Ok(Output::events(vec![self.pending_event()]));
+                }
                 vec![self.turn_start(input)]
+            }
+            "steer" => {
+                let (Some(thread), Some(turn)) = (self.thread.clone(), self.active_turn.clone())
+                else {
+                    return Ok(Output::default());
+                };
+                if self.waiting.is_empty() {
+                    return Ok(Output::default());
+                }
+                self.steering = std::mem::take(&mut self.waiting);
+                let input: Vec<Value> = self
+                    .steering
+                    .iter()
+                    .flat_map(|(_, input)| input.clone())
+                    .collect();
+                let frame = self.request(
+                    "turn/steer",
+                    json!({ "threadId": thread, "expectedTurnId": turn, "input": input }),
+                    "",
+                );
+                return Ok(Output {
+                    events: vec![self.pending_event()],
+                    frames: vec![frame],
+                });
+            }
+            "rename" => match self.thread.clone() {
+                Some(thread) => vec![self.request(
+                    "thread/name/set",
+                    json!({ "threadId": thread, "name": op["title"] }),
+                    "",
+                )],
+                None => vec![],
+            },
+            "agent_runs" => return Ok(Output::events(vec![self.agent_runs()])),
+            "subagent_transcript" => {
+                let id = text(&op["agent_id"]).to_string();
+                vec![self.request(
+                    "thread/turns/list",
+                    json!({ "threadId": id, "itemsView": "full", "sortDirection": "asc", "limit": 200 }),
+                    &id,
+                )]
+            }
+            "mcp_list" => {
+                self.mcp_watched = true;
+                let thread = self.thread.clone();
+                vec![self.request(
+                    "mcpServerStatus/list",
+                    json!({ "detail": "toolsAndAuthOnly", "threadId": thread }),
+                    "",
+                )]
+            }
+            "mcp_reconnect" => {
+                let thread = self.thread.clone();
+                vec![
+                    self.request("config/mcpServer/reload", json!({}), ""),
+                    self.request(
+                        "mcpServerStatus/list",
+                        json!({ "detail": "toolsAndAuthOnly", "threadId": thread }),
+                        "",
+                    ),
+                ]
+            }
+            "mcp_login" => {
+                let name = text(&op["name"]).to_string();
+                let thread = self.thread.clone();
+                vec![self.request(
+                    "mcpServer/oauth/login",
+                    json!({ "name": name, "threadId": thread }),
+                    &name,
+                )]
             }
             "approve" => {
                 let call = text(&op["call_id"]);
-                let Some(request) = self.approvals.remove(call) else {
+                let Some((request, method, params)) = self.approvals.remove(call) else {
                     return Err(format!("no open approval {call}"));
                 };
-                let decision = if op["decision"] == "deny" {
-                    "decline"
-                } else if op["always"] == true {
-                    "acceptForSession"
-                } else {
-                    "accept"
+                let deny = op["decision"] == "deny";
+                let always = op["always"] == true;
+                let result = match method.as_str() {
+                    "item/permissions/requestApproval" => json!({
+                        "permissions": if deny { json!({}) } else { params["permissions"].clone() },
+                        "scope": if always { "session" } else { "turn" },
+                    }),
+                    "item/tool/requestUserInput" => {
+                        let mut answers = serde_json::Map::new();
+                        if !deny {
+                            for q in params["questions"].as_array().into_iter().flatten() {
+                                if let Some(answer) = op["answers"][text(&q["question"])].as_str() {
+                                    answers.insert(
+                                        text(&q["id"]).to_string(),
+                                        json!({ "answers": [answer] }),
+                                    );
+                                }
+                            }
+                        }
+                        json!({ "answers": answers })
+                    }
+                    "mcpServer/elicitation/request" => {
+                        if deny {
+                            json!({ "action": "decline", "content": null, "_meta": null })
+                        } else {
+                            let content = super::claude::elicitation_content(
+                                &params["requestedSchema"],
+                                &op["answers"],
+                            );
+                            json!({ "action": "accept", "content": content, "_meta": null })
+                        }
+                    }
+                    _ => {
+                        let amendment = &params["proposedExecpolicyAmendment"];
+                        let decision = if deny {
+                            json!("decline")
+                        } else if always && op["always_scope"] == "rule" && amendment.is_array() {
+                            json!({ "acceptWithExecpolicyAmendment": { "execpolicy_amendment": amendment } })
+                        } else if always {
+                            json!("acceptForSession")
+                        } else {
+                            json!("accept")
+                        };
+                        json!({ "decision": decision })
+                    }
                 };
-                vec![
-                    json!({ "jsonrpc": "2.0", "id": request, "result": { "decision": decision } })
-                        .to_string(),
-                ]
+                vec![json!({ "jsonrpc": "2.0", "id": request, "result": result }).to_string()]
             }
             "interrupt" => match (self.thread.clone(), self.active_turn.clone()) {
                 (Some(thread), Some(turn)) => vec![self.request(
@@ -1186,17 +1892,46 @@ impl Adapter for Codex {
                         };
                         vec![self.request(method, params, "")]
                     }
-                    ("/rewind", Some(thread)) => match arg.parse::<u64>() {
-                        Ok(turns) if turns > 0 => {
+                    // The Nth user message from the end: back to before its turn.
+                    ("/rewind", Some(thread)) => match arg.parse::<usize>() {
+                        Ok(n) if n > 0 && n <= self.user_turns.len() => {
+                            let at = self.user_turns.len() - n;
+                            let dropped = self.user_turns.split_off(at);
+                            let before = dropped[0].clone();
+                            // Messages of one turn (a steered one) go together.
+                            while self.user_turns.last() == Some(&before) {
+                                self.user_turns.pop();
+                            }
                             self.rolling_back = true;
                             vec![self.request(
-                                "thread/rollback",
-                                json!({ "threadId": thread, "numTurns": turns }),
-                                "",
+                                "thread/revert",
+                                json!({ "threadId": thread, "beforeTurnId": before }),
+                                &dropped.join(","),
                             )]
                         }
-                        _ => vec![],
+                        _ => return Err(format!("Codex cannot rewind {arg} messages here")),
                     },
+                    ("/fast" | "/thinking", _) => {
+                        let on = match arg {
+                            "" if command == "/fast" => !self.fast(),
+                            "" => !self.thinking,
+                            "on" => true,
+                            "off" => false,
+                            other => return Err(format!("{command} takes on or off, not {other}")),
+                        };
+                        if command == "/fast" {
+                            self.service_tier =
+                                Some(if on { "priority" } else { "default" }.to_string());
+                        } else {
+                            self.thinking = on;
+                        }
+                        return Ok(Output::events(vec![self.model_status()]));
+                    }
+                    ("/login", _) => vec![self.request(
+                        "account/login/start",
+                        json!({ "type": "chatgptDeviceCode" }),
+                        "",
+                    )],
                     ("/review", Some(thread)) => {
                         let target = if arg.is_empty() {
                             json!({ "type": "uncommittedChanges" })
@@ -1257,6 +1992,14 @@ impl Adapter for Codex {
 
     fn restart_for(&self, _op: &Value) -> Option<Options> {
         None
+    }
+
+    fn keep(&self, options: Options) -> Options {
+        Options {
+            fast: self.fast(),
+            thinking: Some(self.thinking),
+            ..options
+        }
     }
 
     fn conversation(&self) -> Option<String> {
@@ -1416,20 +2159,324 @@ mod tests {
     #[test]
     fn a_message_sent_during_a_rewind_waits_for_it() {
         let mut c = opened();
-        let rollback = sent(
+        for (turn, text) in [("t1", "one"), ("t2", "two")] {
+            frame(
+                &mut c,
+                json!({ "method": "item/started", "params": { "threadId": "th-1", "turnId": turn,
+                "item": { "type": "userMessage", "id": format!("u-{turn}"), "content": [{ "type": "text", "text": text }] } } }),
+            );
+        }
+        assert!(c
+            .encode(&json!({ "op": "command", "input": "/rewind 3" }))
+            .is_err());
+        let revert = sent(
             &c.encode(&json!({ "op": "command", "input": "/rewind 1" }))
                 .unwrap()
                 .frames,
         );
-        assert_eq!(rollback[0]["method"], "thread/rollback");
+        assert_eq!(revert[0]["method"], "thread/revert");
+        assert_eq!(revert[0]["params"]["beforeTurnId"], "t2");
         let held = c
             .encode(&json!({ "op": "user_message", "content": "again" }))
             .unwrap();
         assert!(held.frames.is_empty());
-        let id = rollback[0]["id"].clone();
+        let id = revert[0]["id"].clone();
         let done = sent(&frame(&mut c, json!({ "id": id, "result": {} })).frames);
         assert_eq!(done[0]["method"], "turn/start");
         assert_eq!(done[0]["params"]["input"][0]["text"], "again");
+        // The next rewind goes before the first message.
+        let revert = sent(
+            &c.encode(&json!({ "op": "command", "input": "/rewind 1" }))
+                .unwrap()
+                .frames,
+        );
+        assert_eq!(revert[0]["params"]["beforeTurnId"], "t1");
+    }
+
+    fn busy(c: &mut Codex) {
+        let started = c
+            .encode(&json!({ "op": "user_message", "content": "go" }))
+            .unwrap();
+        assert_eq!(sent(&started.frames)[0]["method"], "turn/start");
+        frame(
+            c,
+            json!({ "method": "turn/started", "params": { "threadId": "th-1", "turn": { "id": "turn-1" } } }),
+        );
+    }
+
+    #[test]
+    fn a_message_mid_turn_waits_or_steers_in() {
+        let mut c = opened();
+        busy(&mut c);
+        let queued = c
+            .encode(&json!({ "op": "user_message", "content": "also this" }))
+            .unwrap();
+        assert!(queued.frames.is_empty());
+        assert_eq!(
+            queued.events[0],
+            json!({ "type": "pending_messages", "messages": ["also this"] })
+        );
+        let steer = c.encode(&json!({ "op": "steer" })).unwrap();
+        let frames = sent(&steer.frames);
+        assert_eq!(frames[0]["method"], "turn/steer");
+        assert_eq!(frames[0]["params"]["expectedTurnId"], "turn-1");
+        assert_eq!(frames[0]["params"]["input"][0]["text"], "also this");
+        // Not steerable after all: it waits for the next turn.
+        let failed = frame(
+            &mut c,
+            json!({ "id": frames[0]["id"], "error": { "code": -32600, "message": "turn is not steerable" } }),
+        );
+        assert!(failed
+            .events
+            .iter()
+            .any(|e| e["type"] == "pending_messages" && e["messages"] == json!(["also this"])));
+        let ended = frame(
+            &mut c,
+            json!({ "method": "turn/completed", "params": { "threadId": "th-1", "turn": { "id": "turn-1", "status": "completed" } } }),
+        );
+        let next = sent(&ended.frames);
+        assert_eq!(next[0]["method"], "turn/start");
+        assert_eq!(next[0]["params"]["input"][0]["text"], "also this");
+    }
+
+    #[test]
+    fn a_subagents_thread_stays_out_of_the_conversation() {
+        let mut c = opened();
+        busy(&mut c);
+        let spawned = frame(&mut c, json!({ "method": "item/started", "params": { "threadId": "th-1", "turnId": "turn-1",
+            "item": { "type": "subAgentActivity", "id": "call-1", "kind": "started", "agentThreadId": "child", "agentPath": "/root/pong" } } })).events;
+        assert!(spawned
+            .iter()
+            .any(|e| e["type"] == "tool_start" && e["name"] == "spawn_agent"));
+        assert!(spawned
+            .iter()
+            .any(|e| e["type"] == "subagent_lifecycle" && e["label"] == "pong"));
+        let runs = spawned.iter().find(|e| e["type"] == "agent_runs").unwrap();
+        assert_eq!(runs["agents"][0]["tool_use_id"], "call-1");
+        // The child's text, usage and turn end are not this turn's.
+        let delta = frame(&mut c, json!({ "method": "item/agentMessage/delta", "params": { "threadId": "child", "itemId": "m", "delta": "PONG" } })).events;
+        assert!(delta.is_empty());
+        frame(
+            &mut c,
+            json!({ "method": "thread/tokenUsage/updated", "params": { "threadId": "child", "tokenUsage": { "total": { "totalTokens": 900 }, "last": {} } } }),
+        );
+        let done = frame(&mut c, json!({ "method": "turn/completed", "params": { "threadId": "child", "turn": { "id": "c1", "status": "completed", "durationMs": 3814 } } })).events;
+        assert!(c.busy());
+        let runs = done.iter().find(|e| e["type"] == "agent_runs").unwrap();
+        assert_eq!(runs["agents"][0]["tokens"], 900);
+        assert_eq!(runs["agents"][0]["status"], "completed");
+        assert_eq!(runs["agents"][0]["duration_ms"], 3814);
+        // Its conversation is read back from its thread.
+        let ask = sent(
+            &c.encode(&json!({ "op": "subagent_transcript", "agent_id": "child" }))
+                .unwrap()
+                .frames,
+        );
+        assert_eq!(ask[0]["method"], "thread/turns/list");
+        assert_eq!(ask[0]["params"]["itemsView"], "full");
+        let read = frame(
+            &mut c,
+            json!({ "id": ask[0]["id"], "result": { "data": [{ "id": "c1", "items": [
+            { "type": "userMessage", "content": [{ "type": "text", "text": "reply PONG" }] },
+            { "type": "agentMessage", "text": "PONG" }
+        ] }] } }),
+        )
+        .events;
+        assert_eq!(read[0]["type"], "subagent_transcript");
+        assert_eq!(read[0]["agent_id"], "child");
+        assert_eq!(read[0]["items"][1]["content"], "PONG");
+    }
+
+    fn request(c: &mut Codex, method: &str, params: Value) -> Value {
+        let out = frame(c, json!({ "id": 77, "method": method, "params": params }));
+        out.events
+            .into_iter()
+            .find(|e| e["type"] == "approval_request")
+            .unwrap()
+    }
+
+    fn answer(c: &mut Codex, op: Value) -> Value {
+        let frames = c.encode(&op).unwrap().frames;
+        sent(&frames)[0]["result"].clone()
+    }
+
+    #[test]
+    fn codex_asks_for_permissions_input_and_mcp_forms() {
+        let mut c = opened();
+        let card = request(
+            &mut c,
+            "item/permissions/requestApproval",
+            json!({ "threadId": "th-1", "itemId": "i", "reason": "fetch deps",
+            "permissions": { "network": { "enabled": true }, "fileSystem": null } }),
+        );
+        assert_eq!(card["name"], "permissions");
+        assert!(card["summary"].as_str().unwrap().contains("network access"));
+        let result = answer(
+            &mut c,
+            json!({ "op": "approve", "call_id": card["call_id"], "decision": "allow", "always": true }),
+        );
+        assert_eq!(
+            result,
+            json!({ "permissions": { "network": { "enabled": true }, "fileSystem": null }, "scope": "session" })
+        );
+
+        let card = request(
+            &mut c,
+            "item/tool/requestUserInput",
+            json!({ "threadId": "th-1", "itemId": "i", "questions": [
+            { "id": "q1", "header": "Purpose", "question": "What is it for?", "isOther": true, "isSecret": false, "options": [{ "label": "Docs", "description": "" }] }
+        ] }),
+        );
+        assert_eq!(card["questions"][0]["options"][0]["label"], "Docs");
+        let result = answer(
+            &mut c,
+            json!({ "op": "approve", "call_id": card["call_id"], "decision": "allow", "answers": { "What is it for?": "Docs" } }),
+        );
+        assert_eq!(
+            result,
+            json!({ "answers": { "q1": { "answers": ["Docs"] } } })
+        );
+
+        let card = request(
+            &mut c,
+            "mcpServer/elicitation/request",
+            json!({ "threadId": "th-1", "serverName": "jira", "mode": "form", "message": "Pick",
+            "requestedSchema": { "type": "object", "properties": { "n": { "type": "integer" } } } }),
+        );
+        assert_eq!(card["name"], "mcp_elicitation");
+        let result = answer(
+            &mut c,
+            json!({ "op": "approve", "call_id": card["call_id"], "decision": "allow", "answers": { "n": "3" } }),
+        );
+        assert_eq!(
+            result,
+            json!({ "action": "accept", "content": { "n": 3 }, "_meta": null })
+        );
+
+        let card = request(
+            &mut c,
+            "item/commandExecution/requestApproval",
+            json!({ "threadId": "th-1", "itemId": "i", "command": "npm test",
+            "proposedExecpolicyAmendment": ["npm", "test"] }),
+        );
+        assert_eq!(card["scopes"], json!(["session", "rule"]));
+        let result = answer(
+            &mut c,
+            json!({ "op": "approve", "call_id": card["call_id"], "decision": "allow", "always": true, "always_scope": "rule" }),
+        );
+        assert_eq!(
+            result,
+            json!({ "decision": { "acceptWithExecpolicyAmendment": { "execpolicy_amendment": ["npm", "test"] } } })
+        );
+    }
+
+    #[test]
+    fn notices_titles_and_session_switches() {
+        let mut c = opened();
+        let warn = |c: &mut Codex| {
+            frame(c, json!({ "method": "configWarning", "params": { "summary": "bad key", "details": null } })).events
+        };
+        assert_eq!(warn(&mut c)[0]["message"], "[codex] bad key");
+        assert!(warn(&mut c).is_empty());
+        let retry = frame(
+            &mut c,
+            json!({ "method": "error", "params": { "threadId": "th-1", "willRetry": true,
+            "error": { "message": "Reconnecting... 2/5", "additionalDetails": "HTTP 502" } } }),
+        )
+        .events;
+        assert_eq!(
+            retry[0],
+            json!({ "type": "retrying", "attempt": 2, "max_attempts": 5, "delay_ms": 0, "reason": "HTTP 502" })
+        );
+        let fallback = frame(&mut c, json!({ "method": "model/rerouted", "params": { "threadId": "th-1", "fromModel": "gpt-5", "toModel": "gpt-5-mini", "reason": "capacity" } })).events;
+        assert_eq!(fallback[0]["type"], "model_fallback");
+        let title = frame(&mut c, json!({ "method": "thread/name/updated", "params": { "threadId": "th-1", "threadName": "Fix login" } })).events;
+        assert_eq!(
+            title[0],
+            json!({ "type": "session_title", "title": "Fix login" })
+        );
+        let rename = sent(
+            &c.encode(&json!({ "op": "rename", "title": "New" }))
+                .unwrap()
+                .frames,
+        );
+        assert_eq!(rename[0]["method"], "thread/name/set");
+
+        let status = c
+            .encode(&json!({ "op": "command", "input": "/fast on" }))
+            .unwrap()
+            .events;
+        assert_eq!(status[0]["fast"], true);
+        c.encode(&json!({ "op": "command", "input": "/thinking off" }))
+            .unwrap();
+        c.encode(&json!({ "op": "set_approval_mode", "mode": "plan" }))
+            .unwrap();
+        let turn = sent(
+            &c.encode(&json!({ "op": "user_message", "content": "plan it" }))
+                .unwrap()
+                .frames,
+        );
+        assert_eq!(turn[0]["params"]["serviceTier"], "priority");
+        assert_eq!(turn[0]["params"]["summary"], "none");
+        assert_eq!(turn[0]["params"]["collaborationMode"]["mode"], "plan");
+        assert_eq!(turn[0]["params"]["sandboxPolicy"]["type"], "readOnly");
+        frame(
+            &mut c,
+            json!({ "method": "turn/completed", "params": { "threadId": "th-1", "turn": { "id": "x", "status": "completed" } } }),
+        );
+        c.encode(&json!({ "op": "set_approval_mode", "mode": "auto" }))
+            .unwrap();
+        let turn = sent(
+            &c.encode(&json!({ "op": "user_message", "content": "do it" }))
+                .unwrap()
+                .frames,
+        );
+        assert_eq!(turn[0]["params"]["collaborationMode"]["mode"], "default");
+        assert_eq!(turn[0]["params"]["approvalsReviewer"], "auto_review");
+        let kept = c.keep(Options::default());
+        assert!(kept.fast);
+        assert_eq!(kept.thinking, Some(false));
+    }
+
+    #[test]
+    fn mcp_servers_list_reload_and_sign_in() {
+        let mut c = opened();
+        let list = sent(&c.encode(&json!({ "op": "mcp_list" })).unwrap().frames);
+        assert_eq!(list[0]["params"]["detail"], "toolsAndAuthOnly");
+        let view = frame(&mut c, json!({ "id": list[0]["id"], "result": { "data": [
+            { "name": "gh", "runtimeStatus": "authenticationRequired", "httpOrigin": "https://x", "tools": {} },
+            { "name": "fs", "runtimeStatus": "connected", "httpOrigin": null, "tools": { "read": { "description": "Read" } } }
+        ] } })).events;
+        let servers = view[0]["servers"].as_array().unwrap();
+        assert_eq!(
+            (
+                servers[0]["state"].as_str(),
+                servers[0]["needs_auth"].as_bool()
+            ),
+            (Some("failed"), Some(true))
+        );
+        assert_eq!(servers[1]["tools"][0]["name"], "read");
+        assert_eq!(servers[1]["can_toggle"], false);
+        let login = sent(
+            &c.encode(&json!({ "op": "mcp_login", "name": "gh" }))
+                .unwrap()
+                .frames,
+        );
+        let url = frame(
+            &mut c,
+            json!({ "id": login[0]["id"], "result": { "authorizationUrl": "https://auth" } }),
+        )
+        .events;
+        assert_eq!(
+            url[0],
+            json!({ "type": "mcp_login", "name": "gh", "url": "https://auth" })
+        );
+        // A server that changes is listed again for the client watching.
+        let relist = frame(
+            &mut c,
+            json!({ "method": "mcpServer/startupStatus/updated", "params": {} }),
+        );
+        assert_eq!(sent(&relist.frames)[0]["method"], "mcpServerStatus/list");
     }
 
     #[test]
@@ -1520,10 +2567,10 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["/model", "/resume", "/compact", "/review", "/goal", "/lint"]
+            ["/model", "/resume", "/compact", "/review", "/goal", "/login", "/lint"]
         );
-        assert_eq!(commands[5]["description"], "Run the linters");
-        assert_eq!(commands[5]["marker"], "SKILL");
+        assert_eq!(commands[6]["description"], "Run the linters");
+        assert_eq!(commands[6]["marker"], "SKILL");
 
         let skill = c
             .encode(&json!({ "op": "command", "input": "/lint src" }))

@@ -285,6 +285,20 @@ Claude Code sessions take more:
 | `permission_rules` | The rules in effect, as `/permissions` lists them | `permission_rules` with `rules: [{behavior, source, rule, editability}]`, `directories` |
 | `approve` with `always_scope` | `project` saves the always-allow rule to the project's `.claude/settings.local.json`, `user` to `~/.claude/settings.json`; the session otherwise | — |
 
+Codex sessions take the same `steer`, `/fast`, `/thinking`, `rename`,
+`agent_runs`, `subagent_transcript`, `mcp_list` and `mcp_reconnect`, plus
+`mcp_login` `name` (answered by `mcp_login` with the server's sign-in `url`)
+and `/login` (a device code to sign Codex in to ChatGPT, as an `info`). A
+message sent mid-turn waits in the daemon (`pending_messages`) and starts the
+next turn; `steer` sends it into the running one (`turn/steer`). Approval
+mode `plan` is Codex's plan collaboration mode and `auto` its `auto_review`
+reviewer. Codex's own requests for permissions, for the user's answers
+(`ask_question` with `questions`) and MCP elicitations come as approval
+cards; a command card with `scopes: ["session", "rule"]` can be allowed
+always with `always_scope: "rule"` (a Codex exec rule). Subagents are
+threads of their own: their events feed `agent_runs` and
+`subagent_lifecycle`, never the conversation.
+
 And sends more events: `background_tasks` (`tasks: [{id, kind,
 description}]`, the live set: replace yours), `task_progress` (`task_id`,
 `message`), `task_done` (`task_id`, `kind`, `status`, `summary`: a background

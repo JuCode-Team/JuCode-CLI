@@ -425,14 +425,14 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 if let Some(group) = op["group"].as_str() {
                     gateway::set_group(&session, Some(group));
                 }
-                // Claude Code keeps the name too, for `claude --resume`.
+                // Claude Code and Codex keep the name too, for their own lists.
                 if let Some(title) = op["title"].as_str().map(str::trim).filter(|t| !t.is_empty()) {
-                    let claude = hub
+                    let named = hub
                         .store
                         .sessions()
                         .iter()
-                        .any(|r| r.id == session && r.engine.as_deref() == Some("claude"));
-                    if claude {
+                        .any(|r| r.id == session && matches!(r.engine.as_deref(), Some("claude" | "codex")));
+                    if named {
                         let _ = hub.forward(&session, json!({ "op": "rename", "title": title }));
                     }
                 }
