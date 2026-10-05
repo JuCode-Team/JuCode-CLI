@@ -41,6 +41,28 @@ pub fn command(options: &Options) -> Command {
     command
 }
 
+/// Codex's own TUI resuming thread `id`, in the session's approval mode and
+/// model (for the GUI ⇄ TUI handoff).
+pub fn tui(id: &str, options: &Options) -> Command {
+    let program = match &options.bin {
+        Some(bin) => PathBuf::from(bin),
+        None => resolve("codex", "CODEX_BIN", &[]),
+    };
+    let mut command = Command::new(program);
+    command.args(["resume", id]);
+    let mode = engine_mode(options.approval_mode.as_deref().unwrap_or_default());
+    if mode == "full-auto" {
+        command.arg("--dangerously-bypass-approvals-and-sandbox");
+    } else {
+        let (approval, sandbox) = policy(mode);
+        command.args(["-a", approval, "-s", sandbox_mode(&sandbox)]);
+    }
+    if let Some(model) = &options.model {
+        command.args(["-m", model]);
+    }
+    command
+}
+
 /// The provider a gateway session configures (see `use_gateway`).
 const GATEWAY_PROVIDER: &str = "jucode_gateway";
 

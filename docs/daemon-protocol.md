@@ -545,6 +545,30 @@ PowerShell on Windows, with the daemon's environment plus
 `TERM=xterm-256color`, `COLORTERM=truecolor` and `LANG=en_US.UTF-8` when
 `LANG` is unset.
 
+### A conversation in its TUI
+
+`{"op":"session_tui","session":"<id>","cols":120,"rows":40}` moves a
+claude, codex or jucode conversation from the client's chat view into the
+engine's own terminal interface, on a pty of the daemon. The reply is
+`term_opened`; the terminal then works like one from `term_open` (only the
+requesting client gets its output and may type into it, `term_close` ends
+it). It is refused while a turn runs, for an ACP engine, and for an agent's
+session.
+
+The engine process stops first and the TUI resumes the same conversation
+(`claude --resume <id>`, `codex resume <id>`, jucode's `/resume <id>`) with
+the session's approval mode and model; under the gateway it gets its own
+key. Every client of the session gets
+`{"type":"surface","session":"<id>","surface":"tui","term":"t-…","client":1}`.
+While the TUI runs, ops on the session other than `snapshot` are errors.
+
+When the TUI exits (the user quits it, or `term_close`) the engine starts
+again on the conversation, now including the turns typed in the TUI, and
+the session publishes `{"type":"surface","session":"<id>","surface":"gui"}`
+and a fresh `transcript`. Variables that would mark the TUI as a nested
+Claude Code session (`CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`, …) are
+removed so it saves its transcript.
+
 ## Requirements
 
 A requirement is what the user means to get done: their words (`text`),

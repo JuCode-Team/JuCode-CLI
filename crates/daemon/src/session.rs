@@ -116,6 +116,10 @@ fn run(hub: &Hub, mut core: AgentCore, id: &str, ops: Receiver<Value>) {
     loop {
         loop {
             match ops.try_recv() {
+                Ok(op) if op["op"] == "tui" => match terminal(hub, core, id, &op, &ops) {
+                    Some(next) => core = next,
+                    None => return,
+                },
                 Ok(op) => {
                     if apply(hub, &mut core, id, &op) {
                         return;
@@ -141,6 +145,94 @@ fn run(hub: &Hub, mut core: AgentCore, id: &str, ops: Receiver<Value>) {
             last_status = Some(status);
         }
         thread::sleep(Duration::from_millis(30));
+    }
+}
+
+/// The conversation in the jucode TUI, on a terminal for the client that
+/// asked: the engine here lets go of the session while the TUI has it, and
+/// opens it again once the TUI exits. None when the session should stop.
+fn terminal(
+    hub: &Hub,
+    core: AgentCore,
+    id: &str,
+    request: &Value,
+    ops: &Receiver<Value>,
+) -> Option<AgentCore> {
+    let client = request["client"].as_u64().unwrap_or(0);
+    let refuse = |message: String| {
+        let mut error = json!({ "type": "error", "message": message });
+        if !request["id"].is_null() {
+            error["id"] = request["id"].clone();
+        }
+        hub.send_to(client, &error);
+    };
+    if hub.is_busy(id) {
+        refuse("the running turn must end first".to_string());
+        return Some(core);
+    }
+    // An agent's session runs as the agent set it up (tools, sandbox).
+    let agent = hub
+        .store
+        .sessions()
+        .into_iter()
+        .any(|r| r.id == id && r.agent.is_some());
+    // The jucode TUI is this binary, or the one JUCODE_BIN names.
+    let exe = std::env::var_os("JUCODE_BIN")
+        .map(std::path::PathBuf::from)
+        .map_or_else(std::env::current_exe, Ok);
+    let (Some(arc), Ok(exe), false) = (hub.handle(), exe, agent) else {
+        refuse("this session cannot open in the terminal".to_string());
+        return Some(core);
+    };
+    let cwd = core.cwd().to_path_buf();
+    // Lets go of the session, its lock with it.
+    drop(core);
+    let (exit_hub, exit_session) = (Arc::clone(&arc), id.to_string());
+    let on_exit: Box<dyn FnOnce() + Send> = Box::new(move || {
+        let _ = exit_hub.forward(&exit_session, json!({ "op": "tui_exit" }));
+    });
+    let tui = crate::terminal::tui(&std::process::Command::new(exe), &cwd);
+    match crate::terminal::open_command(&arc, client, request, tui, Some(on_exit)) {
+        Ok(term) => {
+            crate::terminal::type_in(hub, &term, format!("/resume {id}\r").as_bytes());
+            let surface = json!({ "type": "surface", "surface": "tui", "term": term, "client": client, "session": id });
+            hub.broadcast(&surface);
+            loop {
+                let Ok(op) = ops.recv() else {
+                    crate::terminal::kill(hub, &term);
+                    return None;
+                };
+                match op["op"].as_str().unwrap_or_default() {
+                    "tui_exit" => break,
+                    "shutdown" => {
+                        crate::terminal::kill(hub, &term);
+                        return None;
+                    }
+                    "snapshot" => {
+                        if let Some(watcher) = op["client"].as_u64() {
+                            hub.send_to(watcher, &surface);
+                        }
+                    }
+                    "set_attended" => {}
+                    _ => hub.broadcast(&json!({ "type": "error", "session": id, "message": "the conversation is open in its terminal: exit the TUI to continue here" })),
+                }
+            }
+        }
+        Err(error) => refuse(error),
+    }
+    match open(&arc, cwd, Some(id), None) {
+        Ok(core) => {
+            hub.broadcast(&json!({ "type": "surface", "surface": "gui", "session": id }));
+            for event in core.state_events() {
+                publish(hub, id, event);
+            }
+            publish(hub, id, core.transcript_event());
+            Some(core)
+        }
+        Err(error) => {
+            hub.broadcast(&json!({ "type": "error", "session": id, "message": error }));
+            None
+        }
     }
 }
 

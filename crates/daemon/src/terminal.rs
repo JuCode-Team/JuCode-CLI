@@ -1,6 +1,7 @@
-//! Remote terminals: the user's login shell on a pty, in a known directory.
-//! A terminal belongs to the client that opened it: only that client may
-//! use it or sees its output, and it is killed when that client goes.
+//! Remote terminals: the user's login shell on a pty, in a known directory,
+//! or a session's own TUI (see `open_command`). A terminal belongs to the
+//! client that opened it: only that client may use it or sees its output,
+//! and it is killed when that client goes.
 
 use crate::{
     files,
@@ -102,6 +103,18 @@ fn open(hub: &Arc<Hub>, client: u64, op: &Value) -> Result<Value, String> {
     if !cwd.is_dir() {
         return Err(format!("not a directory: {}", cwd.display()));
     }
+    open_command(hub, client, op, shell(&cwd), None).map(|_| Value::Null)
+}
+
+/// A terminal running `command` for `client`, replying `term_opened` (with
+/// `op`'s id) before any output; `on_exit` runs once it has exited. Its id.
+pub fn open_command(
+    hub: &Arc<Hub>,
+    client: u64,
+    op: &Value,
+    command: CommandBuilder,
+    on_exit: Option<Box<dyn FnOnce() + Send>>,
+) -> Result<String, String> {
     // Held until the terminal is listed: keeps the cap exact, and its
     // thread cannot unlist it before that.
     let mut open = lock(&hub.terminals.open);
@@ -118,7 +131,7 @@ fn open(hub: &Arc<Hub>, client: u64, op: &Value) -> Result<Value, String> {
         .map_err(|error| error.to_string())?;
     let child = pair
         .slave
-        .spawn_command(shell(&cwd))
+        .spawn_command(command)
         .map_err(|error| error.to_string())?;
     // The pty reads end of file once the shell's side is closed.
     drop(pair.slave);
@@ -154,9 +167,14 @@ fn open(hub: &Arc<Hub>, client: u64, op: &Value) -> Result<Value, String> {
     let output = events.clone();
     thread::spawn(move || read(reader, output));
     let (pumping, term) = (Arc::clone(hub), id.clone());
-    thread::spawn(move || pump(&pumping, client, &term, child, received));
+    thread::spawn(move || {
+        pump(&pumping, client, &term, child, received);
+        if let Some(on_exit) = on_exit {
+            on_exit();
+        }
+    });
     open.insert(
-        id,
+        id.clone(),
         Terminal {
             client,
             master: pair.master,
@@ -164,7 +182,41 @@ fn open(hub: &Arc<Hub>, client: u64, op: &Value) -> Result<Value, String> {
             events,
         },
     );
-    Ok(Value::Null)
+    Ok(id)
+}
+
+/// Types `data` into terminal `id` (a TUI's first command).
+pub fn type_in(hub: &Hub, id: &str, data: &[u8]) {
+    if let Some(terminal) = lock(&hub.terminals.open).get(id) {
+        let _ = terminal.input.send(data.to_vec());
+    }
+}
+
+/// Kills terminal `id` (its exit still follows).
+pub fn kill(hub: &Hub, id: &str) {
+    if let Some(terminal) = lock(&hub.terminals.open).get(id) {
+        let _ = terminal.events.send(Event::Close);
+    }
+}
+
+/// `command` (an engine's TUI) on a pty: its program, arguments and
+/// environment, in `cwd`, with the terminal variables a shell gets.
+pub fn tui(command: &std::process::Command, cwd: &Path) -> CommandBuilder {
+    let mut builder = CommandBuilder::new(command.get_program());
+    builder.args(command.get_args());
+    for (name, value) in command.get_envs() {
+        match value {
+            Some(value) => builder.env(name, value),
+            None => builder.env_remove(name),
+        }
+    }
+    builder.cwd(cwd);
+    builder.env("TERM", "xterm-256color");
+    builder.env("COLORTERM", "truecolor");
+    if builder.get_env("LANG").is_none() {
+        builder.env("LANG", "en_US.UTF-8");
+    }
+    builder
 }
 
 /// The user's login shell in `cwd`, with the daemon's environment.

@@ -728,6 +728,16 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 json!({ "type": "mcp_saved" })
             })
         }
+        // The session's engine stops and its own TUI runs on a terminal for
+        // this client; the engine resumes when the TUI exits.
+        ("session_tui", Some(session)) => hub
+            .forward(
+                &session,
+                json!({ "op": "tui", "client": client, "id": op["id"], "cols": op["cols"], "rows": op["rows"] }),
+            )
+            .map(|()| Value::Null),
+        // Ops the daemon sends a session itself.
+        ("tui" | "tui_exit", Some(_)) => Err(format!("{name} is not a client op")),
         (_, Some(session)) => hub.forward(&session, op.clone()).map(|()| Value::Null),
         (name, None) => Err(format!("{name} requires session")),
     };

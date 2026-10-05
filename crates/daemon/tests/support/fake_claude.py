@@ -30,6 +30,21 @@ def read():
     line = sys.stdin.readline()
     return json.loads(line) if line else None
 
+# Without --print it stands in for Claude Code's TUI: each line typed is a
+# turn saved to the conversation, until "exit".
+if "--print" not in args:
+    out_line = lambda text: (sys.stdout.write(text + "\r\n"), sys.stdout.flush())
+    out_line("TUI " + session)
+    for line in sys.stdin:
+        line = line.strip()
+        if line == "exit":
+            break
+        if line:
+            save("user", line)
+            save("assistant", "tui: " + line)
+            out_line("tui: " + line)
+    sys.exit(0)
+
 while True:
     frame = read()
     if frame is None:

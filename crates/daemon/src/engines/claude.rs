@@ -163,6 +163,48 @@ pub fn command(id: &str, options: &Options) -> Command {
     command
 }
 
+/// Claude Code's own TUI resuming conversation `id`, in the session's
+/// permission mode and model (for the GUI ⇄ TUI handoff).
+pub fn tui(id: &str, options: &Options) -> Command {
+    let program = match &options.bin {
+        Some(bin) => PathBuf::from(bin),
+        None => resolve(
+            "claude",
+            "CLAUDE_BIN",
+            &[home().join(".claude").join("local").join("claude")],
+        ),
+    };
+    let mut command = Command::new(program);
+    command.args(["--resume", id]);
+    match to_claude_mode(options.approval_mode.as_deref().unwrap_or_default()) {
+        "bypassPermissions" => {
+            command.arg("--dangerously-skip-permissions");
+        }
+        mode => {
+            command.args(["--permission-mode", mode]);
+        }
+    }
+    if let Some(model) = &options.model {
+        command.args(["--model", model]);
+    }
+    // A daemon started from inside Claude Code inherits that session's
+    // markers; with them the TUI counts as a nested child and does not save
+    // its transcript, so turns typed there would be lost on the way back.
+    for name in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_SESSION_ATTENDED",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+        "CLAUDE_PID",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
 /// Client approval mode (jucode or Desktop names) → claude permission mode.
 pub fn to_claude_mode(mode: &str) -> &'static str {
     match mode {

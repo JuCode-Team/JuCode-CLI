@@ -1874,6 +1874,133 @@ fn turn_done(session: &str) -> impl FnMut(&Value) -> bool + '_ {
     }
 }
 
+/// Terminal output of `term` among `frames`, decoded.
+fn term_text(frames: &[Value], term: &str) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    frames
+        .iter()
+        .filter(|f| f["type"] == "term_output" && f["term"] == term)
+        .map(|f| {
+            String::from_utf8_lossy(&STANDARD.decode(f["data"].as_str().unwrap()).unwrap())
+                .to_string()
+        })
+        .collect()
+}
+
+fn type_in(client: &mut Client, term: &str, text: &str) {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    client.send(json!({ "op": "term_input", "term": term, "data": STANDARD.encode(text) }));
+}
+
+#[test]
+fn a_claude_conversation_moves_to_its_tui_and_back() {
+    let _guard = setup();
+    let log = fake_claude();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-claude-tui");
+    fs::create_dir_all(&dir).unwrap();
+    let mut desktop = Client::connect(&daemon);
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": { "approval_mode": "auto-edit" } }),
+    );
+    let session = created["session"].as_str().unwrap().to_string();
+    desktop.send(json!({ "op": "watch", "session": session }));
+    desktop.until(is_ready(&session));
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "hello" }));
+    desktop.until(turn_done(&session));
+
+    // The engine stops and Claude Code's TUI resumes the conversation.
+    let opened = request(
+        &mut desktop,
+        json!({ "op": "session_tui", "session": session, "cols": 100, "rows": 30 }),
+    );
+    assert_eq!(opened["type"], "term_opened", "{opened}");
+    let term = opened["term"].as_str().unwrap().to_string();
+    let frames = desktop.until(|f| f["session"] == session.as_str() && f["type"] == "surface");
+    assert_eq!(frames.last().unwrap()["surface"], "tui");
+    let started = format!("TUI {session}");
+    desktop.until(|f| term_text(std::slice::from_ref(f), &term).contains(&started));
+    let args = &starts(&log)[1];
+    assert!(
+        args.windows(2).any(|w| w == ["--resume", session.as_str()]),
+        "{args:?}"
+    );
+    assert!(!args.contains(&"--print".to_string()), "{args:?}");
+    // The session stays listed and open; its GUI ops wait for the TUI.
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "too soon" }));
+    desktop.until(|f| f["session"] == session.as_str() && f["type"] == "error");
+
+    type_in(&mut desktop, &term, "from the tui\n");
+    let frames =
+        desktop.until(|f| term_text(std::slice::from_ref(f), &term).contains("tui: from the tui"));
+    assert!(!frames.is_empty());
+    type_in(&mut desktop, &term, "exit\n");
+
+    // Back in the GUI: the engine resumed, with what the TUI added.
+    let frames = desktop.until(|f| f["session"] == session.as_str() && f["type"] == "transcript");
+    assert!(frames
+        .iter()
+        .any(|f| f["type"] == "surface" && f["surface"] == "gui"));
+    let transcript = frames.last().unwrap();
+    assert!(
+        transcript["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["content"] == "tui: from the tui"),
+        "{transcript}"
+    );
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "again" }));
+    let frames = desktop.until(turn_done(&session));
+    assert_eq!(claude_reply(&frames, &session), "ok: again");
+    let args = &starts(&log)[2];
+    assert!(
+        args.windows(2).any(|w| w == ["--resume", session.as_str()]),
+        "{args:?}"
+    );
+    assert!(args.contains(&"--print".to_string()));
+}
+
+#[test]
+fn a_jucode_conversation_moves_to_its_tui_and_back() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-jucode-tui");
+    fs::create_dir_all(&dir).unwrap();
+    // The jucode TUI stands in as a script echoing what it is typed.
+    let script = dir.join("tui.sh");
+    fs::write(&script, "#!/bin/sh\necho TUI\nwhile read line; do echo \"got: $line\"; [ \"$line\" = exit ] && exit 0; done\n").unwrap();
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(&script)
+        .status()
+        .unwrap();
+    std::env::set_var("JUCODE_BIN", &script);
+    let mut desktop = Client::connect(&daemon);
+    let session = desktop.create_session(&dir);
+    desktop.send(json!({ "op": "watch", "session": session }));
+    let opened = request(
+        &mut desktop,
+        json!({ "op": "session_tui", "session": session }),
+    );
+    std::env::remove_var("JUCODE_BIN");
+    let term = opened["term"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{opened}"))
+        .to_string();
+    let resume = format!("got: /resume {session}");
+    desktop.until(|f| term_text(std::slice::from_ref(f), &term).contains(&resume));
+    type_in(&mut desktop, &term, "exit\n");
+    let frames = desktop.until(|f| f["session"] == session.as_str() && f["type"] == "transcript");
+    assert!(frames
+        .iter()
+        .any(|f| f["type"] == "surface" && f["surface"] == "gui"));
+    // The engine has the session again.
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "hi" }));
+    desktop.until(ready(&session));
+}
+
 #[test]
 fn a_claude_session_runs_turns_and_shares_approvals_with_every_client() {
     let _guard = setup();

@@ -634,6 +634,11 @@ impl Hub {
     }
 
     /// Notifies the paired phones (see `push`).
+    /// This hub, for a thread that outlives the caller's borrow.
+    pub fn handle(&self) -> Option<Arc<Hub>> {
+        self.me.upgrade()
+    }
+
     pub fn notify(&self, title: &str, body: &str, tag: &str) {
         if let Some(hub) = self.me.upgrade() {
             crate::push::notify(&hub, title, body, tag);

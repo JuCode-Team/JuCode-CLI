@@ -206,11 +206,37 @@ fn adapter(kind: Kind, cwd: &Path, options: &Options) -> Box<dyn Adapter> {
 /// The engine's command, and the local gateway key it holds when it runs
 /// on the JuCode gateway (see crate::gateway).
 fn command(kind: Kind, id: &str, options: &Options) -> Result<(Command, Option<String>), String> {
-    let mut command = match kind {
+    let command = match kind {
         Kind::Claude => claude::command(id, options),
         Kind::Codex => codex::command(options),
         Kind::Acp => acp::command(options),
     };
+    with_gateway(kind, id, options, command)
+}
+
+/// The engine's own TUI resuming conversation `id` (Claude Code, Codex),
+/// configured as its GUI process is: environment and gateway.
+fn tui_command(
+    kind: Kind,
+    id: &str,
+    options: &Options,
+) -> Result<(Command, Option<String>), String> {
+    let command = match kind {
+        Kind::Claude => claude::tui(id, options),
+        Kind::Codex => codex::tui(id, options),
+        Kind::Acp => return Err("an ACP agent has no TUI here".to_string()),
+    };
+    with_gateway(kind, id, options, command)
+}
+
+/// `command` with the session's environment, and on the JuCode gateway when
+/// it runs there: with the local gateway key it holds.
+fn with_gateway(
+    kind: Kind,
+    id: &str,
+    options: &Options,
+    mut command: Command,
+) -> Result<(Command, Option<String>), String> {
     command.envs(options.env.iter().map(|(name, value)| (name, value)));
     if options.gateway != Some(true) {
         return Ok((command, None));
@@ -521,6 +547,7 @@ pub fn spawn(
             restart: None,
             pending_mode: None,
             gateway_key,
+            tui_request: None,
         };
         session.snapshot.seed(transcript);
         // A resumed conversation is ready once the engine has opened it.
@@ -571,6 +598,8 @@ struct Session<'a> {
     pending_mode: Option<String>,
     /// The engine's local gateway key (gateway sessions).
     gateway_key: Option<String>,
+    /// A client asked for the conversation in the engine's own TUI.
+    tui_request: Option<Value>,
 }
 
 impl Drop for Session<'_> {
@@ -609,6 +638,8 @@ impl Session<'_> {
     fn run(&mut self, mut process: Process, options: Options, ops: Receiver<Value>) {
         let mut adapter = adapter(self.kind, &self.cwd, &options);
         process.write(adapter.start());
+        // What the process runs as now (a restart changes it).
+        let mut current = options.clone();
         loop {
             loop {
                 match ops.try_recv() {
@@ -686,6 +717,7 @@ impl Session<'_> {
                     next.env = options.env.clone();
                     next.gateway = next.gateway.or(options.gateway);
                     next.approval_mode = next.approval_mode.or(options.approval_mode.clone());
+                    current = next.clone();
                     process.stop();
                     let id = self.id.clone().unwrap_or_default();
                     if let Some(key) = self.gateway_key.take() {
@@ -707,6 +739,154 @@ impl Session<'_> {
                     }
                 }
             }
+            if let Some(request) = self.tui_request.take() {
+                if busy {
+                    self.refuse(&request, "the running turn must end first".to_string());
+                } else {
+                    let keep = adapter.keep(current.clone());
+                    if let Some(tui) = self.tui_for(adapter.as_ref(), &keep, &request) {
+                        process.stop();
+                        match self.terminal(tui, keep, &request, &ops) {
+                            Some((started, next, options)) => {
+                                process = started;
+                                adapter = next;
+                                current = options;
+                            }
+                            None => return,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Answers a TUI request with an error, to the client that made it.
+    fn refuse(&self, request: &Value, message: String) {
+        let mut error = json!({ "type": "error", "message": message });
+        if !request["id"].is_null() {
+            error["id"] = request["id"].clone();
+        }
+        self.hub
+            .send_to(request["client"].as_u64().unwrap_or(0), &error);
+    }
+
+    /// The TUI command for a request: the conversation and the engine's own
+    /// TUI resuming it, with the local gateway key it holds. None (the
+    /// client told why) leaves the engine running.
+    fn tui_for(
+        &self,
+        adapter: &dyn Adapter,
+        options: &Options,
+        request: &Value,
+    ) -> Option<(String, Command, Option<String>)> {
+        let Some(id) = adapter.conversation().or(self.id.clone()) else {
+            self.refuse(request, "the conversation has not started yet".to_string());
+            return None;
+        };
+        match tui_command(self.kind, &id, options) {
+            Ok((tui, key)) => Some((id, tui, key)),
+            Err(error) => {
+                self.refuse(request, error);
+                None
+            }
+        }
+    }
+
+    /// The conversation in its engine's own TUI, on a terminal for the
+    /// client that asked, its engine stopped (one process per conversation);
+    /// the engine starts again, resuming, once the TUI exits, and clients see
+    /// `surface` change and the conversation as the TUI left it. None when
+    /// the session should stop.
+    fn terminal(
+        &mut self,
+        (id, tui, tui_key): (String, Command, Option<String>),
+        options: Options,
+        request: &Value,
+        ops: &Receiver<Value>,
+    ) -> Option<(Process, Box<dyn Adapter>, Options)> {
+        let client = request["client"].as_u64().unwrap_or(0);
+        let hub = self.hub.handle()?;
+        if let Some(key) = self.gateway_key.take() {
+            release_key(self.kind, &key);
+        }
+        let session = self.id.clone().unwrap_or_default();
+        let (exit_hub, exit_session) = (Arc::clone(&hub), session.clone());
+        let on_exit: Box<dyn FnOnce() + Send> = Box::new(move || {
+            let _ = exit_hub.forward(&exit_session, json!({ "op": "tui_exit" }));
+        });
+        let opened = crate::terminal::open_command(
+            &hub,
+            client,
+            request,
+            crate::terminal::tui(&tui, &self.cwd),
+            Some(on_exit),
+        );
+        match opened {
+            Ok(term) => {
+                self.hub.set_busy(&session, false);
+                self.publish(vec![
+                    json!({ "type": "surface", "surface": "tui", "term": term, "client": client }),
+                ]);
+                loop {
+                    let Ok(op) = ops.recv() else {
+                        crate::terminal::kill(self.hub, &term);
+                        return None;
+                    };
+                    match op["op"].as_str().unwrap_or_default() {
+                        "tui_exit" => break,
+                        "shutdown" => {
+                            crate::terminal::kill(self.hub, &term);
+                            if let Some(key) = &tui_key {
+                                release_key(self.kind, key);
+                            }
+                            return None;
+                        }
+                        "snapshot" => {
+                            if let Some(watcher) = op["client"].as_u64() {
+                                let mut events = self.snapshot.events(false);
+                                events.push(json!({ "type": "surface", "surface": "tui", "term": term, "client": client }));
+                                for event in events {
+                                    self.hub.send_to(watcher, &self.tagged(event));
+                                }
+                            }
+                        }
+                        "set_attended" => {}
+                        _ => self.publish(vec![json!({ "type": "error", "message": "the conversation is open in its terminal: exit the TUI to continue here" })]),
+                    }
+                }
+            }
+            Err(error) => self.refuse(request, error),
+        }
+        if let Some(key) = tui_key {
+            release_key(self.kind, &key);
+        }
+        // Back to the engine, on the conversation as the TUI left it.
+        let next = Options {
+            resume: Some(id.clone()),
+            resume_at: None,
+            ..options
+        };
+        let started = self::command(self.kind, &id, &next).and_then(|(command, key)| {
+            self.gateway_key = key;
+            Process::spawn(command, &self.cwd)
+        });
+        match started {
+            Ok(started) => {
+                let mut engine = self::adapter(self.kind, &self.cwd, &next);
+                started.write(engine.start());
+                let mut events = vec![json!({ "type": "surface", "surface": "gui" })];
+                // Codex replays its thread when it resumes; Claude Code's
+                // conversation is read from its file.
+                if self.kind == Kind::Claude {
+                    events.push(json!({ "type": "transcript", "items": claude::transcript(&self.cwd, &id) }));
+                }
+                self.publish(events);
+                Some((started, engine, next))
+            }
+            Err(error) => {
+                self.publish(vec![json!({ "type": "error", "message": error })]);
+                None
+            }
         }
     }
 
@@ -718,6 +898,10 @@ impl Session<'_> {
             }
         }
         match op["op"].as_str().unwrap_or_default() {
+            "tui" => {
+                self.tui_request = Some(op.clone());
+                false
+            }
             "snapshot" => {
                 if let Some(client) = op["client"].as_u64() {
                     for event in self.snapshot.events(adapter.busy()) {
