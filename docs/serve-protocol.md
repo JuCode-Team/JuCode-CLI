@@ -193,7 +193,7 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `type` | Fields | Meaning |
 | --- | --- | --- |
 | `startup` | `version`, `session_id`, `profile_dir`, `config_path`, `cwd`, `model`, `context_window` | First event; identifies the session. |
-| `model_status` | `provider`, `model`, `reasoning_effort`, `context_window`, `context_limit`, `max_output_tokens`, `reasoning_efforts`, `state` | Current model selection; deduplicated, re-emitted on change. |
+| `model_status` | `provider`, `model`, `reasoning_effort`, `context_window`, `context_limit`, `max_output_tokens`, `reasoning_efforts`, `state` | Current model selection; deduplicated, re-emitted on change. Claude Code sessions add their own fields (`docs/daemon-protocol.md` → Other engines). |
 | `command_list` | `commands: [{command, marker, args, description}]` | Available slash commands incl. custom and MCP prompt commands. |
 | `approval_mode` | `mode` | Current approval mode; emitted at startup and on change. |
 | `mcp_servers` | `servers: [{name, transport, state, tools, error?}]` | MCP server states; `state` ∈ `connecting`/`connected`/`failed`/`disabled`. |

@@ -422,6 +422,17 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 if let Some(group) = op["group"].as_str() {
                     gateway::set_group(&session, Some(group));
                 }
+                // Claude Code keeps the name too, for `claude --resume`.
+                if let Some(title) = op["title"].as_str().map(str::trim).filter(|t| !t.is_empty()) {
+                    let claude = hub
+                        .store
+                        .sessions()
+                        .iter()
+                        .any(|r| r.id == session && r.engine.as_deref() == Some("claude"));
+                    if claude {
+                        let _ = hub.forward(&session, json!({ "op": "rename", "title": title }));
+                    }
+                }
                 hub.broadcast(&hub.sessions_json());
                 Ok(Value::Null)
             }

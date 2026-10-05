@@ -1040,6 +1040,11 @@ impl Hub {
         if event["type"] == "user_message" {
             self.note_user_message(session, event["content"].as_str().unwrap_or_default());
         }
+        // A name the session has in Claude Code (given there, or the one we
+        // gave it) is the user's.
+        if event["type"] == "session_title" {
+            self.adopt_engine_title(session, event["title"].as_str().unwrap_or_default());
+        }
         let (due, ended, failed) = {
             let mut turns = lock(&self.turns);
             let turns = turns.entry(session.to_string()).or_default();
@@ -1204,6 +1209,25 @@ impl Hub {
                 hub.broadcast(&hub.sessions_json());
             }
         });
+    }
+
+    fn adopt_engine_title(&self, session: &str, title: &str) {
+        let title = title.trim();
+        let current = self
+            .store
+            .sessions()
+            .into_iter()
+            .find(|record| record.id == session)
+            .and_then(|record| record.title);
+        if title.is_empty() || current.as_deref() == Some(title) {
+            return;
+        }
+        if let Ok(true) = self
+            .store
+            .record_session_meta(session, &json!({ "title": title }))
+        {
+            self.broadcast(&self.sessions_json());
+        }
     }
 
     /// The session's record when its title is ours to write (none yet, or

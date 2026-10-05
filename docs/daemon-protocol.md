@@ -231,6 +231,7 @@ clients need nothing engine-specific. `options`:
 | `approval_mode` | `manual`/`read-only` (Claude's `default`), `plan`, `auto`, `auto-edit`, `full-access`/`full-auto` |
 | `model` | Model to start with |
 | `resume_at` | Claude Code: resume the conversation as it was at this assistant message uuid |
+| `effort`, `ultracode`, `fast`, `thinking` | Claude Code: start with this thinking effort, ultracode on, fast mode on, thinking summaries shown (`false` hides them). A restart (full access, gateway switch) keeps the session's own |
 | `jucode_gateway` | Claude Code / Codex: `true` runs this session through the JuCode gateway on the user's JuCode login; `false` on the provider in the user's own Claude Code / Codex config. The endpoint and key go to this process only (Claude: `--settings` file; Codex: `-c` overrides and an env var), never to the user's config files. Omitted on `session_open`: as the session last ran |
 | `command`, `args` | ACP: the agent's command line |
 | `bin` | Claude Code / Codex: the engine binary to run instead of the one found on `PATH` |
@@ -264,9 +265,45 @@ Differences from a jucode session:
   conversation (it only honors that mode as a start flag), after the running
   turn. Codex applies a new mode, and a model picked with `/model`, from the
   next turn.
-- `steer`, `decide_action`, MCP ops and the jucode-only commands (`/resume`,
-  `/rewind`, `/tree`, ...) are refused with an `error` event. Other slash
-  commands go to Claude Code as a user message, as Claude Code expects.
+- `steer`, `decide_action`, `mcp_set`/`mcp_remove` and the jucode-only
+  commands (`/resume`, `/rewind`, `/tree`, ...) are refused with an `error`
+  event. Other slash commands go to Claude Code as a user message, as Claude
+  Code expects.
+
+Claude Code sessions take more:
+
+| Op / command | Does | Answered by |
+| --- | --- | --- |
+| `/effort ultracode [on\|off]`, `/fast [on\|off]`, `/thinking [on\|off]` | Ultracode (standing multi-agent Workflow orchestration), fast mode, thinking summaries | `model_status` with `ultracode`, `ultracode_available`, `fast`, `fast_state`, `fast_available`, `thinking_summaries`; a refused fast mode also an `info` |
+| `/btw <question>` | A side question, answered from the conversation without tools and never added to it | `side_answer` with `question` and `answer` or `error` |
+| `stop_task` `task_id` | Stops a background task | `background_tasks`, then `task_done` |
+| `task_output` `task_id` | A background shell's or Monitor's output, its last 8 KiB | `task_output` with `task_id`, `output`, `truncated` (or `error`) |
+| `mcp_list`, `mcp_toggle` `name` `enabled`, `mcp_reconnect` `name` | Claude Code's own MCP servers, for this session | `mcp_servers` |
+| `agent_runs` | The agent trace: every Workflow and Task subagent of the conversation, live ones and those Claude Code saved before this process | `agent_runs` (below) |
+| `subagent_transcript` `agent_id` | One subagent's own conversation, read from the file Claude Code keeps for it | `subagent_transcript` with `agent_id` and `items` (`user`/`assistant`/`reasoning` with `content`; `tool` with `call_id`, `name`, `output`, `is_error`, `running`; the newest 600), or `error` |
+| `permission_rules` | The rules in effect, as `/permissions` lists them | `permission_rules` with `rules: [{behavior, source, rule, editability}]`, `directories` |
+| `approve` with `always_scope` | `project` saves the always-allow rule to the project's `.claude/settings.local.json`, `user` to `~/.claude/settings.json`; the session otherwise | — |
+
+And sends more events: `background_tasks` (`tasks: [{id, kind,
+description}]`, the live set: replace yours), `task_progress` (`task_id`,
+`message`), `task_done` (`task_id`, `kind`, `status`, `summary`: a background
+task ended; its `<task-notification>` message is not echoed as a
+`user_message`), `subagent_lifecycle` with a `label` (Task subagents, by task
+id) and `tool_start` with `subagent` (the subagent that made the call),
+`retrying` (API retries), `model_fallback` (`from`, `to`, `reason`),
+`prompt_suggestion` (`text`, the likely next prompt), `agent_runs`
+(`workflows: [{id, tool_use_id, name, description, status, started_at,
+duration_ms, tokens, tool_calls, phases: [{index, title}], agents: [{id,
+label, phase, model, state, started_at, duration_ms, tokens, tool_calls,
+prompt, result, error}]}]`, `agents: [{id, label, type, tool_use_id, status,
+model, started_at, duration_ms, tokens, tool_calls}]`; sent whenever a run
+changes, and part of a watcher's snapshot), and `approval_request`
+named `mcp_elicitation` for an MCP server's question (`url` to open, or
+`questions` from its form; answered with `approve` and `answers`). Images
+attached to a `user_message` go as image blocks (files over 3.75 MB as a path
+to Read). A session's name is shared both ways: a `session_meta` title is
+sent to Claude Code (`claude --resume` lists it), and a name Claude Code
+has for the session becomes its title.
 
 ## Agents
 

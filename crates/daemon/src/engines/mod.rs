@@ -77,6 +77,14 @@ pub struct Options {
     /// instead of the provider in their own config (which stays untouched).
     /// None: as the session last ran.
     pub gateway: Option<bool>,
+    /// Claude: start with ultracode on (standing Workflow orchestration).
+    pub ultracode: bool,
+    /// Claude: the thinking effort to start with.
+    pub effort: Option<String>,
+    /// Claude: start in fast mode.
+    pub fast: bool,
+    /// Claude: show thinking summaries (Some(false) hides them).
+    pub thinking: Option<bool>,
 }
 
 impl Options {
@@ -108,6 +116,10 @@ impl Options {
                 .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
                 .collect(),
             gateway: value["jucode_gateway"].as_bool(),
+            ultracode: value["ultracode"] == true,
+            effort: text("effort"),
+            fast: value["fast"] == true,
+            thinking: value["thinking"].as_bool(),
         }
     }
 
@@ -168,6 +180,11 @@ pub trait Adapter: Send {
     fn restart_for(&self, op: &Value) -> Option<Options>;
     /// The engine's conversation id, for resuming it.
     fn conversation(&self) -> Option<String>;
+    /// The session settings a restart keeps (Claude: effort, ultracode,
+    /// fast mode, thinking display).
+    fn keep(&self, options: Options) -> Options {
+        options
+    }
     /// The approval mode it runs in now (client names), kept across a restart.
     fn approval_mode(&self) -> Option<String> {
         None
@@ -180,7 +197,7 @@ pub trait Adapter: Send {
 
 fn adapter(kind: Kind, cwd: &Path, options: &Options) -> Box<dyn Adapter> {
     match kind {
-        Kind::Claude => Box::new(claude::Claude::new(options)),
+        Kind::Claude => Box::new(claude::Claude::new(options).at(cwd)),
         Kind::Codex => Box::new(codex::Codex::new(cwd, options)),
         Kind::Acp => Box::new(acp::Acp::new(cwd)),
     }
@@ -354,6 +371,8 @@ const STATE_EVENTS: &[&str] = &[
     "approval_mode",
     "approval_mode_pending",
     "mcp_servers",
+    "background_tasks",
+    "agent_runs",
     "plan",
     "rate_limit",
     "plan_usage",
@@ -723,15 +742,17 @@ impl Session<'_> {
                     self.publish(vec![json!({ "type": "error", "message": "an ACP agent has no JuCode gateway mode" })]);
                     return false;
                 }
-                self.restart = Some(Options {
-                    gateway: Some(gateway),
-                    model: op["model"]
-                        .as_str()
-                        .filter(|m| !m.is_empty())
-                        .map(str::to_string),
-                    approval_mode: adapter.approval_mode(),
-                    ..Options::default()
-                });
+                self.restart = Some(
+                    adapter.keep(Options {
+                        gateway: Some(gateway),
+                        model: op["model"]
+                            .as_str()
+                            .filter(|m| !m.is_empty())
+                            .map(str::to_string),
+                        approval_mode: adapter.approval_mode(),
+                        ..Options::default()
+                    }),
+                );
                 if let Some(id) = &self.id {
                     let _ = self
                         .hub
