@@ -163,6 +163,7 @@ fn apply(hub: &Hub, core: &mut AgentCore, id: &str, op: &Value) -> bool {
             let _ = hub.store.record_decided(action, decision == "allow");
         }
     }
+    hub.note_sent_images(id, op);
     let (quit, events) = protocol::apply_op(core, op);
     if op["claimed"] == true {
         hub.release_claim(id);
@@ -227,6 +228,7 @@ fn publish_on(hub: &Hub, id: &str, event: AgentEvent, turn: Option<String>) {
         AgentEvent::ActionDeferred(_) | AgentEvent::ActionDecided { .. }
     );
     let mut json = session_event_json(id, event);
+    hub.attach_sent_images(id, &mut json);
     if let Some(turn) = turn {
         json["turn"] = json!(turn);
     }

@@ -396,8 +396,11 @@ impl Snapshot {
             }
             "user_message" => {
                 self.in_reply = false;
-                self.transcript
-                    .push(json!({ "role": "user", "content": event["content"] }));
+                let mut item = json!({ "role": "user", "content": event["content"] });
+                if event["images"].is_array() {
+                    item["images"] = event["images"].clone();
+                }
+                self.transcript.push(item);
             }
             "assistant_start" => {
                 self.in_reply = true;
@@ -784,6 +787,9 @@ impl Session<'_> {
                         self.snapshot.answered(call);
                     }
                 }
+                if let Some(id) = &self.id {
+                    self.hub.note_sent_images(id, op);
+                }
                 match adapter.encode(op) {
                     Ok(output) => {
                         process.write(output.frames);
@@ -879,7 +885,10 @@ impl Session<'_> {
     }
 
     fn publish(&mut self, events: Vec<Value>) {
-        for event in events {
+        for mut event in events {
+            if let Some(id) = &self.id {
+                self.hub.attach_sent_images(id, &mut event);
+            }
             if event["type"] == "error" {
                 self.last_error = event["message"].as_str().map(str::to_string);
             }

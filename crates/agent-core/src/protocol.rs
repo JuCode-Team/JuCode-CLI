@@ -410,6 +410,9 @@ pub fn event_json(event: AgentEvent) -> Value {
             "type": "transcript",
             "items": items.into_iter().map(|item| match item {
                 crate::TranscriptItem::User(content) => json!({ "role": "user", "content": content }),
+                crate::TranscriptItem::UserWithImages { content, images } => {
+                    json!({ "role": "user", "content": content, "images": images })
+                }
                 crate::TranscriptItem::Assistant(content) => json!({ "role": "assistant", "content": content }),
                 crate::TranscriptItem::Tool { name, output } => json!({ "role": "tool", "name": name, "output": output }),
                 crate::TranscriptItem::Branch(label) => json!({ "role": "branch", "label": label }),

@@ -68,6 +68,9 @@ pub struct Hub {
     /// Sessions created here that have not had a user message yet: the
     /// first one becomes their title.
     untitled: Mutex<HashSet<String>>,
+    /// Images sent with a message, by session and the message's text, until
+    /// the engine echoes it: no engine's `user_message` carries them.
+    sent_images: Mutex<HashMap<String, Vec<(String, Value)>>>,
     /// Each session's conversation so far, for its model-written title.
     turns: Mutex<HashMap<String, Turns>>,
     /// Sessions whose title is being written now.
@@ -143,6 +146,7 @@ impl Hub {
             pairings: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
             untitled: Mutex::new(HashSet::new()),
+            sent_images: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1238,6 +1242,33 @@ impl Hub {
             .into_iter()
             .find(|record| record.id == session)
             .filter(|record| record.title.is_none() || record.title_auto)
+    }
+
+    /// A `user_message` op with images: its echo will show them.
+    pub fn note_sent_images(&self, session: &str, op: &Value) {
+        if op["op"] == "user_message" && op["images"].as_array().is_some_and(|i| !i.is_empty()) {
+            let text = op["content"].as_str().unwrap_or_default().to_string();
+            lock(&self.sent_images)
+                .entry(session.to_string())
+                .or_default()
+                .push((text, op["images"].clone()));
+        }
+    }
+
+    /// The images of the message a `user_message` event echoes, so every
+    /// client (the remote page too) shows them.
+    pub fn attach_sent_images(&self, session: &str, event: &mut Value) {
+        if event["type"] != "user_message" || !event["images"].is_null() {
+            return;
+        }
+        let text = event["content"].as_str().unwrap_or_default();
+        let mut sent = lock(&self.sent_images);
+        let Some(list) = sent.get_mut(session) else {
+            return;
+        };
+        if let Some(at) = list.iter().position(|(t, _)| t == text) {
+            event["images"] = list.remove(at).1;
+        }
     }
 
     /// A session accepted a user message: a new session is titled after

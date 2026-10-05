@@ -84,8 +84,16 @@ pub struct PlanItem {
 #[derive(Debug, Clone)]
 pub enum TranscriptItem {
     User(String),
+    /// A user message with the images attached to it.
+    UserWithImages {
+        content: String,
+        images: Vec<String>,
+    },
     Assistant(String),
-    Tool { name: String, output: String },
+    Tool {
+        name: String,
+        output: String,
+    },
     Branch(String),
 }
 

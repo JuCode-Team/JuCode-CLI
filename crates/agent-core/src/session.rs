@@ -763,36 +763,56 @@ impl SessionStore {
     }
 
     pub fn transcript_items(&self) -> Vec<TranscriptItem> {
-        self.branch()
-            .into_iter()
-            .filter_map(|entry| match &entry.kind {
-                EntryKind::Branch { label } => Some(TranscriptItem::Branch(label.clone())),
-                EntryKind::User { content } => Some(TranscriptItem::User(content.clone())),
-                EntryKind::ResponseItem { item } => {
-                    // Runtime-injected user items (reminders, subagent
-                    // messages) are never displayed live, so keep them out of
-                    // the reloaded transcript too.
-                    if item.get("type").and_then(Value::as_str) == Some("function_call")
-                        || item.get("role").and_then(Value::as_str) == Some("user")
-                    {
-                        None
-                    } else {
-                        let text = extract_response_text(item);
-                        (!text.trim().is_empty()).then_some(TranscriptItem::Assistant(text))
-                    }
+        let mut items: Vec<TranscriptItem> = Vec::new();
+        for entry in self.branch() {
+            // A message's images are recorded right after it: they belong to it.
+            if let (EntryKind::UserImage { paths }, Some(TranscriptItem::User(_))) =
+                (&entry.kind, items.last())
+            {
+                if !paths.is_empty() {
+                    let Some(TranscriptItem::User(content)) = items.pop() else {
+                        unreachable!()
+                    };
+                    items.push(TranscriptItem::UserWithImages {
+                        content,
+                        images: paths.clone(),
+                    });
                 }
-                EntryKind::ToolOutput { name, output, .. } => Some(TranscriptItem::Tool {
-                    name: name.clone(),
-                    output: output.clone(),
-                }),
-                EntryKind::UserImage { paths } => {
-                    (!paths.is_empty()).then(|| TranscriptItem::User(image_attachment_label(paths)))
+                continue;
+            }
+            items.extend(Self::transcript_item(entry));
+        }
+        items
+    }
+
+    fn transcript_item(entry: &SessionEntry) -> Option<TranscriptItem> {
+        Some(entry).and_then(|entry| match &entry.kind {
+            EntryKind::Branch { label } => Some(TranscriptItem::Branch(label.clone())),
+            EntryKind::User { content } => Some(TranscriptItem::User(content.clone())),
+            EntryKind::ResponseItem { item } => {
+                // Runtime-injected user items (reminders, subagent
+                // messages) are never displayed live, so keep them out of
+                // the reloaded transcript too.
+                if item.get("type").and_then(Value::as_str) == Some("function_call")
+                    || item.get("role").and_then(Value::as_str) == Some("user")
+                {
+                    None
+                } else {
+                    let text = extract_response_text(item);
+                    (!text.trim().is_empty()).then_some(TranscriptItem::Assistant(text))
                 }
-                EntryKind::PinnedSkill { .. } => None,
-                EntryKind::GoalContext { .. } => None,
-                EntryKind::Compaction { .. } => None,
-            })
-            .collect()
+            }
+            EntryKind::ToolOutput { name, output, .. } => Some(TranscriptItem::Tool {
+                name: name.clone(),
+                output: output.clone(),
+            }),
+            EntryKind::UserImage { paths } => {
+                (!paths.is_empty()).then(|| TranscriptItem::User(image_attachment_label(paths)))
+            }
+            EntryKind::PinnedSkill { .. } => None,
+            EntryKind::GoalContext { .. } => None,
+            EntryKind::Compaction { .. } => None,
+        })
     }
 
     // Saving must not bump `updated_at`: every content mutation already does,
@@ -2004,6 +2024,27 @@ mod tests {
         release.join().unwrap();
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_messages_images_come_with_it_in_the_transcript() {
+        let mut session = SessionStore::new();
+        session.append(EntryKind::User {
+            content: "look".to_string(),
+        });
+        session.append(EntryKind::UserImage {
+            paths: vec!["/u/a.png".to_string()],
+        });
+        session.append(EntryKind::User {
+            content: "plain".to_string(),
+        });
+        let items = session.transcript_items();
+        assert!(matches!(
+            &items[0],
+            TranscriptItem::UserWithImages { content, images } if content == "look" && images == &["/u/a.png"]
+        ));
+        assert!(matches!(&items[1], TranscriptItem::User(content) if content == "plain"));
+        assert_eq!(items.len(), 2);
     }
 
     #[test]

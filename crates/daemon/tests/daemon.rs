@@ -2413,6 +2413,49 @@ fn requirement<'a>(frame: &'a Value, id: &str) -> Option<&'a Value> {
 }
 
 #[test]
+fn a_message_shows_its_images_to_every_client() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-images");
+    fs::create_dir_all(&dir).unwrap();
+    let mut client = Client::connect(&daemon);
+    let shot = request(
+        &mut client,
+        json!({ "op": "upload", "name": "shot.png", "data": STANDARD.encode(b"png bytes"), "last": true }),
+    );
+    let shot = shot["path"].as_str().unwrap().to_string();
+    let session = client.create_session(&dir);
+    client.send(
+        json!({ "op": "user_message", "session": session, "content": "look", "images": [shot] }),
+    );
+    let frames = client.until(|f| f["session"] == session && f["type"] == "user_message");
+    assert_eq!(frames.last().unwrap()["images"], json!([shot]));
+    client.until(ready(&session));
+
+    // A client that comes later sees them in the conversation so far.
+    let mut phone = Client::connect(&daemon);
+    phone.send(json!({ "op": "watch", "session": session }));
+    let frames = phone.until(|f| f["session"] == session && f["type"] == "transcript");
+    let items = frames.last().unwrap()["items"].as_array().unwrap().clone();
+    assert!(items
+        .iter()
+        .any(|i| i["role"] == "user" && i["images"] == json!([shot])));
+
+    // The remote page reads the image itself; nothing outside is readable.
+    let image = request(&mut phone, json!({ "op": "fs_image", "path": shot }));
+    assert_eq!(
+        image["data"],
+        format!("data:image/png;base64,{}", STANDARD.encode(b"png bytes"))
+    );
+    let outside = request(
+        &mut phone,
+        json!({ "op": "fs_image", "path": daemon.state.join("token") }),
+    );
+    assert_eq!(outside["type"], "error");
+}
+
+#[test]
 fn a_requirement_follows_its_sessions_and_continues_in_them() {
     use base64::{engine::general_purpose::STANDARD, Engine};
     let _guard = setup();

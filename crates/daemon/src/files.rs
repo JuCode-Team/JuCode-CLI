@@ -18,6 +18,8 @@ use std::{
 const MAX_READ: u64 = 1024 * 1024;
 const MAX_ENTRIES: usize = 2000;
 const MAX_DIFF: usize = 1024 * 1024;
+/// Largest image sent to a client.
+const MAX_IMAGE: u64 = 16 * 1024 * 1024;
 
 pub fn handle(hub: &Hub, name: &str, op: &Value) -> Result<Value, String> {
     let path = op["path"]
@@ -38,6 +40,7 @@ pub fn handle(hub: &Hub, name: &str, op: &Value) -> Result<Value, String> {
             list(&dir, dirs_only)
         }
         "fs_read" => read(&allowed(hub, Path::new(path), false)?),
+        "fs_image" => image(hub, Path::new(path)),
         "git_status" => git_status(&allowed(hub, Path::new(path), false)?),
         "git_diff" => {
             let cwd = allowed(hub, Path::new(path), false)?;
@@ -201,6 +204,52 @@ fn read(path: &Path) -> Result<Value, String> {
         "text": if binary { Value::Null } else { json!(String::from_utf8_lossy(&bytes)) },
         "truncated": meta.len() > MAX_READ,
     }))
+}
+
+/// An image a message showed: a file in a known directory or one a client
+/// uploaded, as a data URL for the remote page (which cannot open local paths).
+fn image(hub: &Hub, path: &Path) -> Result<Value, String> {
+    let real = match allowed(hub, path, false) {
+        Ok(real) => real,
+        Err(error) => {
+            let real = path
+                .canonicalize()
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            let uploads = hub
+                .uploads
+                .dir()
+                .canonicalize()
+                .map_err(|_| error.clone())?;
+            if !real.starts_with(uploads) {
+                return Err(error);
+            }
+            real
+        }
+    };
+    let media = match real
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => return Err(format!("not an image: {}", real.display())),
+    };
+    let meta = fs::metadata(&real).map_err(|error| format!("{}: {error}", real.display()))?;
+    if meta.len() > MAX_IMAGE {
+        return Err(format!(
+            "{} is larger than {} MB",
+            real.display(),
+            MAX_IMAGE >> 20
+        ));
+    }
+    let bytes = fs::read(&real).map_err(|error| format!("{}: {error}", real.display()))?;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let data = format!("data:{media};base64,{}", STANDARD.encode(bytes));
+    Ok(json!({ "type": "fs_image", "path": real, "data": data }))
 }
 
 /// Branch and changed files (`git status --porcelain`); `repo: false`

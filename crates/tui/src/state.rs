@@ -798,6 +798,12 @@ impl TuiState {
             .into_iter()
             .map(|item| match item {
                 TranscriptItem::User(text) => ChatLine::User(text),
+                TranscriptItem::UserWithImages { content, images } => {
+                    ChatLine::User(match images.len() {
+                        1 => format!("{content}\n[image attached]"),
+                        n => format!("{content}\n[{n} images attached]"),
+                    })
+                }
                 TranscriptItem::Assistant(text) => ChatLine::Assistant(text),
                 TranscriptItem::Tool { name, output } => ChatLine::Tool {
                     call_id: None,

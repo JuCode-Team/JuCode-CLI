@@ -358,7 +358,10 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     }
     // File and git reads can take a while; they must not hold up this
     // client's other frames.
-    if matches!(name, "fs_list" | "fs_read" | "git_status" | "git_diff") {
+    if matches!(
+        name,
+        "fs_list" | "fs_read" | "fs_image" | "git_status" | "git_diff"
+    ) {
         let hub = Arc::clone(hub);
         let name = name.to_string();
         thread::spawn(move || {

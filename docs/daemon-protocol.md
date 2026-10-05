@@ -157,6 +157,7 @@ every connected client.
 | `project_remove` | `workspace`, `project` | `workspaces`; the files stay |
 | `fs_list` | `path` (`~` is the home directory), optional `dirs_only` | `fs_list` with `path`, `git`, `entries: [{name, dir, size}]`, `truncated`. Git-ignored entries and `.git` are left out |
 | `fs_read` | `path` | `fs_read` with `size`, `binary`, `text` (first 1 MiB), `truncated` |
+| `fs_image` | `path` (a png/jpeg/gif/webp in a known directory or an upload, up to 16 MiB) | `fs_image` with `data`, a data URL: how the remote page shows a message's images |
 | `git_status` | `path` | `git_status` with `repo`, `branch`, `files: [{path, status, from}]` (porcelain codes) |
 | `git_diff` | `path`, optional `file` | `git_diff` with `diff` (unified, untracked files included, first 1 MiB), `truncated` |
 | `agent_list` | — | `agents` |
@@ -496,7 +497,8 @@ so the jucode sandbox lets tools read them) and are written as `<path>.part`
 until the last chunk; parts left over and files older than 30 days are
 removed when the daemon starts. A message names them as the desktop does
 its attachments: images in `user_message`'s `images`, other files as paths
-in its text.
+in its text. The session's `user_message` event, and the user items of its
+`transcript`, carry those `images` too, whichever engine runs it.
 
 ## Terminals
 
