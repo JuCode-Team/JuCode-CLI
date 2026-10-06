@@ -127,17 +127,13 @@ pub fn command(id: &str, options: &Options) -> Command {
         "--verbose",
         "--replay-user-messages",
     ]);
+    // Without a prompt tool the CLI drops AskUserQuestion, even in full access.
+    command.args(["--permission-prompt-tool", "stdio"]);
     let mode = to_claude_mode(options.approval_mode.as_deref().unwrap_or_default());
     if mode == "bypassPermissions" {
-        // Conflicts with --permission-prompt-tool; nothing prompts anyway.
         command.arg("--dangerously-skip-permissions");
     } else {
-        command.args([
-            "--permission-prompt-tool",
-            "stdio",
-            "--permission-mode",
-            mode,
-        ]);
+        command.args(["--permission-mode", mode]);
     }
     match &options.resume {
         Some(resume) => {
@@ -2828,7 +2824,9 @@ mod tests {
             .map(|a| a.to_string_lossy().to_string())
             .collect();
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
-        assert!(!args.contains(&"--permission-prompt-tool".to_string()));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--permission-prompt-tool", "stdio"]));
         assert!(args.windows(2).any(|w| w == ["--resume", "abc"]));
     }
 
