@@ -55,6 +55,7 @@ fn open(
     resume: Option<&str>,
     agent: Option<&str>,
 ) -> Result<AgentCore, String> {
+    let dirs = crate::projects::extra_dirs(hub, &cwd);
     let mut core = AgentCore::open(cwd)
         .map_err(|error| error.to_string())?
         .with_version(hub.version);
@@ -83,6 +84,8 @@ fn open(
             session,
         ));
     }
+    // After an agent's sandbox, which replaces the default one.
+    core.add_writable_dirs(&dirs);
     Ok(core)
 }
 

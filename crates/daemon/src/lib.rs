@@ -510,13 +510,10 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             op["requirement"].as_str().unwrap_or_default(),
             op["index"].as_u64().unwrap_or(0) as usize,
         ),
-        ("requirement_prompt", _) => requirements::prompt_json(
-            hub,
-            op["requirement"].as_str().unwrap_or_default(),
-            op["text"].as_str().unwrap_or_default(),
-            op["lang"].as_str().unwrap_or_default(),
-        ),
         ("requirement_reply", _) => requirements::reply(hub, &op),
+        ("requirement_begin", _) => requirements::begin(hub, &op),
+        ("requirement_confirm", _) => requirements::confirm(hub, &op),
+        ("requirement_proposal", _) => requirements::decide_proposal(hub, &op),
         ("upload", _) => hub.uploads.receive(&op, || hub.new_id("u")),
         // A phone's browser or the Android app asks to be notified (see `push`).
         ("push_subscribe", _) => match hub.device_of(client) {
@@ -538,7 +535,7 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         ("agent_create", _) if op["agent"] == dispatch::AGENT => {
             Err(format!("the agent id {} is reserved", dispatch::AGENT))
         }
-        ("agent_create", _) => {
+        ("agent_create", _) => projects::with_project_cwd(hub, op.clone()).and_then(|op| {
             let text = |key: &str| op[key].as_str().unwrap_or_default();
             hub.agents
                 .create(
@@ -552,7 +549,7 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                     hub.broadcast(&hub.agents_json());
                     json!({ "type": "agent_created", "agent": agent.to_json() })
                 })
-        }
+        }),
         ("message_send", _) => {
             let text = |key: &str| op[key].as_str().map(str::to_string);
             match (text("agent"), text("body")) {
@@ -641,7 +638,9 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             None => Err("agent_get requires a known agent".to_string()),
         },
         ("agent_update", _) => match op["agent"].as_str() {
-            Some(id) => hub.agents.update(id, &op).map(|agent| {
+            Some(id) => projects::with_project_cwd(hub, op.clone())
+                .and_then(|op| hub.agents.update(id, &op))
+                .map(|agent| {
                 hub.broadcast(&hub.agents_json());
                 json!({ "type": "agent_updated", "agent": agent.to_json() })
             }),

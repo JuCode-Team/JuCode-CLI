@@ -87,6 +87,7 @@ fn set(hub: &Hub, op: &Value) -> Result<Value, String> {
             if !Path::new(text(project, "path")?).is_absolute() {
                 return Err("project paths must be absolute".to_string());
             }
+            check_dirs(&project["dirs"])?;
         }
     }
     let rev = op["rev"].as_u64().ok_or("workspaces_set requires rev")?;
@@ -184,13 +185,83 @@ fn canonical_dir(path: &Path) -> Result<PathBuf, String> {
     Ok(real)
 }
 
-/// Every project directory, for deciding what remote clients may read.
-pub fn project_paths(hub: &Hub) -> Vec<PathBuf> {
+/// A project's extra directories (`dirs`), when given, are a list of
+/// absolute paths.
+fn check_dirs(dirs: &Value) -> Result<(), String> {
+    if dirs.is_null() {
+        return Ok(());
+    }
+    let list = dirs.as_array().ok_or("a project's dirs must be a list")?;
+    for dir in list {
+        match dir.as_str() {
+            Some(dir) if Path::new(dir).is_absolute() => {}
+            _ => return Err("project dirs must be absolute paths".to_string()),
+        }
+    }
+    Ok(())
+}
+
+fn projects(hub: &Hub) -> Vec<Value> {
     hub.store.workspaces()["workspaces"]
         .as_array()
         .into_iter()
         .flatten()
-        .flat_map(|ws| ws["projects"].as_array().into_iter().flatten())
-        .filter_map(|project| project["path"].as_str().map(PathBuf::from))
+        .flat_map(|ws| ws["projects"].as_array().cloned().unwrap_or_default())
         .collect()
+}
+
+fn dirs(project: &Value) -> impl Iterator<Item = PathBuf> + '_ {
+    project["dirs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|dir| dir.as_str().map(PathBuf::from))
+}
+
+/// Every project directory (main and extra), for deciding what remote
+/// clients may read.
+pub fn project_paths(hub: &Hub) -> Vec<PathBuf> {
+    projects(hub)
+        .iter()
+        .flat_map(|project| {
+            let main = project["path"].as_str().map(PathBuf::from);
+            main.into_iter().chain(dirs(project)).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The project with id `id`.
+pub fn project(hub: &Hub, id: &str) -> Option<Value> {
+    projects(hub)
+        .into_iter()
+        .find(|project| project["id"] == id)
+}
+
+/// The project whose main directory is `cwd`.
+pub fn project_of_cwd(hub: &Hub, cwd: &Path) -> Option<Value> {
+    projects(hub)
+        .into_iter()
+        .find(|project| project["path"].as_str().map(Path::new) == Some(cwd))
+}
+
+/// An `agent_create` / `agent_update` op with a `project` (an id; null
+/// clears it): the agent works in that project's main directory (`cwd`).
+pub fn with_project_cwd(hub: &Hub, mut op: Value) -> Result<Value, String> {
+    match op.get("project") {
+        Some(Value::String(id)) => {
+            let project = project(hub, id).ok_or_else(|| format!("unknown project {id}"))?;
+            op["cwd"] = project["path"].clone();
+        }
+        None | Some(Value::Null) => {}
+        Some(_) => return Err("project must be a project id or null".to_string()),
+    }
+    Ok(op)
+}
+
+/// The extra directories of the project at `cwd` that still exist: an
+/// engine started there may work in them too.
+pub fn extra_dirs(hub: &Hub, cwd: &Path) -> Vec<PathBuf> {
+    project_of_cwd(hub, cwd)
+        .map(|project| dirs(&project).filter(|dir| dir.is_dir()).collect())
+        .unwrap_or_default()
 }

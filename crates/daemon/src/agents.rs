@@ -60,6 +60,8 @@ pub struct Agent {
     /// workspaces had their own (clients put those in the default one). It
     /// runs whichever workspace is open.
     pub workspace: Option<String>,
+    /// The project it belongs to (its `cwd` is the project's main directory).
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +86,7 @@ impl Agent {
                 "mode": dir.mode,
             })).collect::<Vec<_>>(),
             "command_rules": rules_to_json(&self.command_rules),
+            "project": self.project,
         });
         if let Some(icon) = &self.icon {
             value["icon"] = icon.clone();
@@ -182,6 +185,7 @@ impl Agents {
             color: value["color"].as_str().map(str::to_string),
             avatar_seed: value["avatar_seed"].as_str().map(str::to_string),
             workspace: value["workspace"].as_str().map(str::to_string),
+            project: value["project"].as_str().map(str::to_string),
         })
     }
 
@@ -228,12 +232,14 @@ impl Agents {
             color: None,
             avatar_seed: None,
             workspace: None,
+            project: None,
         };
         let mut settings = agent.to_json();
         settings.as_object_mut().map(|map| map.remove("id"));
         settings["avatar_seed"] = json!(random_hex(8).map_err(|error| error.to_string())?);
         set_appearance(&mut settings, appearance)?;
         set_workspace(&mut settings, appearance);
+        set_project(&mut settings, appearance)?;
         let write = || -> io::Result<()> {
             fs::create_dir_all(dir.join("memory"))?;
             fs::write(
@@ -252,8 +258,9 @@ impl Agents {
 
     /// Changes the settings present in `changes` (`name`, `enabled`,
     /// `approval_mode`, `sandbox`, `network`, `directories`,
-    /// `command_rules`, `icon`, `color`, `avatar_seed`, `workspace`), keeping the rest of
-    /// `agent.json`; `role` rewrites `role.md`.
+    /// `command_rules`, `icon`, `color`, `avatar_seed`, `workspace`,
+    /// `project` with `cwd`), keeping the rest of `agent.json`; `role`
+    /// rewrites `role.md`.
     pub fn update(&self, id: &str, changes: &Value) -> Result<Agent, String> {
         if !valid_id(id) {
             return Err(format!("unknown agent {id}"));
@@ -295,6 +302,7 @@ impl Agents {
         }
         set_appearance(&mut settings, changes)?;
         set_workspace(&mut settings, changes);
+        set_project(&mut settings, changes)?;
         let text = serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())?;
         fs::write(&path, text + "\n").map_err(|error| error.to_string())?;
         if let Some(role) = changes["role"].as_str() {
@@ -543,6 +551,26 @@ fn set_workspace(settings: &mut Value, changes: &Value) {
         }
         _ => {}
     }
+}
+
+/// Applies `project` from `changes` (null clears it). A project comes with
+/// `cwd`, its main directory, where the agent then works.
+fn set_project(settings: &mut Value, changes: &Value) -> Result<(), String> {
+    match changes.get("project") {
+        Some(Value::String(id)) => {
+            let cwd = changes["cwd"]
+                .as_str()
+                .ok_or("a project needs its directory")?;
+            if !Path::new(cwd).is_dir() {
+                return Err(format!("not a directory: {cwd}"));
+            }
+            settings["project"] = json!(id);
+            settings["cwd"] = json!(cwd);
+        }
+        Some(Value::Null) => settings["project"] = Value::Null,
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Applies `icon`, `color` and `avatar_seed` from `changes`; `null` clears

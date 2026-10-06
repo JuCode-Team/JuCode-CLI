@@ -118,6 +118,7 @@ impl Hub {
         let requirements = crate::requirements::Requirements::load(
             store.dir(),
             uploads.dir().join("requirements"),
+            &store.workspaces(),
         );
         Arc::new_cyclic(|me| Self {
             me: me.clone(),

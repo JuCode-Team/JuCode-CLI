@@ -150,8 +150,8 @@ every connected client.
 | `mcp_set` / `mcp_remove` / `mcp_toggle` | as the session ops (`server`; `name`; `name`, `enabled`), with no `session` | `mcp_saved`; saves the change to `config.json` and sends the op to every open JuCode session, which answers with `mcp_servers`. Local clients only, with or without `session` |
 | `pair_link` | — | `pair_link` with `link`, `code` and `expires_at`; an error while the relay is off (local clients only) |
 | `ping` | — | `pong`. Clients behind the relay send it every minute so an idle stream is not closed |
-| `workspaces` | — | `workspaces` with `rev` and `workspaces: [{id, name, is_default?, color?, icon?, projects: [{id, name, path, chats?, worktree?, color?, icon?}]}]`. A project's `color` and `icon` are kept as the client sent them (shaped as an agent's, see "Agents") |
-| `workspaces_set` | `rev`, `workspaces` | `workspaces`; replaces the list when `rev` is the current one, else an error (another client changed it). Desktop imports its list with `rev: 0` into an empty daemon |
+| `workspaces` | — | `workspaces` with `rev` and `workspaces: [{id, name, is_default?, color?, icon?, projects: [{id, name, path, dirs?, chats?, worktree?, color?, icon?}]}]`. A project's `color` and `icon` are kept as the client sent them (shaped as an agent's, see "Agents"). `dirs`: the project's extra directories (absolute paths, not including `path`); remote clients may read them, and an engine started in `path` may work in those that exist: Claude Code gets one `--add-dir` each, Codex has them as writable roots of its workspace-write sandbox (and `--add-dir` in its TUI), and a JuCode session's file tools and sandbox treat them as writable workspace (ACP agents get nothing) |
+| `workspaces_set` | `rev`, `workspaces` | `workspaces`; replaces the list when `rev` is the current one, else an error (another client changed it). A project's `dirs`, when present, must be a list of absolute paths. Desktop imports its list with `rev: 0` into an empty daemon |
 | `project_add` | `path`, optional `workspace`, `project_name`, `workspace_name` | `workspaces`; adds an existing directory. With no workspaces yet, one named `workspace_name` is created |
 | `project_create` | `parent`, `name`, optional `git_init`, `workspace`, `workspace_name` | `workspaces`; makes the folder `parent/name` (optionally `git init`) and adds it |
 | `project_remove` | `workspace`, `project` | `workspaces`; the files stay |
@@ -161,11 +161,11 @@ every connected client.
 | `git_status` | `path` | `git_status` with `repo`, `branch`, `files: [{path, status, from}]` (porcelain codes) |
 | `git_diff` | `path`, optional `file` | `git_diff` with `diff` (unified, untracked files included, first 1 MiB), `truncated` |
 | `agent_list` | — | `agents` |
-| `agent_create` | `agent` (the new agent's id), `name`, `cwd`, `role`, optional `icon`, `color`, `avatar_seed` (see "Agents") | `agent_created`; every client also receives the new `agents` list |
+| `agent_create` | `agent` (the new agent's id), `name`, `cwd`, `role`, optional `icon`, `color`, `avatar_seed`, `project` (see "Agents") | `agent_created`; every client also receives the new `agents` list |
 | `message_send` | `agent`, `body`, optional `session`, `reply_to`, `dedupe_key` | `message_accepted` with `message` (the new message's id) and `duplicate` (a message with this `dedupe_key` was already recorded; nothing is sent). Routed as below; delivery is broadcast as `message_delivered` |
 | `timer_list` | optional `agent` | `timers: [{timer, agent, session, fire_at, body}]`: active timers (of all agents, or of `agent`), soonest first; `fire_at` in ms |
 | `agent_get` | `agent` | `agent`: `agent` (settings), `brief` (`{"role.md": text, "capabilities.md": …, "policy.md": …, "state.md": …}`), `memory` (file names, `["memory/deploy.md", …]`) and the agent's `sessions` (as in `session_list`) |
-| `agent_update` | `agent`, optional `name` (not empty), `role` (rewrites `role.md`), `enabled`, `approval_mode`, `sandbox`, `network`, `directories`, `command_rules`, `icon`, `color`, `avatar_seed` (`null` clears `icon` or `color`; see "Agents") | `agent_updated` with `agent`; every client also receives the new `agents` list |
+| `agent_update` | `agent`, optional `name` (not empty), `role` (rewrites `role.md`), `enabled`, `approval_mode`, `sandbox`, `network`, `directories`, `command_rules`, `icon`, `color`, `avatar_seed`, `project` (`null` clears `icon`, `color` or `project`; see "Agents") | `agent_updated` with `agent`; every client also receives the new `agents` list |
 | `agent_delete` | `agent` | `agent_deleted` with `agent`; an error while any of its sessions is running. See "Agents" |
 | `agent_memory_read` | `agent`, `file` (`deploy.md`, or `memory/deploy.md` as `agent_get` lists it) | `agent_memory` with `agent`, `file`, `content`; an error for anything but an existing `memory/<name>.md` (letters, digits, `-`, `_`) |
 | `schedule_list` | optional `agent` | `schedules`: all scheduled tasks, or `agent`'s. See "Scheduled tasks" |
@@ -337,9 +337,10 @@ notes and `agent.json`:
 | `icon` | none | `{"kind": "builtin", "id": "rocket"}`, `{"kind": "slug", "value": "…"}` (32 UTF-16 units at most) or `{"kind": "svg", "markup": "<svg…>"}` (8192 bytes at most). The daemon checks only the shape and size: clients sanitize an SVG before drawing it. |
 | `color` | none | `#rrggbb`. |
 | `avatar_seed` | random hex at creation | Seeds the generated avatar clients draw when there is no `icon`. Agents created before it have none; clients then use the id. |
+| `project` | `null` | The project it belongs to (an id from `workspaces`; a project has any number of agents). Setting it moves `cwd` to the project's main directory (an unknown project is an error); the agent's prompt names the project and its directories. |
 
-`agent_update` changes any of these fields except `cwd`, and rewrites
-`role.md` from `role`.
+`agent_update` changes any of these fields except `cwd` (which follows
+`project`), and rewrites `role.md` from `role`.
 
 `agent_delete` removes `~/.jucode/agents/<id>/` (brief, memory, settings,
 scheduled tasks), cancels the agent's active timers, closes its open
@@ -381,6 +382,7 @@ the other agents in its system prompt, and three tools:
 | `brief` | Reads or rewrites the agent's own brief and memory files. |
 | `question` | Records a question for the user (`title`, `body`, `assumption`, `default`, `due_in_seconds`, `importance`) and returns at once. The answer, or the deadline passing (the agent then goes with `default`), is delivered to the session that asked. |
 | `report` | Records a report (`title`, `body`) for the user to read; wakes nobody. |
+| `requirements` | `list`, `get`, `progress`, `propose_create`, `propose_close`: see "Agents and requirements". Noting and closing a requirement are only proposals the user accepts. |
 
 Messages (from `message_send`, `message_agent`, a fired timer or a scheduled
 task) are
@@ -578,46 +580,109 @@ removed so it saves its transcript.
 ## Requirements
 
 A requirement is what the user means to get done: their words (`text`),
-screenshots, the projects it concerns, and the sessions that work on it. A
-session works on one requirement at a time. After each turn of a linked
-session, the title model rewrites the requirement's `progress` from the
-previous record and the session's first and latest requests and the end of
-its reply, so a new session starts from where the last one stopped. The
-requirement's id comes as `requirement` (`id` is the request's).
+screenshots, the project it belongs to (`project`, a project id, or `null`),
+and the sessions that work on it. A session works on one requirement at a
+time. After each turn of a linked session, the title model rewrites the
+requirement's `progress` from the previous record and the session's first
+and latest requests and the end of its reply, so a new session starts from
+where the last one stopped. The requirement's id comes as `requirement`
+(`id` is the request's).
 
 | Op | Reply | |
 | --- | --- | --- |
 | `{"op":"requirement_list"}` | `requirements` | |
-| `{"op":"requirement_create","text":"…","projects":["/path"],"images":["/…/.jucode/uploads/…/u-…-shot.png"],"source":"phone","session":"s…"}` | `requirement_created` with `requirement` | All but `text` optional. `session`: noted in that session (its project, when `projects` is empty). `images`: up to 4 uploaded images (see "Uploads"; any other path is refused), moved to `~/.jucode/uploads/requirements/<id>/`. |
-| `{"op":"requirement_update","requirement":"R-1","text":"…","projects":[…],"state":"done"}` | `requirement_saved` | Any of the fields. `state`: `idea`, `open`, `done`, `parked`. |
+| `{"op":"requirement_create","text":"…","project":"p…","images":["/…/.jucode/uploads/…/u-…-shot.png"],"source":"phone","session":"s…"}` | `requirement_created` with `requirement` | All but `text` optional. `project`: a known project's id, or `null` for none; left out, a requirement noted in `session` belongs to the project whose main directory is that session's `cwd`. `images`: up to 4 uploaded images (see "Uploads"; any other path is refused), moved to `~/.jucode/uploads/requirements/<id>/`. |
+| `{"op":"requirement_update","requirement":"R-1","text":"…","project":"p…","state":"done"}` | `requirement_saved` | Any of the fields. `project: null` leaves it unassigned. `state`: `idea`, `open`, `done`, `parked`, `proposed`. |
 | `{"op":"requirement_delete","requirement":"R-1"}` | `requirement_deleted` | Its sessions stay. |
-| `{"op":"requirement_link","requirement":"R-1","session":"s…"}` | `requirement_linked` | The session leaves any other requirement; the requirement becomes `open`. |
-| `{"op":"requirement_unlink","requirement":"R-1","session":"s…"}` | `requirement_unlinked` | |
+| `{"op":"requirement_link","requirement":"R-1","session":"s…"}` | `requirement_linked` | The session leaves any other requirement (and its gate); the requirement becomes `open`. |
+| `{"op":"requirement_unlink","requirement":"R-1","session":"s…"}` | `requirement_unlinked` | A gate on that session ends. |
 | `{"op":"requirement_image","requirement":"R-1","index":0}` | `requirement_image` with `data` (a data URL) | |
-| `{"op":"requirement_prompt","requirement":"R-1","text":"…","lang":"en"}` | `requirement_prompt` with `text` | The first message of a session that starts on it: words, progress, `text` (the user's feedback, optional) and how to work on it. `lang`: `zh` (default) or `en`. |
-| `{"op":"requirement_reply","requirement":"R-1","text":"…","new_session":false,"cwd":"/path","engine":"claude","lang":"zh"}` | `requirement_replied` with `session` | Sends `text` to its latest session (reopened if closed). With `new_session`, or no session yet, starts one in `cwd` on `engine` (defaults: the latest session's, else its first project on jucode) with `requirement_prompt`'s text, and links it. |
+| `{"op":"requirement_begin","requirement":"R-1","session":"s…","plan":false,"mode":"edits","text":"…","lang":"zh"}` | `requirement_begun` with `requirement`, `session` | Starts work behind the gate (below): links the session, switches it to read-only and sends the requirement with the ask to only explain its understanding. `text`: the user's added words (optional). `lang`: `zh` (default) or `en`. |
+| `{"op":"requirement_confirm","requirement":"R-1","text":"…","lang":"zh"}` | `requirement_confirmed` with `requirement`, `stage` (`plan` or `go`) | The user confirms the gate's current step; an error without a gate or while its session runs a turn. `text` (optional) goes with the next message. |
+| `{"op":"requirement_reply","requirement":"R-1","text":"…","new_session":false,"cwd":"/path","engine":"claude","plan":false,"mode":"auto","lang":"zh"}` | `requirement_replied` with `session` | Sends `text` to its latest session (reopened if closed). With `new_session`, or no session yet, starts one in `cwd` (default: the latest session's, else the project's main directory; neither is an error) on `engine` (default: the latest session's, else jucode) and runs `requirement_begin` on it with `plan` (default `false`), `mode` (default `auto`) and `text`. |
+| `{"op":"requirement_proposal","requirement":"R-1","accept":true}` | `requirement_proposal_decided` with `requirement`, `accept` | Decides an agent's proposal: a proposed requirement accepted becomes `idea`, turned down is deleted; a close proposal accepted sets `state` to its `outcome` (and ends any gate), turned down is dropped. The agent is not told. |
 
 `dispatch_send` also takes `requirement`: its tasks' sessions are linked to it.
+
+### The start gate
+
+A session starts on a requirement in steps, each confirmed by the user, so
+nothing changes before they agreed what is to be done. `gate` on the
+requirement, for one session:
+
+```json
+"gate": {"session":"s…","stage":"understand","plan":true,"mode":"auto","answered":false}
+```
+
+`answered` turns true when a turn of that session ends at the stage; only
+then does the requirement show `confirm` (an engine also reports ready when
+it starts or switches modes).
+
+1. `understand`: the session runs read-only (jucode `manual`, Claude Code
+   and Codex `read-only`) and replies with the goal, scope, assumptions and
+   open questions, and whether the work is worth doing, then stops.
+2. With `plan`, confirming moves to `plan`: still read-only, it writes an
+   implementation plan and stops.
+3. The last confirmation switches the session to `mode` and sends it to
+   work; `gate` is removed.
+
+`mode` is the permission mode to work in, as the client names it (`ask`,
+`plan`, `auto`, `edits`, `all`) or an engine does (`manual`, `read-only`,
+`auto-edit`, `full-auto`, `full-access`); the daemon translates it for the
+session's engine (`plan` is `manual` on jucode). A user who replies in the
+session instead of confirming has it revise its understanding or plan; the
+gate stays at its step.
+
+### Agents and requirements
+
+An agent's sessions have a `requirements` tool: `list` (the requirements of
+the agent's project, or all when it has none; filters `project`, with
+`none` for unassigned ones, and `state`), `get`, `progress` (appends items
+to `decided`, `done`, `doing`, `blocked`, `next` once each, replaces
+`note`, and sets `progress_at`), and two proposals the user decides with
+`requirement_proposal`:
+
+- `propose_create` (`text`, `reason`): a new requirement in the agent's
+  project with `state: "proposed"`, `source: "agent"` and
+  `proposal: {kind: "create", agent, session, reason, at}`.
+- `propose_close` (`requirement`, `reason`, `outcome`: `done` or `parked`):
+  on an `idea` or `open` requirement, sets
+  `proposal: {kind: "close", outcome, agent, session, reason, at}`,
+  replacing an earlier one.
 
 `requirements` is also sent on connect and broadcast on every change:
 
 ```json
 {"type":"requirements","requirements":[{
   "id":"R-1","text":"…","title":"…","title_auto":false,"images":["/abs/1.png"],
-  "projects":["/path"],"state":"open","sessions":["s…"],
-  "progress":{"goal":"…","decided":[],"done":[],"doing":[],"blocked":[],"next":[],"files":[]},
+  "project":"p…","state":"open","sessions":["s…"],
+  "progress":{"goal":"…","decided":[],"done":[],"doing":[],"blocked":[],"next":[],"files":[],"note":"…"},
   "progress_at":0,"source":"desktop","source_session":null,
-  "status":"review","session_states":{"s…":"idle"},"last_reply":"…",
+  "gate":{"session":"s…","stage":"understand","plan":false,"mode":"auto"},
+  "proposal":{"kind":"close","outcome":"done","agent":"ops","session":"s…","reason":"…","at":0},
+  "status":"confirm","session_states":{"s…":"idle"},"last_reply":"…",
   "created_at":0,"updated_at":0}]}
 ```
 
 Words longer than 40 characters get a title from the title model
-(`title_auto`). `status` is `state`, except while `open`: `approval` (a
-session waits for an approval), `failed` (the latest session's turn
-failed), `running`, else `review` (the user's turn: the work is done or the
-agent asks something), or `open` with no session. `session_states`:
-`running`, `waiting`, `failed`, `idle`. `last_reply` (the end of the latest
-session's reply) comes with `review` and `failed`.
+(`title_auto`). `source` is `desktop`, `phone`, `session` or `agent`.
+`status` is `state` (`proposed` while an agent's proposal to note it
+waits), except:
+
+- `proposal`: an `idea` or `open` requirement with a close proposal.
+- While `open`: `approval` (a session waits for an approval), `confirm`
+  (the gate's session is idle: the user confirms its understanding or
+  plan), `failed` (the latest session's turn failed), `running`, else
+  `review` (the user's turn: the work is done or the agent asks
+  something), or `open` with no session.
+
+`session_states`: `running`, `waiting`, `failed`, `idle`. `last_reply` (the
+end of the latest session's reply) comes with `review`, `confirm` and
+`failed`.
+
+Requirements saved before projects had ids carry `projects: ["/path"]`;
+once the workspaces have projects, the daemon replaces it with the `project`
+whose main directory is the first path (or `null`).
 
 ## Notifications
 
@@ -629,7 +694,8 @@ the JuCode Android app its 个推 (Getui) client id with
 `{"op":"push_unsubscribe","endpoint":"…"}` or `{"op":"push_unsubscribe","client_id":"…"}`.
 A client id registered again by another device moves to that device. The daemon notifies when a
 dispatch's plan waits for the user, a task waits for an approval, a
-dispatch is done, and an open requirement turns to `review` or `approval`,
+dispatch is done, an open requirement turns to `review`, `confirm` or
+`approval`, and an agent proposes to note or close a requirement,
 through the relay (relay-protocol.md, Web Push). `{"op":"push_test"}` (paired devices
 only) sends a test notification to that device's browsers now and replies
 `push_tested` with `results: [{service, status}]` (or `error`): the push

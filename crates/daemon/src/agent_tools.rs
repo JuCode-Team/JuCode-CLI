@@ -1,6 +1,6 @@
 //! Tools a long-lived agent's sessions get from the daemon, added to the
 //! engine through `HostExtensions`: `message_agent`, `timer`, `schedule`,
-//! `brief`, `question` and `report`.
+//! `brief`, `question`, `report` and `requirements`.
 
 use crate::{
     hub::Hub,
@@ -29,9 +29,42 @@ pub fn extensions(hub: Arc<Hub>, agent: String, session: String) -> HostExtensio
                 Err(error) => (json!({ "error": error }).to_string(), true),
             }
         }),
-        prompt: Arc::new(move || prompt_hub.agents.prompt(&prompt_agent, &prompt_session)),
+        prompt: Arc::new(move || {
+            let mut prompt = prompt_hub.agents.prompt(&prompt_agent, &prompt_session);
+            prompt.push_str(&project_prompt(&prompt_hub, &prompt_agent));
+            prompt
+        }),
         exclusive: false,
     }
+}
+
+/// The project the agent belongs to: its name and directories.
+fn project_prompt(hub: &Hub, agent: &str) -> String {
+    let Some(project) = hub
+        .agents
+        .get(agent)
+        .and_then(|agent| agent.project)
+        .and_then(|id| crate::projects::project(hub, &id))
+    else {
+        return String::new();
+    };
+    let dirs: Vec<&str> = project["dirs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    format!(
+        "\n<project id=\"{}\" name=\"{}\">\nYou belong to this project; the `requirements` tool lists its requirements.\nMain directory: {}\nExtra directories: {}\n</project>",
+        project["id"].as_str().unwrap_or_default(),
+        project["name"].as_str().unwrap_or_default(),
+        project["path"].as_str().unwrap_or_default(),
+        if dirs.is_empty() {
+            "none".to_string()
+        } else {
+            dirs.join(", ")
+        }
+    )
 }
 
 /// The dispatcher's tools (see `dispatch`), plus `question`.
@@ -229,6 +262,10 @@ fn run(
             hub.post_report(&report)?;
             Ok(json!({ "report": report.id }))
         }
+        "requirements" => {
+            let project = hub.agents.get(agent).and_then(|agent| agent.project);
+            crate::requirements::tool(hub, agent, project.as_deref(), session, args)
+        }
         other => Err(format!("unknown tool {other}")),
     }
 }
@@ -330,6 +367,31 @@ fn definitions() -> Vec<Value> {
                     "action": { "type": "string", "enum": ["read", "write", "list"] },
                     "file": { "type": "string" },
                     "content": { "type": "string" }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "requirements",
+            "description": "The user's requirements (what they mean to get done). `list` shows those of your project (`project`: another project's id, or `none` for unassigned ones; `state` filters). `get` shows one in full: words, progress, start gate, pending proposal. `propose_create` and `propose_close` only propose: the user is asked, and nothing changes until they accept. Do not propose the same thing twice; a pending proposal shows in `list`. `progress` adds to a requirement's progress record directly: list items are appended once each.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "get", "propose_create", "propose_close", "progress"] },
+                    "requirement": { "type": "string", "description": "Requirement id (R-12), for get, propose_close and progress." },
+                    "project": { "type": "string", "description": "For list: a project id, or none for unassigned requirements." },
+                    "state": { "type": "string", "enum": ["idea", "open", "done", "parked", "proposed"], "description": "For list." },
+                    "text": { "type": "string", "description": "For propose_create: the requirement in the user's language." },
+                    "reason": { "type": "string", "description": "For propose_create and propose_close: why, in one line the user reads." },
+                    "outcome": { "type": "string", "enum": ["done", "parked"], "description": "For propose_close." },
+                    "decided": { "type": "array", "items": { "type": "string" } },
+                    "done": { "type": "array", "items": { "type": "string" } },
+                    "doing": { "type": "array", "items": { "type": "string" } },
+                    "blocked": { "type": "array", "items": { "type": "string" } },
+                    "next": { "type": "array", "items": { "type": "string" } },
+                    "note": { "type": "string", "description": "For progress: a note that replaces the previous one." }
                 },
                 "required": ["action"],
                 "additionalProperties": false

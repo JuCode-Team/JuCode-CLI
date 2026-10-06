@@ -85,6 +85,9 @@ pub struct Options {
     pub fast: bool,
     /// Claude: show thinking summaries (Some(false) hides them).
     pub thinking: Option<bool>,
+    /// Claude / Codex: directories besides `cwd` the engine may work in (the
+    /// project's extra directories; set by `spawn`, never by a client).
+    pub dirs: Vec<PathBuf>,
 }
 
 impl Options {
@@ -120,6 +123,7 @@ impl Options {
             effort: text("effort"),
             fast: value["fast"] == true,
             thinking: value["thinking"].as_bool(),
+            dirs: Vec::new(),
         }
     }
 
@@ -527,6 +531,10 @@ pub fn spawn(
     options: Options,
     transcript: Vec<Value>,
 ) -> Result<(String, Sender<Value>, u64), String> {
+    let options = Options {
+        dirs: crate::projects::extra_dirs(&hub, &cwd),
+        ..options
+    };
     let (command, gateway_key) = command(kind, id.as_deref().unwrap_or_default(), &options)?;
     let process = match Process::spawn(command, &cwd) {
         Ok(process) => process,
@@ -724,6 +732,7 @@ impl Session<'_> {
                     next.env = options.env.clone();
                     next.gateway = next.gateway.or(options.gateway);
                     next.approval_mode = next.approval_mode.or(options.approval_mode.clone());
+                    next.dirs = crate::projects::extra_dirs(self.hub, &self.cwd);
                     current = next.clone();
                     process.stop();
                     let id = self.id.clone().unwrap_or_default();

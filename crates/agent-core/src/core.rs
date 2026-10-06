@@ -330,6 +330,17 @@ impl AgentCore {
         self.tool_state.set_sandbox(sandbox);
     }
 
+    /// Counts `dirs` as workspace: file tools may write them, and sandboxed
+    /// commands too.
+    pub fn add_writable_dirs(&mut self, dirs: &[PathBuf]) {
+        let mut sandbox = self
+            .tool_state
+            .sandbox()
+            .unwrap_or_else(|| self.config.sandbox.clone());
+        sandbox.writable_dirs.extend_from_slice(dirs);
+        self.tool_state.set_sandbox(Some(sandbox));
+    }
+
     /// Adds host tools and prompt text; they apply from the next turn.
     pub fn set_host_extensions(&mut self, host: crate::host::HostExtensions) {
         self.host = Some(host);

@@ -156,7 +156,15 @@ pub fn command(id: &str, options: &Options) -> Command {
     {
         command.args(["--effort", effort]);
     }
+    add_dirs(&mut command, options);
     command
+}
+
+/// The project's extra directories, which Claude Code may work in too.
+fn add_dirs(command: &mut Command, options: &Options) {
+    for dir in &options.dirs {
+        command.arg("--add-dir").arg(dir);
+    }
 }
 
 /// Claude Code's own TUI resuming conversation `id`, in the session's
@@ -184,6 +192,7 @@ pub fn tui(id: &str, options: &Options, saved: bool) -> Command {
     if let Some(model) = &options.model {
         command.args(["--model", model]);
     }
+    add_dirs(&mut command, options);
     // A daemon started from inside Claude Code inherits that session's
     // markers; with them the TUI counts as a nested child and does not save
     // its transcript, so turns typed there would be lost on the way back.
@@ -3429,5 +3438,22 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         #[cfg(unix)]
         assert_eq!(project_dir(&home, &link), project_dir(&home, &real));
+    }
+
+    #[test]
+    fn the_projects_extra_dirs_are_added_to_both_commands() {
+        let options = Options {
+            dirs: vec![PathBuf::from("/work/api"), PathBuf::from("/work/docs")],
+            ..Options::default()
+        };
+        for command in [command("s-1", &options), tui("s-1", &options, true)] {
+            let args: Vec<String> = command
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+            let joined = args.join(" ");
+            assert!(joined.contains("--add-dir /work/api"), "{joined}");
+            assert!(joined.contains("--add-dir /work/docs"), "{joined}");
+        }
     }
 }

@@ -57,11 +57,14 @@ pub fn tui(id: Option<&str>, options: &Options) -> Command {
     if mode == "full-auto" {
         command.arg("--dangerously-bypass-approvals-and-sandbox");
     } else {
-        let (approval, sandbox) = policy(mode);
+        let (approval, sandbox) = policy(mode, &options.dirs);
         command.args(["-a", approval, "-s", sandbox_mode(&sandbox)]);
     }
     if let Some(model) = &options.model {
         command.args(["-m", model]);
+    }
+    for dir in &options.dirs {
+        command.arg("--add-dir").arg(dir);
     }
     command
 }
@@ -145,13 +148,14 @@ fn engine_mode(mode: &str) -> &'static str {
     }
 }
 
-/// The approval policy and sandbox policy of an engine mode.
-fn policy(mode: &str) -> (&'static str, Value) {
+/// The approval policy and sandbox policy of an engine mode; `dirs` (the
+/// project's extra directories) are writable besides the workspace.
+fn policy(mode: &str, dirs: &[PathBuf]) -> (&'static str, Value) {
     match mode {
         // Auto: workspace writes, with a reviewer subagent deciding approvals.
         "auto-edit" | "auto" => (
             "on-request",
-            json!({ "type": "workspaceWrite", "writableRoots": [], "networkAccess": false, "excludeTmpdirEnvVar": false, "excludeSlashTmp": false }),
+            json!({ "type": "workspaceWrite", "writableRoots": dirs, "networkAccess": false, "excludeTmpdirEnvVar": false, "excludeSlashTmp": false }),
         ),
         "full-auto" => ("never", json!({ "type": "dangerFullAccess" })),
         _ => (
@@ -373,6 +377,8 @@ impl Item {
 
 pub struct Codex {
     cwd: PathBuf,
+    /// The project's extra directories: writable in workspace-write.
+    dirs: Vec<PathBuf>,
     mode: &'static str,
     next_id: u64,
     /// Our outstanding requests: id → (method, tag).
@@ -440,6 +446,7 @@ impl Codex {
     pub fn new(cwd: &Path, options: &Options) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            dirs: options.dirs.clone(),
             mode: engine_mode(options.approval_mode.as_deref().unwrap_or_default()),
             next_id: 0,
             pending: HashMap::new(),
@@ -488,7 +495,7 @@ impl Codex {
     }
 
     fn turn_start(&mut self, input: Vec<Value>) -> String {
-        let (approval, sandbox) = policy(self.mode);
+        let (approval, sandbox) = policy(self.mode, &self.dirs);
         let mut params = json!({
             "threadId": self.thread,
             "input": input,
@@ -844,7 +851,7 @@ impl Codex {
         }
         match method.as_str() {
             "initialize" => {
-                let (approval, sandbox) = policy(self.mode);
+                let (approval, sandbox) = policy(self.mode, &self.dirs);
                 let open = json!({ "cwd": self.cwd, "approvalPolicy": approval, "sandbox": sandbox_mode(&sandbox) });
                 self.open_params = open.clone();
                 let mut frames =
@@ -2893,5 +2900,25 @@ mod tests {
             (found[0].0.as_str(), found[0].1.as_str()),
             ("a", "fix login")
         );
+    }
+
+    #[test]
+    fn the_projects_extra_dirs_are_writable_roots() {
+        let options = Options {
+            approval_mode: Some("auto-edit".to_string()),
+            dirs: vec![PathBuf::from("/work/api")],
+            ..Options::default()
+        };
+        let mut c = Codex::new(Path::new("/work/app"), &options);
+        let turn: Value = serde_json::from_str(&c.turn_start(Vec::new())).unwrap();
+        assert_eq!(
+            turn["params"]["sandboxPolicy"]["writableRoots"],
+            json!(["/work/api"])
+        );
+        let args: Vec<String> = tui(Some("t-1"), &options)
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.join(" ").contains("--add-dir /work/api"), "{args:?}");
     }
 }

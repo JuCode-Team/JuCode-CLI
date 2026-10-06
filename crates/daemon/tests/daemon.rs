@@ -2690,40 +2690,58 @@ fn a_requirement_follows_its_sessions_and_continues_in_them() {
     );
     assert_eq!(outside["type"], "error");
 
+    fs::create_dir_all(&dir).unwrap();
+    let added = request(&mut client, json!({ "op": "project_add", "path": dir }));
+    let project = added["workspaces"][0]["projects"][0]["id"].clone();
     let created = request(
         &mut client,
-        json!({ "op": "requirement_create", "text": "export sessions as markdown", "projects": [dir], "images": [shot] }),
+        json!({ "op": "requirement_create", "text": "export sessions as markdown", "project": project, "images": [shot] }),
     );
     let r = &created["requirement"];
     let id = r["id"].as_str().unwrap().to_string();
     assert!(id.starts_with("R-"));
     assert_eq!(r["state"], "idea");
     assert_eq!(r["title"], "export sessions as markdown");
+    assert_eq!(r["project"], project);
     let image = request(
         &mut client,
         json!({ "op": "requirement_image", "requirement": id, "index": 0 }),
     );
     assert_eq!(image["data"], png);
-    let prompt = request(
-        &mut client,
-        json!({ "op": "requirement_prompt", "requirement": id, "lang": "en" }),
-    );
-    assert!(prompt["text"].as_str().unwrap().starts_with(&format!(
-        "{id}: export sessions as markdown\n\nIn my words:"
-    )));
 
-    // Started from the phone: a new session in its project, linked to it.
+    // Started from the phone: a new session in its project, linked to it,
+    // that first only explains what it understood and waits.
     let started = request(
         &mut client,
         json!({ "op": "requirement_reply", "requirement": id, "lang": "en" }),
     );
     let first = started["session"].as_str().unwrap().to_string();
-    let frames = client.until(|f| requirement(f, &id).is_some_and(|r| r["status"] == "review"));
+    let frames = client.until(|f| requirement(f, &id).is_some_and(|r| r["status"] == "confirm"));
     let shown = requirement(frames.last().unwrap(), &id).unwrap();
     assert_eq!(shown["state"], "open");
     assert_eq!(shown["sessions"], json!([first]));
     assert_eq!(shown["session_states"][&first], "idle");
-    assert!(shown["last_reply"].as_str().unwrap().contains("user said:"));
+    assert_eq!(shown["gate"]["session"], first);
+    assert_eq!(shown["gate"]["stage"], "understand");
+    let reply = shown["last_reply"].as_str().unwrap();
+    assert!(
+        reply.ends_with("Then stop and wait for my confirmation."),
+        "{reply}"
+    );
+
+    // Confirmed, it goes to work in the chosen mode.
+    let confirmed = request(
+        &mut client,
+        json!({ "op": "requirement_confirm", "requirement": id, "lang": "en" }),
+    );
+    assert_eq!(confirmed["stage"], "go", "{confirmed}");
+    let frames = client.until(|f| requirement(f, &id).is_some_and(|r| r["status"] == "review"));
+    let shown = requirement(frames.last().unwrap(), &id).unwrap();
+    assert!(shown.get("gate").is_none());
+    assert!(shown["last_reply"]
+        .as_str()
+        .unwrap()
+        .contains("Now implement it."));
 
     // Feedback goes to the latest session; asked for, a new one starts.
     let again = request(
@@ -2748,7 +2766,7 @@ fn a_requirement_follows_its_sessions_and_continues_in_them() {
     assert_ne!(second, first);
     let frames = client.until(|f| {
         requirement(f, &id)
-            .is_some_and(|r| r["status"] == "review" && r["sessions"] == json!([first, second]))
+            .is_some_and(|r| r["status"] == "confirm" && r["sessions"] == json!([first, second]))
     });
     assert!(
         requirement(frames.last().unwrap(), &id).unwrap()["last_reply"]
