@@ -205,7 +205,17 @@ fn main() -> io::Result<()> {
         let _ = core.set_approval_mode(mode);
     }
     core.start_update_check();
-    TuiApp::new(Runtime(core)).run()
+    let app = TuiApp::new(Runtime(core));
+    match args.iter().position(|arg| arg == "--resume") {
+        Some(index) => match args.get(index + 1) {
+            Some(id) => app.with_command(&format!("/resume {id}")).run(),
+            None => {
+                eprintln!("jucode: --resume requires a session id");
+                std::process::exit(2);
+            }
+        },
+        None => app.run(),
+    }
 }
 
 fn help_text() -> String {
@@ -238,6 +248,7 @@ USAGE:
     jucode version                       print the version
 
 OPTIONS:
+    --resume <id>                        open the TUI on a saved conversation
     --approval-mode <manual|auto-edit|auto|full-access>
                                          tool approval mode for this run
                                          (auto runs a safety classifier on

@@ -513,6 +513,14 @@ impl<R: TuiRuntime> TuiApp<R> {
         app
     }
 
+    /// Runs a slash command before the first frame (`/resume <id>` for a
+    /// conversation the TUI opens on).
+    pub fn with_command(mut self, input: &str) -> Self {
+        let (_, events) = self.runtime.handle_command(input);
+        self.apply_events(events);
+        self
+    }
+
     pub fn run(mut self) -> io::Result<()> {
         let _guard = TerminalGuard::enter()?;
         let mut renderer = TerminalRenderer::new()?;

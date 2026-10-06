@@ -185,13 +185,6 @@ pub fn open_command(
     Ok(id)
 }
 
-/// Types `data` into terminal `id` (a TUI's first command).
-pub fn type_in(hub: &Hub, id: &str, data: &[u8]) {
-    if let Some(terminal) = lock(&hub.terminals.open).get(id) {
-        let _ = terminal.input.send(data.to_vec());
-    }
-}
-
 /// Kills terminal `id` (its exit still follows).
 pub fn kill(hub: &Hub, id: &str) {
     if let Some(terminal) = lock(&hub.terminals.open).get(id) {

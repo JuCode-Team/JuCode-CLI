@@ -43,13 +43,16 @@ pub fn command(options: &Options) -> Command {
 
 /// Codex's own TUI resuming thread `id`, in the session's approval mode and
 /// model (for the GUI ⇄ TUI handoff).
-pub fn tui(id: &str, options: &Options) -> Command {
+pub fn tui(id: Option<&str>, options: &Options) -> Command {
     let program = match &options.bin {
         Some(bin) => PathBuf::from(bin),
         None => resolve("codex", "CODEX_BIN", &[]),
     };
     let mut command = Command::new(program);
-    command.args(["resume", id]);
+    // Codex saves a thread with its first turn: a new one starts in the TUI.
+    if let Some(id) = id {
+        command.args(["resume", id]);
+    }
     let mode = engine_mode(options.approval_mode.as_deref().unwrap_or_default());
     if mode == "full-auto" {
         command.arg("--dangerously-bypass-approvals-and-sandbox");

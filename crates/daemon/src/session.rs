@@ -166,9 +166,16 @@ fn terminal(
         }
         hub.send_to(client, &error);
     };
+    let mut core = core;
     if hub.is_busy(id) {
-        refuse("the running turn must end first".to_string());
-        return Some(core);
+        // `force`: the user agreed to cut the running turn short.
+        if request["force"] != true {
+            refuse("the running turn must end first".to_string());
+            return Some(core);
+        }
+        for event in core.interrupt() {
+            publish(hub, id, event);
+        }
     }
     // An agent's session runs as the agent set it up (tools, sandbox).
     let agent = hub
@@ -191,10 +198,11 @@ fn terminal(
     let on_exit: Box<dyn FnOnce() + Send> = Box::new(move || {
         let _ = exit_hub.forward(&exit_session, json!({ "op": "tui_exit" }));
     });
-    let tui = crate::terminal::tui(&std::process::Command::new(exe), &cwd);
+    let mut command = std::process::Command::new(exe);
+    command.args(["--resume", id]);
+    let tui = crate::terminal::tui(&command, &cwd);
     match crate::terminal::open_command(&arc, client, request, tui, Some(on_exit)) {
         Ok(term) => {
-            crate::terminal::type_in(hub, &term, format!("/resume {id}\r").as_bytes());
             let surface = json!({ "type": "surface", "surface": "tui", "term": term, "client": client, "session": id });
             hub.broadcast(&surface);
             loop {

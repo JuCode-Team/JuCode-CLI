@@ -552,11 +552,17 @@ claude, codex or jucode conversation from the client's chat view into the
 engine's own terminal interface, on a pty of the daemon. The reply is
 `term_opened`; the terminal then works like one from `term_open` (only the
 requesting client gets its output and may type into it, `term_close` ends
-it). It is refused while a turn runs, for an ACP engine, and for an agent's
-session.
+it). It is refused while a turn runs unless the op has `"force":true`
+(the user agreed to stop it: a jucode turn is interrupted, a claude or codex
+engine is killed and every client gets `{"type":"status","message":"interrupted"}`),
+for an ACP engine, and for an agent's session.
 
-The engine process stops first and the TUI resumes the same conversation
-(`claude --resume <id>`, `codex resume <id>`, jucode's `/resume <id>`) with
+The engine process stops first, background tasks with it (clients get an
+empty `background_tasks`), and the TUI resumes the same conversation
+(`claude --resume <id>`, `codex resume <id>`, `jucode --resume <id>`); a
+conversation the engine has not saved yet starts there instead (`claude
+--session-id <id>`, plain `codex`, whose new thread the daemon finds in the
+directory when the TUI exits) with
 the session's approval mode and model; under the gateway it gets its own
 key. Every client of the session gets
 `{"type":"surface","session":"<id>","surface":"tui","term":"t-…","client":1}`.

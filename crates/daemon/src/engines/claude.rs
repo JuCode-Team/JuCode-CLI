@@ -165,7 +165,7 @@ pub fn command(id: &str, options: &Options) -> Command {
 
 /// Claude Code's own TUI resuming conversation `id`, in the session's
 /// permission mode and model (for the GUI ⇄ TUI handoff).
-pub fn tui(id: &str, options: &Options) -> Command {
+pub fn tui(id: &str, options: &Options, saved: bool) -> Command {
     let program = match &options.bin {
         Some(bin) => PathBuf::from(bin),
         None => resolve(
@@ -175,7 +175,8 @@ pub fn tui(id: &str, options: &Options) -> Command {
         ),
     };
     let mut command = Command::new(program);
-    command.args(["--resume", id]);
+    // A conversation not saved yet starts in the TUI, under its id.
+    command.args([if saved { "--resume" } else { "--session-id" }, id]);
     match to_claude_mode(options.approval_mode.as_deref().unwrap_or_default()) {
         "bypassPermissions" => {
             command.arg("--dangerously-skip-permissions");

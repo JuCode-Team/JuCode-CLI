@@ -733,7 +733,7 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         ("session_tui", Some(session)) => hub
             .forward(
                 &session,
-                json!({ "op": "tui", "client": client, "id": op["id"], "cols": op["cols"], "rows": op["rows"] }),
+                json!({ "op": "tui", "client": client, "id": op["id"], "cols": op["cols"], "rows": op["rows"], "force": op["force"] }),
             )
             .map(|()| Value::Null),
         // Ops the daemon sends a session itself.
