@@ -2729,6 +2729,14 @@ fn a_requirement_follows_its_sessions_and_continues_in_them() {
         "{reply}"
     );
 
+    // Until confirmed it stays read-only, whatever a client asks for.
+    client.send(json!({ "op": "watch", "session": first }));
+    client.send(json!({ "op": "set_approval_mode", "session": first, "mode": "full-access" }));
+    let frames = client.until(|f| {
+        f["type"] == "approval_mode" && f["session"] == first.as_str() && f["mode"] != "auto"
+    });
+    assert_eq!(frames.last().unwrap()["mode"], "manual");
+
     // Confirmed, it goes to work in the chosen mode.
     let confirmed = request(
         &mut client,

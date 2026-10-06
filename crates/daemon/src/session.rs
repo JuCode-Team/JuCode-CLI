@@ -86,6 +86,9 @@ fn open(
     }
     // After an agent's sandbox, which replaces the default one.
     core.add_writable_dirs(&dirs);
+    if resume.is_some_and(|id| crate::requirements::gated(hub, id)) {
+        core.set_approval_mode(ApprovalMode::Manual);
+    }
     Ok(core)
 }
 

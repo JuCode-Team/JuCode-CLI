@@ -531,8 +531,17 @@ pub fn spawn(
     options: Options,
     transcript: Vec<Value>,
 ) -> Result<(String, Sender<Value>, u64), String> {
+    let gated = id
+        .as_deref()
+        .or(options.resume.as_deref())
+        .is_some_and(|session| crate::requirements::gated(&hub, session));
     let options = Options {
         dirs: crate::projects::extra_dirs(&hub, &cwd),
+        approval_mode: if gated {
+            Some("read-only".to_string())
+        } else {
+            options.approval_mode
+        },
         ..options
     };
     let (command, gateway_key) = command(kind, id.as_deref().unwrap_or_default(), &options)?;

@@ -294,6 +294,7 @@ pub fn update(hub: &Arc<Hub>, op: &Value) -> Result<Value, String> {
         }
         if let Some(project) = project {
             r["project"] = project;
+            remove(r, "projects");
         }
         if let Some(state) = op["state"].as_str() {
             if !STATES.contains(&state) {
@@ -345,6 +346,10 @@ pub fn link(hub: &Arc<Hub>, id: &str, session: &str) -> Result<(), String> {
             if r["id"] == id {
                 list.push(json!(session));
                 r["state"] = json!("open");
+                // Starting on it accepts an agent's proposal to note it.
+                if r["proposal"]["kind"] == "create" {
+                    remove(r, "proposal");
+                }
                 r["updated_at"] = json!(now());
             } else if r["gate"]["session"] == session {
                 remove(r, "gate");
@@ -543,11 +548,12 @@ pub fn confirm(hub: &Arc<Hub>, op: &Value) -> Result<Value, String> {
         "plan"
     } else {
         let mode = engine_mode(engine, text(&gate["mode"]))?;
-        hub.forward(session, json!({ "op": "set_approval_mode", "mode": mode }))?;
+        // Gone first: while it stands, the session is held read-only.
         reqs.update(id, |r| {
             remove(r, "gate");
             Ok(())
         })?;
+        hub.forward(session, json!({ "op": "set_approval_mode", "mode": mode }))?;
         reqs.mark_running(session);
         hub.send_to_session(session, &go_prompt(planned, extra, lang))?;
         "go"
@@ -610,6 +616,27 @@ fn open(hub: &Arc<Hub>, session: &str) -> Result<Option<engines::Kind>, String> 
 
 /// A permission mode, in a client's names (`ask`, `plan`, `auto`, `edits`,
 /// `all`) or an engine's, as `engine` (None: jucode) takes it.
+/// Whether `session` is at a requirement's start gate: it stays read-only
+/// until the user confirms, whatever mode a client or its start asks for.
+pub fn gated(hub: &Hub, session: &str) -> bool {
+    lock(&hub.requirements.data)
+        .list
+        .iter()
+        .any(|r| r["gate"]["session"] == session)
+}
+
+/// The read-only mode of `session`'s engine.
+pub fn read_only(hub: &Hub, session: &str) -> &'static str {
+    let engine = record(hub, session)
+        .and_then(|record| engines::Kind::parse(record.engine.as_deref().unwrap_or_default()).ok())
+        .flatten();
+    if engine.is_none() {
+        "manual"
+    } else {
+        "read-only"
+    }
+}
+
 fn engine_mode(engine: Option<engines::Kind>, mode: &str) -> Result<&'static str, String> {
     let jucode = engine.is_none();
     Ok(match mode {
@@ -1220,12 +1247,15 @@ fn migrate(list: &mut [Value], workspaces: &Value) -> bool {
         let Some(old) = map.remove("projects") else {
             continue;
         };
+        changed = true;
+        if map.contains_key("project") {
+            continue;
+        }
         let id = old[0]
             .as_str()
             .and_then(|path| projects.iter().find(|p| p["path"] == path))
             .map_or(Value::Null, |p| p["id"].clone());
         map.insert("project".to_string(), id);
-        changed = true;
     }
     changed
 }
@@ -1460,6 +1490,11 @@ mod tests {
         assert!(list[2]["project"].is_null());
         assert!(list.iter().all(|r| r.get("projects").is_none()));
         assert!(!migrate(&mut list, &workspaces));
+        // A project set meanwhile (no projects at the first load) is kept.
+        let mut list = vec![json!({ "id": "R-9", "projects": ["/a"], "project": "p-2" })];
+        assert!(migrate(&mut list, &workspaces));
+        assert_eq!(list[0]["project"], "p-2");
+        assert!(list[0].get("projects").is_none());
     }
 
     #[test]

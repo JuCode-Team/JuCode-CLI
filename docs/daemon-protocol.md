@@ -616,7 +616,9 @@ requirement, for one session:
 
 `answered` turns true when a turn of that session ends at the stage; only
 then does the requirement show `confirm` (an engine also reports ready when
-it starts or switches modes).
+it starts or switches modes). While the gate stands the session is held
+read-only: a client's `set_approval_mode` and the mode its engine starts or
+restarts in are replaced by the read-only one.
 
 1. `understand`: the session runs read-only (jucode `manual`, Claude Code
    and Codex `read-only`) and replies with the goal, scope, assumptions and
