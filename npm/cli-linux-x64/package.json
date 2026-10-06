@@ -1,6 +1,6 @@
 {
   "name": "@jucode/cli-linux-x64",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "description": "JuCode native CLI for Linux x64",
   "license": "Apache-2.0",
   "publishConfig": {
