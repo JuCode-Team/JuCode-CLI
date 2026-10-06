@@ -944,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "jucode-agent-core"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "base64",
  "chacha20poly1305 0.11.0",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "jucode-cli"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "jucode-agent-core",
  "jucode-daemon",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "jucode-daemon"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "base64",
  "chrono",
@@ -993,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "jucode-tui"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "base64",
  "jucode-agent-core",
