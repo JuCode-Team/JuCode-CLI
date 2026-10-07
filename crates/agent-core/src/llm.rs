@@ -29,7 +29,7 @@ use std::{
 /// Wire protocol for a model. The JuCode gateway serves each model in its own
 /// dialect (Claude over Anthropic Messages, the rest over Responses), so the
 /// config-wide `protocol` applies to other providers only.
-fn protocol_for(provider: &str, protocol: &str, model: &str) -> Protocol {
+pub(crate) fn protocol_for(provider: &str, protocol: &str, model: &str) -> Protocol {
     if provider == "jucode" {
         return Protocol::resolve("", model);
     }
@@ -1488,6 +1488,11 @@ impl OpenAiClient {
     /// rejection reason when `name` is an edit tool that is not enabled;
     /// None means the tool may run.
     fn disabled_tool_error(&self, name: &str) -> Option<String> {
+        if name == crate::images::TOOL_NAME {
+            if let Err(reason) = self.tool_state.images() {
+                return Some(reason);
+            }
+        }
         if name == "web_search" && !self.tool_state.web_search_enabled() {
             return Some(
                 "web_search runs through the JuCode gateway and needs a JuCode login. Run /login."
@@ -2093,6 +2098,17 @@ fn approval_summary(name: &str, arguments: &str) -> String {
             .or_else(|| field("cmd"))
             .unwrap_or_default(),
         "write_stdin" => field("text").or_else(|| field("chars")).unwrap_or_default(),
+        crate::images::TOOL_NAME => {
+            let prompt = field("prompt")
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect::<String>();
+            match field("path") {
+                Some(path) => format!("{path}: {prompt}"),
+                None => prompt,
+            }
+        }
         _ => field("path").unwrap_or_default(),
     }
 }
@@ -2771,6 +2787,69 @@ mod tests {
     }
 
     #[test]
+    fn generate_image_is_offered_only_once_configured() {
+        let client = test_client();
+        let names = definition_names(&client);
+        assert!(!names.contains(&"generate_image".to_string()));
+        let request = ToolCallRequest {
+            call_id: "call_image".to_string(),
+            name: "generate_image".to_string(),
+            arguments: json!({ "prompt": "fox" }).to_string(),
+        };
+        client
+            .tool_state
+            .set_images(Err("no image model: set image_model".to_string()));
+        let result =
+            client.run_tool_call(&request, Path::new("."), &[], &HashSet::new(), &mut |_| {
+                Ok(())
+            });
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("no image model"),
+            "{}",
+            result.output
+        );
+        assert!(!definition_names(&client).contains(&"generate_image".to_string()));
+
+        let config = crate::config::Config::from_value(
+            &json!({
+                "provider": "gateway",
+                "protocol": "chat",
+                "model": "gpt-5.5",
+                "models": [{ "name": "gpt-5.5" }, { "name": "gpt-image-2" }],
+                "base_url": "https://gateway.example/v1"
+            })
+            .to_string(),
+            PathBuf::from("config.json"),
+        )
+        .unwrap();
+        client
+            .tool_state
+            .set_images(crate::images::ImageTools::from_config(
+                &config,
+                Some("key".to_string()),
+                &HashMap::new(),
+            ));
+        assert!(definition_names(&client).contains(&"generate_image".to_string()));
+        // Like the edit tools, it saves files and is confined with them.
+        assert_eq!(
+            approval_summary(
+                "generate_image",
+                &json!({ "prompt": "a fox", "path": "fox.png" }).to_string()
+            ),
+            "fox.png: a fox"
+        );
+        let root = Path::new("/work/.jucode/agents/worker-1");
+        assert!(tools::write_target_escapes_root(
+            "generate_image",
+            &json!({ "prompt": "x", "path": "/work/src/fox.png" }).to_string(),
+            root,
+            root
+        )
+        .is_some());
+    }
+
+    #[test]
     fn enabling_extra_edit_tools_exposes_and_executes_them() {
         let mut client = test_client();
         client.enabled_edit_tools = vec![
@@ -2865,6 +2944,8 @@ mod tests {
             // user prompt and may resolve the call itself.
             (ApprovalMode::Auto, "bash", true),
             (ApprovalMode::Auto, "write", false),
+            (ApprovalMode::Manual, "generate_image", true),
+            (ApprovalMode::AutoEdit, "generate_image", false),
             (ApprovalMode::FullAccess, "bash", false),
             (ApprovalMode::FullAccess, "write", false),
         ];

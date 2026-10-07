@@ -1159,6 +1159,7 @@ impl AgentCore {
                     config.model.clone(),
                     config.compact().0,
                     config.safety_model.clone(),
+                    config.image_model.clone(),
                 ]);
             for name in names {
                 let entry = headers.entry(name).or_default();
@@ -1895,8 +1896,23 @@ impl AgentCore {
             fetch_engine: self.config.web_fetch_engine.clone(),
             signed_in,
         }));
-        let prompt_tools =
-            crate::tools::prompt_tool_names(&self.config.edit_tools, true, signed_in);
+        if let Ok(image_model) = crate::config::read_image_model_at(self.config.path()) {
+            self.config.image_model = image_model;
+        }
+        let model_headers = self.model_headers();
+        let images = crate::images::ImageTools::from_config(
+            &self.config,
+            self.provider_api_key(),
+            &model_headers,
+        );
+        let images_enabled = images.is_ok();
+        self.tool_state.set_images(images);
+        let prompt_tools = crate::tools::prompt_tool_names(
+            &self.config.edit_tools,
+            true,
+            signed_in,
+            images_enabled,
+        );
         let mut system_prompt = build_system_prompt(
             &base_prompt,
             &PromptContext {
@@ -1964,7 +1980,7 @@ impl AgentCore {
             approval_mode: self.approval_mode.clone(),
             safety_model: Some(self.config.safety().0).filter(|model| !model.trim().is_empty()),
             safety_reasoning_effort: self.config.safety().1,
-            model_headers: self.model_headers(),
+            model_headers,
             edit_tools: self.config.edit_tools.clone(),
             extra_read_roots,
             tool_state: self.tool_state.clone(),

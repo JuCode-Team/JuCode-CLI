@@ -8,6 +8,7 @@ pub mod event;
 mod hooks;
 pub mod host;
 mod hunks;
+mod images;
 mod llm;
 pub mod logging;
 pub mod machine;

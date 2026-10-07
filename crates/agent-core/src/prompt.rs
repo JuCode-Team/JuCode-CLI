@@ -444,7 +444,7 @@ mod tests {
             &PromptContext {
                 date: "2026-05-27".to_string(),
                 cwd: PathBuf::from("/repo"),
-                tools: crate::tools::prompt_tool_names(&edit_tools, true, false),
+                tools: crate::tools::prompt_tool_names(&edit_tools, true, false, false),
                 edit_tools,
                 project_instructions: Vec::new(),
                 skills: Vec::new(),
@@ -488,7 +488,7 @@ mod tests {
             &PromptContext {
                 date: "2026-05-27".to_string(),
                 cwd: PathBuf::from("/repo"),
-                tools: crate::tools::prompt_tool_names(&edit_tools, false, false),
+                tools: crate::tools::prompt_tool_names(&edit_tools, false, false, false),
                 edit_tools,
                 project_instructions: Vec::new(),
                 skills: Vec::new(),
