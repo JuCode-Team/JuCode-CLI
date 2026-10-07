@@ -1143,6 +1143,7 @@ impl Session<'_> {
             self.snapshot.apply(&event);
             if let Some(id) = &self.id {
                 self.hub.observe(id, &event);
+                self.hub.usage.tag_event(id, &mut event);
             }
             if self.id.is_some() {
                 self.hub.broadcast(&self.tagged(event));

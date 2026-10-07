@@ -9,7 +9,8 @@ use crate::{
     schedules::{self, Schedule},
     session,
     store::{
-        now, random_hex, token_hash, Device, Message, Question, Report, SessionRecord, Store, Timer,
+        now, random_hex, token_hash, Closure, Device, ItemKind, Message, Question, Report,
+        SessionRecord, Store, Timer, CLOSED_KEEP_MS,
     },
     titles::{self, Turns},
     usage::{SessionInfo, Usage},
@@ -57,6 +58,8 @@ pub struct Hub {
     claims: Mutex<HashMap<String, usize>>,
     /// Every agent's scheduled tasks (see `schedules`).
     pub(crate) schedules: Mutex<Vec<Schedule>>,
+    /// Cancellation and firing must not both succeed for the same timer.
+    timer_updates: Mutex<()>,
     /// Serializes message delivery (scheduler ticks, sends, tool calls).
     delivering: Mutex<()>,
     next_id: AtomicU64,
@@ -123,6 +126,7 @@ impl Hub {
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
             schedules,
+            timer_updates: Mutex::new(()),
             turns: Mutex::new(HashMap::new()),
             titling: Mutex::new(HashSet::new()),
             handing_off: Mutex::new(HashSet::new()),
@@ -744,7 +748,7 @@ impl Hub {
         }
         for timer in self.store.active_timers() {
             if timer.agent == id {
-                let _ = self.store.record_timer_done(&timer.id, "cancelled");
+                let _ = self.cancel_timer(&timer.id, None);
             }
         }
         for question in self.store.open_questions() {
@@ -786,6 +790,21 @@ impl Hub {
     pub fn set_timer(&self, timer: &Timer) -> Result<(), String> {
         self.store
             .record_timer(timer)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn cancel_timer(&self, id: &str, agent: Option<&str>) -> Result<(), String> {
+        let _guard = lock(&self.timer_updates);
+        if !self
+            .store
+            .active_timers()
+            .iter()
+            .any(|timer| timer.id == id && agent.is_none_or(|agent| timer.agent == agent))
+        {
+            return Err(format!("no active timer {id}"));
+        }
+        self.store
+            .record_timer_done(id, "cancelled")
             .map_err(|error| error.to_string())
     }
 
@@ -867,27 +886,22 @@ impl Hub {
         Ok(())
     }
 
+    /// Open questions, and the ones closed lately (each with who closed it,
+    /// why and when) so a client can offer to reopen them.
     pub fn questions_json(&self) -> Value {
         let list: Vec<Value> = self
             .store
             .open_questions()
             .iter()
-            .map(|question| {
-                json!({
-                    "id": question.id,
-                    "agent": question.agent,
-                    "session": question.session,
-                    "title": question.title,
-                    "body": question.body,
-                    "assumption": question.assumption,
-                    "default": question.default_action,
-                    "importance": question.importance,
-                    "due_at": question.due_at,
-                    "asked_at": question.asked_at,
-                })
-            })
+            .map(question_json)
             .collect();
-        json!({ "type": "questions", "questions": list })
+        let closed: Vec<Value> = self
+            .store
+            .closed_questions(now().saturating_sub(CLOSED_KEEP_MS))
+            .iter()
+            .map(|(question, closure)| with_closure(question_json(question), closure))
+            .collect();
+        json!({ "type": "questions", "questions": list, "closed": closed })
     }
 
     pub fn reports_json(&self, limit: usize) -> Value {
@@ -895,6 +909,7 @@ impl Hub {
         json!({ "type": "reports", "reports": list })
     }
 
+    /// Open actions, and the ones closed lately (see `questions_json`).
     pub fn actions_json(&self) -> Value {
         let list: Vec<Value> = self
             .store
@@ -902,12 +917,95 @@ impl Hub {
             .iter()
             .map(|action| action.to_json())
             .collect();
-        json!({ "type": "actions", "actions": list })
+        let closed: Vec<Value> = self
+            .store
+            .closed_actions(now().saturating_sub(CLOSED_KEEP_MS))
+            .iter()
+            .map(|(action, closure)| with_closure(action.to_json(), closure))
+            .collect();
+        json!({ "type": "actions", "actions": list, "closed": closed })
+    }
+
+    /// Closes an open question or action without answering it. `by` is
+    /// `user`, `agent:<id>` or `superseded`; an agent closing one tells the
+    /// user's phone, since nobody asked for it.
+    pub fn close_item(
+        &self,
+        kind: ItemKind,
+        id: &str,
+        by: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        let title = match kind {
+            ItemKind::Question => self.store.question(id).map(|q| q.title),
+            ItemKind::Action => self
+                .store
+                .open_actions()
+                .into_iter()
+                .find(|action| action.id == id)
+                .map(|action| format!("{} {}", action.name, action.summary)),
+        };
+        if !self
+            .store
+            .close_item(kind, id, by, reason.trim())
+            .map_err(|error| error.to_string())?
+        {
+            return Err(format!("{id} is not open"));
+        }
+        self.broadcast_items(kind);
+        if by.starts_with("agent:") {
+            let title = title.unwrap_or_else(|| id.to_string());
+            self.notify(&format!("已关闭：{title}"), reason, &format!("closed:{id}"));
+        }
+        Ok(())
+    }
+
+    /// Reopens a closed item; its session comes back out of the archive.
+    pub fn reopen_item(&self, kind: ItemKind, id: &str) -> Result<(), String> {
+        let session = match kind {
+            ItemKind::Question => self.store.question(id).map(|q| q.session),
+            ItemKind::Action => self
+                .store
+                .closed_actions(0)
+                .into_iter()
+                .find(|(action, _)| action.id == id)
+                .map(|(action, _)| action.session_id),
+        };
+        if !self
+            .store
+            .reopen_item(kind, id)
+            .map_err(|error| error.to_string())?
+        {
+            return Err(format!("{id} is not closed"));
+        }
+        self.broadcast_items(kind);
+        let archived = self
+            .store
+            .sessions()
+            .into_iter()
+            .any(|record| Some(&record.id) == session.as_ref() && record.archived);
+        if let (true, Some(session)) = (archived, session) {
+            if let Ok(true) = self
+                .store
+                .record_session_meta(&session, &json!({ "archived": false }))
+            {
+                self.broadcast(&self.sessions_json());
+            }
+        }
+        Ok(())
+    }
+
+    fn broadcast_items(&self, kind: ItemKind) {
+        self.broadcast(&match kind {
+            ItemKind::Question => self.questions_json(),
+            ItemKind::Action => self.actions_json(),
+        });
     }
 
     /// Turns due timers into messages. The timer id is the message's dedupe
     /// key, so a timer that fired just before a crash fires only once.
     fn fire_due_timers(self: &Arc<Self>) {
+        let _guard = lock(&self.timer_updates);
         let due: Vec<Timer> = self
             .store
             .active_timers()
@@ -1427,6 +1525,29 @@ fn report_json(report: &Report) -> Value {
     })
 }
 
+fn question_json(question: &Question) -> Value {
+    json!({
+        "id": question.id,
+        "agent": question.agent,
+        "session": question.session,
+        "title": question.title,
+        "body": question.body,
+        "assumption": question.assumption,
+        "default": question.default_action,
+        "importance": question.importance,
+        "due_at": question.due_at,
+        "asked_at": question.asked_at,
+    })
+}
+
+/// A closed item's JSON with who closed it, why and when.
+fn with_closure(mut item: Value, closure: &Closure) -> Value {
+    item["closed_by"] = json!(closure.by);
+    item["closed_reason"] = json!(closure.reason);
+    item["closed_at"] = json!(closure.at);
+    item
+}
+
 /// A session's title as clients see it: its own, else its first prompt; never
 /// an id or a delivery header (which older daemons wrote as the title).
 fn shown_title(record: &SessionRecord, label: Option<&str>) -> Option<String> {
@@ -1557,6 +1678,60 @@ mod tests {
             ..record
         };
         assert_eq!(shown_title(&named, None).as_deref(), Some("我的标题"));
+    }
+
+    #[test]
+    fn cancelled_timers_stay_cancelled_and_cannot_race_firing() {
+        let dir =
+            std::env::temp_dir().join(format!("jucode-cancel-{}-{}", std::process::id(), now()));
+        let open = || {
+            Hub::new(
+                Store::open(dir.join("daemon")).unwrap(),
+                Agents::open(dir.join("agents")).unwrap(),
+                "test",
+                None,
+            )
+        };
+        let timer = |id: &str| Timer {
+            id: id.into(),
+            agent: "ops".into(),
+            session: None,
+            fire_at: 0,
+            body: "remind".into(),
+        };
+        let hub = open();
+        hub.set_timer(&timer("t1")).unwrap();
+        assert!(hub.cancel_timer("t1", Some("other")).is_err());
+        hub.cancel_timer("t1", Some("ops")).unwrap();
+        drop(hub);
+        let hub = open();
+        hub.fire_due_timers();
+        assert!(hub.store.message_log(None, 100).is_empty());
+        assert!(hub.cancel_timer("t1", None).is_err());
+
+        // Exactly one wins, including cancellation during a scheduler tick.
+        for n in 0..20 {
+            let id = format!("race-{n}");
+            hub.set_timer(&timer(&id)).unwrap();
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let firing = hub.clone();
+            let start = gate.clone();
+            let worker = thread::spawn(move || {
+                start.wait();
+                firing.fire_due_timers();
+            });
+            gate.wait();
+            let cancelled = hub.cancel_timer(&id, None).is_ok();
+            worker.join().unwrap();
+            let fired = hub
+                .store
+                .message_log(None, 100)
+                .iter()
+                .any(|m| m["from"] == format!("timer:{id}"));
+            assert_ne!(cancelled, fired);
+        }
+        drop(hub);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

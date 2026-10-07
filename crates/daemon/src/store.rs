@@ -31,6 +31,60 @@ const WORKSPACES: &str = "workspaces.json";
 
 const LOCK: &str = "lock";
 
+/// How long a closed question or action stays listed (and can be reopened).
+pub const CLOSED_KEEP_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// What waits for the user: an agent's question or a deferred action.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ItemKind {
+    Question,
+    Action,
+}
+
+impl ItemKind {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "question" => Ok(Self::Question),
+            "action" => Ok(Self::Action),
+            other => Err(format!(
+                "unknown item kind '{other}': use question or action"
+            )),
+        }
+    }
+
+    fn file(self) -> &'static str {
+        match self {
+            Self::Question => QUESTIONS,
+            Self::Action => ACTIONS,
+        }
+    }
+
+    /// The log entry that settles an item for good (answered or decided).
+    fn settled(self) -> &'static str {
+        match self {
+            Self::Question => "answered",
+            Self::Action => "decided",
+        }
+    }
+
+    fn opened(self) -> &'static str {
+        match self {
+            Self::Question => "asked",
+            Self::Action => "deferred",
+        }
+    }
+}
+
+/// Why an open item was put away without an answer: by the user, by an
+/// agent (`agent:<id>`) or by a newer run of its scheduled task
+/// (`superseded`). It can be reopened until it ages out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Closure {
+    pub by: String,
+    pub reason: String,
+    pub at: u64,
+}
+
 pub struct Store {
     dir: PathBuf,
     write: Mutex<()>,
@@ -201,11 +255,19 @@ impl Store {
             }
         }
         self.rewrite(SESSIONS, sessions)?;
-        let actions = self
+        let mut actions: Vec<Value> = self
             .open_actions()
             .iter()
             .map(|action| json!({ "kind": "deferred", "action": action.to_json() }))
             .collect();
+        // Closed ones stay while they can still be reopened.
+        for (action, closure) in self.closed_actions(now().saturating_sub(CLOSED_KEEP_MS)) {
+            actions.push(json!({ "kind": "deferred", "action": action.to_json() }));
+            actions.push(json!({
+                "kind": "closed", "id": action.id, "by": closure.by,
+                "reason": closure.reason, "at": closure.at,
+            }));
+        }
         self.rewrite(ACTIONS, actions)?;
         let active: HashSet<String> = self.active_timers().into_iter().map(|t| t.id).collect();
         let timers = self
@@ -490,20 +552,82 @@ impl Store {
         )
     }
 
-    /// Deferred actions that have not been decided yet, oldest first.
+    /// Deferred actions neither decided nor closed, oldest first.
     pub fn open_actions(&self) -> Vec<DeferredAction> {
         let entries = self.read(ACTIONS);
-        let decided: HashSet<&str> = entries
-            .iter()
-            .filter(|entry| entry["kind"] == "decided")
-            .filter_map(|entry| entry["id"].as_str())
-            .collect();
+        let decided = settled_ids(&entries, ItemKind::Action);
+        let closed = closures(&entries);
         entries
             .iter()
             .filter(|entry| entry["kind"] == "deferred")
             .filter_map(|entry| DeferredAction::from_json(&entry["action"]))
             .filter(|action| !decided.contains(action.id.as_str()))
+            .filter(|action| !closed.contains_key(action.id.as_str()))
             .collect()
+    }
+
+    /// Actions closed since `since` (ms) and still closed, newest first.
+    pub fn closed_actions(&self, since: u64) -> Vec<(DeferredAction, Closure)> {
+        let entries = self.read(ACTIONS);
+        let decided = settled_ids(&entries, ItemKind::Action);
+        let closed = closures(&entries);
+        let mut list: Vec<(DeferredAction, Closure)> = entries
+            .iter()
+            .filter(|entry| entry["kind"] == "deferred")
+            .filter_map(|entry| DeferredAction::from_json(&entry["action"]))
+            .filter(|action| !decided.contains(action.id.as_str()))
+            .filter_map(|action| {
+                let closure = closure_from(closed.get(action.id.as_str())?)?;
+                (closure.at >= since).then_some((action, closure))
+            })
+            .collect();
+        list.sort_by_key(|(_, closure)| std::cmp::Reverse(closure.at));
+        list
+    }
+
+    /// Closes an open question or action without answering it; false when
+    /// it is not open (unknown, settled or already closed).
+    pub fn close_item(&self, kind: ItemKind, id: &str, by: &str, reason: &str) -> io::Result<bool> {
+        let _guard = self.lock();
+        if self.item_state(kind, id) != Some(false) {
+            return Ok(false);
+        }
+        self.append_locked(
+            kind.file(),
+            json!({ "kind": "closed", "id": id, "by": by, "reason": reason, "at": now() }),
+        )?;
+        Ok(true)
+    }
+
+    /// Puts a closed item back among the open ones; false when it is not
+    /// closed.
+    pub fn reopen_item(&self, kind: ItemKind, id: &str) -> io::Result<bool> {
+        let _guard = self.lock();
+        if self.item_state(kind, id) != Some(true) {
+            return Ok(false);
+        }
+        self.append_locked(
+            kind.file(),
+            json!({ "kind": "reopened", "id": id, "at": now() }),
+        )?;
+        Ok(true)
+    }
+
+    /// None: unknown or settled; Some(closed) otherwise.
+    fn item_state(&self, kind: ItemKind, id: &str) -> Option<bool> {
+        let entries = self.read(kind.file());
+        let opened = |entry: &Value| match kind {
+            ItemKind::Question => entry["id"] == id,
+            ItemKind::Action => entry["action"]["id"] == id,
+        };
+        if !entries
+            .iter()
+            .any(|e| e["kind"] == kind.opened() && opened(e))
+            || settled_ids(&entries, kind).contains(id)
+        {
+            return None;
+        }
+        Some(closures(&entries).contains_key(id))
     }
 
     /// Records a message; returns false (and records nothing) when a message
@@ -594,6 +718,29 @@ impl Store {
             .collect()
     }
 
+    /// The sessions messages from `from` (`schedule:<id>`, …) were
+    /// delivered to, in delivery order.
+    pub fn sessions_reached_from(&self, from: &str) -> Vec<String> {
+        let entries = self.read(MESSAGES);
+        let sent: HashSet<&str> = entries
+            .iter()
+            .filter(|entry| entry["kind"] == "message" && entry["from"] == from)
+            .filter_map(|entry| entry["id"].as_str())
+            .collect();
+        let mut sessions: Vec<String> = Vec::new();
+        for entry in entries.iter().filter(|entry| entry["kind"] == "delivered") {
+            if !entry["id"].as_str().is_some_and(|id| sent.contains(id)) {
+                continue;
+            }
+            if let Some(session) = entry["session"].as_str() {
+                if !sessions.iter().any(|s| s == session) {
+                    sessions.push(session.to_string());
+                }
+            }
+        }
+        sessions
+    }
+
     /// The session a delivered message went to.
     pub fn delivered_session(&self, id: &str) -> Option<String> {
         self.read(MESSAGES)
@@ -659,8 +806,9 @@ impl Store {
         )
     }
 
-    /// Records the answer; false when the question was already answered or
-    /// does not exist, so a user answer and a deadline never both land.
+    /// Records the answer; false when the question was already answered, is
+    /// closed or does not exist, so a user answer and a deadline never both
+    /// land.
     pub fn record_answer(&self, id: &str, answer: &str, by: &str) -> io::Result<bool> {
         let _guard = self.lock();
         let entries = self.read(QUESTIONS);
@@ -670,7 +818,7 @@ impl Store {
         let answered = entries
             .iter()
             .any(|entry| entry["kind"] == "answered" && entry["id"] == id);
-        if !asked || answered {
+        if !asked || answered || closures(&entries).contains_key(id) {
             return Ok(false);
         }
         self.append_locked(
@@ -687,20 +835,37 @@ impl Store {
             .and_then(question_from_json)
     }
 
-    /// Unanswered questions, oldest first.
+    /// Questions neither answered nor closed, oldest first.
     pub fn open_questions(&self) -> Vec<Question> {
         let entries = self.read(QUESTIONS);
-        let answered: HashSet<&str> = entries
-            .iter()
-            .filter(|entry| entry["kind"] == "answered")
-            .filter_map(|entry| entry["id"].as_str())
-            .collect();
+        let answered = settled_ids(&entries, ItemKind::Question);
+        let closed = closures(&entries);
         entries
             .iter()
             .filter(|entry| entry["kind"] == "asked")
-            .filter(|entry| !entry["id"].as_str().is_some_and(|id| answered.contains(id)))
+            .filter(|entry| {
+                !entry["id"]
+                    .as_str()
+                    .is_some_and(|id| answered.contains(id) || closed.contains_key(id))
+            })
             .filter_map(question_from_json)
             .collect()
+    }
+
+    /// Questions closed since `since` (ms) and still closed, newest first.
+    pub fn closed_questions(&self, since: u64) -> Vec<(Question, Closure)> {
+        let entries = self.read(QUESTIONS);
+        let closed = closures(&entries);
+        let mut list: Vec<(Question, Closure)> = entries
+            .iter()
+            .filter(|entry| entry["kind"] == "asked")
+            .filter_map(|entry| {
+                let closure = closure_from(closed.get(entry["id"].as_str()?)?)?;
+                (closure.at >= since).then_some((question_from_json(entry)?, closure))
+            })
+            .collect();
+        list.sort_by_key(|(_, closure)| std::cmp::Reverse(closure.at));
+        list
     }
 
     pub fn record_report(&self, report: &Report) -> io::Result<()> {
@@ -849,6 +1014,44 @@ impl Store {
         logs.insert(file, Arc::clone(&entries));
         entries
     }
+}
+
+/// Ids of items answered (questions) or decided (actions).
+fn settled_ids(entries: &[Value], kind: ItemKind) -> HashSet<&str> {
+    entries
+        .iter()
+        .filter(|entry| entry["kind"] == kind.settled())
+        .filter_map(|entry| entry["id"].as_str())
+        .collect()
+}
+
+/// Closed items by id, each with its latest `closed` entry; reopening one
+/// takes it out.
+fn closures(entries: &[Value]) -> HashMap<&str, &Value> {
+    let mut closed = HashMap::new();
+    for entry in entries {
+        let Some(id) = entry["id"].as_str() else {
+            continue;
+        };
+        match entry["kind"].as_str() {
+            Some("closed") => {
+                closed.insert(id, entry);
+            }
+            Some("reopened") => {
+                closed.remove(id);
+            }
+            _ => {}
+        }
+    }
+    closed
+}
+
+fn closure_from(entry: &Value) -> Option<Closure> {
+    Some(Closure {
+        by: entry["by"].as_str()?.to_string(),
+        reason: entry["reason"].as_str().unwrap_or_default().to_string(),
+        at: entry["at"].as_u64().unwrap_or_default(),
+    })
 }
 
 fn question_from_json(entry: &Value) -> Option<Question> {
@@ -1275,6 +1478,58 @@ mod tests {
         let open: Vec<String> = store.open_questions().into_iter().map(|q| q.id).collect();
         assert_eq!(open, vec!["q2"]);
         assert_eq!(store.question("q1").unwrap().default_action, "deploy to eu");
+    }
+
+    #[test]
+    fn a_closed_item_leaves_the_open_lists_until_reopened() {
+        let store = store("closed-items");
+        store.record_question(&question("q1")).unwrap();
+        let action = DeferredAction::from_json(&json!({
+            "id": "a1", "session_id": "s1", "cwd": "/p", "call_id": "c", "name": "bash",
+            "arguments": "{}", "summary": "ls", "digest": "d", "created_at": 1,
+        }))
+        .unwrap();
+        store.record_deferred(&action).unwrap();
+
+        assert!(store
+            .close_item(ItemKind::Question, "q1", "user", "不需要了")
+            .unwrap());
+        assert!(!store
+            .close_item(ItemKind::Question, "q1", "user", "again")
+            .unwrap());
+        assert!(store
+            .close_item(ItemKind::Action, "a1", "agent:ops", "已修复")
+            .unwrap());
+        assert!(store.open_questions().is_empty());
+        assert!(store.open_actions().is_empty());
+        // A deadline does not answer a closed question.
+        assert!(!store.record_answer("q1", "", "deadline").unwrap());
+        let closed = store.closed_actions(0);
+        assert_eq!(closed[0].0.id, "a1");
+        assert_eq!(
+            (closed[0].1.by.as_str(), closed[0].1.reason.as_str()),
+            ("agent:ops", "已修复")
+        );
+        assert_eq!(store.closed_questions(0)[0].1.reason, "不需要了");
+        assert!(store.closed_questions(now() + 1).is_empty());
+
+        // Closed actions survive a restart's compaction, still reopenable.
+        let dir = store.dir.clone();
+        drop(store);
+        let store = Store::open(dir).unwrap();
+        assert_eq!(store.closed_actions(0).len(), 1);
+        assert!(store.reopen_item(ItemKind::Action, "a1").unwrap());
+        assert!(!store.reopen_item(ItemKind::Action, "a1").unwrap());
+        assert_eq!(store.open_actions()[0].id, "a1");
+        assert!(store.reopen_item(ItemKind::Question, "q1").unwrap());
+        assert!(store.record_answer("q1", "yes", "user").unwrap());
+        // Settled items neither close nor reopen.
+        assert!(!store
+            .close_item(ItemKind::Question, "q1", "user", "")
+            .unwrap());
+        assert!(!store
+            .close_item(ItemKind::Question, "missing", "user", "")
+            .unwrap());
     }
 
     #[test]

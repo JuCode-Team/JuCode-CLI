@@ -174,17 +174,7 @@ fn run(
                 .collect::<Vec<_>>())),
             Some("cancel") => {
                 let id = text("timer").ok_or("timer cancel requires timer")?;
-                if !hub
-                    .store
-                    .active_timers()
-                    .iter()
-                    .any(|timer| timer.id == id && timer.agent == agent)
-                {
-                    return Err(format!("no active timer {id}"));
-                }
-                hub.store
-                    .record_timer_done(&id, "cancelled")
-                    .map_err(|error| error.to_string())?;
+                hub.cancel_timer(&id, Some(agent))?;
                 Ok(json!({ "cancelled": id }))
             }
             _ => Err("timer action must be set, list or cancel".to_string()),

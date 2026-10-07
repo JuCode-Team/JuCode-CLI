@@ -339,6 +339,7 @@ fn publish_on(hub: &Hub, id: &str, event: AgentEvent, turn: Option<String>) {
         json["turn"] = json!(turn);
     }
     hub.observe(id, &json);
+    hub.usage.tag_event(id, &mut json);
     hub.broadcast(&json);
     if actions_changed {
         hub.broadcast(&hub.actions_json());

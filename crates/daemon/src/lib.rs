@@ -356,6 +356,34 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         thread::spawn(move || respond(&hub, client, &request, Ok(gateway::catalog_json())));
         return;
     }
+    // Ledger reads wait on the network; input and interrupts must keep flowing.
+    if matches!(name, "session_usage" | "schedule_usage") {
+        let hub = Arc::clone(hub);
+        let name = name.to_string();
+        thread::spawn(move || {
+            let key = if name == "session_usage" {
+                "session"
+            } else {
+                "schedule"
+            };
+            let result = match op[key].as_str().filter(|id| !id.is_empty()) {
+                Some(id) => {
+                    let sessions = if key == "session" {
+                        vec![id.to_string()]
+                    } else {
+                        hub.store.sessions_reached_from(&format!("schedule:{id}"))
+                    };
+                    let mut usage = hub.usage.sessions_json(&sessions);
+                    usage["type"] = json!(name);
+                    usage[key] = json!(id);
+                    Ok(usage)
+                }
+                None => Err(format!("{name} requires {key}")),
+            };
+            respond(&hub, client, &request, result);
+        });
+        return;
+    }
     // File and git reads can take a while; they must not hold up this
     // client's other frames.
     if matches!(
@@ -602,6 +630,19 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 .map(|()| json!({ "type": "question_answered", "question": question })),
             _ => Err("question_answer requires question and a non-empty answer".to_string()),
         },
+        // The item's id travels as `item`: `id` is the request id.
+        ("item_close" | "item_reopen", _) => {
+            match (op["kind"].as_str().map(store::ItemKind::parse), op["item"].as_str()) {
+                (Some(Ok(kind)), Some(item)) if name == "item_close" => hub
+                    .close_item(kind, item, "user", op["reason"].as_str().unwrap_or_default())
+                    .map(|()| json!({ "type": "item_closed", "item": item })),
+                (Some(Ok(kind)), Some(item)) => hub
+                    .reopen_item(kind, item)
+                    .map(|()| json!({ "type": "item_reopened", "item": item })),
+                (Some(Err(error)), _) => Err(error),
+                _ => Err(format!("{name} requires kind (question or action) and item")),
+            }
+        }
         ("report_list", _) => Ok(hub.reports_json(op["limit"].as_u64().unwrap_or(50) as usize)),
         ("report_read", _) => match op["report"].as_str() {
             Some(report) => hub
@@ -681,6 +722,12 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             .open_session(&session, None)
             .and_then(|()| hub.forward(&session, op.clone()))
             .map(|()| Value::Null),
+        ("timer_cancel", _) => match op["timer"].as_str() {
+            Some(timer) => hub
+                .cancel_timer(timer, None)
+                .map(|()| json!({ "type": "timer_cancelled", "timer": timer })),
+            None => Err("timer_cancel requires timer".to_string()),
+        },
         ("timer_list", _) => Ok(json!({
             "type": "timers",
             "timers": hub.store.active_timers().iter()

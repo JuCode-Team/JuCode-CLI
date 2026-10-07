@@ -141,7 +141,7 @@ every connected client.
 | `session_open` | `session`, optional `cwd`, `engine`, `options` | `session_opened`; with `cwd`, also opens a session saved there that the daemon never hosted. Reopens a closed session (or one from before a restart), resuming its transcript and its undecided deferred actions |
 | `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped |
 | `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `approval_mode_pending`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
-| `actions_list` | — | `actions`: undecided deferred actions across all sessions |
+| `actions_list` | — | `actions`: undecided deferred actions across all sessions, and in `closed` the ones closed lately (as in `questions`) |
 | `pair_start` | — | `pairing` with `code` and `expires_at` (local clients only) |
 | `device_list` | — | `devices`: paired, unrevoked devices (local clients only) |
 | `device_revoke` | `device` | `device_revoked` (local clients only) |
@@ -164,16 +164,21 @@ every connected client.
 | `agent_create` | `agent` (the new agent's id), `name`, `cwd`, `role`, optional `icon`, `color`, `avatar_seed`, `project` (see "Agents") | `agent_created`; every client also receives the new `agents` list |
 | `message_send` | `agent`, `body`, optional `session`, `reply_to`, `dedupe_key` | `message_accepted` with `message` (the new message's id) and `duplicate` (a message with this `dedupe_key` was already recorded; nothing is sent). Routed as below; delivery is broadcast as `message_delivered` |
 | `timer_list` | optional `agent` | `timers: [{timer, agent, session, fire_at, body}]`: active timers (of all agents, or of `agent`), soonest first; `fire_at` in ms |
+| `timer_cancel` | `timer` (its id) | `timer_cancelled` with `timer`; persists cancellation so the reminder will not fire after a restart. Errors if it already fired or was cancelled |
 | `agent_get` | `agent` | `agent`: `agent` (settings), `brief` (`{"role.md": text, "capabilities.md": …, "policy.md": …, "state.md": …}`), `memory` (file names, `["memory/deploy.md", …]`) and the agent's `sessions` (as in `session_list`) |
 | `agent_update` | `agent`, optional `name` (not empty), `role` (rewrites `role.md`), `enabled`, `approval_mode`, `sandbox`, `network`, `directories`, `command_rules`, `icon`, `color`, `avatar_seed`, `project` (`null` clears `icon`, `color` or `project`; see "Agents") | `agent_updated` with `agent`; every client also receives the new `agents` list |
 | `agent_delete` | `agent` | `agent_deleted` with `agent`; an error while any of its sessions is running. See "Agents" |
 | `agent_memory_read` | `agent`, `file` (`deploy.md`, or `memory/deploy.md` as `agent_get` lists it) | `agent_memory` with `agent`, `file`, `content`; an error for anything but an existing `memory/<name>.md` (letters, digits, `-`, `_`) |
 | `schedule_list` | optional `agent` | `schedules`: all scheduled tasks, or `agent`'s. See "Scheduled tasks" |
+| `session_usage` | `session` (its id) | `session_usage` with `totals`, `sessions` and `turns`: persisted and live usage, with settled gateway charges |
+| `schedule_usage` | `schedule` (its id) | `schedule_usage` with `totals` and `sessions`: token counts and costs of the task's run sessions, including follow-ups; reused sessions count once |
 | `schedule_save` | `schedule`: without `id` creates one (`agent`, `name`, `prompt`, `repeat`, `time`, and `days` / `date` as `repeat` needs; optional `enabled`, `new_session`, both default `true`); with `id` changes the fields present among `name`, `prompt`, `enabled`, `repeat`, `time`, `days`, `date`, `new_session` | `schedule_saved` with `schedule`; `next_run_at` is computed again |
 | `schedule_delete` | `schedule` (its id) | `schedule_deleted` with `schedule` |
 | `schedule_run` | `schedule` (its id) | `schedule_started` with `schedule`; runs it now, enabled or not (an error when its agent is disabled), without changing `next_run_at` |
-| `question_list` | — | `questions`: unanswered questions |
+| `question_list` | — | `questions`: unanswered questions, and in `closed` the ones closed in the last 7 days (each with `closed_by`, `closed_reason`, `closed_at`) |
 | `question_answer` | `question`, `answer` | `question_answered`; the answer is delivered to the session that asked |
+| `item_close` | `kind` (`question` or `action`), `item` (its id), optional `reason` | `item_closed` with `item`; closes an open question or deferred action without answering it, then broadcasts `questions` / `actions`. Nothing is sent to the agent |
+| `item_reopen` | `kind`, `item` | `item_reopened` with `item`; puts a closed item back among the open ones and takes its session out of the archive |
 | `report_list` | optional `limit` (50) | `reports`, newest first, with `read` |
 | `report_read` | `report` | `report_read` |
 | `skills_catalog` | optional `backend` (`jucode`, default, or `claude`) | `skills_catalog` with `skills: [{id, name, description, tags, source, isDefault, installed, license, redistributable, homepage}]`, `warnings` and `installDir` (local clients only). See "Skills" |
@@ -462,6 +467,32 @@ delivery.
 `schedule_delete` and `schedule_run` also take the task's id as `id` when
 `schedule` is absent; that `id` is then the request id too, echoed in the
 reply.
+
+`schedule_usage` joins the task's delivered sessions with persisted turns in
+`usage.jsonl`, including any turn still running. Each unique session is counted
+once, including follow-up turns. `totals` and each row in `sessions` carry the
+five token counters, `turns`, `gateway_cost` (settled points, including group
+multipliers), `estimated_cost_usd` (reference USD cost), `pending_requests`
+(gateway charges not yet available), `unpriced_requests` and `running`.
+Session rows also carry `session` and `started_at` (milliseconds or null).
+Cached input and reasoning tokens are subsets of input and output respectively.
+The two currencies are separate; unavailable amounts are null, never zero.
+Reference estimates are saved with new turns at the time of usage; old turns
+without prices stay unpriced. Gateway amounts are read by turn id from the
+signed-in account's `POST /v1/oauth/agent-usage/charges` endpoint. A failed
+billing lookup sets `billing_error` while still returning the local token counts.
+
+`session_usage` uses the same ledger for a single session, including its history.
+Both usage replies also include `gateway_requests` in each total and a `turns`
+array, whose rows carry `turn_id`, `session` and the same totals. Live `usage`
+events carry `billing_turn` (the ledger key) and `billing_gateway`, allowing the
+client to update the matching reply's fee even if settlement arrives during a
+later turn. Ledger amounts already include each request's group multiplier;
+clients must not multiply them again or display points as dollars. Ledger reads
+run off the connection's input thread, so an unavailable billing server cannot
+hold up user input or interrupts. Clients should coalesce refreshes, recheck
+pending charges while watching, and retain settled values with an explicit error
+when a subsequent lookup fails.
 
 ## Dispatch
 

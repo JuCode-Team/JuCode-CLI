@@ -15,7 +15,7 @@
 use crate::store::{now, random_hex, Store};
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::PathBuf,
@@ -121,6 +121,22 @@ impl Usage {
         }
     }
 
+    /// Give the UI the same stable key used by the gateway's charge ledger.
+    /// Called after observe, before broadcasting a usage event.
+    pub fn tag_event(&self, session: &str, event: &mut Value) {
+        if event["type"] != "usage" {
+            return;
+        }
+        let state = self.lock();
+        let turn = event["turn"]
+            .as_str()
+            .or_else(|| state.current.get(session).map(String::as_str));
+        if let Some(record) = turn.and_then(|turn| state.open.get(turn)) {
+            event["billing_turn"] = record["turn_id"].clone();
+            event["billing_gateway"] = json!(record["channel_kind"] == "jucode");
+        }
+    }
+
     fn add(&self, session: &str, event: &Value, info: &SessionInfo) {
         let mut state = self.lock();
         let turn = match event["turn"].as_str().filter(|turn| !turn.is_empty()) {
@@ -165,26 +181,41 @@ impl Usage {
             let sum = record[field].as_u64().unwrap_or(0) + event[field].as_u64().unwrap_or(0);
             record[field] = json!(sum);
         }
+        if kind != "jucode" {
+            match estimate(
+                &channel,
+                record["model"].as_str().unwrap_or_default(),
+                event,
+            ) {
+                Some(cost) => {
+                    record["estimated_cost_usd"] =
+                        json!(record["estimated_cost_usd"].as_f64().unwrap_or(0.0) + cost);
+                }
+                None => {
+                    record["unpriced_requests"] =
+                        json!(record["unpriced_requests"].as_u64().unwrap_or(0) + 1);
+                }
+            }
+        }
     }
 
     /// The session is ready again: its turns are written.
     pub fn close(&self, session: &str) {
-        let records: Vec<Value> = {
-            let mut state = self.lock();
-            if state.current.remove(session).is_some() {
-                crate::gateway::set_turn(session, None);
-            }
-            let turns: Vec<String> = state
-                .open
-                .iter()
-                .filter(|(_, record)| record["session"] == session)
-                .map(|(turn, _)| turn.clone())
-                .collect();
-            turns
-                .iter()
-                .filter_map(|turn| state.open.remove(turn))
-                .collect()
-        };
+        // Keep the move from open turns to the file atomic for ledger snapshots.
+        let mut state = self.lock();
+        if state.current.remove(session).is_some() {
+            crate::gateway::set_turn(session, None);
+        }
+        let turns: Vec<String> = state
+            .open
+            .iter()
+            .filter(|(_, record)| record["session"] == session)
+            .map(|(turn, _)| turn.clone())
+            .collect();
+        let records: Vec<Value> = turns
+            .iter()
+            .filter_map(|turn| state.open.remove(turn))
+            .collect();
         if records.is_empty() {
             return;
         }
@@ -209,7 +240,7 @@ impl Usage {
             return;
         }
         if upload {
-            self.lock().dirty = true;
+            state.dirty = true;
             self.wake.notify_all();
         }
     }
@@ -281,6 +312,31 @@ impl Usage {
     /// project each turn ran in.
     pub fn local_json(&self, days: u64, tz_offset: i64) -> Value {
         local_summary(&self.records(), days, tz_offset, now())
+    }
+
+    /// Persistent turns of the selected sessions, plus any turn still running.
+    /// Gateway charges remain authoritative in the account's ledger.
+    pub fn sessions_json(&self, sessions: &[String]) -> Value {
+        let selected: HashSet<&str> = sessions.iter().map(String::as_str).collect();
+        let state = self.lock();
+        let mut records = self.records();
+        records.extend(state.open.values().cloned());
+        drop(state);
+        records.retain(|r| r["session"].as_str().is_some_and(|s| selected.contains(s)));
+        let turns: Vec<String> = records
+            .iter()
+            .filter(|r| r["channel_kind"] == "jucode")
+            .filter_map(|r| r["turn_id"].as_str().map(str::to_string))
+            .collect();
+        let (charges, error) = match fetch_charges(&turns) {
+            Ok(charges) => (charges, None),
+            Err(error) => (HashMap::new(), Some(error)),
+        };
+        let mut out = sessions_summary(&records, sessions, &charges);
+        if let Some(error) = error {
+            out["billing_error"] = json!(error);
+        }
+        out
     }
 
     /// Uploads waiting records until the process exits.
@@ -406,6 +462,145 @@ fn channel(engine: &str, gateway: bool, provider: &str) -> (&'static str, String
         ),
         _ => ("local", engine.to_string()),
     }
+}
+
+// A reference estimate is captured when the tokens arrive. Unknown models
+// and cache-write prices stay unknown, rather than borrowing another model's price.
+fn estimate(provider: &str, model: &str, usage: &Value) -> Option<f64> {
+    if usage["cache_write_tokens"].as_u64().unwrap_or(0) > 0
+        || !jucode_agent_core::builtin_providers()
+            .iter()
+            .any(|(id, _, _)| id == provider)
+    {
+        return None;
+    }
+    let prices = jucode_agent_core::models_for_provider(provider)
+        .into_iter()
+        .find(|m| m.name == model)?;
+    let input = usage["input_tokens"].as_u64().unwrap_or(0);
+    let cached = usage["cached_input_tokens"].as_u64().unwrap_or(0);
+    let output = usage["output_tokens"].as_u64().unwrap_or(0);
+    if (input > cached && prices.input_cost <= 0.0)
+        || (cached > 0 && prices.cached_input_cost <= 0.0)
+        || (output > 0 && prices.output_cost <= 0.0)
+    {
+        return None;
+    }
+    Some(prices.cost_for(input, cached, output))
+}
+
+fn fetch_charges(turns: &[String]) -> Result<HashMap<String, Value>, String> {
+    let mut out = HashMap::new();
+    if turns.is_empty() {
+        return Ok(out);
+    }
+    let (api, token) = jucode_agent_core::jucode_gateway_token()?;
+    for batch in turns.chunks(2000) {
+        let response: Value = ureq::post(&format!(
+            "{}/v1/oauth/agent-usage/charges",
+            api.trim_end_matches('/')
+        ))
+        .timeout(Duration::from_secs(15))
+        .set("Authorization", &format!("Bearer {token}"))
+        .send_json(json!({ "turn_ids": batch }))
+        .map_err(|e| e.to_string())?
+        .into_json()
+        .map_err(|e| e.to_string())?;
+        for row in response["items"]
+            .as_array()
+            .ok_or("invalid usage charges response")?
+        {
+            let id = row["turn_id"].as_str().ok_or("missing charge turn_id")?;
+            out.insert(id.to_string(), row.clone());
+        }
+    }
+    Ok(out)
+}
+
+fn sessions_summary(
+    records: &[Value],
+    sessions: &[String],
+    charges: &HashMap<String, Value>,
+) -> Value {
+    let mut by_session: BTreeMap<&str, Vec<&Value>> = BTreeMap::new();
+    for session in sessions {
+        by_session.entry(session).or_default();
+    }
+    for record in records {
+        if let Some(rows) = record["session"]
+            .as_str()
+            .and_then(|s| by_session.get_mut(s))
+        {
+            rows.push(record);
+        }
+    }
+    let totals = turn_totals(by_session.values().flatten().copied(), charges);
+    let turns: Vec<Value> = by_session
+        .values()
+        .flatten()
+        .map(|record| {
+            let mut row = turn_totals(std::iter::once(*record), charges);
+            row["turn_id"] = record["turn_id"].clone();
+            row["session"] = record["session"].clone();
+            row
+        })
+        .collect();
+    let rows: Vec<Value> = by_session
+        .into_iter()
+        .map(|(session, records)| {
+            let mut row = turn_totals(records.iter().copied(), charges);
+            row["session"] = json!(session);
+            row["started_at"] = records
+                .iter()
+                .filter_map(|r| r["started_at"].as_u64())
+                .min()
+                .map_or(Value::Null, |at| json!(at));
+            row
+        })
+        .collect();
+    json!({ "totals": totals, "sessions": rows, "turns": turns })
+}
+
+fn turn_totals<'a>(
+    records: impl Iterator<Item = &'a Value>,
+    charges: &HashMap<String, Value>,
+) -> Value {
+    let mut sums = Sums::default();
+    let (mut actual, mut estimated) = (None::<f64>, None::<f64>);
+    let (mut pending, mut unknown, mut gateway_requests) = (0, 0, 0);
+    let mut running = false;
+    for record in records {
+        sums.add(record);
+        sums.turns += 1;
+        running |= record["ended_at"].is_null();
+        let requests = record["requests"].as_u64().unwrap_or(1);
+        if record["channel_kind"] == "jucode" {
+            gateway_requests += requests;
+            let charge = record["turn_id"].as_str().and_then(|id| charges.get(id));
+            let cost = charge
+                .and_then(|c| c["cost"].as_str()?.parse::<f64>().ok())
+                .filter(|c| c.is_finite() && *c >= 0.0);
+            if let Some(cost) = cost {
+                actual = Some(actual.unwrap_or(0.0) + cost);
+                pending +=
+                    requests.saturating_sub(charge.unwrap()["requests"].as_u64().unwrap_or(0));
+            } else {
+                pending += requests;
+            }
+        } else {
+            if let Some(cost) = record["estimated_cost_usd"].as_f64() {
+                estimated = Some(estimated.unwrap_or(0.0) + cost);
+                unknown += record["unpriced_requests"].as_u64().unwrap_or(0);
+            } else {
+                unknown += requests;
+            }
+        }
+    }
+    sums.json(json!({
+        "gateway_cost": actual, "estimated_cost_usd": estimated,
+        "pending_requests": pending, "unpriced_requests": unknown, "running": running,
+        "gateway_requests": gateway_requests,
+    }))
 }
 
 fn new_turn_id() -> String {
@@ -615,6 +810,130 @@ mod tests {
             .collect();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&json!("t-a")) && ids.contains(&json!("t-b")));
+    }
+
+    #[test]
+    fn schedule_totals_keep_currencies_separate_and_do_not_count_reused_sessions_twice() {
+        let records = vec![
+            json!({ "turn_id": "gw1", "session": "s1", "channel_kind": "jucode", "requests": 2, "input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 20, "started_at": 1, "ended_at": 2 }),
+            json!({ "turn_id": "gw2", "session": "s1", "channel_kind": "jucode", "requests": 1, "input_tokens": 10, "output_tokens": 2, "started_at": 3, "ended_at": 4 }),
+            json!({ "turn_id": "direct", "session": "s2", "channel_kind": "local", "requests": 1, "input_tokens": 50, "output_tokens": 5, "estimated_cost_usd": 0.12, "started_at": 5, "ended_at": 6 }),
+            json!({ "turn_id": "old", "session": "s2", "channel_kind": "local", "requests": 1, "input_tokens": 5, "output_tokens": 1, "ended_at": 6 }),
+            json!({ "turn_id": "unrelated", "session": "s3", "channel_kind": "jucode", "requests": 1, "input_tokens": 99999 }),
+        ];
+        let sessions = vec!["s1".into(), "s2".into(), "s1".into(), "no-record".into()];
+        let charges = HashMap::from([
+            ("gw1".into(), json!({ "cost": "0.05", "requests": 2 })),
+            ("gw2".into(), json!({ "cost": "0", "requests": 1 })),
+        ]);
+        let summary = sessions_summary(&records, &sessions, &charges);
+        assert_eq!(summary["sessions"].as_array().unwrap().len(), 3);
+        assert_eq!(summary["totals"]["turns"], 4);
+        assert_eq!(summary["totals"]["input_tokens"], 165);
+        assert_eq!(summary["totals"]["cached_input_tokens"], 80);
+        assert_eq!(summary["totals"]["gateway_cost"], 0.05);
+        assert_eq!(summary["totals"]["gateway_requests"], 3);
+        let turns = summary["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 4);
+        assert_eq!(
+            turns.iter().find(|t| t["turn_id"] == "gw1").unwrap()["gateway_cost"],
+            0.05
+        );
+        assert_eq!(
+            turns.iter().find(|t| t["turn_id"] == "gw2").unwrap()["gateway_cost"],
+            0.0
+        );
+        assert_eq!(summary["totals"]["estimated_cost_usd"], 0.12);
+        assert_eq!(summary["totals"]["unpriced_requests"], 1);
+        assert_eq!(summary["totals"]["pending_requests"], 0);
+        assert_eq!(summary["totals"]["running"], false);
+        let missing = sessions_summary(&records, &sessions, &HashMap::new());
+        assert!(missing["totals"]["gateway_cost"].is_null());
+        assert_eq!(missing["totals"]["pending_requests"], 3);
+        let partial = HashMap::from([("gw1".into(), json!({ "cost": "0.025", "requests": 1 }))]);
+        assert_eq!(
+            sessions_summary(&records, &sessions, &partial)["totals"]["pending_requests"],
+            2
+        );
+    }
+
+    #[test]
+    fn billing_tags_match_persisted_turns_for_each_engine() {
+        let (usage, dir) = usage_in("billing-tags");
+        for (engine, gateway, provider) in [
+            ("jucode", false, "jucode"),
+            ("claude", true, "anthropic"),
+            ("codex", true, "jucode_gateway"),
+            ("claude", false, "anthropic"),
+        ] {
+            usage.observe(
+                "s",
+                &json!({ "type": "model_status", "provider": provider }),
+                || None,
+            );
+            let mut ids = Vec::new();
+            for i in 0..2 {
+                usage.observe("s", &json!({ "type": "user_message" }), || {
+                    info(engine, gateway)
+                });
+                let mut event = spend(10, 2);
+                if engine == "jucode" {
+                    event["turn"] = json!(format!("native-{i}"));
+                }
+                usage.observe("s", &event, || info(engine, gateway));
+                usage.tag_event("s", &mut event);
+                let id = event["billing_turn"].as_str().unwrap().to_string();
+                assert_eq!(event["billing_gateway"], engine == "jucode" || gateway);
+                // Further requests carry the same key, not a new per-event id.
+                usage.observe("s", &event, || info(engine, gateway));
+                usage.tag_event("s", &mut event);
+                assert_eq!(event["billing_turn"], id);
+                usage.close("s");
+                assert!(usage
+                    .records()
+                    .iter()
+                    .any(|r| r["turn_id"] == id && r["requests"] == 2));
+                ids.push(id);
+            }
+            assert_ne!(ids[0], ids[1]);
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn direct_cost_estimates_are_saved_and_unknown_prices_stay_unknown() {
+        let (usage, dir) = usage_in("estimates");
+        let model = jucode_agent_core::models_for_provider("anthropic")
+            .into_iter()
+            .find(|m| m.input_cost > 0.0 && m.cached_input_cost > 0.0 && m.output_cost > 0.0)
+            .unwrap();
+        let event = json!({ "type": "usage", "input_tokens": 1000, "cached_input_tokens": 600, "output_tokens": 100 });
+        usage.observe(
+            "s1",
+            &json!({ "type": "model_status", "provider": "anthropic", "model": model.name }),
+            || info("claude", false),
+        );
+        usage.observe("s1", &event, || info("claude", false));
+        let live = usage.sessions_json(&["s1".into()]);
+        assert_eq!(live["totals"]["running"], true);
+        let expected = model.cost_for(1000, 600, 100);
+        assert!((live["totals"]["estimated_cost_usd"].as_f64().unwrap() - expected).abs() < 1e-9);
+        usage.close("s1");
+        let store = Store::open(dir.clone()).unwrap();
+        let reopened = Usage::new(&store);
+        let saved = reopened.sessions_json(&["s1".into()]);
+        assert_eq!(
+            saved["totals"]["estimated_cost_usd"],
+            live["totals"]["estimated_cost_usd"]
+        );
+        assert_eq!(saved["totals"]["running"], false);
+        assert!(estimate("my-provider", "unknown-model", &event).is_none());
+        assert!(estimate("anthropic", "unknown-model", &event).is_none());
+        let mut writes = event.clone();
+        writes["cache_write_tokens"] = json!(5);
+        assert!(estimate("anthropic", &model.name, &writes).is_none());
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -580,6 +580,43 @@ fn a_new_session_message_starts_a_conversation_and_the_log_shows_both() {
 }
 
 #[test]
+fn a_timer_can_be_cancelled_from_the_desk_and_stays_cancelled() {
+    let _guard = setup();
+    let root = temp_dir("desk-cancel-timer");
+    let state = root.join("daemon");
+    fs::create_dir_all(&state).unwrap();
+    let timers: String = ["t-cancel", "t-keep"]
+        .iter()
+        .map(|id| {
+            format!(
+                "{}\n",
+                json!({
+                    "kind": "set", "id": id, "agent": "ops", "session": "s1",
+                    "fire_at": 4_000_000_000_000u64, "body": id, "at": 1,
+                })
+            )
+        })
+        .collect();
+    fs::write(state.join("timers.jsonl"), timers).unwrap();
+    let daemon = start_daemon_on(state.clone(), root.join("agents"));
+    let mut client = Client::connect(&daemon);
+    client.send(json!({ "op": "timer_cancel", "timer": "t-cancel", "id": 71 }));
+    let frames = client.until(|frame| frame["id"] == 71);
+    assert_eq!(frames.last().unwrap()["type"], "timer_cancelled");
+    assert_eq!(frames.last().unwrap()["timer"], "t-cancel");
+    client.send(json!({ "op": "timer_cancel", "timer": "t-cancel", "id": 72 }));
+    let frames = client.until(|frame| frame["id"] == 72);
+    assert_eq!(frames.last().unwrap()["type"], "error");
+    drop(client);
+    let mut client = Client::connect(&daemon);
+    client.send(json!({ "op": "timer_list", "id": 73 }));
+    let frames = client.until(|frame| frame["id"] == 73);
+    let active = frames.last().unwrap()["timers"].as_array().unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0]["timer"], "t-keep");
+}
+
+#[test]
 fn a_timer_set_by_an_agent_wakes_it_with_nobody_connected() {
     let _guard = setup();
     let daemon = start_daemon();
@@ -2892,4 +2929,37 @@ fn a_mode_codex_takes_per_turn_waits_and_full_access_answers_the_open_approval()
     desktop.send(json!({ "op": "user_message", "session": session, "content": "hello" }));
     let frames = desktop.until(turn_done(&session));
     assert!(!frames.iter().any(|f| f["type"] == "approval_mode_pending"));
+}
+
+#[test]
+fn session_usage_restores_only_its_persisted_turns_with_correlated_replies() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let row = |session: &str, turn: &str, cost: f64| {
+        json!({
+            "session": session, "turn_id": turn, "channel_kind": "local",
+            "input_tokens": 100, "output_tokens": 10, "requests": 1,
+            "estimated_cost_usd": cost, "ended_at": 123,
+        })
+    };
+    fs::write(
+        daemon.state.join("usage.jsonl"),
+        format!("{}\n{}\n", row("s1", "t1", 0.12), row("other", "t2", 99.0)),
+    )
+    .unwrap();
+    let mut client = Client::connect(&daemon);
+    client.send(json!({ "op": "session_usage", "session": "s1", "id": 81 }));
+    let frames = client.until(|f| f["id"] == 81);
+    let usage = frames.last().unwrap();
+    assert_eq!(usage["type"], "session_usage");
+    assert_eq!(usage["session"], "s1");
+    assert_eq!(usage["totals"]["estimated_cost_usd"], 0.12);
+    assert_eq!(usage["totals"]["input_tokens"], 100);
+    assert_eq!(usage["turns"].as_array().unwrap().len(), 1);
+    assert_eq!(usage["turns"][0]["turn_id"], "t1");
+    client.send(json!({ "op": "session_usage", "id": 82 }));
+    assert_eq!(
+        client.until(|f| f["id"] == 82).last().unwrap()["type"],
+        "error"
+    );
 }
