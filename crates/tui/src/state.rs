@@ -416,6 +416,7 @@ impl TuiState {
                     path,
                     status,
                     message,
+                    ..
                 } => {
                     self.chat.push(ChatLine::System(format!(
                         "Agent {path}: {status} — {message}"
@@ -534,6 +535,8 @@ impl TuiState {
                 // Structured MCP state is for GUI front-ends; the TUI relies on
                 // the accompanying Info lines (and /mcp) instead.
                 AgentEvent::McpServers { .. } => false,
+                // The agent trace is for GUI front-ends (the TUI has /subagents).
+                AgentEvent::AgentRuns(_) | AgentEvent::SubagentTranscript { .. } => false,
                 AgentEvent::Transcript(items) => {
                     self.replace_transcript(items);
                     true

@@ -498,3 +498,92 @@ fn a_proposed_plan_waits_then_runs_in_the_approved_mode() {
         .collect();
     assert_eq!(plans, vec!["approved".to_string()]);
 }
+
+#[test]
+fn subagents_report_their_work_to_the_agent_trace() {
+    let _guard = setup();
+    let dir = temp_dir("trace");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+
+    let args = serde_json::json!({ "task_name": "lister", "message": "RUN: ls" });
+    core.submit_user_message(format!("CALL spawn_agent {args}"));
+    // Whole batches: the lifecycle events follow `ready` in the same batch.
+    let mut events = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !events.iter().any(is_ready) && Instant::now() < deadline {
+        events.extend(core.poll_events());
+        thread::sleep(Duration::from_millis(10));
+    }
+    // The child runs on its own thread; wait until it has finished.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        let AgentEvent::AgentRuns(rows) = core.agent_runs_event() else {
+            unreachable!()
+        };
+        if rows
+            .iter()
+            .any(|row| row["state"] != "running" && row["state"] != "pending")
+        {
+            break;
+        }
+        events.extend(core.poll_events());
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let lifecycle = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::SubagentLifecycle {
+                label, tool_use_id, ..
+            } => Some((label.clone(), tool_use_id.clone())),
+            _ => None,
+        })
+        .expect("subagent_lifecycle");
+    assert_eq!(lifecycle, ("lister".to_string(), "call_1".to_string()));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::AgentRuns(_))));
+
+    let AgentEvent::AgentRuns(rows) = core.agent_runs_event() else {
+        unreachable!()
+    };
+    let row = rows
+        .iter()
+        .find(|row| row["label"] == "lister")
+        .expect("row");
+    assert_eq!(row["id"], "/root/lister");
+    assert_eq!(row["tool_use_id"], "call_1");
+    assert_eq!(row["type"], "subagent");
+    assert_eq!(row["prompt"], "RUN: ls");
+    assert!(row["started_at"].as_u64().unwrap() > 1_700_000_000_000);
+
+    let AgentEvent::SubagentTranscript {
+        items: Some(items), ..
+    } = core.subagent_transcript_event("/root/lister")
+    else {
+        panic!("transcript")
+    };
+    // The child may still be working when the parent's turn ends and closes
+    // it, so only its task is certain.
+    assert_eq!(
+        items[0],
+        serde_json::json!({ "role": "user", "content": "RUN: ls" })
+    );
+    let AgentEvent::SubagentTranscript { items: None, .. } =
+        core.subagent_transcript_event("/root/nobody")
+    else {
+        panic!("unknown agent")
+    };
+
+    // A later turn keeps the earlier turn's agent in the trace.
+    core.submit_user_message("hello".to_string());
+    pump(&mut core, is_ready);
+    let AgentEvent::AgentRuns(rows) = core.agent_runs_event() else {
+        unreachable!()
+    };
+    assert!(rows.iter().any(|row| row["label"] == "lister"));
+    assert!(matches!(
+        core.subagent_transcript_event("/root/lister"),
+        AgentEvent::SubagentTranscript { items: Some(_), .. }
+    ));
+}

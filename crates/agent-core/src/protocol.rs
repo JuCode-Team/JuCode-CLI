@@ -90,6 +90,14 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
                 "decide_action requires action and decision: allow or deny".to_string(),
             )],
         },
+        "agent_runs" => vec![core.agent_runs_event()],
+        "subagent_transcript" => {
+            let id = value
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            vec![core.subagent_transcript_event(id)]
+        }
         "approve_plan" => {
             let text = |key: &str| value.get(key).and_then(Value::as_str).unwrap_or_default();
             let mode = match value.get("mode").and_then(Value::as_str) {
@@ -289,12 +297,33 @@ pub fn event_json(event: AgentEvent) -> Value {
             path,
             status,
             message,
+            label,
+            model,
+            tool_use_id,
         } => json!({
             "type": "subagent_lifecycle",
             "path": path,
             "status": status,
-            "message": message
+            "message": message,
+            "label": label,
+            "model": model,
+            "tool_use_id": tool_use_id,
         }),
+        AgentEvent::AgentRuns(agents) => json!({
+            "type": "agent_runs",
+            "workflows": [],
+            "agents": agents,
+        }),
+        AgentEvent::SubagentTranscript { agent_id, items } => match items {
+            Some(items) => {
+                json!({ "type": "subagent_transcript", "agent_id": agent_id, "items": items })
+            }
+            None => json!({
+                "type": "subagent_transcript",
+                "agent_id": agent_id,
+                "error": format!("unknown agent: {agent_id}"),
+            }),
+        },
         AgentEvent::Usage {
             input_tokens,
             cached_input_tokens,

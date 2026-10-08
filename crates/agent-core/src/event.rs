@@ -174,6 +174,17 @@ pub enum AgentEvent {
         path: String,
         status: String,
         message: String,
+        /// The agent's task name, model and the spawn_agent call that started it.
+        label: String,
+        model: String,
+        tool_use_id: String,
+    },
+    /// Every subagent of the session (`agent_runs` rows, oldest first).
+    AgentRuns(Vec<serde_json::Value>),
+    /// One subagent's work (`subagent_transcript`); None: unknown id.
+    SubagentTranscript {
+        agent_id: String,
+        items: Option<Vec<serde_json::Value>>,
     },
     Usage {
         input_tokens: u64,

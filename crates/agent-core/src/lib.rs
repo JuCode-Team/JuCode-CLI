@@ -22,6 +22,7 @@ pub mod sandbox;
 mod secrets;
 mod session;
 pub mod skills;
+mod subagent_trace;
 mod subagents;
 mod tokens;
 mod tools;

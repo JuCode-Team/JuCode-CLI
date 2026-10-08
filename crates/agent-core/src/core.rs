@@ -42,7 +42,7 @@ use std::{
         Arc,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// Recent context (in tokenizer-counted tokens) kept verbatim when compacting; older
@@ -191,6 +191,11 @@ pub struct AgentCore {
     resume_summary_running: bool,
     interrupt_flag: Arc<AtomicBool>,
     subagent_manager: SubagentManager,
+    /// Agents of earlier turns: (agent_runs row, transcript), newest last.
+    past_subagents: Vec<(Value, Vec<Value>)>,
+    /// What the last `agent_runs` showed, and when it went out (throttle).
+    agent_runs_revision: u64,
+    agent_runs_sent_at: Option<Instant>,
     trust: TrustStore,
     project_trusted: bool,
     hooks: Hooks,
@@ -284,6 +289,9 @@ impl AgentCore {
             resume_summary_running: false,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             subagent_manager: SubagentManager::default(),
+            past_subagents: Vec::new(),
+            agent_runs_revision: 0,
+            agent_runs_sent_at: None,
             trust,
             project_trusted,
             hooks,
@@ -1791,16 +1799,87 @@ impl AgentCore {
         }
     }
 
-    fn drain_subagent_events(&self) -> Vec<AgentEvent> {
-        self.subagent_manager
+    fn drain_subagent_events(&mut self) -> Vec<AgentEvent> {
+        let mut events: Vec<AgentEvent> = self
+            .subagent_manager
             .drain_events()
             .into_iter()
-            .map(|event| AgentEvent::SubagentLifecycle {
-                path: event.path,
-                status: event.status,
-                message: event.message,
+            .map(|event| {
+                let (label, model, tool_use_id) = self
+                    .subagent_manager
+                    .describe(&event.path)
+                    .unwrap_or_default();
+                AgentEvent::SubagentLifecycle {
+                    path: event.path,
+                    status: event.status,
+                    message: event.message,
+                    label,
+                    model,
+                    tool_use_id,
+                }
             })
-            .collect()
+            .collect();
+        // The agent trace: at most two refreshes a second while agents work;
+        // a lifecycle change goes out at once.
+        let revision = self.subagent_manager.trace_revision();
+        if revision != self.agent_runs_revision {
+            let due = !events.is_empty()
+                || self
+                    .agent_runs_sent_at
+                    .is_none_or(|sent| sent.elapsed() >= Duration::from_millis(500));
+            if due {
+                self.agent_runs_revision = revision;
+                self.agent_runs_sent_at = Some(Instant::now());
+                events.push(self.agent_runs_event());
+            }
+        }
+        events
+    }
+
+    /// `agent_runs`: this session's subagents, earlier turns' first.
+    pub fn agent_runs_event(&self) -> AgentEvent {
+        let current = self.subagent_manager.runs_json();
+        let mut agents: Vec<Value> = self
+            .past_subagents
+            .iter()
+            .map(|(row, _)| row.clone())
+            .filter(|row| !current.iter().any(|now| now["id"] == row["id"]))
+            .collect();
+        agents.extend(current);
+        AgentEvent::AgentRuns(agents)
+    }
+
+    /// `subagent_transcript`: one agent's work, this turn's agents first.
+    pub fn subagent_transcript_event(&self, agent_id: &str) -> AgentEvent {
+        let items = self.subagent_manager.transcript_json(agent_id).or_else(|| {
+            self.past_subagents
+                .iter()
+                .rev()
+                .find(|(row, _)| row["id"] == agent_id)
+                .map(|(_, items)| items.clone())
+        });
+        AgentEvent::SubagentTranscript {
+            agent_id: agent_id.to_string(),
+            items,
+        }
+    }
+
+    /// Keeps the agents of the turn that ended (the manager starts afresh
+    /// each turn), bounded to the most recent ones.
+    fn archive_subagents(&mut self) {
+        const MAX_PAST_SUBAGENTS: usize = 24;
+        for row in self.subagent_manager.runs_json() {
+            let id = row["id"].as_str().unwrap_or_default().to_string();
+            let items = self
+                .subagent_manager
+                .transcript_json(&id)
+                .unwrap_or_default();
+            self.past_subagents
+                .retain(|(known, _)| known["id"] != row["id"]);
+            self.past_subagents.push((row, items));
+        }
+        let excess = self.past_subagents.len().saturating_sub(MAX_PAST_SUBAGENTS);
+        self.past_subagents.drain(..excess);
     }
 
     /// Folds finished subagents' token usage into the parent's cumulative totals,
@@ -1844,6 +1923,7 @@ impl AgentCore {
             events.push(AgentEvent::Error(error));
             return events;
         }
+        self.archive_subagents();
         self.subagent_manager = SubagentManager::default();
         let base_prompt = match self.config.system_prompt() {
             Ok(_) if self.chat => crate::chat::CHAT_SYSTEM_PROMPT.to_string(),
