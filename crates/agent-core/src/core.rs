@@ -4754,19 +4754,51 @@ pub fn title_completion(system: &str, user: &str) -> Result<String, String> {
         AuthStore::load_or_create(config.encrypt_secrets).map_err(|error| error.to_string())?
     };
     let (model, reasoning_effort) = config.title();
+    match title_request(&config, &auth, &model, &reasoning_effort, system, user) {
+        // A model that refuses its lightest listed effort (gpt-6-astra takes no
+        // "none") gets the next one up.
+        Err(error) if rejects_reasoning_effort(&error) => {
+            let efforts = config.model_config(&model).reasoning_efforts;
+            match efforts
+                .iter()
+                .skip_while(|effort| **effort != reasoning_effort)
+                .nth(1)
+            {
+                Some(next) => title_request(&config, &auth, &model, next, system, user),
+                None => Err(error),
+            }
+        }
+        reply => reply,
+    }
+}
+
+/// An upstream 400 about the reasoning effort (Responses `reasoning.effort`,
+/// Chat `reasoning_effort`).
+fn rejects_reasoning_effort(error: &str) -> bool {
+    error.contains("reasoning.effort") || error.contains("reasoning_effort")
+}
+
+fn title_request(
+    config: &Config,
+    auth: &AuthStore,
+    model: &str,
+    reasoning_effort: &str,
+    system: &str,
+    user: &str,
+) -> Result<String, String> {
     let client = OpenAiClient::from_config(OpenAiClientConfig {
-        model: model.clone(),
+        model: model.to_string(),
         provider: config.provider.clone(),
         protocol: config.protocol.clone(),
-        reasoning_effort,
+        reasoning_effort: reasoning_effort.to_string(),
         models: Vec::new(),
         subagent_models: Vec::new(),
         system_prompt: String::new(),
         prompt_cache_key: String::new(),
         mcp: McpManager::default(),
         base_url: config.base_url.clone(),
-        max_output_tokens: config.model_config(&model).max_output_tokens,
-        api_key: provider_api_key(&config, &auth).as_deref(),
+        max_output_tokens: config.model_config(model).max_output_tokens,
+        api_key: provider_api_key(config, auth).as_deref(),
         api_key_env: &config.api_key_env,
         retry_attempts: config.retry_attempts,
         connect_timeout: Duration::from_secs(config.connect_timeout_seconds),
@@ -4776,7 +4808,7 @@ pub fn title_completion(system: &str, user: &str) -> Result<String, String> {
         approval_mode: LiveApprovalMode::new(config.approval_mode),
         safety_model: None,
         safety_reasoning_effort: String::new(),
-        model_headers: model_headers(&config),
+        model_headers: model_headers(config),
         edit_tools: Vec::new(),
         extra_read_roots: Vec::new(),
         tool_state: crate::tools::ToolState::default(),

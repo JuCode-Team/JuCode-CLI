@@ -2227,8 +2227,37 @@ fn ripgrep(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value {
     command_args.push(search_path.display().to_string());
 
     let arg_refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
-    let result = run_command("rg", &arg_refs, cwd, Duration::from_secs(30));
-    let mut value = command_result_json("rg", result);
+    let mut value = match run_command("rg", &arg_refs, cwd, Duration::from_secs(30)) {
+        // No rg on this machine (a stock Windows has none): search in-process.
+        Err(error) if error.starts_with("failed to start rg") => {
+            let options = crate::search::Options {
+                ignore_case: args
+                    .get("ignoreCase")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                literal: args
+                    .get("literal")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                context: context_lines,
+                glob: args.get("glob").and_then(Value::as_str),
+                timeout: Duration::from_secs(30),
+            };
+            let out = crate::search::search(pattern, &search_path, &options);
+            command_result_json(
+                "rg",
+                Ok(CommandResult {
+                    exit_code: Some(out.exit_code),
+                    signal: None,
+                    stdout: out.stdout,
+                    stderr: out.stderr,
+                    timed_out: out.timed_out,
+                    truncated: out.truncated,
+                }),
+            )
+        }
+        result => command_result_json("rg", result),
+    };
     // rg exit code 1 means "no matches", which is a valid result; 2+ is an error.
     if value.get("exit_code").and_then(Value::as_i64) == Some(1) {
         value["exit_code"] = json!(0);
