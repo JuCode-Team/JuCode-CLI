@@ -1939,6 +1939,10 @@ impl AgentCore {
                 system_prompt.push_str(extra.trim_end());
             }
         }
+        if self.approval_mode.get() == ApprovalMode::Plan && !self.chat {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(crate::plan_mode::PROMPT_ADDENDUM);
+        }
 
         // Desktop edits subagent_models in config.json while engines run. An
         // unreadable file keeps the list this engine already has.
@@ -2860,6 +2864,9 @@ impl AgentCore {
         if name == "update_plan" {
             return self.handle_update_plan(&args);
         }
+        if name == crate::plan_mode::TOOL_NAME {
+            return self.handle_propose_plan(&args);
+        }
         let result = match name {
             "get_goal" => Ok(self.session.goal().cloned()),
             "create_goal" => {
@@ -2905,6 +2912,148 @@ impl AgentCore {
                 )
             }
         }
+    }
+
+    /// `propose_plan` (plan mode): records the plan as pending and shows it;
+    /// the turn ends there and the user answers with `approve_plan`.
+    fn handle_propose_plan(&mut self, args: &Value) -> (ToolGoalResponse, Option<AgentEvent>) {
+        let field = |key: &str| {
+            args.get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let (title, markdown) = (field("title"), field("plan"));
+        if self.approval_mode.get() != ApprovalMode::Plan {
+            let output =
+                json!({ "error": "propose_plan is only available in plan mode" }).to_string();
+            return (
+                ToolGoalResponse {
+                    output,
+                    is_error: true,
+                },
+                None,
+            );
+        }
+        if title.is_empty() || markdown.is_empty() {
+            let output =
+                json!({ "error": "propose_plan requires a title and the plan" }).to_string();
+            return (
+                ToolGoalResponse {
+                    output,
+                    is_error: true,
+                },
+                None,
+            );
+        }
+        let id = self.next_plan_id();
+        let event = self.record_plan(&id, &title, &markdown, "pending");
+        let output = json!({
+            "status": "proposed",
+            "id": id,
+            "note": "The plan is shown to the user. Stop now and wait for their approval or feedback."
+        })
+        .to_string();
+        (
+            ToolGoalResponse {
+                output,
+                is_error: false,
+            },
+            Some(event),
+        )
+    }
+
+    fn next_plan_id(&self) -> String {
+        let mut bytes = [0u8; 8];
+        let _ = getrandom::getrandom(&mut bytes);
+        format!(
+            "plan-{}",
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        )
+    }
+
+    fn record_plan(&mut self, id: &str, title: &str, markdown: &str, status: &str) -> AgentEvent {
+        self.session.append(EntryKind::ProposedPlan {
+            id: id.to_string(),
+            title: title.to_string(),
+            markdown: markdown.to_string(),
+            status: status.to_string(),
+        });
+        AgentEvent::ProposedPlan {
+            id: id.to_string(),
+            title: title.to_string(),
+            markdown: markdown.to_string(),
+            status: status.to_string(),
+        }
+    }
+
+    /// The latest record of plan `id` on this branch: (title, markdown, status).
+    fn find_plan(&self, id: &str) -> Option<(String, String, String)> {
+        self.session
+            .branch()
+            .into_iter()
+            .rev()
+            .find_map(|entry| match &entry.kind {
+                EntryKind::ProposedPlan {
+                    id: known,
+                    title,
+                    markdown,
+                    status,
+                } if known == id => Some((title.clone(), markdown.clone(), status.clone())),
+                _ => None,
+            })
+    }
+
+    /// `approve_plan`: approve a pending plan and run it in `mode`, or ask
+    /// for a revision with `feedback` (plan mode stays on).
+    pub fn approve_plan(
+        &mut self,
+        id: &str,
+        approve: bool,
+        mode: Option<ApprovalMode>,
+        feedback: &str,
+    ) -> Vec<AgentEvent> {
+        let Some((title, markdown, status)) = self.find_plan(id) else {
+            return vec![AgentEvent::Error(format!("unknown plan: {id}"))];
+        };
+        if status == "approved" {
+            return vec![AgentEvent::Error(
+                "this plan was already approved".to_string(),
+            )];
+        }
+        let mut events = Vec::new();
+        if approve {
+            let mode = mode
+                .filter(|mode| *mode != ApprovalMode::Plan)
+                .unwrap_or(ApprovalMode::AutoEdit);
+            events.push(self.record_plan(id, &title, &markdown, "approved"));
+            events.extend(self.set_approval_mode(mode));
+            let mut message = format!(
+                "The user approved the plan \"{title}\". Implement it now, step by step. Keep the checklist current with update_plan as you go, and verify the result as the plan describes."
+            );
+            if !feedback.trim().is_empty() {
+                message.push_str("\n\nTheir notes: ");
+                message.push_str(feedback.trim());
+            }
+            events.extend(self.submit_user_message(message));
+        } else {
+            if feedback.trim().is_empty() {
+                return vec![AgentEvent::Error(
+                    "revising a plan needs feedback".to_string(),
+                )];
+            }
+            events.push(self.record_plan(id, &title, &markdown, "revising"));
+            if self.approval_mode.get() != ApprovalMode::Plan {
+                events.extend(self.set_approval_mode(ApprovalMode::Plan));
+            }
+            events.extend(self.submit_user_message(format!(
+                "Revise the plan \"{title}\" with this feedback, then propose the complete revised plan with propose_plan:\n\n{}",
+                feedback.trim()
+            )));
+        }
+        events.extend(self.save_session_event());
+        events
     }
 
     fn handle_update_plan(&mut self, args: &Value) -> (ToolGoalResponse, Option<AgentEvent>) {

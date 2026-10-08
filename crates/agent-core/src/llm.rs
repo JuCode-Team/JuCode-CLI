@@ -585,6 +585,23 @@ impl OpenAiClient {
             let mut blocked_results = Vec::new();
             let mut allowed_requests = Vec::new();
             for request in tool_requests {
+                // Plan mode: only read-only calls run (the live mode, so a
+                // switch mid-turn applies to the next call).
+                if self.approval_mode.get() == ApprovalMode::Plan {
+                    let read_only_hint = self.mcp.tool_read_only_hint(&request.name);
+                    if let Some(reason) =
+                        crate::plan_mode::refusal(&request.name, &request.arguments, read_only_hint)
+                    {
+                        emit(StreamEvent::ToolStart {
+                            call_id: request.call_id.clone(),
+                            name: request.name.clone(),
+                        })?;
+                        let result = json_tool_result(json!({ "error": reason }), true);
+                        emit_tool_output(&request, &result, &mut emit)?;
+                        blocked_results.push(ToolCallResult { request, result });
+                        continue;
+                    }
+                }
                 if let Some(reason) = self.hooks.pre_tool(&request.name, &request.arguments, cwd) {
                     emit(StreamEvent::ToolStart {
                         call_id: request.call_id.clone(),
@@ -734,7 +751,16 @@ impl OpenAiClient {
             }
             tool_results.append(&mut blocked_results);
 
+            // Plan mode: a delivered plan ends the turn; the user approves it
+            // or asks for a revision (approve_plan).
+            let plan_delivered = tool_results.iter().any(|tool_result| {
+                tool_result.request.name == crate::plan_mode::TOOL_NAME
+                    && !tool_result.result.is_error
+            });
             push_tool_result_items(&mut input, tool_results);
+            if plan_delivered {
+                return Ok(());
+            }
         }
     }
 
@@ -982,6 +1008,9 @@ impl OpenAiClient {
         if self.goal_tool_tx.is_some() {
             definitions.extend(goal_tool_definitions());
             definitions.push(plan_tool_definition());
+            if self.approval_mode.get() == ApprovalMode::Plan {
+                definitions.push(crate::plan_mode::propose_plan_definition());
+            }
         }
         definitions
     }
@@ -1263,11 +1292,17 @@ impl OpenAiClient {
             reasoning_effort,
             reasoning_efforts: efforts,
             subagent_models: self.subagent_models.clone(),
-            system_prompt: subagent_system_prompt(
-                &self.system_prompt,
-                &child_path,
-                workspace.as_ref().map(|workspace| workspace.root.as_path()),
-            ),
+            system_prompt: {
+                let mut prompt = subagent_system_prompt(
+                    &self.system_prompt,
+                    &child_path,
+                    workspace.as_ref().map(|workspace| workspace.root.as_path()),
+                );
+                if self.approval_mode.get() == ApprovalMode::Plan {
+                    prompt.push_str(crate::plan_mode::SUBAGENT_NOTE);
+                }
+                prompt
+            },
             prompt_cache_key: self.prompt_cache_key.clone(),
             mcp: self.mcp.clone(),
             base_url: self.base_url.clone(),
@@ -1449,7 +1484,11 @@ impl OpenAiClient {
     fn run_goal_tool(&self, name: &str, arguments: &str) -> Option<tools::ToolExecutionResult> {
         if !matches!(
             name,
-            "get_goal" | "create_goal" | "update_goal" | "update_plan"
+            "get_goal"
+                | "create_goal"
+                | "update_goal"
+                | "update_plan"
+                | crate::plan_mode::TOOL_NAME
         ) {
             return None;
         }

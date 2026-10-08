@@ -56,6 +56,18 @@ fn open(cwd: &Path, mode: ApprovalMode) -> AgentCore {
     core
 }
 
+/// A scripted model command that writes `text` to `file` in the session's
+/// directory, in the shell the platform runs.
+fn write_command(text: &str, file: &str) -> String {
+    if cfg!(windows) {
+        format!(
+            "RUN: [System.IO.File]::WriteAllText((Join-Path (Get-Location) '{file}'), '{text}')"
+        )
+    } else {
+        format!("RUN: printf {text} > {file}")
+    }
+}
+
 #[test]
 fn engines_in_one_process_work_in_their_own_directories() {
     let _guard = setup();
@@ -408,4 +420,81 @@ fn subagents_command_saves_the_models_subagents_may_use() {
 
     core.handle_command("/subagents remove fake-model");
     assert_eq!(saved()["subagent_models"], serde_json::json!([]));
+}
+
+fn plan_event(events: &[AgentEvent]) -> Option<(String, String, String)> {
+    events.iter().rev().find_map(|event| match event {
+        AgentEvent::ProposedPlan {
+            id, title, status, ..
+        } => Some((id.clone(), title.clone(), status.clone())),
+        _ => None,
+    })
+}
+
+#[test]
+fn plan_mode_refuses_changes_and_tells_the_model_to_plan() {
+    let _guard = setup();
+    let dir = temp_dir("plan-refuse");
+    let mut core = open(&dir, ApprovalMode::Plan);
+
+    core.submit_user_message(write_command("x", "marker.txt"));
+    let events = pump(&mut core, is_ready);
+    assert!(!dir.join("marker.txt").exists());
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ApprovalRequest { .. })));
+    let reply = assistant_text(&events);
+    assert!(reply.contains("plan mode"), "{reply}");
+    assert!(reply.contains("propose_plan"), "{reply}");
+
+    // The plan-mode rules are part of the prompt.
+    core.submit_user_message("SYSTEM".to_string());
+    let events = pump(&mut core, is_ready);
+    assert!(assistant_text(&events).contains("</plan_mode>"));
+}
+
+#[test]
+fn a_proposed_plan_waits_then_runs_in_the_approved_mode() {
+    let _guard = setup();
+    let dir = temp_dir("plan-approve");
+    let mut core = open(&dir, ApprovalMode::Plan);
+
+    let args = serde_json::json!({ "title": "Add marker", "plan": "| File | Change |\n|---|---|\n| marker.txt | create |" });
+    core.submit_user_message(format!("CALL propose_plan {args}"));
+    let events = pump(&mut core, is_ready);
+    let (id, title, status) = plan_event(&events).expect("proposed_plan event");
+    assert_eq!((title.as_str(), status.as_str()), ("Add marker", "pending"));
+    // The turn ended at the plan: the model did not get to answer the tool.
+    assert!(!assistant_text(&events).contains("tool said"));
+
+    // A revision keeps plan mode and asks the model again.
+    let events = core.approve_plan(&id, false, None, "also add a test");
+    assert_eq!(plan_event(&events).unwrap().2, "revising");
+    let events = pump(&mut core, is_ready);
+    assert!(assistant_text(&events).contains("also add a test"));
+
+    let events = core.approve_plan(&id, true, Some(ApprovalMode::FullAccess), "");
+    assert_eq!(plan_event(&events).unwrap().2, "approved");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ApprovalMode { mode } if mode == "full-access"
+    )));
+    let events = pump(&mut core, is_ready);
+    assert!(assistant_text(&events).contains("approved the plan"));
+    let again = core.approve_plan(&id, true, None, "");
+    assert!(matches!(again.as_slice(), [AgentEvent::Error(_)]));
+
+    // Reloading the session shows the plan once, with its latest status.
+    let transcript = core.transcript_event();
+    let AgentEvent::Transcript(items) = transcript else {
+        panic!("transcript event")
+    };
+    let plans: Vec<_> = items
+        .iter()
+        .filter_map(|item| match item {
+            jucode_agent_core::TranscriptItem::Plan { status, .. } => Some(status.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(plans, vec!["approved".to_string()]);
 }

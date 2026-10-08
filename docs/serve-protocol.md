@@ -140,9 +140,31 @@ can retry with a corrected op.
 {"op":"set_approval_mode","mode":"manual"}
 ```
 
-`mode` is `manual`, `auto-edit`, `auto`, or `full-access`. Emits
+`mode` is `manual`, `plan`, `auto-edit`, `auto`, or `full-access`. Emits
 `status:"approval mode: ..."` and an `approval_mode` event. The change
 applies to new turns; an in-flight turn's gating can only loosen.
+
+`plan` is plan mode: only read-only tools run (reads, listing, search,
+web search/fetch, read-only shell commands, MCP tools marked
+`readOnlyHint`, subagents, which inherit the mode). Every other call
+returns an error telling the model to plan instead. The model delivers
+its plan with the `propose_plan` tool, which emits `proposed_plan` and
+ends the turn.
+
+### `approve_plan`
+
+```json
+{"op":"approve_plan","id":"plan-1a2b3c4d5e6f7a8b","decision":"approve","mode":"auto-edit"}
+{"op":"approve_plan","id":"plan-1a2b3c4d5e6f7a8b","decision":"revise","feedback":"Also add a test"}
+```
+
+`approve` re-emits the plan with `status:"approved"`, switches the
+approval mode to `mode` (default `auto-edit`; `plan` is not allowed) and
+starts a turn that implements the plan (optional `feedback` is passed
+along as notes). `revise` re-emits it with `status:"revising"`, keeps
+plan mode, and starts a turn asking for a complete revised plan with the
+`feedback`, which is required. An unknown or already approved `id`
+returns an `error` event.
 
 ### `set_attended`
 
@@ -196,6 +218,7 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `model_status` | `provider`, `model`, `reasoning_effort`, `context_window`, `context_limit`, `max_output_tokens`, `reasoning_efforts`, `state` | Current model selection; deduplicated, re-emitted on change. Claude Code sessions add their own fields (`docs/daemon-protocol.md` → Other engines). |
 | `command_list` | `commands: [{command, marker, args, description}]` | Available slash commands incl. custom and MCP prompt commands. |
 | `approval_mode` | `mode` | Current approval mode; emitted at startup and on change. |
+| `proposed_plan` | `id`, `title`, `markdown`, `status` | Plan mode: a plan from `propose_plan`. `status` is `pending`, then `approved` or `revising` after `approve_plan`. Session replay (`transcript`) carries it as `{"role":"plan","id","title","content","status"}` with the latest status. |
 | `mcp_servers` | `servers: [{name, transport, state, tools, error?}]` | MCP server states; `state` ∈ `connecting`/`connected`/`failed`/`disabled`. |
 | `trust_prompt` | `cwd`, `repo_root` | Project has local resources (skills, commands, hooks) and no stored trust decision; answer via `command` `/trust yes\|no\|repo`. |
 | `user_message` | `content` | A user turn was accepted and started (echoes the submitted text). |

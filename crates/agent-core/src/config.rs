@@ -72,6 +72,10 @@ pub enum ApprovalMode {
     Auto,
     /// Everything runs without approval.
     FullAccess,
+    /// Planning: only read-only tools run (see `plan_mode::refusal`); the
+    /// agent ends by proposing a plan. Gated like `Manual` for anything that
+    /// reaches the approval layer.
+    Plan,
 }
 
 impl ApprovalMode {
@@ -81,6 +85,7 @@ impl ApprovalMode {
             Self::AutoEdit => "auto-edit",
             Self::Auto => "auto",
             Self::FullAccess => "full-access",
+            Self::Plan => "plan",
         }
     }
 
@@ -90,8 +95,9 @@ impl ApprovalMode {
             "auto-edit" => Ok(Self::AutoEdit),
             "auto" => Ok(Self::Auto),
             "full-access" => Ok(Self::FullAccess),
+            "plan" => Ok(Self::Plan),
             other => Err(format!(
-                "unknown approval mode '{other}': use manual, auto-edit, auto, or full-access"
+                "unknown approval mode '{other}': use manual, auto-edit, auto, full-access, or plan"
             )),
         }
     }
@@ -111,12 +117,12 @@ impl ApprovalMode {
         }
         // generate_image writes files into the workspace like `write`.
         if is_edit_tool(tool_name) || tool_name == crate::images::TOOL_NAME {
-            return *self == Self::Manual;
+            return self.is_strict();
         }
         // Network egress can exfiltrate local context, so the strictest mode
         // still asks; both auto modes already accept broader side effects.
         if is_network_tool(tool_name) {
-            return *self == Self::Manual;
+            return self.is_strict();
         }
         false
     }
@@ -127,12 +133,18 @@ impl ApprovalMode {
         *self == Self::Auto
     }
 
+    /// Manual, and plan mode for any call that still reaches the approval
+    /// layer (plan mode refuses mutating tools before that).
+    fn is_strict(&self) -> bool {
+        matches!(self, Self::Manual | Self::Plan)
+    }
+
     /// Approval policy for MCP tools, given the server's `readOnlyHint`
     /// annotation: manual asks for everything, the auto modes ask unless the
     /// tool is marked read-only, full-access never asks.
     pub fn requires_approval_for_mcp(&self, read_only_hint: bool) -> bool {
         match self {
-            Self::Manual => true,
+            Self::Manual | Self::Plan => true,
             Self::AutoEdit | Self::Auto => !read_only_hint,
             Self::FullAccess => false,
         }
@@ -146,11 +158,12 @@ impl ApprovalMode {
 pub struct LiveApprovalMode(std::sync::Arc<std::sync::atomic::AtomicU8>);
 
 impl LiveApprovalMode {
-    const MODES: [ApprovalMode; 4] = [
+    const MODES: [ApprovalMode; 5] = [
         ApprovalMode::Manual,
         ApprovalMode::AutoEdit,
         ApprovalMode::Auto,
         ApprovalMode::FullAccess,
+        ApprovalMode::Plan,
     ];
 
     pub fn new(mode: ApprovalMode) -> Self {
@@ -2271,7 +2284,11 @@ mod tests {
         );
         let error = ApprovalMode::parse("yolo").unwrap_err();
         assert!(error.contains("yolo"));
-        assert!(error.contains("manual, auto-edit, auto, or full-access"));
+        assert!(error.contains("manual, auto-edit, auto, full-access, or plan"));
+        assert_eq!(ApprovalMode::parse("plan").unwrap(), ApprovalMode::Plan);
+        assert_eq!(ApprovalMode::Plan.as_str(), "plan");
+        let live = LiveApprovalMode::new(ApprovalMode::Plan);
+        assert_eq!(live.get(), ApprovalMode::Plan);
     }
 
     #[test]

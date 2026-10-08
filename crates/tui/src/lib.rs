@@ -1176,7 +1176,7 @@ impl<R: TuiRuntime> TuiApp<R> {
     }
 
     fn cycle_approval_mode(&mut self) {
-        const ORDER: [&str; 4] = ["manual", "auto-edit", "auto", "full-access"];
+        const ORDER: [&str; 5] = ["manual", "plan", "auto-edit", "auto", "full-access"];
         let next = ORDER
             .iter()
             .position(|mode| *mode == self.state.approval_mode)

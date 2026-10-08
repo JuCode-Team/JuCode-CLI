@@ -14,6 +14,7 @@ pub mod logging;
 pub mod machine;
 mod mcp;
 mod oauth;
+mod plan_mode;
 mod prompt;
 pub mod protocol;
 mod providers;

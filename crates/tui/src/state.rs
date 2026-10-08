@@ -519,6 +519,18 @@ impl TuiState {
                     self.mark_history_dirty();
                     true
                 }
+                AgentEvent::ProposedPlan {
+                    title,
+                    markdown,
+                    status,
+                    ..
+                } => {
+                    self.chat.push(ChatLine::System(format!(
+                        "Plan ({status}): {title}\n{markdown}"
+                    )));
+                    self.mark_history_dirty();
+                    true
+                }
                 // Structured MCP state is for GUI front-ends; the TUI relies on
                 // the accompanying Info lines (and /mcp) instead.
                 AgentEvent::McpServers { .. } => false,
@@ -812,6 +824,12 @@ impl TuiState {
                     running: false,
                 },
                 TranscriptItem::Branch(label) => ChatLine::System(label),
+                TranscriptItem::Plan {
+                    title,
+                    content,
+                    status,
+                    ..
+                } => ChatLine::System(format!("Plan ({status}): {title}\n{content}")),
             })
             .collect();
         self.reset_screen = true;

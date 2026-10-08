@@ -95,6 +95,13 @@ pub enum TranscriptItem {
         output: String,
     },
     Branch(String),
+    /// A plan proposed in plan mode, with its latest status.
+    Plan {
+        id: String,
+        title: String,
+        content: String,
+        status: String,
+    },
 }
 
 #[derive(Debug)]
@@ -196,6 +203,14 @@ pub enum AgentEvent {
     CommandList(Vec<CommandView>),
     Goal(Option<GoalView>),
     Plan(Vec<PlanItem>),
+    /// Plan mode: a plan waiting for the user (`pending`), approved, or being
+    /// revised; `id` is the propose_plan call id.
+    ProposedPlan {
+        id: String,
+        title: String,
+        markdown: String,
+        status: String,
+    },
     ApprovalRequest {
         call_id: String,
         name: String,
