@@ -26,6 +26,68 @@ Keep it decision-complete and concise: whoever executes it must not have to make
 /// Added to a subagent's context when it starts in plan mode.
 pub const SUBAGENT_NOTE: &str = " Plan mode applies to you too: only read-only tools run. Report your findings to the parent; do not propose a plan.";
 
+/// The value of string field `key` in a JSON object still being written:
+/// what has arrived of it so far, unescaped; None until the value starts.
+pub fn partial_string_field(json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{key}\"");
+    let mut from = 0;
+    while let Some(found) = json[from..].find(&pattern) {
+        let after = from + found + pattern.len();
+        let rest = json[after..].trim_start();
+        if let Some(value) = rest.strip_prefix(':').map(str::trim_start) {
+            return value.strip_prefix('"').map(unescape_partial);
+        }
+        from = after;
+    }
+    None
+}
+
+/// A JSON string body up to its closing quote, or to the end when the rest
+/// has not arrived; an escape cut off at the end is left out.
+fn unescape_partial(body: &str) -> String {
+    let mut out = String::new();
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => break,
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('b') => out.push('\u{8}'),
+                Some('f') => out.push('\u{c}'),
+                Some(c @ ('"' | '\\' | '/')) => out.push(c),
+                Some('u') => {
+                    let Some(high) = hex4(&mut chars) else { break };
+                    let code = if (0xD800..0xDC00).contains(&high) {
+                        // A surrogate pair: its low half follows as \uXXXX.
+                        if chars.next() != Some('\\') || chars.next() != Some('u') {
+                            break;
+                        }
+                        let Some(low) = hex4(&mut chars) else { break };
+                        0x10000 + ((high - 0xD800) << 10) + (low.wrapping_sub(0xDC00) & 0x3FF)
+                    } else {
+                        high
+                    };
+                    if let Some(c) = char::from_u32(code) {
+                        out.push(c);
+                    }
+                }
+                _ => break,
+            },
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn hex4(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<u32> {
+    let digits: String = chars.by_ref().take(4).collect();
+    (digits.len() == 4)
+        .then(|| u32::from_str_radix(&digits, 16).ok())
+        .flatten()
+}
+
 pub fn propose_plan_definition() -> Value {
     json!({
         "type": "function",
@@ -347,5 +409,25 @@ mod tests {
         assert!(refusal("bash", &escalated, None).is_some());
         let refused = refusal("exec_command", r#"{"cmd":"cargo build"}"#, None).unwrap();
         assert!(refused.contains("`cargo build`"), "{refused}");
+    }
+
+    #[test]
+    fn reads_a_string_field_while_it_is_still_being_written() {
+        let whole =
+            r###"{"title": "Web 版", "plan": "## Goal\n\n- \"one\" \u4e2d \ud83d\ude00\n"}"###;
+        assert_eq!(partial_string_field(whole, "title").unwrap(), "Web 版");
+        assert_eq!(
+            partial_string_field(whole, "plan").unwrap(),
+            "## Goal\n\n- \"one\" 中 😀\n"
+        );
+        // Cut anywhere: what arrived so far, an escape cut off left out.
+        let cut = |json: &str| partial_string_field(json, "plan");
+        assert_eq!(cut(r###"{"title":"T","plan":"## Go"###).unwrap(), "## Go");
+        assert_eq!(cut(r###"{"title":"T","plan":"line\"###).unwrap(), "line");
+        assert_eq!(cut(r###"{"title":"T","plan":"a\u4e"###).unwrap(), "a");
+        assert_eq!(cut(r###"{"title":"T","pl"###), None);
+        assert_eq!(cut(r###"{"title":"T","plan": "###), None);
+        // A quoted "plan" inside the title is not the field.
+        assert_eq!(cut(r###"{"title":"the \"plan\" one"}"###), None);
     }
 }

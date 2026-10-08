@@ -453,6 +453,12 @@ pub fn event_json(event: AgentEvent) -> Value {
                 "status": item.status,
             })).collect::<Vec<_>>()
         }),
+        AgentEvent::PlanDraft { id, title, append } => json!({
+            "type": "plan_draft",
+            "id": id,
+            "title": title,
+            "append": append,
+        }),
         AgentEvent::ProposedPlan {
             id,
             title,

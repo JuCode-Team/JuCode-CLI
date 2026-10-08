@@ -213,8 +213,8 @@ impl SubagentTrace {
                 self.tokens = self.tokens.saturating_add(input_tokens + output_tokens);
                 self.revision += 1;
             }
-            // Only the main agent is steered.
-            StreamEvent::Steered(_) => {}
+            // Only the main agent is steered; its plan is the one drafted live.
+            StreamEvent::Steered(_) | StreamEvent::ToolArgumentsDelta { .. } => {}
         }
     }
 

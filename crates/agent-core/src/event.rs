@@ -214,6 +214,14 @@ pub enum AgentEvent {
     CommandList(Vec<CommandView>),
     Goal(Option<GoalView>),
     Plan(Vec<PlanItem>),
+    /// Plan mode: the plan while the model writes it (`append` is the text
+    /// added since the last draft event); `id` is the propose_plan call id
+    /// the finished plan comes with.
+    PlanDraft {
+        id: String,
+        title: String,
+        append: String,
+    },
     /// Plan mode: a plan waiting for the user (`pending`), approved, or being
     /// revised; `id` is the propose_plan call id.
     ProposedPlan {

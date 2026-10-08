@@ -75,6 +75,11 @@ struct ActionOutcome {
 enum WorkerEvent {
     /// A steered user message reached the model mid-turn.
     Steered(String),
+    /// A fragment of the propose_plan call's arguments as the model writes it.
+    PlanDraft {
+        call_id: String,
+        delta: String,
+    },
     CompactionStart,
     CompactionProgress {
         output_tokens: u64,
@@ -190,6 +195,9 @@ pub struct AgentCore {
     force_compaction: bool,
     overflow_retry_pending: bool,
     overflow_retried: bool,
+    /// The propose_plan call being written: its call id, its arguments so
+    /// far and how much of the plan text clients were sent.
+    plan_draft: Option<PlanDraft>,
     resume_summary_running: bool,
     interrupt_flag: Arc<AtomicBool>,
     subagent_manager: SubagentManager,
@@ -290,6 +298,7 @@ impl AgentCore {
             force_compaction: false,
             overflow_retry_pending: false,
             overflow_retried: false,
+            plan_draft: None,
             resume_summary_running: false,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             subagent_manager: SubagentManager::default(),
@@ -1511,6 +1520,12 @@ impl AgentCore {
         if let Some(rx) = self.receiver.take() {
             while let Ok(event) = rx.try_recv() {
                 match event {
+                    WorkerEvent::PlanDraft { call_id, delta } => {
+                        let draft = self.plan_draft.get_or_insert_with(PlanDraft::default);
+                        if let Some(event) = draft.push(&call_id, &delta) {
+                            events.push(event);
+                        }
+                    }
                     WorkerEvent::CompactionStart => events.push(AgentEvent::CompactionStart),
                     WorkerEvent::CompactionProgress { output_tokens } => {
                         events.push(AgentEvent::CompactionProgress { output_tokens });
@@ -2220,6 +2235,18 @@ impl AgentCore {
                     },
                     StreamEvent::ResponseItem(item) => WorkerEvent::ResponseItem(item),
                     StreamEvent::Steered(message) => WorkerEvent::Steered(message),
+                    // Only the plan is shown as it is written; every other
+                    // call's arguments arrive whole with its ResponseItem.
+                    StreamEvent::ToolArgumentsDelta {
+                        call_id,
+                        name,
+                        delta,
+                    } => {
+                        if name != crate::plan_mode::TOOL_NAME {
+                            return Ok(());
+                        }
+                        WorkerEvent::PlanDraft { call_id, delta }
+                    }
                     StreamEvent::ToolStart { call_id, name } => {
                         WorkerEvent::ToolStart { call_id, name }
                     }
@@ -3051,6 +3078,7 @@ impl AgentCore {
     /// `propose_plan` (plan mode): records the plan as pending and shows it;
     /// the turn ends there and the user answers with `approve_plan`.
     fn handle_propose_plan(&mut self, args: &Value) -> (ToolGoalResponse, Option<AgentEvent>) {
+        self.plan_draft = None;
         let field = |key: &str| {
             args.get(key)
                 .and_then(Value::as_str)
@@ -4824,9 +4852,76 @@ fn title_request(
     client.summarize_text(system, user, |_| Ok(()))
 }
 
+/// The plan as the model writes its propose_plan call, for clients to show
+/// before the call completes.
+#[derive(Default)]
+struct PlanDraft {
+    call_id: String,
+    arguments: String,
+    title: String,
+    sent: usize,
+}
+
+impl PlanDraft {
+    /// Adds a fragment of the call's arguments; the event carries the title
+    /// and the plan text added since the last one (nothing when unchanged).
+    fn push(&mut self, call_id: &str, delta: &str) -> Option<AgentEvent> {
+        if !call_id.is_empty() && call_id != self.call_id {
+            if !self.call_id.is_empty() {
+                *self = PlanDraft::default();
+            }
+            self.call_id = call_id.to_string();
+        }
+        self.arguments.push_str(delta);
+        let title =
+            crate::plan_mode::partial_string_field(&self.arguments, "title").unwrap_or_default();
+        let plan =
+            crate::plan_mode::partial_string_field(&self.arguments, "plan").unwrap_or_default();
+        let append = plan.get(self.sent..).unwrap_or_default().to_string();
+        if append.is_empty() && title == self.title {
+            return None;
+        }
+        self.sent = plan.len();
+        self.title = title.clone();
+        Some(AgentEvent::PlanDraft {
+            id: if self.call_id.is_empty() {
+                "draft".to_string()
+            } else {
+                self.call_id.clone()
+            },
+            title,
+            append,
+        })
+    }
+}
 #[cfg(test)]
 mod approval_decision_tests {
     use super::*;
+
+    #[test]
+    fn a_plan_draft_sends_its_title_and_only_the_new_text() {
+        let mut draft = PlanDraft::default();
+        let mut push = |call_id: &str, delta: &str| match draft.push(call_id, delta) {
+            Some(AgentEvent::PlanDraft { id, title, append }) => Some((id, title, append)),
+            _ => None,
+        };
+        let event = |id: &str, title: &str, append: &str| {
+            Some((id.to_string(), title.to_string(), append.to_string()))
+        };
+        assert_eq!(
+            push("call_1", "{\"title\":\"Sna"),
+            event("call_1", "Sna", "")
+        );
+        assert_eq!(
+            push("", "ke\",\"plan\":\"## Go"),
+            event("call_1", "Snake", "## Go")
+        );
+        assert_eq!(push("", "al\\n"), event("call_1", "Snake", "al\n"));
+        // Nothing new yet (an escape cut off): no event.
+        assert_eq!(push("", "\\"), None);
+        // Another call starts over.
+        assert_eq!(push("call_2", "{\"title\":\"B"), event("call_2", "B", ""));
+    }
     use std::sync::mpsc::TryRecvError;
 
     fn pending(

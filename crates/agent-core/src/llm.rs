@@ -311,6 +311,12 @@ pub enum StreamEvent {
     },
     /// A user message steered into the running turn reached the model.
     Steered(String),
+    /// A fragment of a tool call's arguments while the model writes it.
+    ToolArgumentsDelta {
+        call_id: String,
+        name: String,
+        delta: String,
+    },
 }
 
 /// Maps a protocol parser's [`WireEvent`] onto the engine's [`StreamEvent`].
@@ -320,6 +326,15 @@ fn wire_to_stream(event: WireEvent) -> StreamEvent {
         WireEvent::ReasoningDelta(delta) => StreamEvent::ReasoningDelta(delta),
         WireEvent::ResponseItem(item) => StreamEvent::ResponseItem(item),
         WireEvent::Usage(usage) => usage_event(usage),
+        WireEvent::ToolArgumentsDelta {
+            call_id,
+            name,
+            delta,
+        } => StreamEvent::ToolArgumentsDelta {
+            call_id,
+            name,
+            delta,
+        },
     }
 }
 

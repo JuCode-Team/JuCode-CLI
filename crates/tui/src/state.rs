@@ -532,6 +532,8 @@ impl TuiState {
                     self.mark_history_dirty();
                     true
                 }
+                // The TUI shows the plan once it is proposed, not while written.
+                AgentEvent::PlanDraft { .. } => false,
                 // Structured MCP state is for GUI front-ends; the TUI relies on
                 // the accompanying Info lines (and /mcp) instead.
                 AgentEvent::McpServers { .. } => false,
