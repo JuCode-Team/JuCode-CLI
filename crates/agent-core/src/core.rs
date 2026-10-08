@@ -73,6 +73,8 @@ struct ActionOutcome {
 
 #[derive(Debug)]
 enum WorkerEvent {
+    /// A steered user message reached the model mid-turn.
+    Steered(String),
     CompactionStart,
     CompactionProgress {
         output_tokens: u64,
@@ -191,6 +193,8 @@ pub struct AgentCore {
     resume_summary_running: bool,
     interrupt_flag: Arc<AtomicBool>,
     subagent_manager: SubagentManager,
+    /// Messages steered into the running turn, until the model reads them.
+    steered_pending: Vec<String>,
     /// Agents of earlier turns: (agent_runs row, transcript), newest last.
     past_subagents: Vec<(Value, Vec<Value>)>,
     /// What the last `agent_runs` showed, and when it went out (throttle).
@@ -289,6 +293,7 @@ impl AgentCore {
             resume_summary_running: false,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             subagent_manager: SubagentManager::default(),
+            steered_pending: Vec::new(),
             past_subagents: Vec::new(),
             agent_runs_revision: 0,
             agent_runs_sent_at: None,
@@ -635,9 +640,28 @@ impl AgentCore {
         self.queued.iter().map(|(text, _)| text.clone()).collect()
     }
 
+    /// Sends the next queued message into the running turn: the model reads
+    /// it before its next request (after the current tool calls finish), and
+    /// running tools and subagents keep going. A message with images, or one
+    /// sent while nothing runs, starts a turn of its own as before.
     pub fn steer(&mut self) -> Vec<AgentEvent> {
         if !self.running || self.queued.is_empty() {
             return Vec::new();
+        }
+        if self
+            .queued
+            .front()
+            .is_some_and(|(_, images)| images.is_empty())
+        {
+            let Some((next, _)) = self.queued.pop_front() else {
+                return Vec::new();
+            };
+            self.subagent_manager.steer_main(&next);
+            self.steered_pending.push(next);
+            return vec![
+                AgentEvent::Status("steering".to_string()),
+                AgentEvent::PendingMessages(self.pending_texts()),
+            ];
         }
         self.stop_current_turn();
         let Some((next, images)) = self.queued.pop_front() else {
@@ -1525,6 +1549,17 @@ impl AgentCore {
                             delay_ms,
                         });
                     }
+                    WorkerEvent::Steered(message) => {
+                        if let Some(at) = self.steered_pending.iter().position(|m| *m == message) {
+                            self.steered_pending.remove(at);
+                        }
+                        self.session.append(EntryKind::User {
+                            content: message.clone(),
+                        });
+                        events.extend(self.save_session_event());
+                        events.push(AgentEvent::UserMessage(message));
+                        events.push(AgentEvent::PendingMessages(self.pending_texts()));
+                    }
                     WorkerEvent::ResponseItem(item) => {
                         // The request went through: a later overflow in this
                         // turn may compact and retry again.
@@ -1604,6 +1639,8 @@ impl AgentCore {
                     WorkerEvent::Done => {
                         self.subagent_manager
                             .close_all_with_message("parent turn finished");
+                        // Steered after the model's last request: run next.
+                        self.requeue_unread_steers();
                         events.extend(self.finish_goal_turn());
                         self.running = false;
                         disconnected = true;
@@ -1836,6 +1873,16 @@ impl AgentCore {
         events
     }
 
+    /// A turn that ended before reading what was steered into it: those
+    /// messages run next, in order, instead of being lost.
+    fn requeue_unread_steers(&mut self) {
+        let unread = self.subagent_manager.take_unread_steers();
+        self.steered_pending.clear();
+        for message in unread.into_iter().rev() {
+            self.queued.push_front((message, Vec::new()));
+        }
+    }
+
     /// `agent_runs`: this session's subagents, earlier turns' first.
     pub fn agent_runs_event(&self) -> AgentEvent {
         let current = self.subagent_manager.runs_json();
@@ -1924,6 +1971,7 @@ impl AgentCore {
             return events;
         }
         self.archive_subagents();
+        self.requeue_unread_steers();
         self.subagent_manager = SubagentManager::default();
         let base_prompt = match self.config.system_prompt() {
             Ok(_) if self.chat => crate::chat::CHAT_SYSTEM_PROMPT.to_string(),
@@ -2166,6 +2214,7 @@ impl AgentCore {
                         delay_ms,
                     },
                     StreamEvent::ResponseItem(item) => WorkerEvent::ResponseItem(item),
+                    StreamEvent::Steered(message) => WorkerEvent::Steered(message),
                     StreamEvent::ToolStart { call_id, name } => {
                         WorkerEvent::ToolStart { call_id, name }
                     }

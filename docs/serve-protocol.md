@@ -98,9 +98,13 @@ Structured views come back as events (`model_view`, `resume_view`,
 {"op":"steer"}
 ```
 
-Stops the in-flight turn and immediately starts the next queued message.
-Emits `status:"steering"`, the updated `pending_messages`, then the new turn's
-`user_message` event. No-op when idle or when the queue is empty.
+Sends the next queued message into the in-flight turn: the model reads it
+before its next request (once the current tool calls finish), and running
+tools and subagents keep going. Emits `status:"steering"` and the updated
+`pending_messages`; when the model reads it, a `user_message` event (it is
+saved as the user's message). If the turn ends before reading it, it runs as
+the next turn. A queued message with images still stops the turn and starts
+a new one with it. No-op when idle or when the queue is empty.
 
 ### `interrupt`
 

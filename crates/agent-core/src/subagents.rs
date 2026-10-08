@@ -227,6 +227,9 @@ struct SubagentInner {
 struct SubagentRegistry {
     agents: BTreeMap<String, SubagentRecord>,
     events: VecDeque<SubagentLifecycleEvent>,
+    /// The user's messages for the running main turn (`steer`), read before
+    /// its next model request; kept apart from agent mail.
+    user_inbox: VecDeque<String>,
     /// Token usage of subagents that reached a final state, awaiting fold-in to
     /// the parent's cumulative totals. Drained once via `drain_finished_usage`.
     finished_usage: Vec<SubagentRunResult>,
@@ -417,6 +420,24 @@ impl SubagentManager {
             "delivered": true,
             "status": "queued"
         }))
+    }
+
+    /// A user message for the running main turn: the model reads it before
+    /// its next request, while the turn (and its tools) keep running.
+    pub(crate) fn steer_main(&self, message: &str) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.user_inbox.push_back(message.to_string());
+    }
+
+    /// Messages the user steered into the main turn, oldest first.
+    pub(crate) fn drain_user_inbox(&self) -> Vec<String> {
+        let mut state = self.inner.state.lock().unwrap();
+        state.user_inbox.drain(..).collect()
+    }
+
+    /// Steered messages the turn ended before reading.
+    pub(crate) fn take_unread_steers(&self) -> Vec<String> {
+        self.drain_user_inbox()
     }
 
     pub(crate) fn drain_messages(&self, path: &str) -> Vec<String> {

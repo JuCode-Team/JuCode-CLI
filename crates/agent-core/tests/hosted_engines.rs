@@ -587,3 +587,45 @@ fn subagents_report_their_work_to_the_agent_trace() {
         AgentEvent::SubagentTranscript { items: Some(_), .. }
     ));
 }
+
+#[test]
+fn a_steered_message_joins_the_running_turn_without_stopping_its_tool() {
+    let _guard = setup();
+    let dir = temp_dir("steer");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+
+    // A command that takes a moment, so the message arrives while it runs.
+    let slow = if cfg!(windows) {
+        "RUN: Start-Sleep -Milliseconds 800; Set-Content done.txt ok".to_string()
+    } else {
+        "RUN: sleep 0.8 && printf ok > done.txt".to_string()
+    };
+    core.submit_user_message(slow);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut events = Vec::new();
+    while Instant::now() < deadline
+        && !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolStart { .. }))
+    {
+        events.extend(core.poll_events());
+        thread::sleep(Duration::from_millis(5));
+    }
+    core.submit_user_message("also check the weather".to_string());
+    events.extend(core.steer());
+    events.extend(pump(&mut core, is_ready));
+
+    // The tool was not killed: its file exists.
+    assert_eq!(fs::read_to_string(dir.join("done.txt")).unwrap(), "ok");
+    // The message reached the model in the same turn (it answered it), and
+    // shows as the user's message.
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::UserMessage(m) if m == "also check the weather")));
+    assert!(assistant_text(&events).contains("also check the weather"));
+    let turns = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Status(s) if s == "ready"))
+        .count();
+    assert_eq!(turns, 1, "one turn, not a restart");
+}

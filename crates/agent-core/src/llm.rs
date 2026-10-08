@@ -300,6 +300,8 @@ pub enum StreamEvent {
         output_tokens: u64,
         reasoning_tokens: u64,
     },
+    /// A user message steered into the running turn reached the model.
+    Steered(String),
 }
 
 /// Maps a protocol parser's [`WireEvent`] onto the engine's [`StreamEvent`].
@@ -1473,6 +1475,18 @@ impl OpenAiClient {
         let Some(manager) = &self.subagent_manager else {
             return Ok(());
         };
+        // The main agent: what the user sent while it worked (steer).
+        if self.agent_depth == 0 {
+            for message in manager.drain_user_inbox() {
+                // The core records it as the user's own message (shown and
+                // replayed like any other), not as a hidden runtime item.
+                emit(StreamEvent::Steered(message.clone()))?;
+                input.push(json!({
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": message }]
+                }));
+            }
+        }
         for message in manager.drain_messages(&self.agent_path) {
             let item = json!({
                 "role": "user",
