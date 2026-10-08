@@ -88,6 +88,9 @@ pub struct OpenAiClient {
     allow_subagents: bool,
     max_tool_calls: Option<u64>,
     deadline: Option<Instant>,
+    /// Input tokens past which the main turn stops between requests so the
+    /// conversation can be compacted and the turn continued; 0 = never.
+    context_budget: u64,
     provider_kind: Protocol,
     goal_tool_tx: Option<Sender<GoalToolRequest>>,
     approval_tx: Option<Sender<ApprovalRequest>>,
@@ -262,6 +265,12 @@ pub struct ToolGoalResponse {
     pub is_error: bool,
 }
 
+/// The error `run_turn_events` ends the main turn with when the context passed
+/// the compaction threshold mid-turn. It reads as a context overflow, so the
+/// core compacts and continues the turn (`is_context_overflow`).
+pub const MID_TURN_COMPACTION: &str =
+    "context_length_exceeded: the conversation passed the compaction threshold mid-turn";
+
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     /// HTTP request is being sent; the connection is being established.
@@ -425,8 +434,22 @@ impl OpenAiClient {
             .find(|model| model.name == config.model)
             .map(|model| model.reasoning_efforts.clone())
             .unwrap_or_default();
-        let subagent_models = config
-            .subagent_models
+        // No list configured: every chat model of the provider, so the agent
+        // picks per task (and takes the one the user names).
+        let entries: Vec<crate::config::SubagentModel> = if config.subagent_models.is_empty() {
+            config
+                .models
+                .iter()
+                .filter(|model| !model.name.to_ascii_lowercase().contains("image"))
+                .map(|model| crate::config::SubagentModel {
+                    name: model.name.clone(),
+                    description: String::new(),
+                })
+                .collect()
+        } else {
+            config.subagent_models.clone()
+        };
+        let subagent_models = entries
             .iter()
             .filter(|entry| entry.name != config.model)
             .filter_map(|entry| {
@@ -471,6 +494,7 @@ impl OpenAiClient {
             allow_subagents: true,
             max_tool_calls: None,
             deadline: None,
+            context_budget: 0,
             provider_kind,
             goal_tool_tx: config.goal_tool_tx,
             approval_tx: config.approval_tx,
@@ -488,12 +512,25 @@ impl OpenAiClient {
         })
     }
 
+    /// Sets the input size at which `run_turn_events` hands the turn back for
+    /// compaction (see [`MID_TURN_COMPACTION`]); 0 turns it off.
+    pub fn set_context_budget(&mut self, tokens: u64) {
+        self.context_budget = tokens;
+    }
+
     pub fn run_turn_events(
         &self,
         mut input: Vec<Value>,
         cwd: &Path,
-        mut emit: impl FnMut(StreamEvent) -> Result<(), String>,
+        mut outer_emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<(), String> {
+        let last_input = std::cell::Cell::new(0u64);
+        let mut emit = |event: StreamEvent| {
+            if let StreamEvent::Usage { input_tokens, .. } = &event {
+                last_input.set(*input_tokens);
+            }
+            outer_emit(event)
+        };
         let mut tool_calls_executed = 0u64;
         let mut empty_response_continuations = 0usize;
         loop {
@@ -502,6 +539,12 @@ impl OpenAiClient {
                 .is_some_and(|deadline| Instant::now() >= deadline)
             {
                 return Err("subagent timed out".to_string());
+            }
+            // The last request already passed the compaction threshold and its
+            // tool results are recorded: stop before the next request so the
+            // conversation is compacted and the turn continues from there.
+            if self.context_budget > 0 && last_input.get() > self.context_budget {
+                return Err(MID_TURN_COMPACTION.to_string());
             }
             self.append_queued_subagent_messages(&mut input, &mut emit)?;
             emit(StreamEvent::CallStart)?;
@@ -1320,6 +1363,7 @@ impl OpenAiClient {
             allow_subagents: child_depth < MAX_SUBAGENT_DEPTH,
             max_tool_calls,
             deadline: timeout.map(|timeout| started + timeout),
+            context_budget: 0,
             // Each model speaks its own wire protocol (on the JuCode gateway
             // Claude uses Anthropic Messages, the rest Responses).
             provider_kind: protocol,
@@ -1834,7 +1878,7 @@ fn efforts_label(efforts: &[String]) -> String {
 /// may pick, their tiers, and when to use each (config `subagent_models`).
 fn subagent_model_guide(own: &str, own_efforts: &[String], specs: &[SubagentModelSpec]) -> String {
     let mut guide = format!(
-        "\n\nModels (omit model to use your own):\n- {own} (your model; {})",
+        "\n\nModels: pick the one that suits the task; when the user names a model for subagents, use it. Omit model to use your own.\n- {own} (your model; {})",
         efforts_label(own_efforts)
     );
     for spec in specs.iter().filter(|spec| spec.name != own) {
@@ -2790,6 +2834,34 @@ mod tests {
             .find(|definition| definition["name"] == "spawn_agent")
             .unwrap();
         assert!(spawn["parameters"]["properties"]["model"].is_null());
+    }
+
+    #[test]
+    fn without_subagent_models_every_chat_model_is_choosable() {
+        let mut config = test_client_config();
+        config.provider = "jucode".to_string();
+        config.model = "gpt-main".to_string();
+        config.models = vec![
+            model("gpt-main", &["low", "high"], 8000),
+            model("claude-helper", &["low", "high"], 4000),
+            model("gpt-image-2", &[], 0),
+        ];
+        config.subagent_manager = Some(SubagentManager::default());
+        let spawn = OpenAiClient::from_config(config)
+            .unwrap()
+            .tool_definitions()
+            .into_iter()
+            .find(|definition| definition["name"] == "spawn_agent")
+            .unwrap();
+        // An image model cannot run a subagent; the main model picks among the rest.
+        assert_eq!(
+            spawn["parameters"]["properties"]["model"]["enum"],
+            json!(["gpt-main", "claude-helper"])
+        );
+        assert!(spawn["description"]
+            .as_str()
+            .unwrap()
+            .contains("when the user names a model for subagents, use it"));
     }
 
     #[test]

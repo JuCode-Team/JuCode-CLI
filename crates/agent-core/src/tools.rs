@@ -382,7 +382,7 @@ pub fn run_tool_with_events(
         }
         "write_stdin" => match optional_u64(&args, "session_id") {
             Ok(Some(session_id)) if !state.owns_shell(session_id) => {
-                json!({ "session_id": session_id, "error": format!("unknown shell session {session_id}") })
+                json!({ "session_id": session_id, "error": format!("no running shell session {session_id}: a bash command that finishes returns its full output in its own result; write_stdin is only for a session_id that a still-running bash command returned") })
             }
             _ => write_stdin(&args),
         },
@@ -3102,7 +3102,7 @@ fn add_command_soft_hint(value: &mut Value) {
         add_soft_hint(
             value,
             "command timed out",
-            "Inspect partial output, narrow the command, or rerun with a longer timeout only if the full command is necessary.",
+            "Inspect partial output, narrow the command, or rerun with a longer timeout only if the full command is necessary. In the sandbox, a program that writes outside the writable directories (a browser's profile under ~/Library, for example) can hang: rerun it with escalate.",
         );
     } else if value
         .get("truncated")
@@ -5582,7 +5582,7 @@ mod tests {
             foreign["error"]
                 .as_str()
                 .unwrap()
-                .contains("unknown shell session"),
+                .contains("no running shell session"),
             "{foreign}"
         );
         let own = call(
