@@ -19,7 +19,19 @@ const SKILL_STATE_FILE: &str = "skills-state.json";
 pub const ANTHROPIC_SKILLS_URL: &str = "https://github.com/anthropics/skills";
 const ANTHROPIC_SKILLS_INDEX: &str = include_str!("anthropic-skills.json");
 
-/// A skill in a GitHub repository's `skills/<id>/` directory.
+/// Public GitHub repositories of skills the desktop marketplace lists beside
+/// Anthropic's: (shown name, repository). Their skills sit in `skills/<id>/`
+/// or at the top level (`<id>/SKILL.md`); see [`fetch_github_source`].
+pub const COMMUNITY_SKILL_SOURCES: [(&str, &str); 3] = [
+    ("Ikaleio", "https://github.com/Ikaleio/skills"),
+    ("Superpowers", "https://github.com/obra/superpowers"),
+    (
+        "Composio",
+        "https://github.com/ComposioHQ/awesome-claude-skills",
+    ),
+];
+
+/// A skill in a GitHub repository's `<dir>/<id>/` directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceSkill {
     pub id: String,
@@ -37,12 +49,29 @@ pub struct SkillSource {
     pub repository: String,
     /// A commit SHA; empty follows the default branch.
     pub revision: String,
+    /// The directory holding the skill folders: `skills`, or empty for the
+    /// repository's top level.
+    pub dir: String,
     pub skills: Vec<SourceSkill>,
 }
 
 impl SkillSource {
     pub fn homepage(&self, id: &str) -> String {
-        format!("{}/tree/{}/skills/{id}", self.repository, self.git_ref())
+        format!(
+            "{}/tree/{}/{}",
+            self.repository,
+            self.git_ref(),
+            self.skill_path(id)
+        )
+    }
+
+    /// `<dir>/<id>` in the repository.
+    fn skill_path(&self, id: &str) -> String {
+        if self.dir.is_empty() {
+            id.to_string()
+        } else {
+            format!("{}/{id}", self.dir)
+        }
     }
 
     fn git_ref(&self) -> &str {
@@ -135,6 +164,97 @@ pub fn fetch_extra_skill_source(spec: &str) -> Result<Option<SkillSource>, Strin
         .map(Some)
 }
 
+/// A GitHub repository's skills, wherever its `SKILL.md` files sit: every
+/// `<id>/SKILL.md` at the top level or `<dir>/<id>/SKILL.md` one level down,
+/// from the directory holding the most. Names and descriptions come from each
+/// SKILL.md's frontmatter, read in parallel.
+pub fn fetch_github_source(name: &str, repository: &str) -> Result<SkillSource, String> {
+    let (owner, repo) = github_repository_parts(repository)?;
+    let tree = download(
+        &format!("https://api.github.com/repos/{owner}/{repo}/git/trees/HEAD?recursive=1"),
+        MAX_TREE_BYTES,
+    )
+    .map_err(|error| error.to_string())?;
+    let tree: Value = serde_json::from_slice(&tree).map_err(|error| error.to_string())?;
+    let mut by_dir: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for path in tree["tree"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["type"] == "blob")
+        .filter_map(|entry| entry["path"].as_str())
+    {
+        let parts: Vec<&str> = path.split('/').collect();
+        let (dir, id) = match parts.as_slice() {
+            [id, "SKILL.md"] => ("", *id),
+            [dir, id, "SKILL.md"] => (*dir, *id),
+            _ => continue,
+        };
+        if !id.starts_with('.') && validate_skill_id(id).is_ok() {
+            by_dir
+                .entry(dir.to_string())
+                .or_default()
+                .push(id.to_string());
+        }
+    }
+    let (dir, ids) = by_dir
+        .into_iter()
+        // `skills/` or the top level hold a repository's own skills; another
+        // folder (a vendored collection) only when there are none there.
+        .max_by_key(|(dir, ids)| (dir == "skills" || dir.is_empty(), ids.len()))
+        .ok_or_else(|| format!("no SKILL.md found in {repository}"))?;
+    let read = |id: &str| -> (String, String) {
+        let path = if dir.is_empty() {
+            format!("{id}/SKILL.md")
+        } else {
+            format!("{dir}/{id}/SKILL.md")
+        };
+        let text = download(
+            &format!(
+                "https://raw.githubusercontent.com/{owner}/{repo}/HEAD/{}",
+                encode_url_path(&path)
+            ),
+            256 * 1024,
+        )
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+        let field = |key| crate::prompt::read_frontmatter_field(&text, key).unwrap_or_default();
+        (field("name"), field("description"))
+    };
+    let metas: Vec<(String, String)> = std::thread::scope(|scope| {
+        let read = &read;
+        let handles: Vec<_> = ids.iter().map(|id| scope.spawn(move || read(id))).collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or_default())
+            .collect()
+    });
+    let mut skills: Vec<SourceSkill> = ids
+        .iter()
+        .zip(metas)
+        .map(|(id, (skill_name, description))| SourceSkill {
+            id: id.clone(),
+            name: if skill_name.is_empty() {
+                id.clone()
+            } else {
+                skill_name
+            },
+            description,
+            tags: Vec::new(),
+            license: String::new(),
+            redistributable: true,
+        })
+        .collect();
+    skills.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(SkillSource {
+        name: name.to_string(),
+        repository: normalize_repository_url(repository),
+        revision: String::new(),
+        dir,
+        skills,
+    })
+}
+
 fn parse_source_index(value: &Value) -> Result<SkillSource, String> {
     let name = read_string(value, "name").ok_or_else(|| "source index missing name".to_string())?;
     let repository = read_string(value, "repository")
@@ -175,6 +295,7 @@ fn parse_source_index(value: &Value) -> Result<SkillSource, String> {
         name,
         repository: normalize_repository_url(&repository),
         revision,
+        dir: "skills".to_string(),
         skills,
     })
 }
@@ -210,6 +331,7 @@ pub fn parse_github_skills_directory(
         name: github_repository_parts(repository)?.1,
         repository: normalize_repository_url(repository),
         revision: String::new(),
+        dir: "skills".to_string(),
         skills,
     })
 }
@@ -253,7 +375,7 @@ fn install_github_skill(
         )));
     }
 
-    let prefix = format!("skills/{}/", skill.id);
+    let prefix = format!("{}/", source.skill_path(&skill.id));
     let mut files = Vec::new();
     let mut declared_bytes = 0_u64;
     for entry in tree
@@ -1397,6 +1519,7 @@ mod tests {
             name: "example".to_string(),
             repository: "https://github.com/example/skills".to_string(),
             revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            dir: "skills".to_string(),
             skills: vec![SourceSkill {
                 id: "demo".to_string(),
                 name: "Demo".to_string(),
@@ -1432,5 +1555,30 @@ mod tests {
             zip.write_all(content.as_bytes()).unwrap();
         }
         zip.finish().unwrap();
+    }
+
+    /// Network: the community repositories list their skills with metadata.
+    #[test]
+    #[ignore]
+    fn community_sources_list_skills() {
+        for (name, repository) in COMMUNITY_SKILL_SOURCES {
+            let source = fetch_github_source(name, repository).unwrap();
+            eprintln!(
+                "{name}: dir={:?} {} skills",
+                source.dir,
+                source.skills.len()
+            );
+            for skill in source.skills.iter().take(3) {
+                eprintln!(
+                    "  {} | {} | {:.60}",
+                    skill.id, skill.name, skill.description
+                );
+            }
+            assert!(!source.skills.is_empty());
+            assert!(source
+                .skills
+                .iter()
+                .any(|skill| !skill.description.is_empty()));
+        }
     }
 }

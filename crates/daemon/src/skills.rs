@@ -1,6 +1,7 @@
-//! The skills marketplace for the desktop: the JuCode marketplace and
-//! github.com/anthropics/skills in one catalog, installed into the personal
-//! skills directory of the session's engine.
+//! The skills marketplace for the desktop: the JuCode marketplace,
+//! github.com/anthropics/skills and community skill repositories in one
+//! catalog, installed into the personal skills directory of the session's
+//! engine.
 
 use crate::engines;
 use jucode_agent_core::skills;
@@ -37,8 +38,61 @@ fn install_dir(backend: &str) -> Result<PathBuf, String> {
     Ok(home.join(".claude").join("skills"))
 }
 
-/// A JuCode marketplace failure is only a warning: the Anthropic catalog is
-/// bundled and stays installable.
+/// The community repositories, fetched at most once an hour: listing one
+/// reads every SKILL.md it has.
+fn community_sources() -> Vec<(String, Result<skills::SkillSource, String>)> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    type Cached = (Instant, Result<skills::SkillSource, String>);
+    static CACHE: Mutex<Vec<(String, Cached)>> = Mutex::new(Vec::new());
+    const FRESH: Duration = Duration::from_secs(3600);
+    // `JUCODE_SKILL_SOURCES="Name=https://github.com/o/r;…"` replaces the
+    // list (empty: none, as the tests run offline).
+    let configured: Vec<(String, String)> = match std::env::var("JUCODE_SKILL_SOURCES") {
+        Ok(list) => list
+            .split(';')
+            .filter_map(|item| item.split_once('='))
+            .map(|(name, repository)| (name.trim().to_string(), repository.trim().to_string()))
+            .collect(),
+        Err(_) => skills::COMMUNITY_SKILL_SOURCES
+            .iter()
+            .map(|(name, repository)| (name.to_string(), repository.to_string()))
+            .collect(),
+    };
+    configured
+        .iter()
+        .map(|(name, repository)| {
+            let cached = CACHE.lock().ok().and_then(|cache| {
+                cache
+                    .iter()
+                    .find(|(repo, (at, result))| {
+                        repo == repository && (result.is_ok() && at.elapsed() < FRESH)
+                    })
+                    .map(|(_, (_, result))| result.clone())
+            });
+            let result = cached.unwrap_or_else(|| {
+                let result = skills::fetch_github_source(name, repository);
+                if let Ok(mut cache) = CACHE.lock() {
+                    cache.retain(|(repo, _)| repo != repository);
+                    cache.push((repository.clone(), (Instant::now(), result.clone())));
+                }
+                result
+            });
+            (name.clone(), result)
+        })
+        .collect()
+}
+
+/// A catalog entry's `source`: `jucode`, `anthropic`, or a community
+/// repository's `owner/repo`.
+fn source_key(repository: &str) -> String {
+    repository
+        .trim_start_matches("https://github.com/")
+        .to_string()
+}
+
+/// Anthropic's catalog is bundled; the JuCode marketplace or a community
+/// repository that cannot be read is only a warning.
 fn catalog(dir: PathBuf) -> Result<Value, String> {
     let mut entries = Vec::new();
     let mut warnings = Vec::new();
@@ -50,6 +104,7 @@ fn catalog(dir: PathBuf) -> Result<Value, String> {
                 "description": skill.description,
                 "tags": skill.tags,
                 "source": "jucode",
+                "sourceName": "JuCode",
                 "isDefault": market.default_skill_ids.contains(&skill.id),
                 "installed": skills::skill_installed(&dir, &skill.id),
                 "license": "",
@@ -59,25 +114,36 @@ fn catalog(dir: PathBuf) -> Result<Value, String> {
         })),
         Err(error) => warnings.push(format!("JuCode marketplace: {error}")),
     }
-    let anthropic = skills::anthropic_source()?;
-    entries.extend(anthropic.skills.iter().map(|skill| {
-        json!({
-            "id": skill.id,
-            "name": skill.name,
-            "description": skill.description,
-            "tags": skill.tags,
-            "source": "anthropic",
-            "isDefault": false,
-            "installed": skills::skill_installed(&dir, &skill.id),
-            "license": skill.license,
-            "redistributable": skill.redistributable,
-            "homepage": anthropic.homepage(&skill.id),
-        })
-    }));
+    let mut add = |source: &skills::SkillSource, key: &str, shown: &str| {
+        entries.extend(source.skills.iter().map(|skill| {
+            json!({
+                "id": skill.id,
+                "name": skill.name,
+                "description": skill.description,
+                "tags": skill.tags,
+                "source": key,
+                "sourceName": shown,
+                "isDefault": false,
+                "installed": skills::skill_installed(&dir, &skill.id),
+                "license": skill.license,
+                "redistributable": skill.redistributable,
+                "homepage": source.homepage(&skill.id),
+            })
+        }))
+    };
+    add(&skills::anthropic_source()?, "anthropic", "Anthropic");
+    for (name, result) in community_sources() {
+        match result {
+            Ok(source) => add(&source, &source_key(&source.repository), &source.name),
+            Err(error) => warnings.push(format!("{name}: {error}")),
+        }
+    }
     let key = |entry: &Value| {
         (
-            entry["source"].as_str().unwrap_or_default().to_string(),
-            entry["name"].as_str().unwrap_or_default().to_string(),
+            entry["source"] != "jucode",
+            entry["source"] != "anthropic",
+            entry["sourceName"].as_str().unwrap_or_default().to_string(),
+            entry["name"].as_str().unwrap_or_default().to_lowercase(),
         )
     };
     entries.sort_by_key(key);
@@ -93,32 +159,33 @@ fn catalog(dir: PathBuf) -> Result<Value, String> {
 /// client sent beyond its source and id. Anthropic's source-available skills
 /// are listed but not installed, as in the TUI's `/skills`.
 fn install(dir: PathBuf, source: &str, id: &str) -> Result<PathBuf, String> {
-    match source {
-        "anthropic" => {
-            let anthropic = skills::anthropic_source()?;
-            let skill = anthropic
-                .skills
-                .iter()
-                .find(|skill| skill.id == id)
-                .ok_or_else(|| format!("Anthropic skill not found: {id}"))?;
-            if !skill.redistributable {
-                return Err(format!(
-                    "skill {id} is not offered: {}; not redistributed by JuCode",
-                    skill.license
-                ));
-            }
-            skills::install_source_skill(&dir, &anthropic, skill)
-        }
-        "jucode" => {
-            let market = skills::fetch_jucode_marketplace()?;
-            let skill = market
-                .skills
-                .iter()
-                .find(|skill| skill.id == id)
-                .ok_or_else(|| format!("JuCode skill not found: {id}"))?;
-            skills::install_marketplace_skill(&dir, skill)
-        }
-        other => return Err(format!("unknown skill source: {other}")),
+    if source == "jucode" {
+        let market = skills::fetch_jucode_marketplace()?;
+        let skill = market
+            .skills
+            .iter()
+            .find(|skill| skill.id == id)
+            .ok_or_else(|| format!("JuCode skill not found: {id}"))?;
+        return skills::install_marketplace_skill(&dir, skill).map_err(|error| error.to_string());
     }
-    .map_err(|error| error.to_string())
+    let found = if source == "anthropic" {
+        skills::anthropic_source()?
+    } else {
+        community_sources()
+            .into_iter()
+            .find_map(|(_, result)| result.ok().filter(|s| source_key(&s.repository) == source))
+            .ok_or_else(|| format!("unknown skill source: {source}"))?
+    };
+    let skill = found
+        .skills
+        .iter()
+        .find(|skill| skill.id == id)
+        .ok_or_else(|| format!("skill not found in {}: {id}", found.name))?;
+    if !skill.redistributable {
+        return Err(format!(
+            "skill {id} is not offered: {}; not redistributed by JuCode",
+            skill.license
+        ));
+    }
+    skills::install_source_skill(&dir, &found, skill).map_err(|error| error.to_string())
 }
