@@ -1572,6 +1572,8 @@ impl AgentCore {
                         reason,
                         delay_ms,
                     } => {
+                        // The retried request streams the plan call again.
+                        self.plan_draft = None;
                         events.push(AgentEvent::Retrying {
                             attempt,
                             max_attempts,
@@ -5019,6 +5021,29 @@ mod approval_decision_tests {
         assert_eq!(push("", "\\"), None);
         // Another call starts over.
         assert_eq!(push("call_2", "{\"title\":\"B"), event("call_2", "B", ""));
+    }
+
+    #[test]
+    fn a_retried_request_starts_the_plan_draft_over() {
+        // poll_events clears the draft on Retrying; the retried stream sends
+        // the same call's arguments again from the start.
+        let stream = ["{\"title\":\"Snake\",", "\"plan\":\"## Goal\"}"];
+        let mut draft = Some(PlanDraft::default());
+        draft.as_mut().unwrap().push("call_1", stream[0]);
+        draft = None;
+        let mut last = None;
+        for delta in stream {
+            last = draft
+                .get_or_insert_with(PlanDraft::default)
+                .push("call_1", delta);
+        }
+        let draft = draft.unwrap();
+        assert_eq!(draft.arguments, stream.concat());
+        assert!(matches!(
+            last,
+            Some(AgentEvent::PlanDraft { title, append, .. })
+                if title == "Snake" && append == "## Goal"
+        ));
     }
     use std::sync::mpsc::TryRecvError;
 
