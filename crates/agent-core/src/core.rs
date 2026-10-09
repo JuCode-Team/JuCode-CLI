@@ -1814,6 +1814,9 @@ impl AgentCore {
         for message in self.mcp.drain_messages() {
             events.push(AgentEvent::Info(message));
         }
+        for message in self.tool_state.take_notices() {
+            events.push(AgentEvent::Info(message));
+        }
         if self.mcp.take_dirty() {
             events.push(self.mcp_servers_event());
             events.push(self.command_list_event());

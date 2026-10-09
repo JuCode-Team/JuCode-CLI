@@ -285,16 +285,10 @@ fn run_inner(
         .map(|path| read_input_image(cwd, path, extra_read_roots))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let generated = generate_with_progress(&tools, &model, &request, inputs, emit)?;
-    let paths = allocate_paths(&base, &generated.images)?;
-    for path in &paths {
-        crate::tools::write_target(cwd, &path.to_string_lossy(), state)?;
-    }
-    // Every target is new: rewinding the turn deletes them again.
-    let _ = crate::tools::create_checkpoint(cwd, "auto-generate-image", &paths);
-    for (path, bytes) in paths.iter().zip(&generated.images) {
-        write_new(path, bytes)?;
-    }
+    let generated = generate_with_progress(&tools, &model, &request, inputs, emit, |rx| {
+        save_after_interrupt(rx, cwd.to_path_buf(), state.clone(), base.clone())
+    })?;
+    let paths = save(cwd, state, &base, &generated)?;
     crate::log_info!(
         "generate_image",
         "saved images",
@@ -311,14 +305,74 @@ fn run_inner(
     Ok(result)
 }
 
+/// Saves generated images under `base` with the same checks as `write`.
+fn save(
+    cwd: &Path,
+    state: &ToolState,
+    base: &Path,
+    generated: &Generated,
+) -> Result<Vec<PathBuf>, String> {
+    let paths = allocate_paths(base, &generated.images)?;
+    for path in &paths {
+        crate::tools::write_target(cwd, &path.to_string_lossy(), state)?;
+    }
+    // Every target is new: rewinding the turn deletes them again.
+    let _ = crate::tools::create_checkpoint(cwd, "auto-generate-image", &paths);
+    for (path, bytes) in paths.iter().zip(&generated.images) {
+        write_new(path, bytes)?;
+    }
+    Ok(paths)
+}
+
+/// The request cannot be cancelled and is billed anyway: wait for it on its
+/// own thread, save what it returns and tell the session where it went.
+fn save_after_interrupt(
+    rx: mpsc::Receiver<Result<Generated, String>>,
+    cwd: PathBuf,
+    state: ToolState,
+    base: PathBuf,
+) {
+    thread::spawn(move || {
+        let saved = rx
+            .recv()
+            .map_err(|_| "the image request ended without a result".to_string())
+            .and_then(|result| result)
+            .and_then(|generated| save(&cwd, &state, &base, &generated));
+        match saved {
+            Ok(paths) => {
+                let labels = paths
+                    .iter()
+                    .map(|path| crate::tools::diff_label(&cwd, path))
+                    .collect::<Vec<_>>();
+                crate::log_info!(
+                    "generate_image",
+                    "saved images after interrupt",
+                    count = paths.len()
+                );
+                state.push_notice(format!(
+                    "中断前提交的图片已生成，保存在 {}",
+                    labels.join(", ")
+                ));
+            }
+            Err(error) => crate::log_warn!(
+                "generate_image",
+                "image request after interrupt failed",
+                error = error
+            ),
+        }
+    });
+}
+
 /// Runs the request on its own thread and reports progress meanwhile, so an
-/// interrupt ends the call instead of waiting out a minutes-long request.
+/// interrupt ends the call instead of waiting out a minutes-long request;
+/// `on_interrupt` then takes over the pending result.
 fn generate_with_progress(
     tools: &ImageTools,
     model: &str,
     request: &ImageRequest,
     inputs: Vec<InputImage>,
     emit: &mut impl FnMut(ToolExecutionEvent) -> Result<(), String>,
+    on_interrupt: impl FnOnce(mpsc::Receiver<Result<Generated, String>>),
 ) -> Result<Generated, String> {
     let action = if inputs.is_empty() {
         "generating"
@@ -340,10 +394,15 @@ fn generate_with_progress(
     loop {
         match rx.recv_timeout(PROGRESS_INTERVAL) {
             Ok(result) => return result,
-            Err(mpsc::RecvTimeoutError::Timeout) => emit(ToolExecutionEvent::Update(format!(
-                "{label} ({}s)",
-                started.elapsed().as_secs()
-            )))?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(error) = emit(ToolExecutionEvent::Update(format!(
+                    "{label} ({}s)",
+                    started.elapsed().as_secs()
+                ))) {
+                    on_interrupt(rx);
+                    return Err(error);
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err("the image request ended without a result".to_string())
             }
@@ -1144,6 +1203,53 @@ mod tests {
         unconfigured.set_images(Err("no image model".to_string()));
         let result = run_tool(json!({ "prompt": "fox" }), &dir, &unconfigured);
         assert_eq!(result["error"], "no image model");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_interrupted_request_still_saves_its_images_and_says_where() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let body = json!({ "data": [{ "b64_json": BASE64_STANDARD.encode(PNG) }] });
+        let response = json_response("200 OK", &body.to_string());
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            // Past the first progress update, which the interrupt fails.
+            thread::sleep(PROGRESS_INTERVAL + Duration::from_millis(500));
+            let _ = stream.write_all(response.as_bytes());
+        });
+        let dir = test_dir("interrupt");
+        let state = state_with(tools(&url));
+
+        let mut updates = 0;
+        let result = run(
+            &json!({ "prompt": "fox", "path": "art/fox" }),
+            &dir,
+            &[],
+            &state,
+            &mut |_| {
+                updates += 1;
+                if updates > 1 {
+                    Err("interrupted".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result["error"], "interrupted");
+        assert!(!dir.join("art/fox.png").exists());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let notices = loop {
+            let notices = state.take_notices();
+            if !notices.is_empty() || Instant::now() > deadline {
+                break notices;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(notices, ["中断前提交的图片已生成，保存在 art/fox.png"]);
+        assert_eq!(fs::read(dir.join("art/fox.png")).unwrap(), PNG);
         let _ = fs::remove_dir_all(dir);
     }
 

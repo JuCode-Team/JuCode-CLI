@@ -2527,6 +2527,9 @@ struct ToolStateInner {
     /// Endpoint and model for generate_image, or why it is unavailable;
     /// None until the engine configures it.
     images: Option<Result<crate::images::ImageTools, String>>,
+    /// Messages for the session from work that outlived its tool call (an
+    /// interrupted generate_image saving its result), drained into Info events.
+    notices: Vec<String>,
 }
 
 impl Drop for ToolStateInner {
@@ -2591,6 +2594,19 @@ impl ToolState {
             .ok()
             .and_then(|inner| inner.images.clone())
             .unwrap_or_else(|| Err(crate::images::UNAVAILABLE.to_string()))
+    }
+
+    pub(crate) fn push_notice(&self, notice: String) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.notices.push(notice);
+        }
+    }
+
+    pub(crate) fn take_notices(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .map(|mut inner| std::mem::take(&mut inner.notices))
+            .unwrap_or_default()
     }
 
     /// The same engine state with an empty read record, for a subagent: it
