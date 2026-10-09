@@ -854,6 +854,18 @@ impl Hub {
         } else {
             format!("Q: {}\nA: {answer}", question.title)
         };
+        // The dispatcher has no `open_items` tool.
+        let others = match question.agent.as_str() {
+            crate::dispatch::AGENT => 0,
+            agent => self.open_items_of(agent).len(),
+        };
+        let body = if others > 0 {
+            format!(
+                "{body}\n\nYou have {others} other open item(s) waiting for the user. Check them with `open_items` and close any this answer made unnecessary."
+            )
+        } else {
+            body
+        };
         self.store
             .record_message(&Message {
                 id: self.new_id("m"),
@@ -924,6 +936,43 @@ impl Hub {
             .map(|(action, closure)| with_closure(action.to_json(), closure))
             .collect();
         json!({ "type": "actions", "actions": list, "closed": closed })
+    }
+
+    /// `agent`'s open questions and the open actions of its sessions, as
+    /// its `open_items` tool lists them.
+    pub fn open_items_of(&self, agent: &str) -> Vec<Value> {
+        let own: HashSet<String> = self
+            .store
+            .sessions()
+            .into_iter()
+            .filter(|record| record.agent.as_deref() == Some(agent))
+            .map(|record| record.id)
+            .collect();
+        let questions = self
+            .store
+            .open_questions()
+            .into_iter()
+            .filter(|question| question.agent == agent)
+            .map(|question| {
+                json!({
+                    "kind": "question", "id": question.id, "session": question.session,
+                    "title": question.title, "assumption": question.assumption,
+                    "asked_at_unix": question.asked_at / 1000,
+                })
+            });
+        let actions = self
+            .store
+            .open_actions()
+            .into_iter()
+            .filter(|action| own.contains(&action.session_id))
+            .map(|action| {
+                json!({
+                    "kind": "action", "id": action.id, "session": action.session_id,
+                    "tool": action.name, "summary": action.summary,
+                    "asked_at_unix": action.created_at / 1000,
+                })
+            });
+        questions.chain(actions).collect()
     }
 
     /// Closes an open question or action without answering it. `by` is
@@ -1000,6 +1049,45 @@ impl Hub {
             ItemKind::Question => self.questions_json(),
             ItemKind::Action => self.actions_json(),
         });
+    }
+
+    /// A scheduled task started a new run in `current`: its earlier runs
+    /// are done with. Their open questions and actions close (the new run
+    /// asks again if it still needs to) and the runs are archived, so the
+    /// agent's page shows the latest run. A run still working is left.
+    pub(crate) fn retire_schedule_runs(&self, schedule: &str, name: &str, current: &str) {
+        let earlier: Vec<String> = self
+            .store
+            .sessions_reached_from(&format!("schedule:{schedule}"))
+            .into_iter()
+            .filter(|session| session != current && !self.is_busy(session))
+            .collect();
+        if earlier.is_empty() {
+            return;
+        }
+        let reason = format!("定时任务「{name}」已开始新一次运行");
+        for question in self.store.open_questions() {
+            if earlier.contains(&question.session) {
+                let _ = self.close_item(ItemKind::Question, &question.id, "superseded", &reason);
+            }
+        }
+        for action in self.store.open_actions() {
+            if earlier.contains(&action.session_id) {
+                let _ = self.close_item(ItemKind::Action, &action.id, "superseded", &reason);
+            }
+        }
+        let mut archived = false;
+        for record in self.store.sessions() {
+            if earlier.contains(&record.id) && !record.archived {
+                archived |= self
+                    .store
+                    .record_session_meta(&record.id, &json!({ "archived": true }))
+                    .unwrap_or(false);
+            }
+        }
+        if archived {
+            self.broadcast(&self.sessions_json());
+        }
     }
 
     /// Turns due timers into messages. The timer id is the message's dedupe
@@ -1766,6 +1854,80 @@ mod tests {
         assert_eq!(reports[0].session, "a1");
         assert_eq!(reports[0].agent, "ops");
         assert!(reports[0].body.contains("HTTP 502"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_new_scheduled_run_retires_the_earlier_ones() {
+        let dir = std::env::temp_dir().join(format!(
+            "jucode-hub-retire-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let hub = Hub::new(
+            Store::open(dir.join("daemon")).unwrap(),
+            Agents::open(dir.join("agents")).unwrap(),
+            "test",
+            None,
+        );
+        for (message, session) in [("m1", "run1"), ("m2", "run2"), ("m3", "run3")] {
+            hub.store
+                .record_engine_session(session, &dir, Some("ops"), None, false)
+                .unwrap();
+            hub.store
+                .record_message(&Message {
+                    id: message.into(),
+                    to: "ops".into(),
+                    from: "schedule:sch-1".into(),
+                    body: "巡检".into(),
+                    session: None,
+                    reply_to: None,
+                    dedupe_key: None,
+                    at: 1,
+                })
+                .unwrap();
+            hub.store.record_delivered(message, session).unwrap();
+        }
+        let ask = |id: &str, session: &str| Question {
+            id: id.into(),
+            agent: "ops".into(),
+            session: session.into(),
+            title: id.into(),
+            body: String::new(),
+            assumption: String::new(),
+            default_action: String::new(),
+            importance: "normal".into(),
+            due_at: None,
+            asked_at: 1,
+        };
+        hub.ask(&ask("q1", "run1")).unwrap();
+        hub.ask(&ask("q3", "run3")).unwrap();
+        // run2 is still working: left alone.
+        lock(&hub.busy).insert("run2".into());
+
+        hub.retire_schedule_runs("sch-1", "巡检", "run3");
+        let open: Vec<String> = hub
+            .store
+            .open_questions()
+            .into_iter()
+            .map(|q| q.id)
+            .collect();
+        assert_eq!(open, ["q3"]);
+        assert_eq!(hub.store.closed_questions(0)[0].1.by, "superseded");
+        let archived = |id: &str| {
+            hub.store
+                .sessions()
+                .iter()
+                .any(|r| r.id == id && r.archived)
+        };
+        assert!(archived("run1") && !archived("run2") && !archived("run3"));
+        assert_eq!(hub.open_items_of("ops").len(), 1);
+
+        // Reopening brings its run back out of the archive.
+        hub.reopen_item(ItemKind::Question, "q1").unwrap();
+        assert!(!archived("run1"));
+        assert_eq!(hub.open_items_of("ops").len(), 2);
+        assert!(hub.reopen_item(ItemKind::Question, "q1").is_err());
         let _ = fs::remove_dir_all(dir);
     }
 

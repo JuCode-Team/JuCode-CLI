@@ -394,7 +394,13 @@ the other agents in its system prompt, and three tools:
 | `brief` | Reads or rewrites the agent's own brief and memory files. |
 | `question` | Records a question for the user (`title`, `body`, `assumption`, `default`, `due_in_seconds`, `importance`) and returns at once. The answer, or the deadline passing (the agent then goes with `default`), is delivered to the session that asked. |
 | `report` | Records a report (`title`, `body`) for the user to read; wakes nobody. |
+| `open_items` | `list`: the agent's open questions and the open actions of its sessions. `close` (`item`, `reason`): closes one of them unanswered; the user's phone is told, the desk lists it with the reason and can reopen it. An answer to a question tells the agent when it has other open items. |
 | `requirements` | `list`, `get`, `progress`, `propose_create`, `propose_close`: see "Agents and requirements". Noting and closing a requirement are only proposals the user accepts. |
+
+When a scheduled task's run starts in a new session, its earlier runs that are
+not working close their open questions and actions (`closed_by`:
+`superseded`) and are archived; reopening an item takes its session out of the
+archive.
 
 Messages (from `message_send`, `message_agent`, a fired timer or a scheduled
 task) are

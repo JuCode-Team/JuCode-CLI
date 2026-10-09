@@ -394,7 +394,8 @@ impl Hub {
     }
 
     /// A run of schedule `id` reached `session`: later runs that continue
-    /// the last session go there.
+    /// the last session go there, and a run in a new session retires the
+    /// earlier ones (see `retire_schedule_runs`).
     pub(crate) fn schedule_delivered(&self, id: &str, session: &str) {
         let mut list = lock(&self.schedules);
         let Some(schedule) = list.iter_mut().find(|schedule| schedule.id == id) else {
@@ -404,12 +405,13 @@ impl Hub {
             return;
         }
         schedule.last_session = Some(session.to_string());
-        let agent = schedule.agent.clone();
+        let (agent, name) = (schedule.agent.clone(), schedule.name.clone());
         if let Err(error) = self.persist_schedules(&list, &agent) {
             jucode_agent_core::log_warn!("daemon", "schedules not saved", error = error);
         }
         drop(list);
         self.broadcast(&self.schedules_json(None));
+        self.retire_schedule_runs(id, &name, session);
     }
 
     /// Records the message for one run: into the last run's session when

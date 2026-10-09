@@ -464,7 +464,8 @@ impl Agents {
              waiting. When only the user can decide, `question` them and continue under your assumption; \
              when something is done or blocked, `report` it. Use `timer` to come back to something once, \
              `schedule` to propose recurring work (the user switches it on), and `message_agent` to hand \
-             work to another agent.\n",
+             work to another agent. When the user answers or decides one of your open items, check \
+             `open_items` and close the ones that made unnecessary.\n",
             agent.id, agent.name
         );
         for file in BRIEF_FILES {

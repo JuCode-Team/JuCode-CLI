@@ -1,10 +1,10 @@
 //! Tools a long-lived agent's sessions get from the daemon, added to the
 //! engine through `HostExtensions`: `message_agent`, `timer`, `schedule`,
-//! `brief`, `question`, `report` and `requirements`.
+//! `brief`, `question`, `report`, `open_items` and `requirements`.
 
 use crate::{
     hub::Hub,
-    store::{now, Message, Question, Report, Timer},
+    store::{now, ItemKind, Message, Question, Report, Timer},
 };
 use jucode_agent_core::host::HostExtensions;
 use serde_json::{json, Value};
@@ -252,6 +252,22 @@ fn run(
             hub.post_report(&report)?;
             Ok(json!({ "report": report.id }))
         }
+        "open_items" => match text("action").as_deref() {
+            Some("list") => Ok(json!(hub.open_items_of(agent))),
+            Some("close") => {
+                let item = text("item").ok_or("close requires item")?;
+                let reason = text("reason").ok_or("close requires a reason the user will read")?;
+                let kind = hub
+                    .open_items_of(agent)
+                    .iter()
+                    .find(|open| open["id"] == item.as_str())
+                    .and_then(|open| open["kind"].as_str().map(str::to_string))
+                    .ok_or_else(|| format!("{item} is not one of your open items"))?;
+                hub.close_item(ItemKind::parse(&kind)?, &item, &format!("agent:{agent}"), &reason)?;
+                Ok(json!({ "closed": item, "note": "The user is told it was closed, with your reason, and can reopen it." }))
+            }
+            _ => Err("open_items action must be list or close".to_string()),
+        },
         "requirements" => {
             let project = hub.agents.get(agent).and_then(|agent| agent.project);
             crate::requirements::tool(hub, agent, project.as_deref(), session, args)
@@ -357,6 +373,20 @@ fn definitions() -> Vec<Value> {
                     "action": { "type": "string", "enum": ["read", "write", "list"] },
                     "file": { "type": "string" },
                     "content": { "type": "string" }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "open_items",
+            "description": "Your questions and approval-waiting actions that still wait for the user, across all your sessions. `list` shows them; `close` puts one away unanswered, with a `reason` the user reads (they are told and can reopen it). When the user answers or decides one item, check the rest: close the ones that answer made unnecessary or that newer work already settled. Never close one only because it is old.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "close"] },
+                    "item": { "type": "string", "description": "Item id, for close." },
+                    "reason": { "type": "string", "description": "For close: why it is no longer needed, in one line in the user's language." }
                 },
                 "required": ["action"],
                 "additionalProperties": false
