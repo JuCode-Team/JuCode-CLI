@@ -187,7 +187,6 @@ const READ_ONLY_GIT: &[&str] = &[
     "show-ref",
     "merge-base",
     "name-rev",
-    "reflog",
 ];
 
 /// Whether `command` provably only reads: a pipeline or list of known
@@ -253,12 +252,21 @@ fn forbidden_option(program: &str, arg: &str) -> bool {
                 | "-fls"
         ),
         "sort" => {
-            arg == "-o" || arg.starts_with("--output") || (arg.starts_with("-o") && arg.len() > 2)
+            short_flag(arg, 'o')
+                || arg.starts_with("--output")
+                || arg.starts_with("--compress-program")
         }
-        "rg" => arg.starts_with("--pre"),
-        "tree" => arg == "-o",
+        "rg" => arg.starts_with("--pre") || arg.starts_with("--hostname-bin"),
+        // -R writes 00Tree.html into every directory.
+        "tree" => short_flag(arg, 'o') || short_flag(arg, 'R') || arg.starts_with("--output"),
+        "file" => short_flag(arg, 'C') || arg == "--compile",
         _ => false,
     }
+}
+
+/// Whether `arg` is a cluster of short options (`-uo`) that includes `flag`.
+fn short_flag(arg: &str, flag: char) -> bool {
+    arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains(flag)
 }
 
 fn git_is_read_only(args: &[&str]) -> bool {
@@ -274,10 +282,14 @@ fn git_is_read_only(args: &[&str]) -> bool {
     let Some((&subcommand, options)) = rest.split_first() else {
         return false;
     };
-    if options
-        .iter()
-        .any(|arg| *arg == "-o" || arg.starts_with("--output") || arg.starts_with("--ext-diff"))
-    {
+    // Writing a file, or running an external diff, textconv filter or pager.
+    if options.iter().any(|arg| {
+        *arg == "-o"
+            || arg.starts_with("--output")
+            || arg.starts_with("--ext-diff")
+            || arg.starts_with("--textconv")
+            || arg.starts_with("--filters")
+    }) {
         return false;
     }
     match subcommand {
@@ -297,6 +309,12 @@ fn git_is_read_only(args: &[&str]) -> bool {
         "remote" => options.iter().all(|arg| matches!(*arg, "-v" | "--verbose")),
         "tag" => options.iter().all(|arg| matches!(*arg, "-l" | "--list")),
         "stash" => options.first() == Some(&"list"),
+        // `reflog expire` and `reflog delete` rewrite history.
+        "reflog" => options.first().is_none_or(|arg| *arg == "show"),
+        // -O / --open-files-in-pager runs a program on the matches.
+        "grep" => !options
+            .iter()
+            .any(|arg| short_flag(arg, 'O') || arg.starts_with("--open-files-in-pager")),
         "config" => options.first().is_some_and(|arg| {
             matches!(
                 *arg,
@@ -370,6 +388,12 @@ mod tests {
             "cd crates && grep -rn TODO .",
             "git branch -a",
             "git config --get user.name",
+            "git reflog",
+            "git reflog show --oneline -5",
+            "git grep -n foo",
+            "sort -u in.txt",
+            "file -b Cargo.toml",
+            "tree -a -L 2",
         ] {
             assert!(is_read_only_command(command), "{command}");
             assert_eq!(
@@ -402,6 +426,24 @@ mod tests {
             "sed -i s/a/b/ f",
             "python -c 'print(1)'",
             "git stash",
+            "git grep -Ovim foo",
+            "git grep -nO foo",
+            "git grep --open-files-in-pager=vim foo",
+            "git reflog expire --expire=now --all",
+            "git reflog delete HEAD@{1}",
+            "git log -p --output=patch.diff",
+            "git log -p --ext-diff",
+            "git diff --textconv",
+            "git cat-file --filters HEAD:a",
+            "sort -uo out.txt in.txt",
+            "sort -o out.txt in.txt",
+            "sort --compress-program=sh in.txt",
+            "file -C -m magic",
+            "file -bC -m magic",
+            "file --compile -m magic",
+            "tree -ao out.txt",
+            "tree -R -H . ",
+            "rg --hostname-bin=./x foo",
         ] {
             assert!(!is_read_only_command(command), "{command:?}");
         }
