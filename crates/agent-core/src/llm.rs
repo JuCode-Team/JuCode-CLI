@@ -450,22 +450,8 @@ impl OpenAiClient {
             .find(|model| model.name == config.model)
             .map(|model| model.reasoning_efforts.clone())
             .unwrap_or_default();
-        // No list configured: every chat model of the provider, so the agent
-        // picks per task (and takes the one the user names).
-        let entries: Vec<crate::config::SubagentModel> = if config.subagent_models.is_empty() {
-            config
-                .models
-                .iter()
-                .filter(|model| !model.name.to_ascii_lowercase().contains("image"))
-                .map(|model| crate::config::SubagentModel {
-                    name: model.name.clone(),
-                    description: String::new(),
-                })
-                .collect()
-        } else {
-            config.subagent_models.clone()
-        };
-        let subagent_models = entries
+        let subagent_models = config
+            .subagent_models
             .iter()
             .filter(|entry| entry.name != config.model)
             .filter_map(|entry| {
@@ -1904,8 +1890,13 @@ fn efforts_label(efforts: &[String]) -> String {
 /// The spawn_agent `model`/`reasoning_effort` guidance: which models the agent
 /// may pick, their tiers, and when to use each (config `subagent_models`).
 fn subagent_model_guide(own: &str, own_efforts: &[String], specs: &[SubagentModelSpec]) -> String {
+    let choice = if specs.iter().any(|spec| spec.name != own) {
+        "pick the one that suits the task; when the user names a model for subagents, use it. "
+    } else {
+        ""
+    };
     let mut guide = format!(
-        "\n\nModels: pick the one that suits the task; when the user names a model for subagents, use it. Omit model to use your own.\n- {own} (your model; {})",
+        "\n\nModels: {choice}Omit model to use your own.\n- {own} (your model; {})",
         efforts_label(own_efforts)
     );
     for spec in specs.iter().filter(|spec| spec.name != own) {
@@ -2938,23 +2929,36 @@ mod tests {
     }
 
     #[test]
-    fn without_subagent_models_every_chat_model_is_choosable() {
-        let mut config = test_client_config();
-        config.provider = "jucode".to_string();
-        config.model = "gpt-main".to_string();
-        config.models = vec![
-            model("gpt-main", &["low", "high"], 8000),
-            model("claude-helper", &["low", "high"], 4000),
-            model("gpt-image-2", &[], 0),
-        ];
-        config.subagent_manager = Some(SubagentManager::default());
-        let spawn = OpenAiClient::from_config(config)
+    fn subagent_models_are_offered_only_from_the_configured_list() {
+        let spawn_of = |subagent_models: Vec<SubagentModel>| {
+            let mut config = test_client_config();
+            config.provider = "jucode".to_string();
+            config.model = "gpt-main".to_string();
+            config.models = vec![
+                model("gpt-main", &["low", "high"], 8000),
+                model("claude-helper", &["low", "high"], 4000),
+            ];
+            config.subagent_models = subagent_models;
+            config.subagent_manager = Some(SubagentManager::default());
+            OpenAiClient::from_config(config)
+                .unwrap()
+                .tool_definitions()
+                .into_iter()
+                .find(|definition| definition["name"] == "spawn_agent")
+                .unwrap()
+        };
+        // No list: subagents run on the main model, whatever else is configured.
+        let spawn = spawn_of(Vec::new());
+        assert!(spawn["parameters"]["properties"]["model"].is_null());
+        assert!(!spawn["description"]
+            .as_str()
             .unwrap()
-            .tool_definitions()
-            .into_iter()
-            .find(|definition| definition["name"] == "spawn_agent")
-            .unwrap();
-        // An image model cannot run a subagent; the main model picks among the rest.
+            .contains("when the user names a model"));
+        // A list: the agent picks from it, and takes the one the user names.
+        let spawn = spawn_of(vec![SubagentModel {
+            name: "claude-helper".to_string(),
+            description: String::new(),
+        }]);
         assert_eq!(
             spawn["parameters"]["properties"]["model"]["enum"],
             json!(["gpt-main", "claude-helper"])
