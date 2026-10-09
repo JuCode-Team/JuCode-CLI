@@ -260,6 +260,7 @@ pub fn definitions() -> Vec<Value> {
         }),
         crate::web_fetch::definition(),
         crate::web::search_definition(),
+        crate::images::definition(),
     ])
 }
 
@@ -273,6 +274,7 @@ pub fn prompt_tool_names(
     edit_tools: &[String],
     subagents: bool,
     web_search: bool,
+    images: bool,
 ) -> Vec<&'static str> {
     let mut names = vec!["read"];
     for name in crate::config::EDIT_TOOL_NAMES {
@@ -292,6 +294,9 @@ pub fn prompt_tool_names(
     ]);
     if web_search {
         names.push("web_search");
+    }
+    if images {
+        names.push(crate::images::TOOL_NAME);
     }
     if subagents {
         names.extend([
@@ -377,7 +382,7 @@ pub fn run_tool_with_events(
         }
         "write_stdin" => match optional_u64(&args, "session_id") {
             Ok(Some(session_id)) if !state.owns_shell(session_id) => {
-                json!({ "session_id": session_id, "error": format!("unknown shell session {session_id}") })
+                json!({ "session_id": session_id, "error": format!("no running shell session {session_id}: a bash command that finishes returns its full output in its own result; write_stdin is only for a session_id that a still-running bash command returned") })
             }
             _ => write_stdin(&args),
         },
@@ -388,6 +393,9 @@ pub fn run_tool_with_events(
         "checkpoint" => checkpoint_tool(&args, cwd, state),
         "web_fetch" => crate::web::run_fetch(&args, state.web().as_ref()),
         "web_search" => crate::web::run_search(&args, state.web().as_ref()),
+        crate::images::TOOL_NAME => {
+            crate::images::run(&args, cwd, extra_read_roots, state, &mut emit)
+        }
         _ => json!({ "error": format!("unknown tool: {name}") }),
     };
     tool_result(name, result, cwd)
@@ -2219,8 +2227,37 @@ fn ripgrep(args: &Value, cwd: &Path, extra_read_roots: &[PathBuf]) -> Value {
     command_args.push(search_path.display().to_string());
 
     let arg_refs = command_args.iter().map(String::as_str).collect::<Vec<_>>();
-    let result = run_command("rg", &arg_refs, cwd, Duration::from_secs(30));
-    let mut value = command_result_json("rg", result);
+    let mut value = match run_command("rg", &arg_refs, cwd, Duration::from_secs(30)) {
+        // No rg on this machine (a stock Windows has none): search in-process.
+        Err(error) if error.starts_with("failed to start rg") => {
+            let options = crate::search::Options {
+                ignore_case: args
+                    .get("ignoreCase")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                literal: args
+                    .get("literal")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                context: context_lines,
+                glob: args.get("glob").and_then(Value::as_str),
+                timeout: Duration::from_secs(30),
+            };
+            let out = crate::search::search(pattern, &search_path, &options);
+            command_result_json(
+                "rg",
+                Ok(CommandResult {
+                    exit_code: Some(out.exit_code),
+                    signal: None,
+                    stdout: out.stdout,
+                    stderr: out.stderr,
+                    timed_out: out.timed_out,
+                    truncated: out.truncated,
+                }),
+            )
+        }
+        result => command_result_json("rg", result),
+    };
     // rg exit code 1 means "no matches", which is a valid result; 2+ is an error.
     if value.get("exit_code").and_then(Value::as_i64) == Some(1) {
         value["exit_code"] = json!(0);
@@ -2353,7 +2390,7 @@ fn checkpoint_tool(args: &Value, cwd: &Path, state: &ToolState) -> Value {
     }
 }
 
-fn image_mime(path: &Path) -> Option<&'static str> {
+pub(crate) fn image_mime(path: &Path) -> Option<&'static str> {
     match path
         .extension()
         .and_then(|value| value.to_str())
@@ -2487,6 +2524,9 @@ struct ToolStateInner {
     /// Gateway settings for the web tools; None fetches locally and leaves
     /// web_search unavailable.
     web: Option<crate::web::WebTools>,
+    /// Endpoint and model for generate_image, or why it is unavailable;
+    /// None until the engine configures it.
+    images: Option<Result<crate::images::ImageTools, String>>,
 }
 
 impl Drop for ToolStateInner {
@@ -2536,6 +2576,21 @@ impl ToolState {
     /// web_search runs through the gateway, so it needs a JuCode session.
     pub fn web_search_enabled(&self) -> bool {
         self.web().is_some_and(|web| web.signed_in)
+    }
+
+    pub(crate) fn set_images(&self, images: Result<crate::images::ImageTools, String>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.images = Some(images);
+        }
+    }
+
+    /// generate_image's settings, or the reason it is not offered.
+    pub(crate) fn images(&self) -> Result<crate::images::ImageTools, String> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.images.clone())
+            .unwrap_or_else(|| Err(crate::images::UNAVAILABLE.to_string()))
     }
 
     /// The same engine state with an empty read record, for a subagent: it
@@ -2613,7 +2668,7 @@ fn patch_target_paths(patch: &str, cwd: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn create_checkpoint(cwd: &Path, name: &str, paths: &[PathBuf]) -> io::Result<Value> {
+pub(crate) fn create_checkpoint(cwd: &Path, name: &str, paths: &[PathBuf]) -> io::Result<Value> {
     let id = format!("cp-{}", now_nanos());
     let mut files = Vec::new();
     let mut bytes = 0usize;
@@ -3047,7 +3102,7 @@ fn add_command_soft_hint(value: &mut Value) {
         add_soft_hint(
             value,
             "command timed out",
-            "Inspect partial output, narrow the command, or rerun with a longer timeout only if the full command is necessary.",
+            "Inspect partial output, narrow the command, or rerun with a longer timeout only if the full command is necessary. In the sandbox, a program that writes outside the writable directories (a browser's profile under ~/Library, for example) can hang: rerun it with escalate.",
         );
     } else if value
         .get("truncated")
@@ -3234,7 +3289,7 @@ fn command_failure_message(command: &str, result: &CommandResult) -> String {
         .unwrap_or_else(|| format!("{command} failed"))
 }
 
-fn diff_label(cwd: &Path, path: &Path) -> String {
+pub(crate) fn diff_label(cwd: &Path, path: &Path) -> String {
     path.strip_prefix(cwd)
         .unwrap_or(path)
         .to_string_lossy()
@@ -3465,7 +3520,7 @@ fn optional_usize(args: &Value, key: &str) -> Result<Option<usize>, String> {
 
 /// `Ok(None)` when the key is absent or null. Accepts integer-valued floats
 /// (e.g. 30.0); anything else is a descriptive error instead of a silent default.
-fn optional_u64(args: &Value, key: &str) -> Result<Option<u64>, String> {
+pub(crate) fn optional_u64(args: &Value, key: &str) -> Result<Option<u64>, String> {
     let Some(value) = args.get(key) else {
         return Ok(None);
     };
@@ -3500,7 +3555,7 @@ pub(crate) fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
 /// rejected too.
 /// Where a mutating file tool may write: the workspace, or one of the
 /// sandbox's read-write directories, and never where the sandbox forbids.
-fn write_target(cwd: &Path, path: &str, state: &ToolState) -> Result<PathBuf, String> {
+pub(crate) fn write_target(cwd: &Path, path: &str, state: &ToolState) -> Result<PathBuf, String> {
     let sandbox = state.sandbox();
     let resolved = resolve_path(cwd, path);
     let target = match &sandbox {
@@ -3523,7 +3578,11 @@ pub(crate) fn workspace_path(cwd: &Path, path: &str) -> Result<PathBuf, String> 
 /// `extra_roots` (discovered skill directories, so a skill's relative
 /// references resolve). Returns the workspace error unchanged when the path
 /// is under neither.
-fn readable_path(cwd: &Path, path: &str, extra_roots: &[PathBuf]) -> Result<PathBuf, String> {
+pub(crate) fn readable_path(
+    cwd: &Path,
+    path: &str,
+    extra_roots: &[PathBuf],
+) -> Result<PathBuf, String> {
     let resolved = resolve_path(cwd, path);
     match ensure_in_workspace(cwd, &resolved) {
         Ok(()) => Ok(resolved),
@@ -3606,7 +3665,7 @@ pub(crate) fn write_target_escapes_root(
 ) -> Option<String> {
     let args = serde_json::from_str::<Value>(arguments).ok()?;
     match name {
-        "write" | "str_replace" | "edit" | "hashline_edit" => {
+        "write" | "str_replace" | "edit" | "hashline_edit" | crate::images::TOOL_NAME => {
             let path = args.get("path").and_then(Value::as_str)?;
             let resolved = normalize_lexically(&resolve_path(cwd, path));
             if resolved.starts_with(normalize_lexically(root)) {
@@ -4345,7 +4404,8 @@ mod tests {
                 "outline",
                 "checkpoint",
                 "web_fetch",
-                "web_search"
+                "web_search",
+                "generate_image"
             ]
         );
         assert!(tools
@@ -4368,8 +4428,10 @@ mod tests {
                     .is_none_or(|canonical| edit_tools.iter().any(|tool| tool == canonical))
             })
             .collect::<Vec<_>>();
-        assert_eq!(prompt_tool_names(&edit_tools, false, true), expected);
-        assert!(!prompt_tool_names(&edit_tools, false, false).contains(&"web_search"));
+        assert_eq!(prompt_tool_names(&edit_tools, false, true, true), expected);
+        let without = prompt_tool_names(&edit_tools, false, false, false);
+        assert!(!without.contains(&"web_search"));
+        assert!(!without.contains(&"generate_image"));
 
         let all = vec![
             "str_replace".to_string(),
@@ -4377,7 +4439,7 @@ mod tests {
             "write".to_string(),
             "apply_patch".to_string(),
         ];
-        let names = prompt_tool_names(&all, true, false);
+        let names = prompt_tool_names(&all, true, false, true);
         assert_eq!(
             names,
             [
@@ -4394,6 +4456,7 @@ mod tests {
                 "outline",
                 "checkpoint",
                 "web_fetch",
+                "generate_image",
                 "spawn_agent",
                 "wait_agent",
                 "list_agents",
@@ -5519,7 +5582,7 @@ mod tests {
             foreign["error"]
                 .as_str()
                 .unwrap()
-                .contains("unknown shell session"),
+                .contains("no running shell session"),
             "{foreign}"
         );
         let own = call(

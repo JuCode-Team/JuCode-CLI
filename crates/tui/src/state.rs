@@ -416,6 +416,7 @@ impl TuiState {
                     path,
                     status,
                     message,
+                    ..
                 } => {
                     self.chat.push(ChatLine::System(format!(
                         "Agent {path}: {status} — {message}"
@@ -519,9 +520,25 @@ impl TuiState {
                     self.mark_history_dirty();
                     true
                 }
+                AgentEvent::ProposedPlan {
+                    title,
+                    markdown,
+                    status,
+                    ..
+                } => {
+                    self.chat.push(ChatLine::System(format!(
+                        "Plan ({status}): {title}\n{markdown}"
+                    )));
+                    self.mark_history_dirty();
+                    true
+                }
+                // The TUI shows the plan once it is proposed, not while written.
+                AgentEvent::PlanDraft { .. } => false,
                 // Structured MCP state is for GUI front-ends; the TUI relies on
                 // the accompanying Info lines (and /mcp) instead.
                 AgentEvent::McpServers { .. } => false,
+                // The agent trace is for GUI front-ends (the TUI has /subagents).
+                AgentEvent::AgentRuns(_) | AgentEvent::SubagentTranscript { .. } => false,
                 AgentEvent::Transcript(items) => {
                     self.replace_transcript(items);
                     true
@@ -812,6 +829,12 @@ impl TuiState {
                     running: false,
                 },
                 TranscriptItem::Branch(label) => ChatLine::System(label),
+                TranscriptItem::Plan {
+                    title,
+                    content,
+                    status,
+                    ..
+                } => ChatLine::System(format!("Plan ({status}): {title}\n{content}")),
             })
             .collect();
         self.reset_screen = true;

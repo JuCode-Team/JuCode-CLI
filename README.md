@@ -239,6 +239,7 @@ JuCode exposes a small set of direct tools to the model:
 | `ripgrep` | Search with ripgrep and optional limits. |
 | `outline` | Get lightweight source-file symbols without reading full bodies. |
 | `checkpoint` | Create/list/restore local `.jucode/checkpoints` snapshots. |
+| `generate_image` | Generate an image from a prompt, or edit workspace images, through the provider's OpenAI-compatible `/images/generations` and `/images/edits` endpoints, and save it in the workspace (never overwriting a file). Offered on `responses`/`chat` providers when an image model resolves: `image_model` in `config.json`, else the first configured model whose name contains `image` (e.g. `gpt-image-2`). Gated like `write`. |
 | `spawn_agent`, `wait_agent`, `list_agents`, `send_message`, `close_agent` | Coordinate lightweight subagents. |
 
 `diff` is intentionally not exposed as an agent tool. Edit tools still return diff data for the TUI and for compact model-facing summaries, but workspace diff inspection should happen through scoped shell commands when needed.

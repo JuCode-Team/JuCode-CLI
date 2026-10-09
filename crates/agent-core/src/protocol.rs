@@ -90,6 +90,32 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
                 "decide_action requires action and decision: allow or deny".to_string(),
             )],
         },
+        "agent_runs" => vec![core.agent_runs_event()],
+        "subagent_transcript" => {
+            let id = value
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            vec![core.subagent_transcript_event(id)]
+        }
+        "approve_plan" => {
+            let text = |key: &str| value.get(key).and_then(Value::as_str).unwrap_or_default();
+            let mode = match value.get("mode").and_then(Value::as_str) {
+                Some(mode) => match ApprovalMode::parse(mode) {
+                    Ok(mode) => Some(mode),
+                    Err(error) => return (false, vec![AgentEvent::Error(error)]),
+                },
+                None => None,
+            };
+            match (text("id"), text("decision")) {
+                ("", _) => vec![AgentEvent::Error("approve_plan requires id".to_string())],
+                (id, "approve") => core.approve_plan(id, true, mode, text("feedback")),
+                (id, "revise") => core.approve_plan(id, false, None, text("feedback")),
+                _ => vec![AgentEvent::Error(
+                    "approve_plan requires decision: approve or revise".to_string(),
+                )],
+            }
+        }
         "mcp_list" => vec![core.mcp_servers_event()],
         "mcp_set" => match value.get("server") {
             Some(server) => core.mcp_set(server),
@@ -271,12 +297,33 @@ pub fn event_json(event: AgentEvent) -> Value {
             path,
             status,
             message,
+            label,
+            model,
+            tool_use_id,
         } => json!({
             "type": "subagent_lifecycle",
             "path": path,
             "status": status,
-            "message": message
+            "message": message,
+            "label": label,
+            "model": model,
+            "tool_use_id": tool_use_id,
         }),
+        AgentEvent::AgentRuns(agents) => json!({
+            "type": "agent_runs",
+            "workflows": [],
+            "agents": agents,
+        }),
+        AgentEvent::SubagentTranscript { agent_id, items } => match items {
+            Some(items) => {
+                json!({ "type": "subagent_transcript", "agent_id": agent_id, "items": items })
+            }
+            None => json!({
+                "type": "subagent_transcript",
+                "agent_id": agent_id,
+                "error": format!("unknown agent: {agent_id}"),
+            }),
+        },
         AgentEvent::Usage {
             input_tokens,
             cached_input_tokens,
@@ -406,6 +453,24 @@ pub fn event_json(event: AgentEvent) -> Value {
                 "status": item.status,
             })).collect::<Vec<_>>()
         }),
+        AgentEvent::PlanDraft { id, title, append } => json!({
+            "type": "plan_draft",
+            "id": id,
+            "title": title,
+            "append": append,
+        }),
+        AgentEvent::ProposedPlan {
+            id,
+            title,
+            markdown,
+            status,
+        } => json!({
+            "type": "proposed_plan",
+            "id": id,
+            "title": title,
+            "markdown": markdown,
+            "status": status,
+        }),
         AgentEvent::Transcript(items) => json!({
             "type": "transcript",
             "items": items.into_iter().map(|item| match item {
@@ -416,6 +481,9 @@ pub fn event_json(event: AgentEvent) -> Value {
                 crate::TranscriptItem::Assistant(content) => json!({ "role": "assistant", "content": content }),
                 crate::TranscriptItem::Tool { name, output } => json!({ "role": "tool", "name": name, "output": output }),
                 crate::TranscriptItem::Branch(label) => json!({ "role": "branch", "label": label }),
+                crate::TranscriptItem::Plan { id, title, content, status } => json!({
+                    "role": "plan", "id": id, "title": title, "content": content, "status": status,
+                }),
             }).collect::<Vec<_>>()
         }),
         AgentEvent::Info(message) => json!({ "type": "info", "message": message }),

@@ -1026,6 +1026,31 @@ fn tool_output_preview_projects_read_and_ls() {
 }
 
 #[test]
+fn generate_image_preview_lists_saved_paths() {
+    let output = serde_json::json!({
+        "paths": ["images/fox.png", "images/fox-2.png"],
+        "model": "gpt-image-2",
+        "revised_prompt": "a fox"
+    })
+    .to_string();
+    let preview = tool_output_preview("generate_image", &output, false);
+    assert_eq!(
+        preview_text(&preview),
+        "saved images/fox.png\nsaved images/fox-2.png"
+    );
+    let header = format_tool_header(
+        "generate_image",
+        false,
+        preview.first().map(|l| &l.line),
+        60,
+    );
+    assert!(header
+        .spans
+        .iter()
+        .any(|span| span.content.as_ref() == "Generated"));
+}
+
+#[test]
 fn tool_error_json_shows_message_not_raw_json() {
     let preview = tool_output_preview(
         "write_stdin",

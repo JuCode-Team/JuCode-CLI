@@ -110,6 +110,7 @@ fn reasoning_effort_span(effort: &str) -> Span<'static> {
 /// in the loop, red for unrestricted; manual stays muted.
 pub(crate) fn approval_mode_style(mode: &str) -> Style {
     let color = match mode {
+        "plan" => Color::Rgb(120, 160, 230),
         "auto-edit" => Color::Rgb(90, 190, 140),
         "auto" => Color::Rgb(230, 200, 90),
         "full-access" => Color::Rgb(245, 90, 90),

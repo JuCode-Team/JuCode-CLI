@@ -72,6 +72,10 @@ pub enum ApprovalMode {
     Auto,
     /// Everything runs without approval.
     FullAccess,
+    /// Planning: only read-only tools run (see `plan_mode::refusal`); the
+    /// agent ends by proposing a plan. Gated like `Manual` for anything that
+    /// reaches the approval layer.
+    Plan,
 }
 
 impl ApprovalMode {
@@ -81,6 +85,7 @@ impl ApprovalMode {
             Self::AutoEdit => "auto-edit",
             Self::Auto => "auto",
             Self::FullAccess => "full-access",
+            Self::Plan => "plan",
         }
     }
 
@@ -90,8 +95,9 @@ impl ApprovalMode {
             "auto-edit" => Ok(Self::AutoEdit),
             "auto" => Ok(Self::Auto),
             "full-access" => Ok(Self::FullAccess),
+            "plan" => Ok(Self::Plan),
             other => Err(format!(
-                "unknown approval mode '{other}': use manual, auto-edit, auto, or full-access"
+                "unknown approval mode '{other}': use manual, auto-edit, auto, full-access, or plan"
             )),
         }
     }
@@ -109,13 +115,14 @@ impl ApprovalMode {
         if is_shell_tool(tool_name) {
             return *self != Self::FullAccess;
         }
-        if is_edit_tool(tool_name) {
-            return *self == Self::Manual;
+        // generate_image writes files into the workspace like `write`.
+        if is_edit_tool(tool_name) || tool_name == crate::images::TOOL_NAME {
+            return self.is_strict();
         }
         // Network egress can exfiltrate local context, so the strictest mode
         // still asks; both auto modes already accept broader side effects.
         if is_network_tool(tool_name) {
-            return *self == Self::Manual;
+            return self.is_strict();
         }
         false
     }
@@ -126,12 +133,18 @@ impl ApprovalMode {
         *self == Self::Auto
     }
 
+    /// Manual, and plan mode for any call that still reaches the approval
+    /// layer (plan mode refuses mutating tools before that).
+    fn is_strict(&self) -> bool {
+        matches!(self, Self::Manual | Self::Plan)
+    }
+
     /// Approval policy for MCP tools, given the server's `readOnlyHint`
     /// annotation: manual asks for everything, the auto modes ask unless the
     /// tool is marked read-only, full-access never asks.
     pub fn requires_approval_for_mcp(&self, read_only_hint: bool) -> bool {
         match self {
-            Self::Manual => true,
+            Self::Manual | Self::Plan => true,
             Self::AutoEdit | Self::Auto => !read_only_hint,
             Self::FullAccess => false,
         }
@@ -145,11 +158,12 @@ impl ApprovalMode {
 pub struct LiveApprovalMode(std::sync::Arc<std::sync::atomic::AtomicU8>);
 
 impl LiveApprovalMode {
-    const MODES: [ApprovalMode; 4] = [
+    const MODES: [ApprovalMode; 5] = [
         ApprovalMode::Manual,
         ApprovalMode::AutoEdit,
         ApprovalMode::Auto,
         ApprovalMode::FullAccess,
+        ApprovalMode::Plan,
     ];
 
     pub fn new(mode: ApprovalMode) -> Self {
@@ -231,6 +245,9 @@ pub struct Config {
     /// Model that names conversations (`jucode daemon`). Empty: the main
     /// `model`.
     pub title_model: String,
+    /// Model behind `generate_image`. Empty: the first of `models` whose
+    /// name contains "image" (see `images::resolve_model`).
+    pub image_model: String,
     pub models: Vec<ModelConfig>,
     /// Models the main agent may pick for `spawn_agent` (`subagent_models`),
     /// each with a note on when to use it. Empty: subagents run on the main
@@ -418,6 +435,7 @@ impl Config {
                 safety_model: "gpt-5.5".to_string(),
                 safety_reasoning_effort: DEFAULT_COMPACT_REASONING_EFFORT.to_string(),
                 title_model: String::new(),
+                image_model: String::new(),
                 models: models_for_provider("jucode"),
                 subagent_models: Vec::new(),
                 jucode_models: Vec::new(),
@@ -472,7 +490,7 @@ impl Config {
 
     /// Parse `content` as config.json. Malformed JSON and invalid field values
     /// are hard errors; `load_or_create` offers to reset the file in that case.
-    fn from_value(content: &str, path: PathBuf) -> io::Result<Self> {
+    pub(crate) fn from_value(content: &str, path: PathBuf) -> io::Result<Self> {
         let value = serde_json::from_str::<Value>(content).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -526,6 +544,7 @@ impl Config {
             safety_model,
             safety_reasoning_effort,
             title_model: read_string(&value, "title_model", ""),
+            image_model: read_string(&value, "image_model", ""),
             subagent_models: read_subagent_models(&value),
             models,
             jucode_models: value
@@ -603,6 +622,7 @@ impl Config {
             "safety_model": self.safety_model,
             "safety_reasoning_effort": self.safety_reasoning_effort,
             "title_model": self.title_model,
+            "image_model": self.image_model,
             "models": self.models.iter().map(model_config_value).collect::<Vec<_>>(),
             "subagent_models": self.subagent_models.iter().map(|model| json!({
                 "name": model.name,
@@ -907,11 +927,31 @@ fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temp = path.with_file_name(format!(".{file_name}.{}.{n}.tmp", std::process::id()));
     fs::write(&temp, contents)?;
-    if let Err(error) = fs::rename(&temp, path) {
-        let _ = fs::remove_file(&temp);
-        return Err(error);
+    // Windows refuses to replace a file another process has open (the
+    // desktop reading config.json, an antivirus scan); that lasts moments, so
+    // retry briefly instead of failing the save (a model pick that silently
+    // did nothing). Elsewhere a refused rename is a real error.
+    let mut attempt = 0;
+    loop {
+        match fs::rename(&temp, path) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if cfg!(windows)
+                    && attempt < 20
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::PermissionDenied | io::ErrorKind::ResourceBusy
+                    ) =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25 * attempt));
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temp);
+                return Err(error);
+            }
+        }
     }
-    Ok(())
 }
 
 /// When config.json fails to parse (invalid values, malformed JSON), offer an
@@ -1651,6 +1691,14 @@ pub(crate) fn read_jucode_groups_at(path: &Path) -> io::Result<BTreeMap<String, 
     Ok(read_jucode_groups(&value))
 }
 
+/// `image_model` as config.json has it now (Desktop sets it while engines run).
+pub(crate) fn read_image_model_at(path: &Path) -> io::Result<String> {
+    let content = fs::read_to_string(path)?;
+    let value = serde_json::from_str::<Value>(&content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(read_string(&value, "image_model", ""))
+}
+
 pub(crate) fn read_context_window_overrides_at(path: &Path) -> io::Result<BTreeMap<String, u64>> {
     let content = fs::read_to_string(path)?;
     let value = serde_json::from_str::<Value>(&content)
@@ -2183,6 +2231,7 @@ mod tests {
             safety_model: "compact-model".to_string(),
             safety_reasoning_effort: "low".to_string(),
             title_model: String::new(),
+            image_model: String::new(),
             subagent_models: Vec::new(),
             models: vec![
                 ModelConfig {
@@ -2255,7 +2304,11 @@ mod tests {
         );
         let error = ApprovalMode::parse("yolo").unwrap_err();
         assert!(error.contains("yolo"));
-        assert!(error.contains("manual, auto-edit, auto, or full-access"));
+        assert!(error.contains("manual, auto-edit, auto, full-access, or plan"));
+        assert_eq!(ApprovalMode::parse("plan").unwrap(), ApprovalMode::Plan);
+        assert_eq!(ApprovalMode::Plan.as_str(), "plan");
+        let live = LiveApprovalMode::new(ApprovalMode::Plan);
+        assert_eq!(live.get(), ApprovalMode::Plan);
     }
 
     #[test]
@@ -2273,6 +2326,7 @@ mod tests {
             "str_replace",
             "hashline_edit",
             "apply_patch",
+            "generate_image",
         ];
         let network_tools = ["web_fetch", "web_search"];
         let free_tools = ["read", "ls", "ripgrep", "outline", "spawn_agent"];
@@ -2399,6 +2453,29 @@ mod tests {
             config.jucode_groups,
             BTreeMap::from([("claude-opus-5-5".to_string(), "g1".to_string())])
         );
+    }
+
+    #[test]
+    fn image_model_defaults_empty_and_survives_a_save() {
+        let dir = std::env::temp_dir().join(format!("jucode-image-model-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let config = Config::from_value("{}", path.clone()).unwrap();
+        assert_eq!(config.image_model, "");
+        config.save().unwrap();
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["image_model"], "");
+
+        fs::write(&path, r#"{"image_model":" gpt-image-2 "}"#).unwrap();
+        assert_eq!(read_image_model_at(&path).unwrap(), " gpt-image-2 ");
+        let mut config =
+            Config::from_value(&fs::read_to_string(&path).unwrap(), path.clone()).unwrap();
+        assert_eq!(config.image_model, " gpt-image-2 ");
+        config.image_model = "gpt-image-1.5".to_string();
+        config.save().unwrap();
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["image_model"], "gpt-image-1.5");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

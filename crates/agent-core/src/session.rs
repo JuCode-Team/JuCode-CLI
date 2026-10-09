@@ -60,6 +60,14 @@ pub enum EntryKind {
     GoalContext {
         content: String,
     },
+    /// A plan proposed in plan mode (`propose_plan`) and its latest status;
+    /// a status change appends the entry again with the same id.
+    ProposedPlan {
+        id: String,
+        title: String,
+        markdown: String,
+        status: String,
+    },
     /// Marks that all branch entries up to and including `replaced_through` have
     /// been folded into `summary`. Projections emit the summary in place of those
     /// entries and keep everything after it verbatim.
@@ -780,6 +788,27 @@ impl SessionStore {
                 }
                 continue;
             }
+            if let EntryKind::ProposedPlan {
+                id,
+                title,
+                markdown,
+                status,
+            } = &entry.kind
+            {
+                let latest = TranscriptItem::Plan {
+                    id: id.clone(),
+                    title: title.clone(),
+                    content: markdown.clone(),
+                    status: status.clone(),
+                };
+                match items.iter_mut().find(
+                    |item| matches!(item, TranscriptItem::Plan { id: known, .. } if known == id),
+                ) {
+                    Some(item) => *item = latest,
+                    None => items.push(latest),
+                }
+                continue;
+            }
             items.extend(Self::transcript_item(entry));
         }
         items
@@ -811,6 +840,7 @@ impl SessionStore {
             }
             EntryKind::PinnedSkill { .. } => None,
             EntryKind::GoalContext { .. } => None,
+            EntryKind::ProposedPlan { .. } => None,
             EntryKind::Compaction { .. } => None,
         })
     }
@@ -1471,6 +1501,12 @@ fn render_entry_for_summary(entry: &SessionEntry) -> Option<String> {
         EntryKind::ToolOutput { name, output, .. } => Some(format!("Tool {name} output: {output}")),
         EntryKind::PinnedSkill { name, .. } => Some(format!("(pinned skill: {name})")),
         EntryKind::GoalContext { content } => Some(format!("Goal context: {content}")),
+        EntryKind::ProposedPlan {
+            title,
+            markdown,
+            status,
+            ..
+        } => Some(format!("Proposed plan ({status}): {title}\n{markdown}")),
         EntryKind::Branch { .. } | EntryKind::Compaction { .. } => None,
     }
 }
@@ -1512,6 +1548,9 @@ fn render_entry_for_resume_summary(entry: &SessionEntry) -> Option<String> {
             "Goal context: {}",
             single_line_with_limit(content, SESSION_LABEL_MAX_CHARS)
         )),
+        EntryKind::ProposedPlan { title, status, .. } => {
+            Some(format!("Proposed plan ({status}): {title}"))
+        }
         EntryKind::PinnedSkill { .. } | EntryKind::Branch { .. } | EntryKind::Compaction { .. } => {
             None
         }
@@ -1588,6 +1627,9 @@ fn context_item_for_entry(entry: &SessionEntry) -> Option<Value> {
             "role": "user",
             "content": [{ "type": "input_text", "text": content }]
         })),
+        // The plan itself reaches the model as the propose_plan call; the
+        // status record is for the transcript only.
+        EntryKind::ProposedPlan { .. } => None,
     }
 }
 
@@ -1607,6 +1649,7 @@ fn count_context_entry(kind: &EntryKind, counts: &mut ContextEntryCounts) {
         EntryKind::ToolOutput { .. } => counts.tool_outputs += 1,
         EntryKind::PinnedSkill { .. } => counts.pinned_skills += 1,
         EntryKind::GoalContext { .. } => counts.users += 1,
+        EntryKind::ProposedPlan { .. } => {}
         EntryKind::UserImage { .. } => {}
         EntryKind::Compaction { .. } => {}
     }
@@ -1632,6 +1675,7 @@ fn context_entry_label(entry: &SessionEntry) -> String {
         EntryKind::ToolOutput { name, .. } => format!("tool output:{name}"),
         EntryKind::PinnedSkill { name, .. } => format!("pinned skill:{name}"),
         EntryKind::GoalContext { .. } => "goal context".to_string(),
+        EntryKind::ProposedPlan { .. } => "proposed plan".to_string(),
         EntryKind::Compaction { .. } => "compaction".to_string(),
     }
 }
@@ -1693,6 +1737,18 @@ fn entry_to_json(entry: &SessionEntry) -> Value {
             json!({ "type": "pinned_skill", "name": name, "content": content })
         }
         EntryKind::GoalContext { content } => json!({ "type": "goal_context", "content": content }),
+        EntryKind::ProposedPlan {
+            id,
+            title,
+            markdown,
+            status,
+        } => json!({
+            "type": "proposed_plan",
+            "id": id,
+            "title": title,
+            "markdown": markdown,
+            "status": status,
+        }),
         EntryKind::Compaction {
             summary,
             replaced_through,
@@ -1749,6 +1805,12 @@ fn entry_from_json(value: &Value) -> Option<SessionEntry> {
         },
         "goal_context" => EntryKind::GoalContext {
             content: kind_value.get("content")?.as_str()?.to_string(),
+        },
+        "proposed_plan" => EntryKind::ProposedPlan {
+            id: kind_value.get("id")?.as_str()?.to_string(),
+            title: kind_value.get("title")?.as_str()?.to_string(),
+            markdown: kind_value.get("markdown")?.as_str()?.to_string(),
+            status: kind_value.get("status")?.as_str()?.to_string(),
         },
         "compaction" => EntryKind::Compaction {
             summary: kind_value.get("summary")?.as_str()?.to_string(),

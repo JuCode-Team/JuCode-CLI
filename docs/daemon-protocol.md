@@ -181,8 +181,8 @@ every connected client.
 | `item_reopen` | `kind`, `item` | `item_reopened` with `item`; puts a closed item back among the open ones and takes its session out of the archive |
 | `report_list` | optional `limit` (50) | `reports`, newest first, with `read` |
 | `report_read` | `report` | `report_read` |
-| `skills_catalog` | optional `backend` (`jucode`, default, or `claude`) | `skills_catalog` with `skills: [{id, name, description, tags, source, isDefault, installed, license, redistributable, homepage}]`, `warnings` and `installDir` (local clients only). See "Skills" |
-| `skill_install` | `source` (`jucode` or `anthropic`), `skill` (its `id` in the catalog), optional `backend` | `skill_installed` with `path` (local clients only) |
+| `skills_catalog` | optional `backend` (`jucode`, default, or `claude`) | `skills_catalog` with `skills: [{id, name, description, tags, source, sourceName, isDefault, installed, license, redistributable, homepage}]`, `warnings` and `installDir` (local clients only). See "Skills" |
+| `skill_install` | `source` (`jucode`, `anthropic` or a configured repository's `owner/repo`), `skill` (its `id` in the catalog), optional `backend` | `skill_installed` with `path` (local clients only) |
 
 `decide_action` (a session op) also works for a session that is closed or
 was hosted before a restart: the daemon reopens it first.
@@ -212,6 +212,13 @@ cannot be reached its error is one of `warnings` and only the Anthropic
 skills are listed. `source` is `jucode` or `anthropic`; `redistributable` is
 false for Anthropic's source-available document skills, which `skill_install`
 refuses.
+
+Other GitHub skill repositories are listed only when the daemon's environment
+sets `JUCODE_SKILL_SOURCES` (`Name=https://github.com/owner/repo`, separated
+by `;`); none are listed by default. Their entries have `source`
+`owner/repo` and `sourceName` the configured name, and install from the
+repository's default branch. A repository that cannot be read is one of
+`warnings`.
 
 `backend` picks the directory: `claude` installs into `~/.claude/skills`,
 anything else into `~/.jucode/skills`. `installed` means

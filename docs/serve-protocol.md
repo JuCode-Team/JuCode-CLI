@@ -98,9 +98,13 @@ Structured views come back as events (`model_view`, `resume_view`,
 {"op":"steer"}
 ```
 
-Stops the in-flight turn and immediately starts the next queued message.
-Emits `status:"steering"`, the updated `pending_messages`, then the new turn's
-`user_message` event. No-op when idle or when the queue is empty.
+Sends the next queued message into the in-flight turn: the model reads it
+before its next request (once the current tool calls finish), and running
+tools and subagents keep going. Emits `status:"steering"` and the updated
+`pending_messages`; when the model reads it, a `user_message` event (it is
+saved as the user's message). If the turn ends before reading it, it runs as
+the next turn. A queued message with images still stops the turn and starts
+a new one with it. No-op when idle or when the queue is empty.
 
 ### `interrupt`
 
@@ -140,9 +144,51 @@ can retry with a corrected op.
 {"op":"set_approval_mode","mode":"manual"}
 ```
 
-`mode` is `manual`, `auto-edit`, `auto`, or `full-access`. Emits
+`mode` is `manual`, `plan`, `auto-edit`, `auto`, or `full-access`. Emits
 `status:"approval mode: ..."` and an `approval_mode` event. The change
 applies to new turns; an in-flight turn's gating can only loosen.
+
+`plan` is plan mode: only read-only tools run (reads, listing, search,
+web search/fetch, read-only shell commands, MCP tools marked
+`readOnlyHint`, subagents, which inherit the mode). Every other call
+returns an error telling the model to plan instead. The model delivers
+its plan with the `propose_plan` tool, which emits `proposed_plan` and
+ends the turn.
+
+### `agent_runs` / `subagent_transcript`
+
+```json
+{"op":"agent_runs"}
+{"op":"subagent_transcript","agent_id":"/root/lister"}
+```
+
+The agent trace. `agent_runs` answers with the `agent_runs` event (also
+sent on its own while subagents work, at most twice a second, and at once
+on a lifecycle change). `subagent_transcript` answers with one agent's
+work: `{"type":"subagent_transcript","agent_id","items":[...]}`, items
+`{"role":"user","content"}` (the task first, then messages the parent
+sent), `{"role":"assistant","content"}`, `{"role":"reasoning","content"}`
+and `{"role":"tool","call_id","name","input","output","running","is_error"}`.
+Each agent keeps at most 300 items and 256 KB of text (older steps are
+replaced by one "… earlier steps trimmed" item); tool input and output are
+cut to 4 KB (output keeps its end). An unknown id answers with `"error"`
+instead of `items`. Agents of earlier turns (the 24 most recent) stay
+listed and readable.
+
+### `approve_plan`
+
+```json
+{"op":"approve_plan","id":"plan-1a2b3c4d5e6f7a8b","decision":"approve","mode":"auto-edit"}
+{"op":"approve_plan","id":"plan-1a2b3c4d5e6f7a8b","decision":"revise","feedback":"Also add a test"}
+```
+
+`approve` re-emits the plan with `status:"approved"`, switches the
+approval mode to `mode` (default `auto-edit`; `plan` is not allowed) and
+starts a turn that implements the plan (optional `feedback` is passed
+along as notes). `revise` re-emits it with `status:"revising"`, keeps
+plan mode, and starts a turn asking for a complete revised plan with the
+`feedback`, which is required. An unknown or already approved `id`
+returns an `error` event.
 
 ### `set_attended`
 
@@ -196,6 +242,9 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `model_status` | `provider`, `model`, `reasoning_effort`, `context_window`, `context_limit`, `max_output_tokens`, `reasoning_efforts`, `state` | Current model selection; deduplicated, re-emitted on change. Claude Code sessions add their own fields (`docs/daemon-protocol.md` → Other engines). |
 | `command_list` | `commands: [{command, marker, args, description}]` | Available slash commands incl. custom and MCP prompt commands. |
 | `approval_mode` | `mode` | Current approval mode; emitted at startup and on change. |
+| `agent_runs` | `workflows: []`, `agents: [{id, label, model, effort, state, started_at, duration_ms, tokens, tool_calls, prompt, result, error, type: "subagent", tool_use_id, activity}]` | Every subagent of the session, oldest first. `id` is its path (`/root/<task_name>`), `state` ∈ `pending`/`running`/`completed`/`errored`/`interrupted`/`closed`, `started_at` epoch ms, `tool_use_id` the parent's `spawn_agent` call, `activity` its latest action in a few words ("Running cargo test"). |
+| `plan_draft` | `id`, `title`, `append` | Plan mode: the plan while the model writes its `propose_plan` call. `append` is the Markdown added since the previous `plan_draft` of the same `id`; `title` is the title so far. The finished plan follows as `proposed_plan` with the same `id`. Not replayed. |
+| `proposed_plan` | `id`, `title`, `markdown`, `status` | Plan mode: a plan from `propose_plan`. `status` is `pending`, then `approved` or `revising` after `approve_plan`. Session replay (`transcript`) carries it as `{"role":"plan","id","title","content","status"}` with the latest status. |
 | `mcp_servers` | `servers: [{name, transport, state, tools, error?}]` | MCP server states; `state` ∈ `connecting`/`connected`/`failed`/`disabled`. |
 | `trust_prompt` | `cwd`, `repo_root` | Project has local resources (skills, commands, hooks) and no stored trust decision; answer via `command` `/trust yes\|no\|repo`. |
 | `user_message` | `content` | A user turn was accepted and started (echoes the submitted text). |
@@ -214,7 +263,7 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `action_deferred` | `id`, `session_id`, `cwd`, `call_id`, `name`, `arguments`, `summary`, `subagent_id`, `digest`, `created_at` | An unattended session recorded a gated call instead of prompting; decide it with `decide_action`. |
 | `action_decided` | `id`, `decision`, `output`, `is_error` | A deferred action was decided; `output` is the tool result when it ran, `null` when declined. |
 | `attended` | `attended` | Current attended state, after `set_attended`. |
-| `subagent_lifecycle` | `path`, `status`, `message` | Subagent spawn/progress/finish notices. |
+| `subagent_lifecycle` | `path`, `status`, `message`, `label`, `model`, `tool_use_id` | Subagent spawn/progress/finish notices. |
 | `usage` | `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_tokens` | Real API usage for the completed turn. |
 | `context_usage` | `tokens`, `tokenizer`, `cost` | Tokenizer-counted context size; `cost` is cumulative USD (0 when unpriced). |
 | `compaction_start` / `compaction_end` | — | Context compaction began/finished. |

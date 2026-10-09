@@ -348,19 +348,38 @@ fn read_skill_file(path: &Path) -> io::Result<Option<SkillPromptItem>> {
     }))
 }
 
-fn read_frontmatter_field(content: &str, key: &str) -> Option<String> {
-    let mut lines = content.lines();
-    if lines.next()? != "---" {
+pub(crate) fn read_frontmatter_field(content: &str, key: &str) -> Option<String> {
+    let mut lines = content.lines().peekable();
+    if lines.next()?.trim_end() != "---" {
         return None;
     }
-    for line in lines {
-        if line == "---" {
+    while let Some(line) = lines.next() {
+        if line.trim_end() == "---" {
             return None;
         }
-        let (field, value) = line.split_once(':')?;
-        if field.trim() == key {
-            return Some(value.trim().trim_matches('"').to_string());
+        // An indented line, or one without a colon, continues another field.
+        if line.starts_with([' ', '\t']) {
+            continue;
         }
+        let Some((field, value)) = line.split_once(':') else {
+            continue;
+        };
+        if field.trim() != key {
+            continue;
+        }
+        let value = value.trim();
+        // A block scalar (`>`, `|`, `>-`, `|+`…): the indented lines below.
+        if value.starts_with(['>', '|']) && value.len() <= 2 {
+            let mut parts = Vec::new();
+            while let Some(next) =
+                lines.next_if(|next| next.trim().is_empty() || next.starts_with([' ', '\t']))
+            {
+                parts.push(next.trim());
+            }
+            let separator = if value.starts_with('>') { " " } else { "\n" };
+            return Some(parts.join(separator).trim().to_string());
+        }
+        return Some(value.trim_matches('"').trim_matches('\'').to_string());
     }
     None
 }
@@ -444,7 +463,7 @@ mod tests {
             &PromptContext {
                 date: "2026-05-27".to_string(),
                 cwd: PathBuf::from("/repo"),
-                tools: crate::tools::prompt_tool_names(&edit_tools, true, false),
+                tools: crate::tools::prompt_tool_names(&edit_tools, true, false, false),
                 edit_tools,
                 project_instructions: Vec::new(),
                 skills: Vec::new(),
@@ -488,7 +507,7 @@ mod tests {
             &PromptContext {
                 date: "2026-05-27".to_string(),
                 cwd: PathBuf::from("/repo"),
-                tools: crate::tools::prompt_tool_names(&edit_tools, false, false),
+                tools: crate::tools::prompt_tool_names(&edit_tools, false, false, false),
                 edit_tools,
                 project_instructions: Vec::new(),
                 skills: Vec::new(),
@@ -535,6 +554,21 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn frontmatter_reads_block_scalars_and_skips_continuations() {
+        let text = "---\nname: finetone\ndescription: >-\n  Tune the voice\n  of prose.\nlicense: MIT\n---\nbody";
+        assert_eq!(
+            read_frontmatter_field(text, "description").unwrap(),
+            "Tune the voice of prose."
+        );
+        assert_eq!(read_frontmatter_field(text, "license").unwrap(), "MIT");
+        let quoted = "---\nother: |\n  a: b\nname: 'Code Review'\n---\n";
+        assert_eq!(
+            read_frontmatter_field(quoted, "name").unwrap(),
+            "Code Review"
+        );
     }
 
     #[test]

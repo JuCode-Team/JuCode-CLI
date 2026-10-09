@@ -1176,6 +1176,7 @@ impl<R: TuiRuntime> TuiApp<R> {
     }
 
     fn cycle_approval_mode(&mut self) {
+        // Not plan mode: the TUI has no way to approve a proposed plan.
         const ORDER: [&str; 4] = ["manual", "auto-edit", "auto", "full-access"];
         let next = ORDER
             .iter()

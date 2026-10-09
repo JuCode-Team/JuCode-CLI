@@ -29,7 +29,7 @@ use std::{
 /// Wire protocol for a model. The JuCode gateway serves each model in its own
 /// dialect (Claude over Anthropic Messages, the rest over Responses), so the
 /// config-wide `protocol` applies to other providers only.
-fn protocol_for(provider: &str, protocol: &str, model: &str) -> Protocol {
+pub(crate) fn protocol_for(provider: &str, protocol: &str, model: &str) -> Protocol {
     if provider == "jucode" {
         return Protocol::resolve("", model);
     }
@@ -88,6 +88,10 @@ pub struct OpenAiClient {
     allow_subagents: bool,
     max_tool_calls: Option<u64>,
     deadline: Option<Instant>,
+    /// Input tokens the main turn may grow by (past its first request) before
+    /// it stops between requests so the conversation can be compacted and the
+    /// turn continued; 0 = never.
+    context_headroom: u64,
     provider_kind: Protocol,
     goal_tool_tx: Option<Sender<GoalToolRequest>>,
     approval_tx: Option<Sender<ApprovalRequest>>,
@@ -262,6 +266,12 @@ pub struct ToolGoalResponse {
     pub is_error: bool,
 }
 
+/// The error `run_turn_events` ends the main turn with when the context passed
+/// the compaction threshold mid-turn. It reads as a context overflow, so the
+/// core compacts and continues the turn (`is_context_overflow`).
+pub const MID_TURN_COMPACTION: &str =
+    "context_length_exceeded: the conversation passed the compaction threshold mid-turn";
+
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     /// HTTP request is being sent; the connection is being established.
@@ -300,6 +310,14 @@ pub enum StreamEvent {
         output_tokens: u64,
         reasoning_tokens: u64,
     },
+    /// A user message steered into the running turn reached the model.
+    Steered(String),
+    /// A fragment of a tool call's arguments while the model writes it.
+    ToolArgumentsDelta {
+        call_id: String,
+        name: String,
+        delta: String,
+    },
 }
 
 /// Maps a protocol parser's [`WireEvent`] onto the engine's [`StreamEvent`].
@@ -309,6 +327,15 @@ fn wire_to_stream(event: WireEvent) -> StreamEvent {
         WireEvent::ReasoningDelta(delta) => StreamEvent::ReasoningDelta(delta),
         WireEvent::ResponseItem(item) => StreamEvent::ResponseItem(item),
         WireEvent::Usage(usage) => usage_event(usage),
+        WireEvent::ToolArgumentsDelta {
+            call_id,
+            name,
+            delta,
+        } => StreamEvent::ToolArgumentsDelta {
+            call_id,
+            name,
+            delta,
+        },
     }
 }
 
@@ -469,6 +496,7 @@ impl OpenAiClient {
             allow_subagents: true,
             max_tool_calls: None,
             deadline: None,
+            context_headroom: 0,
             provider_kind,
             goal_tool_tx: config.goal_tool_tx,
             approval_tx: config.approval_tx,
@@ -486,12 +514,33 @@ impl OpenAiClient {
         })
     }
 
+    /// Sets how far the input may grow during the turn before
+    /// `run_turn_events` hands it back for compaction (see
+    /// [`MID_TURN_COMPACTION`]); 0 turns it off.
+    pub fn set_context_headroom(&mut self, tokens: u64) {
+        self.context_headroom = tokens;
+    }
+
     pub fn run_turn_events(
         &self,
         mut input: Vec<Value>,
         cwd: &Path,
-        mut emit: impl FnMut(StreamEvent) -> Result<(), String>,
+        mut outer_emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<(), String> {
+        // Input of the first and of the latest request: the growth between
+        // them is what this turn added, measured like the headroom (the
+        // system prompt and tools are in both).
+        let first_input = std::cell::Cell::new(None::<u64>);
+        let last_input = std::cell::Cell::new(0u64);
+        let mut emit = |event: StreamEvent| {
+            if let StreamEvent::Usage { input_tokens, .. } = &event {
+                if first_input.get().is_none() {
+                    first_input.set(Some(*input_tokens));
+                }
+                last_input.set(*input_tokens);
+            }
+            outer_emit(event)
+        };
         let mut tool_calls_executed = 0u64;
         let mut empty_response_continuations = 0usize;
         loop {
@@ -500,6 +549,15 @@ impl OpenAiClient {
                 .is_some_and(|deadline| Instant::now() >= deadline)
             {
                 return Err("subagent timed out".to_string());
+            }
+            // The last request already passed the compaction threshold and its
+            // tool results are recorded: stop before the next request so the
+            // conversation is compacted and the turn continues from there.
+            let grown = last_input
+                .get()
+                .saturating_sub(first_input.get().unwrap_or_default());
+            if self.context_headroom > 0 && grown > self.context_headroom {
+                return Err(MID_TURN_COMPACTION.to_string());
             }
             self.append_queued_subagent_messages(&mut input, &mut emit)?;
             emit(StreamEvent::CallStart)?;
@@ -585,6 +643,23 @@ impl OpenAiClient {
             let mut blocked_results = Vec::new();
             let mut allowed_requests = Vec::new();
             for request in tool_requests {
+                // Plan mode: only read-only calls run (the live mode, so a
+                // switch mid-turn applies to the next call).
+                if self.approval_mode.get() == ApprovalMode::Plan {
+                    let read_only_hint = self.mcp.tool_read_only_hint(&request.name);
+                    if let Some(reason) =
+                        crate::plan_mode::refusal(&request.name, &request.arguments, read_only_hint)
+                    {
+                        emit(StreamEvent::ToolStart {
+                            call_id: request.call_id.clone(),
+                            name: request.name.clone(),
+                        })?;
+                        let result = json_tool_result(json!({ "error": reason }), true);
+                        emit_tool_output(&request, &result, &mut emit)?;
+                        blocked_results.push(ToolCallResult { request, result });
+                        continue;
+                    }
+                }
                 if let Some(reason) = self.hooks.pre_tool(&request.name, &request.arguments, cwd) {
                     emit(StreamEvent::ToolStart {
                         call_id: request.call_id.clone(),
@@ -734,7 +809,16 @@ impl OpenAiClient {
             }
             tool_results.append(&mut blocked_results);
 
+            // Plan mode: a delivered plan ends the turn; the user approves it
+            // or asks for a revision (approve_plan).
+            let plan_delivered = tool_results.iter().any(|tool_result| {
+                tool_result.request.name == crate::plan_mode::TOOL_NAME
+                    && !tool_result.result.is_error
+            });
             push_tool_result_items(&mut input, tool_results);
+            if plan_delivered {
+                return Ok(());
+            }
         }
     }
 
@@ -982,12 +1066,16 @@ impl OpenAiClient {
         if self.goal_tool_tx.is_some() {
             definitions.extend(goal_tool_definitions());
             definitions.push(plan_tool_definition());
+            if self.approval_mode.get() == ApprovalMode::Plan {
+                definitions.push(crate::plan_mode::propose_plan_definition());
+            }
         }
         definitions
     }
 
     fn run_subagent_tool(
         &self,
+        call_id: &str,
         name: &str,
         arguments: &str,
         cwd: &Path,
@@ -1001,7 +1089,7 @@ impl OpenAiClient {
             return None;
         }
         let result = match name {
-            "spawn_agent" => self.spawn_agent(arguments, cwd, input, pending_call_ids),
+            "spawn_agent" => self.spawn_agent(call_id, arguments, cwd, input, pending_call_ids),
             "wait_agent" => self.wait_agent(arguments),
             "list_agents" => self.list_agents(arguments),
             "send_message" => self.send_message(arguments),
@@ -1052,6 +1140,7 @@ impl OpenAiClient {
         } else if let Some(result) = self.run_goal_tool(&request.name, &request.arguments) {
             result
         } else if let Some(result) = self.run_subagent_tool(
+            &request.call_id,
             &request.name,
             &request.arguments,
             cwd,
@@ -1104,6 +1193,7 @@ impl OpenAiClient {
 
     fn spawn_agent(
         &self,
+        call_id: &str,
         arguments: &str,
         cwd: &Path,
         input: &[Value],
@@ -1230,6 +1320,7 @@ impl OpenAiClient {
             model: model.clone(),
             reasoning_effort: reasoning_effort.clone(),
             depth: child_depth,
+            tool_use_id: call_id.to_string(),
         })?;
         let child_input =
             build_subagent_input(input, pending_call_ids, &fork_turns, &slot.path, message)?;
@@ -1263,11 +1354,17 @@ impl OpenAiClient {
             reasoning_effort,
             reasoning_efforts: efforts,
             subagent_models: self.subagent_models.clone(),
-            system_prompt: subagent_system_prompt(
-                &self.system_prompt,
-                &child_path,
-                workspace.as_ref().map(|workspace| workspace.root.as_path()),
-            ),
+            system_prompt: {
+                let mut prompt = subagent_system_prompt(
+                    &self.system_prompt,
+                    &child_path,
+                    workspace.as_ref().map(|workspace| workspace.root.as_path()),
+                );
+                if self.approval_mode.get() == ApprovalMode::Plan {
+                    prompt.push_str(crate::plan_mode::SUBAGENT_NOTE);
+                }
+                prompt
+            },
             prompt_cache_key: self.prompt_cache_key.clone(),
             mcp: self.mcp.clone(),
             base_url: self.base_url.clone(),
@@ -1279,6 +1376,7 @@ impl OpenAiClient {
             allow_subagents: child_depth < MAX_SUBAGENT_DEPTH,
             max_tool_calls,
             deadline: timeout.map(|timeout| started + timeout),
+            context_headroom: 0,
             // Each model speaks its own wire protocol (on the JuCode gateway
             // Claude uses Anthropic Messages, the rest Responses).
             provider_kind: protocol,
@@ -1322,6 +1420,7 @@ impl OpenAiClient {
                 {
                     return Err("interrupted".to_string());
                 }
+                child_manager.record(&child_path, &event);
                 stats.record(event);
                 Ok(())
             });
@@ -1433,6 +1532,18 @@ impl OpenAiClient {
         let Some(manager) = &self.subagent_manager else {
             return Ok(());
         };
+        // The main agent: what the user sent while it worked (steer).
+        if self.agent_depth == 0 {
+            for message in manager.drain_user_inbox() {
+                // The core records it as the user's own message (shown and
+                // replayed like any other), not as a hidden runtime item.
+                emit(StreamEvent::Steered(message.clone()))?;
+                input.push(json!({
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": message }]
+                }));
+            }
+        }
         for message in manager.drain_messages(&self.agent_path) {
             let item = json!({
                 "role": "user",
@@ -1449,7 +1560,11 @@ impl OpenAiClient {
     fn run_goal_tool(&self, name: &str, arguments: &str) -> Option<tools::ToolExecutionResult> {
         if !matches!(
             name,
-            "get_goal" | "create_goal" | "update_goal" | "update_plan"
+            "get_goal"
+                | "create_goal"
+                | "update_goal"
+                | "update_plan"
+                | crate::plan_mode::TOOL_NAME
         ) {
             return None;
         }
@@ -1488,6 +1603,11 @@ impl OpenAiClient {
     /// rejection reason when `name` is an edit tool that is not enabled;
     /// None means the tool may run.
     fn disabled_tool_error(&self, name: &str) -> Option<String> {
+        if name == crate::images::TOOL_NAME {
+            if let Err(reason) = self.tool_state.images() {
+                return Some(reason);
+            }
+        }
         if name == "web_search" && !self.tool_state.web_search_enabled() {
             return Some(
                 "web_search runs through the JuCode gateway and needs a JuCode login. Run /login."
@@ -1770,8 +1890,13 @@ fn efforts_label(efforts: &[String]) -> String {
 /// The spawn_agent `model`/`reasoning_effort` guidance: which models the agent
 /// may pick, their tiers, and when to use each (config `subagent_models`).
 fn subagent_model_guide(own: &str, own_efforts: &[String], specs: &[SubagentModelSpec]) -> String {
+    let choice = if specs.iter().any(|spec| spec.name != own) {
+        "pick the one that suits the task; when the user names a model for subagents, use it. "
+    } else {
+        ""
+    };
     let mut guide = format!(
-        "\n\nModels (omit model to use your own):\n- {own} (your model; {})",
+        "\n\nModels: {choice}Omit model to use your own.\n- {own} (your model; {})",
         efforts_label(own_efforts)
     );
     for spec in specs.iter().filter(|spec| spec.name != own) {
@@ -2093,6 +2218,17 @@ fn approval_summary(name: &str, arguments: &str) -> String {
             .or_else(|| field("cmd"))
             .unwrap_or_default(),
         "write_stdin" => field("text").or_else(|| field("chars")).unwrap_or_default(),
+        crate::images::TOOL_NAME => {
+            let prompt = field("prompt")
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect::<String>();
+            match field("path") {
+                Some(path) => format!("{path}: {prompt}"),
+                None => prompt,
+            }
+        }
         _ => field("path").unwrap_or_default(),
     }
 }
@@ -2597,6 +2733,80 @@ mod tests {
         assert!(!forked.iter().any(|item| item["call_id"] == "pending_1"));
     }
 
+    /// A chat server answering each request in turn with a tool call (or,
+    /// last, plain text) that reports `prompt_tokens` from `inputs`.
+    fn usage_server(inputs: &'static [u64]) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (index, input) in inputs.iter().enumerate() {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(&mut stream);
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let line = line.trim_end().to_ascii_lowercase();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let delta = if index + 1 < inputs.len() {
+                    json!({ "tool_calls": [{ "index": 0, "id": format!("call_{index}"),
+                        "type": "function",
+                        "function": { "name": "no_such_tool", "arguments": "{}" } }] })
+                } else {
+                    json!({ "content": "done" })
+                };
+                let chunks = [
+                    json!({ "choices": [{ "index": 0, "delta": delta, "finish_reason": "stop" }] }),
+                    json!({ "choices": [], "usage": { "prompt_tokens": input, "completion_tokens": 1 } }),
+                ];
+                let mut reply = String::new();
+                for chunk in chunks {
+                    reply.push_str(&format!("data: {chunk}\n\n"));
+                }
+                reply.push_str("data: [DONE]\n\n");
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{reply}"
+                );
+            }
+        });
+        format!("http://{address}/v1")
+    }
+
+    #[test]
+    fn mid_turn_compaction_fires_only_past_the_headroom_the_turn_grew() {
+        let run = |inputs: &'static [u64], headroom: u64| {
+            let mut config = test_client_config();
+            config.protocol = "chat".to_string();
+            let base_url = usage_server(inputs);
+            config.base_url = base_url;
+            let mut client = OpenAiClient::from_config(config).unwrap();
+            client.set_context_headroom(headroom);
+            client.run_turn_events(Vec::new(), Path::new("."), |_| Ok(()))
+        };
+        // The first request is large (system prompt, tools, history) but the
+        // turn grew by less than the headroom: it runs to its end.
+        assert_eq!(run(&[90_000, 95_000, 99_000], 10_000), Ok(()));
+        // Grown past the headroom: stop before the next request to compact.
+        assert_eq!(
+            run(&[90_000, 101_000, 102_000], 10_000),
+            Err(MID_TURN_COMPACTION.to_string())
+        );
+        // No headroom set (nothing to fold): never stops for compaction.
+        assert_eq!(run(&[90_000, 500_000, 900_000], 0), Ok(()));
+    }
+
     fn test_client() -> OpenAiClient {
         OpenAiClient::from_config(test_client_config()).unwrap()
     }
@@ -2719,10 +2929,57 @@ mod tests {
     }
 
     #[test]
+    fn subagent_models_are_offered_only_from_the_configured_list() {
+        let spawn_of = |subagent_models: Vec<SubagentModel>| {
+            let mut config = test_client_config();
+            config.provider = "jucode".to_string();
+            config.model = "gpt-main".to_string();
+            config.models = vec![
+                model("gpt-main", &["low", "high"], 8000),
+                model("claude-helper", &["low", "high"], 4000),
+            ];
+            config.subagent_models = subagent_models;
+            config.subagent_manager = Some(SubagentManager::default());
+            OpenAiClient::from_config(config)
+                .unwrap()
+                .tool_definitions()
+                .into_iter()
+                .find(|definition| definition["name"] == "spawn_agent")
+                .unwrap()
+        };
+        // No list: subagents run on the main model, whatever else is configured.
+        let spawn = spawn_of(Vec::new());
+        assert!(spawn["parameters"]["properties"]["model"].is_null());
+        assert!(!spawn["description"]
+            .as_str()
+            .unwrap()
+            .contains("when the user names a model"));
+        // A list: the agent picks from it, and takes the one the user names.
+        let spawn = spawn_of(vec![SubagentModel {
+            name: "claude-helper".to_string(),
+            description: String::new(),
+        }]);
+        assert_eq!(
+            spawn["parameters"]["properties"]["model"]["enum"],
+            json!(["gpt-main", "claude-helper"])
+        );
+        assert!(spawn["description"]
+            .as_str()
+            .unwrap()
+            .contains("when the user names a model for subagents, use it"));
+    }
+
+    #[test]
     fn spawn_agent_rejects_unlisted_model_and_unsupported_effort() {
         let client = subagent_model_client();
         let spawn = |arguments: Value| {
-            client.spawn_agent(&arguments.to_string(), Path::new("."), &[], &HashSet::new())
+            client.spawn_agent(
+                "call_test",
+                &arguments.to_string(),
+                Path::new("."),
+                &[],
+                &HashSet::new(),
+            )
         };
         let error =
             spawn(json!({ "task_name": "a", "message": "m", "model": "gpt-other" })).unwrap_err();
@@ -2768,6 +3025,69 @@ mod tests {
         for kept in ["read", "bash", "ls", "ripgrep", "outline", "checkpoint"] {
             assert!(names.contains(&kept.to_string()), "{kept}");
         }
+    }
+
+    #[test]
+    fn generate_image_is_offered_only_once_configured() {
+        let client = test_client();
+        let names = definition_names(&client);
+        assert!(!names.contains(&"generate_image".to_string()));
+        let request = ToolCallRequest {
+            call_id: "call_image".to_string(),
+            name: "generate_image".to_string(),
+            arguments: json!({ "prompt": "fox" }).to_string(),
+        };
+        client
+            .tool_state
+            .set_images(Err("no image model: set image_model".to_string()));
+        let result =
+            client.run_tool_call(&request, Path::new("."), &[], &HashSet::new(), &mut |_| {
+                Ok(())
+            });
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("no image model"),
+            "{}",
+            result.output
+        );
+        assert!(!definition_names(&client).contains(&"generate_image".to_string()));
+
+        let config = crate::config::Config::from_value(
+            &json!({
+                "provider": "gateway",
+                "protocol": "chat",
+                "model": "gpt-5.5",
+                "models": [{ "name": "gpt-5.5" }, { "name": "gpt-image-2" }],
+                "base_url": "https://gateway.example/v1"
+            })
+            .to_string(),
+            PathBuf::from("config.json"),
+        )
+        .unwrap();
+        client
+            .tool_state
+            .set_images(crate::images::ImageTools::from_config(
+                &config,
+                Some("key".to_string()),
+                &HashMap::new(),
+            ));
+        assert!(definition_names(&client).contains(&"generate_image".to_string()));
+        // Like the edit tools, it saves files and is confined with them.
+        assert_eq!(
+            approval_summary(
+                "generate_image",
+                &json!({ "prompt": "a fox", "path": "fox.png" }).to_string()
+            ),
+            "fox.png: a fox"
+        );
+        let root = Path::new("/work/.jucode/agents/worker-1");
+        assert!(tools::write_target_escapes_root(
+            "generate_image",
+            &json!({ "prompt": "x", "path": "/work/src/fox.png" }).to_string(),
+            root,
+            root
+        )
+        .is_some());
     }
 
     #[test]
@@ -2865,6 +3185,8 @@ mod tests {
             // user prompt and may resolve the call itself.
             (ApprovalMode::Auto, "bash", true),
             (ApprovalMode::Auto, "write", false),
+            (ApprovalMode::Manual, "generate_image", true),
+            (ApprovalMode::AutoEdit, "generate_image", false),
             (ApprovalMode::FullAccess, "bash", false),
             (ApprovalMode::FullAccess, "write", false),
         ];

@@ -42,7 +42,7 @@ use std::{
         Arc,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// Recent context (in tokenizer-counted tokens) kept verbatim when compacting; older
@@ -73,6 +73,13 @@ struct ActionOutcome {
 
 #[derive(Debug)]
 enum WorkerEvent {
+    /// A steered user message reached the model mid-turn.
+    Steered(String),
+    /// A fragment of the propose_plan call's arguments as the model writes it.
+    PlanDraft {
+        call_id: String,
+        delta: String,
+    },
     CompactionStart,
     CompactionProgress {
         output_tokens: u64,
@@ -188,9 +195,22 @@ pub struct AgentCore {
     force_compaction: bool,
     overflow_retry_pending: bool,
     overflow_retried: bool,
+    /// The next spawn continues a turn stopped for mid-turn compaction: it
+    /// keeps that turn's subagents and unread steers.
+    keep_subagents: bool,
+    /// The propose_plan call being written: its call id, its arguments so
+    /// far and how much of the plan text clients were sent.
+    plan_draft: Option<PlanDraft>,
     resume_summary_running: bool,
     interrupt_flag: Arc<AtomicBool>,
     subagent_manager: SubagentManager,
+    /// Messages steered into the running turn, until the model reads them.
+    steered_pending: Vec<String>,
+    /// Agents of earlier turns: (agent_runs row, transcript), newest last.
+    past_subagents: Vec<(Value, Vec<Value>)>,
+    /// What the last `agent_runs` showed, and when it went out (throttle).
+    agent_runs_revision: u64,
+    agent_runs_sent_at: Option<Instant>,
     trust: TrustStore,
     project_trusted: bool,
     hooks: Hooks,
@@ -281,9 +301,15 @@ impl AgentCore {
             force_compaction: false,
             overflow_retry_pending: false,
             overflow_retried: false,
+            keep_subagents: false,
+            plan_draft: None,
             resume_summary_running: false,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             subagent_manager: SubagentManager::default(),
+            steered_pending: Vec::new(),
+            past_subagents: Vec::new(),
+            agent_runs_revision: 0,
+            agent_runs_sent_at: None,
             trust,
             project_trusted,
             hooks,
@@ -627,9 +653,34 @@ impl AgentCore {
         self.queued.iter().map(|(text, _)| text.clone()).collect()
     }
 
+    /// Sends the next queued message into the running turn: the model reads
+    /// it before its next request (after the current tool calls finish), and
+    /// running tools and subagents keep going. A message with images, or one
+    /// sent while nothing runs, starts a turn of its own as before.
     pub fn steer(&mut self) -> Vec<AgentEvent> {
         if !self.running || self.queued.is_empty() {
             return Vec::new();
+        }
+        if self
+            .queued
+            .front()
+            .is_some_and(|(_, images)| images.is_empty())
+        {
+            let Some((next, _)) = self.queued.pop_front() else {
+                return Vec::new();
+            };
+            if let Err(reason) = self.hooks.user_prompt_submit(&next, &self.cwd) {
+                return vec![
+                    AgentEvent::Error(format!("blocked by user_prompt_submit hook: {reason}")),
+                    AgentEvent::PendingMessages(self.pending_texts()),
+                ];
+            }
+            self.subagent_manager.steer_main(&next);
+            self.steered_pending.push(next);
+            return vec![
+                AgentEvent::Status("steering".to_string()),
+                AgentEvent::PendingMessages(self.pending_texts()),
+            ];
         }
         self.stop_current_turn();
         let Some((next, images)) = self.queued.pop_front() else {
@@ -650,6 +701,7 @@ impl AgentCore {
     fn stop_current_turn(&mut self) {
         self.interrupt_flag.store(true, Ordering::SeqCst);
         self.subagent_manager.close_all();
+        self.requeue_unread_steers();
         self.receiver = None;
         self.running = false;
         self.goal_tool_receiver = None;
@@ -681,6 +733,9 @@ impl AgentCore {
             AgentEvent::Info("request interrupted".to_string()),
             AgentEvent::Status("interrupted".to_string()),
         ];
+        if !self.queued.is_empty() {
+            events.push(AgentEvent::PendingMessages(self.pending_texts()));
+        }
         events.extend(self.drain_subagent_events());
         events
     }
@@ -1159,6 +1214,7 @@ impl AgentCore {
                     config.model.clone(),
                     config.compact().0,
                     config.safety_model.clone(),
+                    config.image_model.clone(),
                 ]);
             for name in names {
                 let entry = headers.entry(name).or_default();
@@ -1478,6 +1534,12 @@ impl AgentCore {
         if let Some(rx) = self.receiver.take() {
             while let Ok(event) = rx.try_recv() {
                 match event {
+                    WorkerEvent::PlanDraft { call_id, delta } => {
+                        let draft = self.plan_draft.get_or_insert_with(PlanDraft::default);
+                        if let Some(event) = draft.push(&call_id, &delta) {
+                            events.push(event);
+                        }
+                    }
                     WorkerEvent::CompactionStart => events.push(AgentEvent::CompactionStart),
                     WorkerEvent::CompactionProgress { output_tokens } => {
                         events.push(AgentEvent::CompactionProgress { output_tokens });
@@ -1515,6 +1577,17 @@ impl AgentCore {
                             reason,
                             delay_ms,
                         });
+                    }
+                    WorkerEvent::Steered(message) => {
+                        if let Some(at) = self.steered_pending.iter().position(|m| *m == message) {
+                            self.steered_pending.remove(at);
+                        }
+                        self.session.append(EntryKind::User {
+                            content: message.clone(),
+                        });
+                        events.extend(self.save_session_event());
+                        events.push(AgentEvent::UserMessage(message));
+                        events.push(AgentEvent::PendingMessages(self.pending_texts()));
                     }
                     WorkerEvent::ResponseItem(item) => {
                         // The request went through: a later overflow in this
@@ -1595,6 +1668,8 @@ impl AgentCore {
                     WorkerEvent::Done => {
                         self.subagent_manager
                             .close_all_with_message("parent turn finished");
+                        // Steered after the model's last request: run next.
+                        self.requeue_unread_steers();
                         events.extend(self.finish_goal_turn());
                         self.running = false;
                         disconnected = true;
@@ -1613,19 +1688,29 @@ impl AgentCore {
                         }));
                     }
                     WorkerEvent::Error(error)
-                        if is_context_overflow(&error)
-                            && !self.overflow_retried
-                            && self
-                                .session
-                                .plan_compaction(COMPACTION_KEEP_RECENT_TOKENS, &self.config.model)
-                                .is_some() =>
+                        if error == crate::llm::MID_TURN_COMPACTION
+                            || is_context_overflow(&error)
+                                && !self.overflow_retried
+                                && self
+                                    .session
+                                    .plan_compaction(
+                                        COMPACTION_KEEP_RECENT_TOKENS,
+                                        &self.config.model,
+                                    )
+                                    .is_some() =>
                     {
                         // Over the window (unknown, or raised past what this
                         // route serves): compact and retry once instead of
                         // failing the turn. The retry spawns from the idle
-                        // branch below, once this worker is drained.
-                        self.subagent_manager
-                            .close_all_with_message("parent turn hit the context window");
+                        // branch below, once this worker is drained. A
+                        // mid-turn compaction continues the same turn, so its
+                        // subagents keep running.
+                        if error == crate::llm::MID_TURN_COMPACTION {
+                            self.keep_subagents = true;
+                        } else {
+                            self.subagent_manager
+                                .close_all_with_message("parent turn hit the context window");
+                        }
                         self.running = false;
                         disconnected = true;
                         self.goal_tool_receiver = None;
@@ -1633,13 +1718,18 @@ impl AgentCore {
                         self.overflow_retry_pending = true;
                         self.force_compaction = true;
                         events.push(AgentEvent::Info(
-                            "request exceeded the model's context window; compacting and retrying"
-                                .to_string(),
+                            if error == crate::llm::MID_TURN_COMPACTION {
+                                "context reached the compaction threshold; compacting and continuing"
+                            } else {
+                                "request exceeded the model's context window; compacting and retrying"
+                            }
+                            .to_string(),
                         ));
                     }
                     WorkerEvent::Error(error) => {
                         self.subagent_manager
                             .close_all_with_message("parent turn failed");
+                        self.requeue_unread_steers();
                         events.extend(self.finish_goal_turn());
                         self.running = false;
                         disconnected = true;
@@ -1790,16 +1880,99 @@ impl AgentCore {
         }
     }
 
-    fn drain_subagent_events(&self) -> Vec<AgentEvent> {
-        self.subagent_manager
+    fn drain_subagent_events(&mut self) -> Vec<AgentEvent> {
+        let mut events: Vec<AgentEvent> = self
+            .subagent_manager
             .drain_events()
             .into_iter()
-            .map(|event| AgentEvent::SubagentLifecycle {
-                path: event.path,
-                status: event.status,
-                message: event.message,
+            .map(|event| {
+                let (label, model, tool_use_id) = self
+                    .subagent_manager
+                    .describe(&event.path)
+                    .unwrap_or_default();
+                AgentEvent::SubagentLifecycle {
+                    path: event.path,
+                    status: event.status,
+                    message: event.message,
+                    label,
+                    model,
+                    tool_use_id,
+                }
             })
-            .collect()
+            .collect();
+        // The agent trace: at most two refreshes a second while agents work;
+        // a lifecycle change goes out at once.
+        let revision = self.subagent_manager.trace_revision();
+        if revision != self.agent_runs_revision {
+            let due = !events.is_empty()
+                || self
+                    .agent_runs_sent_at
+                    .is_none_or(|sent| sent.elapsed() >= Duration::from_millis(500));
+            if due {
+                self.agent_runs_revision = revision;
+                self.agent_runs_sent_at = Some(Instant::now());
+                events.push(self.agent_runs_event());
+            }
+        }
+        events
+    }
+
+    /// A turn that ended before reading what was steered into it: those
+    /// messages run next, ahead of anything queued after them, instead of
+    /// being lost. `steered_pending` is what the session has not recorded,
+    /// including a message the worker read whose event the turn's end
+    /// dropped; the inbox is emptied with it.
+    fn requeue_unread_steers(&mut self) {
+        self.subagent_manager.drain_user_inbox();
+        for message in self.steered_pending.drain(..).rev() {
+            self.queued.push_front((message, Vec::new()));
+        }
+    }
+
+    /// `agent_runs`: this session's subagents, earlier turns' first.
+    pub fn agent_runs_event(&self) -> AgentEvent {
+        let current = self.subagent_manager.runs_json();
+        let mut agents: Vec<Value> = self
+            .past_subagents
+            .iter()
+            .map(|(row, _)| row.clone())
+            .filter(|row| !current.iter().any(|now| now["id"] == row["id"]))
+            .collect();
+        agents.extend(current);
+        AgentEvent::AgentRuns(agents)
+    }
+
+    /// `subagent_transcript`: one agent's work, this turn's agents first.
+    pub fn subagent_transcript_event(&self, agent_id: &str) -> AgentEvent {
+        let items = self.subagent_manager.transcript_json(agent_id).or_else(|| {
+            self.past_subagents
+                .iter()
+                .rev()
+                .find(|(row, _)| row["id"] == agent_id)
+                .map(|(_, items)| items.clone())
+        });
+        AgentEvent::SubagentTranscript {
+            agent_id: agent_id.to_string(),
+            items,
+        }
+    }
+
+    /// Keeps the agents of the turn that ended (the manager starts afresh
+    /// each turn), bounded to the most recent ones.
+    fn archive_subagents(&mut self) {
+        const MAX_PAST_SUBAGENTS: usize = 24;
+        for row in self.subagent_manager.runs_json() {
+            let id = row["id"].as_str().unwrap_or_default().to_string();
+            let items = self
+                .subagent_manager
+                .transcript_json(&id)
+                .unwrap_or_default();
+            self.past_subagents
+                .retain(|(known, _)| known["id"] != row["id"]);
+            self.past_subagents.push((row, items));
+        }
+        let excess = self.past_subagents.len().saturating_sub(MAX_PAST_SUBAGENTS);
+        self.past_subagents.drain(..excess);
     }
 
     /// Folds finished subagents' token usage into the parent's cumulative totals,
@@ -1838,12 +2011,20 @@ impl AgentCore {
     }
 
     fn spawn_current_context_turn(&mut self, save_event: Vec<AgentEvent>) -> Vec<AgentEvent> {
+        let keep_subagents = std::mem::take(&mut self.keep_subagents);
         if let Err(error) = self.ensure_provider_credentials() {
+            self.subagent_manager
+                .close_all_with_message("parent turn failed");
+            self.requeue_unread_steers();
             let mut events = save_event;
             events.push(AgentEvent::Error(error));
             return events;
         }
-        self.subagent_manager = SubagentManager::default();
+        if !keep_subagents {
+            self.archive_subagents();
+            self.requeue_unread_steers();
+            self.subagent_manager = SubagentManager::default();
+        }
         let base_prompt = match self.config.system_prompt() {
             Ok(_) if self.chat => crate::chat::CHAT_SYSTEM_PROMPT.to_string(),
             Ok(prompt) => prompt,
@@ -1895,8 +2076,23 @@ impl AgentCore {
             fetch_engine: self.config.web_fetch_engine.clone(),
             signed_in,
         }));
-        let prompt_tools =
-            crate::tools::prompt_tool_names(&self.config.edit_tools, true, signed_in);
+        if let Ok(image_model) = crate::config::read_image_model_at(self.config.path()) {
+            self.config.image_model = image_model;
+        }
+        let model_headers = self.model_headers();
+        let images = crate::images::ImageTools::from_config(
+            &self.config,
+            self.provider_api_key(),
+            &model_headers,
+        );
+        let images_enabled = images.is_ok();
+        self.tool_state.set_images(images);
+        let prompt_tools = crate::tools::prompt_tool_names(
+            &self.config.edit_tools,
+            true,
+            signed_in,
+            images_enabled,
+        );
         let mut system_prompt = build_system_prompt(
             &base_prompt,
             &PromptContext {
@@ -1923,6 +2119,10 @@ impl AgentCore {
                 system_prompt.push_str(extra.trim_end());
             }
         }
+        if self.approval_mode.get() == ApprovalMode::Plan && !self.chat {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(crate::plan_mode::PROMPT_ADDENDUM);
+        }
 
         // Desktop edits subagent_models in config.json while engines run. An
         // unreadable file keeps the list this engine already has.
@@ -1942,7 +2142,7 @@ impl AgentCore {
         let (approval_tx, approval_rx) = mpsc::channel();
         self.approval_receiver = Some(approval_rx);
         self.pending_approvals.clear();
-        let Ok(client) = OpenAiClient::from_config(OpenAiClientConfig {
+        let Ok(mut client) = OpenAiClient::from_config(OpenAiClientConfig {
             model: self.config.model.clone(),
             provider: self.config.provider.clone(),
             protocol: self.config.protocol.clone(),
@@ -1964,7 +2164,7 @@ impl AgentCore {
             approval_mode: self.approval_mode.clone(),
             safety_model: Some(self.config.safety().0).filter(|model| !model.trim().is_empty()),
             safety_reasoning_effort: self.config.safety().1,
-            model_headers: self.model_headers(),
+            model_headers,
             edit_tools: self.config.edit_tools.clone(),
             extra_read_roots,
             tool_state: self.tool_state.clone(),
@@ -1993,6 +2193,19 @@ impl AgentCore {
         } else {
             None
         };
+        // Mid-turn compaction: only for a turn that starts uncompacted with
+        // earlier history to fold. A turn that compacts here (including the
+        // continuation of a mid-turn compaction) runs on to the real limit,
+        // so it never compacts again and again.
+        if compaction.is_none()
+            && model_context_budget > context_tokens
+            && self
+                .session
+                .plan_compaction(COMPACTION_KEEP_RECENT_TOKENS, &self.config.model)
+                .is_some()
+        {
+            client.set_context_headroom((model_context_budget - context_tokens) as u64);
+        }
         let mut events = save_event;
         events.push(AgentEvent::ContextUsage {
             tokens: context_tokens as u64,
@@ -2066,6 +2279,19 @@ impl AgentCore {
                         delay_ms,
                     },
                     StreamEvent::ResponseItem(item) => WorkerEvent::ResponseItem(item),
+                    StreamEvent::Steered(message) => WorkerEvent::Steered(message),
+                    // Only the plan is shown as it is written; every other
+                    // call's arguments arrive whole with its ResponseItem.
+                    StreamEvent::ToolArgumentsDelta {
+                        call_id,
+                        name,
+                        delta,
+                    } => {
+                        if name != crate::plan_mode::TOOL_NAME {
+                            return Ok(());
+                        }
+                        WorkerEvent::PlanDraft { call_id, delta }
+                    }
                     StreamEvent::ToolStart { call_id, name } => {
                         WorkerEvent::ToolStart { call_id, name }
                     }
@@ -2844,6 +3070,9 @@ impl AgentCore {
         if name == "update_plan" {
             return self.handle_update_plan(&args);
         }
+        if name == crate::plan_mode::TOOL_NAME {
+            return self.handle_propose_plan(&args);
+        }
         let result = match name {
             "get_goal" => Ok(self.session.goal().cloned()),
             "create_goal" => {
@@ -2889,6 +3118,149 @@ impl AgentCore {
                 )
             }
         }
+    }
+
+    /// `propose_plan` (plan mode): records the plan as pending and shows it;
+    /// the turn ends there and the user answers with `approve_plan`.
+    fn handle_propose_plan(&mut self, args: &Value) -> (ToolGoalResponse, Option<AgentEvent>) {
+        self.plan_draft = None;
+        let field = |key: &str| {
+            args.get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let (title, markdown) = (field("title"), field("plan"));
+        if self.approval_mode.get() != ApprovalMode::Plan {
+            let output =
+                json!({ "error": "propose_plan is only available in plan mode" }).to_string();
+            return (
+                ToolGoalResponse {
+                    output,
+                    is_error: true,
+                },
+                None,
+            );
+        }
+        if title.is_empty() || markdown.is_empty() {
+            let output =
+                json!({ "error": "propose_plan requires a title and the plan" }).to_string();
+            return (
+                ToolGoalResponse {
+                    output,
+                    is_error: true,
+                },
+                None,
+            );
+        }
+        let id = self.next_plan_id();
+        let event = self.record_plan(&id, &title, &markdown, "pending");
+        let output = json!({
+            "status": "proposed",
+            "id": id,
+            "note": "The plan is shown to the user. Stop now and wait for their approval or feedback."
+        })
+        .to_string();
+        (
+            ToolGoalResponse {
+                output,
+                is_error: false,
+            },
+            Some(event),
+        )
+    }
+
+    fn next_plan_id(&self) -> String {
+        let mut bytes = [0u8; 8];
+        let _ = getrandom::getrandom(&mut bytes);
+        format!(
+            "plan-{}",
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        )
+    }
+
+    fn record_plan(&mut self, id: &str, title: &str, markdown: &str, status: &str) -> AgentEvent {
+        self.session.append(EntryKind::ProposedPlan {
+            id: id.to_string(),
+            title: title.to_string(),
+            markdown: markdown.to_string(),
+            status: status.to_string(),
+        });
+        AgentEvent::ProposedPlan {
+            id: id.to_string(),
+            title: title.to_string(),
+            markdown: markdown.to_string(),
+            status: status.to_string(),
+        }
+    }
+
+    /// The latest record of plan `id` on this branch: (title, markdown, status).
+    fn find_plan(&self, id: &str) -> Option<(String, String, String)> {
+        self.session
+            .branch()
+            .into_iter()
+            .rev()
+            .find_map(|entry| match &entry.kind {
+                EntryKind::ProposedPlan {
+                    id: known,
+                    title,
+                    markdown,
+                    status,
+                } if known == id => Some((title.clone(), markdown.clone(), status.clone())),
+                _ => None,
+            })
+    }
+
+    /// `approve_plan`: approve a pending plan and run it in `mode`, or ask
+    /// for a revision with `feedback` (plan mode stays on).
+    pub fn approve_plan(
+        &mut self,
+        id: &str,
+        approve: bool,
+        mode: Option<ApprovalMode>,
+        feedback: &str,
+    ) -> Vec<AgentEvent> {
+        let Some((title, markdown, status)) = self.find_plan(id) else {
+            return vec![AgentEvent::Error(format!("unknown plan: {id}"))];
+        };
+        if status == "approved" {
+            return vec![AgentEvent::Error(
+                "this plan was already approved".to_string(),
+            )];
+        }
+        let mut events = Vec::new();
+        if approve {
+            let mode = mode
+                .filter(|mode| *mode != ApprovalMode::Plan)
+                .unwrap_or(ApprovalMode::AutoEdit);
+            events.push(self.record_plan(id, &title, &markdown, "approved"));
+            events.extend(self.set_approval_mode(mode));
+            let mut message = format!(
+                "The user approved the plan \"{title}\". Implement it now, step by step. Keep the checklist current with update_plan as you go, and verify the result as the plan describes."
+            );
+            if !feedback.trim().is_empty() {
+                message.push_str("\n\nTheir notes: ");
+                message.push_str(feedback.trim());
+            }
+            events.extend(self.submit_user_message(message));
+        } else {
+            if feedback.trim().is_empty() {
+                return vec![AgentEvent::Error(
+                    "revising a plan needs feedback".to_string(),
+                )];
+            }
+            events.push(self.record_plan(id, &title, &markdown, "revising"));
+            if self.approval_mode.get() != ApprovalMode::Plan {
+                events.extend(self.set_approval_mode(ApprovalMode::Plan));
+            }
+            events.extend(self.submit_user_message(format!(
+                "Revise the plan \"{title}\" with this feedback, then propose the complete revised plan with propose_plan:\n\n{}",
+                feedback.trim()
+            )));
+        }
+        events.extend(self.save_session_event());
+        events
     }
 
     fn handle_update_plan(&mut self, args: &Value) -> (ToolGoalResponse, Option<AgentEvent>) {
@@ -4460,19 +4832,51 @@ pub fn title_completion(system: &str, user: &str) -> Result<String, String> {
         AuthStore::load_or_create(config.encrypt_secrets).map_err(|error| error.to_string())?
     };
     let (model, reasoning_effort) = config.title();
+    match title_request(&config, &auth, &model, &reasoning_effort, system, user) {
+        // A model that refuses its lightest listed effort (gpt-6-astra takes no
+        // "none") gets the next one up.
+        Err(error) if rejects_reasoning_effort(&error) => {
+            let efforts = config.model_config(&model).reasoning_efforts;
+            match efforts
+                .iter()
+                .skip_while(|effort| **effort != reasoning_effort)
+                .nth(1)
+            {
+                Some(next) => title_request(&config, &auth, &model, next, system, user),
+                None => Err(error),
+            }
+        }
+        reply => reply,
+    }
+}
+
+/// An upstream 400 about the reasoning effort (Responses `reasoning.effort`,
+/// Chat `reasoning_effort`).
+fn rejects_reasoning_effort(error: &str) -> bool {
+    error.contains("reasoning.effort") || error.contains("reasoning_effort")
+}
+
+fn title_request(
+    config: &Config,
+    auth: &AuthStore,
+    model: &str,
+    reasoning_effort: &str,
+    system: &str,
+    user: &str,
+) -> Result<String, String> {
     let client = OpenAiClient::from_config(OpenAiClientConfig {
-        model: model.clone(),
+        model: model.to_string(),
         provider: config.provider.clone(),
         protocol: config.protocol.clone(),
-        reasoning_effort,
+        reasoning_effort: reasoning_effort.to_string(),
         models: Vec::new(),
         subagent_models: Vec::new(),
         system_prompt: String::new(),
         prompt_cache_key: String::new(),
         mcp: McpManager::default(),
         base_url: config.base_url.clone(),
-        max_output_tokens: config.model_config(&model).max_output_tokens,
-        api_key: provider_api_key(&config, &auth).as_deref(),
+        max_output_tokens: config.model_config(model).max_output_tokens,
+        api_key: provider_api_key(config, auth).as_deref(),
         api_key_env: &config.api_key_env,
         retry_attempts: config.retry_attempts,
         connect_timeout: Duration::from_secs(config.connect_timeout_seconds),
@@ -4482,7 +4886,7 @@ pub fn title_completion(system: &str, user: &str) -> Result<String, String> {
         approval_mode: LiveApprovalMode::new(config.approval_mode),
         safety_model: None,
         safety_reasoning_effort: String::new(),
-        model_headers: model_headers(&config),
+        model_headers: model_headers(config),
         edit_tools: Vec::new(),
         extra_read_roots: Vec::new(),
         tool_state: crate::tools::ToolState::default(),
@@ -4493,9 +4897,76 @@ pub fn title_completion(system: &str, user: &str) -> Result<String, String> {
     client.summarize_text(system, user, |_| Ok(()))
 }
 
+/// The plan as the model writes its propose_plan call, for clients to show
+/// before the call completes.
+#[derive(Default)]
+struct PlanDraft {
+    call_id: String,
+    arguments: String,
+    title: String,
+    sent: usize,
+}
+
+impl PlanDraft {
+    /// Adds a fragment of the call's arguments; the event carries the title
+    /// and the plan text added since the last one (nothing when unchanged).
+    fn push(&mut self, call_id: &str, delta: &str) -> Option<AgentEvent> {
+        if !call_id.is_empty() && call_id != self.call_id {
+            if !self.call_id.is_empty() {
+                *self = PlanDraft::default();
+            }
+            self.call_id = call_id.to_string();
+        }
+        self.arguments.push_str(delta);
+        let title =
+            crate::plan_mode::partial_string_field(&self.arguments, "title").unwrap_or_default();
+        let plan =
+            crate::plan_mode::partial_string_field(&self.arguments, "plan").unwrap_or_default();
+        let append = plan.get(self.sent..).unwrap_or_default().to_string();
+        if append.is_empty() && title == self.title {
+            return None;
+        }
+        self.sent = plan.len();
+        self.title = title.clone();
+        Some(AgentEvent::PlanDraft {
+            id: if self.call_id.is_empty() {
+                "draft".to_string()
+            } else {
+                self.call_id.clone()
+            },
+            title,
+            append,
+        })
+    }
+}
 #[cfg(test)]
 mod approval_decision_tests {
     use super::*;
+
+    #[test]
+    fn a_plan_draft_sends_its_title_and_only_the_new_text() {
+        let mut draft = PlanDraft::default();
+        let mut push = |call_id: &str, delta: &str| match draft.push(call_id, delta) {
+            Some(AgentEvent::PlanDraft { id, title, append }) => Some((id, title, append)),
+            _ => None,
+        };
+        let event = |id: &str, title: &str, append: &str| {
+            Some((id.to_string(), title.to_string(), append.to_string()))
+        };
+        assert_eq!(
+            push("call_1", "{\"title\":\"Sna"),
+            event("call_1", "Sna", "")
+        );
+        assert_eq!(
+            push("", "ke\",\"plan\":\"## Go"),
+            event("call_1", "Snake", "## Go")
+        );
+        assert_eq!(push("", "al\\n"), event("call_1", "Snake", "al\n"));
+        // Nothing new yet (an escape cut off): no event.
+        assert_eq!(push("", "\\"), None);
+        // Another call starts over.
+        assert_eq!(push("call_2", "{\"title\":\"B"), event("call_2", "B", ""));
+    }
     use std::sync::mpsc::TryRecvError;
 
     fn pending(

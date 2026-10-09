@@ -138,7 +138,7 @@ fn collect_files(root: &Path, dir: &Path, files: &mut Vec<String>) {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubagentStatus {
     Pending,
     Running,
@@ -177,6 +177,8 @@ pub(crate) struct SubagentSpawn {
     pub model: String,
     pub reasoning_effort: String,
     pub depth: u64,
+    /// The parent's spawn_agent call id (front-ends match the card to it).
+    pub tool_use_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -225,6 +227,9 @@ struct SubagentInner {
 struct SubagentRegistry {
     agents: BTreeMap<String, SubagentRecord>,
     events: VecDeque<SubagentLifecycleEvent>,
+    /// The user's messages for the running main turn (`steer`), read before
+    /// its next model request; kept apart from agent mail.
+    user_inbox: VecDeque<String>,
     /// Token usage of subagents that reached a final state, awaiting fold-in to
     /// the parent's cumulative totals. Drained once via `drain_finished_usage`.
     finished_usage: Vec<SubagentRunResult>,
@@ -247,6 +252,9 @@ struct SubagentRecord {
     completed_at_ms: Option<u64>,
     /// Isolated workspace path once prepared; None until then.
     workdir: Option<String>,
+    tool_use_id: String,
+    /// What it is doing, for the front-ends' agent trace.
+    trace: crate::subagent_trace::SubagentTrace,
 }
 
 impl SubagentManager {
@@ -271,6 +279,7 @@ impl SubagentManager {
             ));
         }
         let interrupt_flag = Arc::new(AtomicBool::new(false));
+        let trace = crate::subagent_trace::SubagentTrace::new(&spawn.message);
         state.agents.insert(
             path.clone(),
             SubagentRecord {
@@ -289,6 +298,8 @@ impl SubagentManager {
                 started_at_ms: now_ms(),
                 completed_at_ms: None,
                 workdir: None,
+                trace,
+                tool_use_id: spawn.tool_use_id,
             },
         );
         state.push_event(&path, "pending", "reserved");
@@ -332,6 +343,7 @@ impl SubagentManager {
             }
             agent.status = SubagentStatus::Completed;
             agent.completed_at_ms = Some(now_ms());
+            agent.trace.finish("Done");
             agent.result = Some(result.clone());
             agent.error = None;
             event = Some(("completed", "finished".to_string()));
@@ -364,6 +376,13 @@ impl SubagentManager {
             agent.completed_at_ms = Some(now_ms());
             agent.result = Some(partial.clone());
             agent.error = Some(error.clone());
+            agent
+                .trace
+                .finish(if agent.status == SubagentStatus::Interrupted {
+                    "Interrupted"
+                } else {
+                    "Failed"
+                });
             let status = agent.status.as_str();
             event = Some((status, error));
             finished = Some(partial);
@@ -393,6 +412,7 @@ impl SubagentManager {
             return Err(format!("agent is not running: {target}"));
         }
         agent.queued_messages.push_back(message.to_string());
+        agent.trace.note(message);
         state.push_event(&target, "message", "queued message");
         self.inner.changed.notify_all();
         Ok(json!({
@@ -400,6 +420,19 @@ impl SubagentManager {
             "delivered": true,
             "status": "queued"
         }))
+    }
+
+    /// A user message for the running main turn: the model reads it before
+    /// its next request, while the turn (and its tools) keep running.
+    pub(crate) fn steer_main(&self, message: &str) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.user_inbox.push_back(message.to_string());
+    }
+
+    /// Messages the user steered into the main turn, oldest first.
+    pub(crate) fn drain_user_inbox(&self) -> Vec<String> {
+        let mut state = self.inner.state.lock().unwrap();
+        state.user_inbox.drain(..).collect()
     }
 
     pub(crate) fn drain_messages(&self, path: &str) -> Vec<String> {
@@ -424,6 +457,7 @@ impl SubagentManager {
                 agent.interrupt_flag.store(true, Ordering::SeqCst);
                 agent.status = SubagentStatus::Closed;
                 agent.completed_at_ms = Some(now_ms());
+                agent.trace.finish("Closed");
                 should_emit = true;
             }
             previous
@@ -451,6 +485,7 @@ impl SubagentManager {
                 agent.interrupt_flag.store(true, Ordering::SeqCst);
                 agent.status = SubagentStatus::Closed;
                 agent.completed_at_ms = Some(now_ms());
+                agent.trace.finish("Closed");
                 closed.push(agent.path.clone());
             }
         }
@@ -516,6 +551,78 @@ impl SubagentManager {
             "status": statuses,
             "timed_out": !ready,
         }))
+    }
+
+    /// Records one event of a running agent's turn in its trace.
+    pub(crate) fn record(&self, path: &str, event: &crate::llm::StreamEvent) {
+        let mut state = self.inner.state.lock().unwrap();
+        if let Some(agent) = state.agents.get_mut(path) {
+            agent.trace.record(event);
+        }
+    }
+
+    /// Sum of the trace revisions: changes whenever any agent did something.
+    pub(crate) fn trace_revision(&self) -> u64 {
+        let state = self.inner.state.lock().unwrap();
+        state
+            .agents
+            .values()
+            .map(|agent| agent.trace.revision.wrapping_add(agent.status as u64))
+            .fold(state.agents.len() as u64, u64::wrapping_add)
+    }
+
+    /// Every agent of this session as an `agent_runs` row (oldest first).
+    pub(crate) fn runs_json(&self) -> Vec<Value> {
+        let state = self.inner.state.lock().unwrap();
+        let now = now_ms();
+        let mut agents: Vec<&SubagentRecord> = state.agents.values().collect();
+        agents.sort_by_key(|agent| agent.started_at_ms);
+        agents
+            .into_iter()
+            .map(|agent| {
+                let end = agent.completed_at_ms.unwrap_or(now);
+                let result = agent.result.as_ref();
+                json!({
+                    "id": agent.path,
+                    "label": agent.task_name,
+                    "model": agent.model,
+                    "effort": agent.reasoning_effort,
+                    "state": agent.status.as_str(),
+                    "started_at": agent.started_at_ms,
+                    "duration_ms": end.saturating_sub(agent.started_at_ms),
+                    "tokens": result
+                        .map(|result| result.input_tokens + result.output_tokens)
+                        .unwrap_or_else(|| agent.trace.tokens()),
+                    "tool_calls": result
+                        .map(|result| result.tool_calls)
+                        .unwrap_or_else(|| agent.trace.tool_calls()),
+                    "prompt": agent.message,
+                    "result": result.map(|result| result.summary.clone()).unwrap_or_default(),
+                    "error": agent.error.clone().unwrap_or_default(),
+                    "type": "subagent",
+                    "tool_use_id": agent.tool_use_id,
+                    "activity": agent.trace.activity(),
+                })
+            })
+            .collect()
+    }
+
+    /// One agent's work for `subagent_transcript`, or None for an unknown id.
+    pub(crate) fn transcript_json(&self, path: &str) -> Option<Vec<Value>> {
+        let state = self.inner.state.lock().unwrap();
+        state.agents.get(path).map(|agent| agent.trace.items_json())
+    }
+
+    /// Label, model and spawn call of an agent, for its lifecycle events.
+    pub(crate) fn describe(&self, path: &str) -> Option<(String, String, String)> {
+        let state = self.inner.state.lock().unwrap();
+        state.agents.get(path).map(|agent| {
+            (
+                agent.task_name.clone(),
+                agent.model.clone(),
+                agent.tool_use_id.clone(),
+            )
+        })
     }
 
     pub(crate) fn drain_events(&self) -> Vec<SubagentLifecycleEvent> {
@@ -700,6 +807,7 @@ mod tests {
             model: "gpt-test".to_string(),
             reasoning_effort: "medium".to_string(),
             depth: 1,
+            tool_use_id: String::new(),
         }
     }
 

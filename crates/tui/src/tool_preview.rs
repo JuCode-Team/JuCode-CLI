@@ -129,6 +129,7 @@ fn tool_action_label(name: &str) -> Cow<'_, str> {
         "outline" => "Outlined".into(),
         "checkpoint" => "Checkpointed".into(),
         "web_fetch" => "Fetched".into(),
+        "generate_image" => "Generated".into(),
         // Unknown tools (including MCP) keep their real name; `mcp__a__b` shows
         // as `a/b` instead of a useless "Tool".
         other => match other.strip_prefix("mcp__") {
@@ -165,6 +166,15 @@ fn projected_tool_output(name: &str, output: &str) -> Option<Vec<UiLine>> {
             let path = value.get("path").and_then(serde_json::Value::as_str)?;
             Some(vec![plain_preview_line(format!("ls {}", path))])
         }
+        "generate_image" => Some(
+            value
+                .get("paths")?
+                .as_array()?
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|path| plain_preview_line(format!("saved {path}")))
+                .collect(),
+        ),
         _ if is_shell_tool(name) || name == "write_stdin" => Some(project_bash_output(&value)),
         _ => None,
     }
