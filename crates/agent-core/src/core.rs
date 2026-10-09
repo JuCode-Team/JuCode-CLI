@@ -195,6 +195,9 @@ pub struct AgentCore {
     force_compaction: bool,
     overflow_retry_pending: bool,
     overflow_retried: bool,
+    /// The next spawn continues a turn stopped for mid-turn compaction: it
+    /// keeps that turn's subagents and unread steers.
+    keep_subagents: bool,
     /// The propose_plan call being written: its call id, its arguments so
     /// far and how much of the plan text clients were sent.
     plan_draft: Option<PlanDraft>,
@@ -298,6 +301,7 @@ impl AgentCore {
             force_compaction: false,
             overflow_retry_pending: false,
             overflow_retried: false,
+            keep_subagents: false,
             plan_draft: None,
             resume_summary_running: false,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
@@ -1674,19 +1678,29 @@ impl AgentCore {
                         }));
                     }
                     WorkerEvent::Error(error)
-                        if is_context_overflow(&error)
-                            && !self.overflow_retried
-                            && self
-                                .session
-                                .plan_compaction(COMPACTION_KEEP_RECENT_TOKENS, &self.config.model)
-                                .is_some() =>
+                        if error == crate::llm::MID_TURN_COMPACTION
+                            || is_context_overflow(&error)
+                                && !self.overflow_retried
+                                && self
+                                    .session
+                                    .plan_compaction(
+                                        COMPACTION_KEEP_RECENT_TOKENS,
+                                        &self.config.model,
+                                    )
+                                    .is_some() =>
                     {
                         // Over the window (unknown, or raised past what this
                         // route serves): compact and retry once instead of
                         // failing the turn. The retry spawns from the idle
-                        // branch below, once this worker is drained.
-                        self.subagent_manager
-                            .close_all_with_message("parent turn hit the context window");
+                        // branch below, once this worker is drained. A
+                        // mid-turn compaction continues the same turn, so its
+                        // subagents keep running.
+                        if error == crate::llm::MID_TURN_COMPACTION {
+                            self.keep_subagents = true;
+                        } else {
+                            self.subagent_manager
+                                .close_all_with_message("parent turn hit the context window");
+                        }
                         self.running = false;
                         disconnected = true;
                         self.goal_tool_receiver = None;
@@ -1984,14 +1998,19 @@ impl AgentCore {
     }
 
     fn spawn_current_context_turn(&mut self, save_event: Vec<AgentEvent>) -> Vec<AgentEvent> {
+        let keep_subagents = std::mem::take(&mut self.keep_subagents);
         if let Err(error) = self.ensure_provider_credentials() {
+            self.subagent_manager
+                .close_all_with_message("parent turn failed");
             let mut events = save_event;
             events.push(AgentEvent::Error(error));
             return events;
         }
-        self.archive_subagents();
-        self.requeue_unread_steers();
-        self.subagent_manager = SubagentManager::default();
+        if !keep_subagents {
+            self.archive_subagents();
+            self.requeue_unread_steers();
+            self.subagent_manager = SubagentManager::default();
+        }
         let base_prompt = match self.config.system_prompt() {
             Ok(_) if self.chat => crate::chat::CHAT_SYSTEM_PROMPT.to_string(),
             Ok(prompt) => prompt,
@@ -2153,7 +2172,6 @@ impl AgentCore {
             &self.config.current_model_config(),
             self.config.compaction_threshold_percent,
         );
-        client.set_context_budget(model_context_budget as u64);
         let forced = std::mem::take(&mut self.force_compaction);
         let compaction = if forced || should_auto_compact(context_tokens, model_context_budget) {
             self.session
@@ -2161,6 +2179,19 @@ impl AgentCore {
         } else {
             None
         };
+        // Mid-turn compaction: only for a turn that starts uncompacted with
+        // earlier history to fold. A turn that compacts here (including the
+        // continuation of a mid-turn compaction) runs on to the real limit,
+        // so it never compacts again and again.
+        if compaction.is_none()
+            && model_context_budget > context_tokens
+            && self
+                .session
+                .plan_compaction(COMPACTION_KEEP_RECENT_TOKENS, &self.config.model)
+                .is_some()
+        {
+            client.set_context_headroom((model_context_budget - context_tokens) as u64);
+        }
         let mut events = save_event;
         events.push(AgentEvent::ContextUsage {
             tokens: context_tokens as u64,

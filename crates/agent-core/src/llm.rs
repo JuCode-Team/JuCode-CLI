@@ -88,9 +88,10 @@ pub struct OpenAiClient {
     allow_subagents: bool,
     max_tool_calls: Option<u64>,
     deadline: Option<Instant>,
-    /// Input tokens past which the main turn stops between requests so the
-    /// conversation can be compacted and the turn continued; 0 = never.
-    context_budget: u64,
+    /// Input tokens the main turn may grow by (past its first request) before
+    /// it stops between requests so the conversation can be compacted and the
+    /// turn continued; 0 = never.
+    context_headroom: u64,
     provider_kind: Protocol,
     goal_tool_tx: Option<Sender<GoalToolRequest>>,
     approval_tx: Option<Sender<ApprovalRequest>>,
@@ -509,7 +510,7 @@ impl OpenAiClient {
             allow_subagents: true,
             max_tool_calls: None,
             deadline: None,
-            context_budget: 0,
+            context_headroom: 0,
             provider_kind,
             goal_tool_tx: config.goal_tool_tx,
             approval_tx: config.approval_tx,
@@ -527,10 +528,11 @@ impl OpenAiClient {
         })
     }
 
-    /// Sets the input size at which `run_turn_events` hands the turn back for
-    /// compaction (see [`MID_TURN_COMPACTION`]); 0 turns it off.
-    pub fn set_context_budget(&mut self, tokens: u64) {
-        self.context_budget = tokens;
+    /// Sets how far the input may grow during the turn before
+    /// `run_turn_events` hands it back for compaction (see
+    /// [`MID_TURN_COMPACTION`]); 0 turns it off.
+    pub fn set_context_headroom(&mut self, tokens: u64) {
+        self.context_headroom = tokens;
     }
 
     pub fn run_turn_events(
@@ -539,9 +541,16 @@ impl OpenAiClient {
         cwd: &Path,
         mut outer_emit: impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<(), String> {
+        // Input of the first and of the latest request: the growth between
+        // them is what this turn added, measured like the headroom (the
+        // system prompt and tools are in both).
+        let first_input = std::cell::Cell::new(None::<u64>);
         let last_input = std::cell::Cell::new(0u64);
         let mut emit = |event: StreamEvent| {
             if let StreamEvent::Usage { input_tokens, .. } = &event {
+                if first_input.get().is_none() {
+                    first_input.set(Some(*input_tokens));
+                }
                 last_input.set(*input_tokens);
             }
             outer_emit(event)
@@ -558,7 +567,10 @@ impl OpenAiClient {
             // The last request already passed the compaction threshold and its
             // tool results are recorded: stop before the next request so the
             // conversation is compacted and the turn continues from there.
-            if self.context_budget > 0 && last_input.get() > self.context_budget {
+            let grown = last_input
+                .get()
+                .saturating_sub(first_input.get().unwrap_or_default());
+            if self.context_headroom > 0 && grown > self.context_headroom {
                 return Err(MID_TURN_COMPACTION.to_string());
             }
             self.append_queued_subagent_messages(&mut input, &mut emit)?;
@@ -1378,7 +1390,7 @@ impl OpenAiClient {
             allow_subagents: child_depth < MAX_SUBAGENT_DEPTH,
             max_tool_calls,
             deadline: timeout.map(|timeout| started + timeout),
-            context_budget: 0,
+            context_headroom: 0,
             // Each model speaks its own wire protocol (on the JuCode gateway
             // Claude uses Anthropic Messages, the rest Responses).
             provider_kind: protocol,
@@ -2728,6 +2740,80 @@ mod tests {
         assert_eq!(forked[1]["call_id"], "done_1");
         assert!(response_content_text(&forked[2], "input_text").contains("inspect"));
         assert!(!forked.iter().any(|item| item["call_id"] == "pending_1"));
+    }
+
+    /// A chat server answering each request in turn with a tool call (or,
+    /// last, plain text) that reports `prompt_tokens` from `inputs`.
+    fn usage_server(inputs: &'static [u64]) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (index, input) in inputs.iter().enumerate() {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(&mut stream);
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let line = line.trim_end().to_ascii_lowercase();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let delta = if index + 1 < inputs.len() {
+                    json!({ "tool_calls": [{ "index": 0, "id": format!("call_{index}"),
+                        "type": "function",
+                        "function": { "name": "no_such_tool", "arguments": "{}" } }] })
+                } else {
+                    json!({ "content": "done" })
+                };
+                let chunks = [
+                    json!({ "choices": [{ "index": 0, "delta": delta, "finish_reason": "stop" }] }),
+                    json!({ "choices": [], "usage": { "prompt_tokens": input, "completion_tokens": 1 } }),
+                ];
+                let mut reply = String::new();
+                for chunk in chunks {
+                    reply.push_str(&format!("data: {chunk}\n\n"));
+                }
+                reply.push_str("data: [DONE]\n\n");
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{reply}"
+                );
+            }
+        });
+        format!("http://{address}/v1")
+    }
+
+    #[test]
+    fn mid_turn_compaction_fires_only_past_the_headroom_the_turn_grew() {
+        let run = |inputs: &'static [u64], headroom: u64| {
+            let mut config = test_client_config();
+            config.protocol = "chat".to_string();
+            let base_url = usage_server(inputs);
+            config.base_url = base_url;
+            let mut client = OpenAiClient::from_config(config).unwrap();
+            client.set_context_headroom(headroom);
+            client.run_turn_events(Vec::new(), Path::new("."), |_| Ok(()))
+        };
+        // The first request is large (system prompt, tools, history) but the
+        // turn grew by less than the headroom: it runs to its end.
+        assert_eq!(run(&[90_000, 95_000, 99_000], 10_000), Ok(()));
+        // Grown past the headroom: stop before the next request to compact.
+        assert_eq!(
+            run(&[90_000, 101_000, 102_000], 10_000),
+            Err(MID_TURN_COMPACTION.to_string())
+        );
+        // No headroom set (nothing to fold): never stops for compaction.
+        assert_eq!(run(&[90_000, 500_000, 900_000], 0), Ok(()));
     }
 
     fn test_client() -> OpenAiClient {
