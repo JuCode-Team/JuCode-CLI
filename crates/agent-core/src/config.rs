@@ -930,13 +930,14 @@ fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
     // Windows refuses to replace a file another process has open (the
     // desktop reading config.json, an antivirus scan); that lasts moments, so
     // retry briefly instead of failing the save (a model pick that silently
-    // did nothing).
+    // did nothing). Elsewhere a refused rename is a real error.
     let mut attempt = 0;
     loop {
         match fs::rename(&temp, path) {
             Ok(()) => return Ok(()),
             Err(error)
-                if attempt < 20
+                if cfg!(windows)
+                    && attempt < 20
                     && matches!(
                         error.kind(),
                         io::ErrorKind::PermissionDenied | io::ErrorKind::ResourceBusy
