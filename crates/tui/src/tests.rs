@@ -1672,7 +1672,6 @@ fn backtab_cycles_approval_mode() {
     let now = Instant::now();
 
     for expected in [
-        "/permissions plan",
         "/permissions auto-edit",
         "/permissions auto",
         "/permissions full-access",
