@@ -32,6 +32,8 @@ pub(super) struct TuiState {
     /// Approval requests waiting behind the currently shown picker; with
     /// subagents several can be pending at once. (call_id, name, summary).
     pub(super) queued_approvals: Vec<(String, String, String)>,
+    /// A proposed plan (id, title) waiting behind the shown picker.
+    pub(super) queued_plan: Option<(String, String)>,
     pub(super) pending_messages: Vec<String>,
     pub(super) reset_screen: bool,
     /// Latest git branch/dirty reading for the bottom bar (None outside a repo).
@@ -73,6 +75,7 @@ impl Default for TuiState {
             completion_index: 0,
             picker_view: None,
             queued_approvals: Vec::new(),
+            queued_plan: None,
             pending_messages: Vec::new(),
             reset_screen: false,
             git_status: None,
@@ -521,15 +524,30 @@ impl TuiState {
                     true
                 }
                 AgentEvent::ProposedPlan {
+                    id,
                     title,
                     markdown,
                     status,
-                    ..
                 } => {
                     self.chat.push(ChatLine::System(format!(
                         "Plan ({status}): {title}\n{markdown}"
                     )));
                     self.mark_history_dirty();
+                    // A pending plan waits for the user: approve or revise it.
+                    if status == "pending" {
+                        self.collapse_live_thinking();
+                        if self.picker_view.is_some() {
+                            self.queued_plan = Some((id, title));
+                        } else {
+                            self.picker_view = Some(PickerState::plan(id, title));
+                        }
+                    } else if self
+                        .queued_plan
+                        .as_ref()
+                        .is_some_and(|(queued, _)| *queued == id)
+                    {
+                        self.queued_plan = None;
+                    }
                     true
                 }
                 // The TUI shows the plan once it is proposed, not while written.
@@ -581,12 +599,18 @@ impl TuiState {
     }
 
     /// Surface the next queued approval request once no picker is showing.
+    /// Surface the next queued approval request (then a queued plan) once no
+    /// picker is showing.
     pub(super) fn show_next_queued_approval(&mut self) {
-        if self.picker_view.is_some() || self.queued_approvals.is_empty() {
+        if self.picker_view.is_some() {
             return;
         }
-        let (call_id, name, summary) = self.queued_approvals.remove(0);
-        self.picker_view = Some(PickerState::approval(call_id, name, summary));
+        if !self.queued_approvals.is_empty() {
+            let (call_id, name, summary) = self.queued_approvals.remove(0);
+            self.picker_view = Some(PickerState::approval(call_id, name, summary));
+        } else if let Some((id, title)) = self.queued_plan.take() {
+            self.picker_view = Some(PickerState::plan(id, title));
+        }
     }
 
     /// The request connected (or the turn ended without connecting): show

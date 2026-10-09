@@ -249,7 +249,7 @@ USAGE:
 
 OPTIONS:
     --resume <id>                        open the TUI on a saved conversation
-    --approval-mode <manual|auto-edit|auto|full-access>
+    --approval-mode <manual|plan|auto-edit|auto|full-access>
                                          tool approval mode for this run
                                          (auto runs a safety classifier on
                                          shell commands; full-access runs

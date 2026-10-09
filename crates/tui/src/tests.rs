@@ -1672,6 +1672,7 @@ fn backtab_cycles_approval_mode() {
     let now = Instant::now();
 
     for expected in [
+        "/permissions plan",
         "/permissions auto-edit",
         "/permissions auto",
         "/permissions full-access",
@@ -1684,6 +1685,75 @@ fn backtab_cycles_approval_mode() {
         );
     }
     assert_eq!(app.state.approval_mode, "manual");
+}
+
+fn proposed_plan(id: &str, status: &str) -> AgentEvent {
+    AgentEvent::ProposedPlan {
+        id: id.to_string(),
+        title: "Add login".to_string(),
+        markdown: "1. Do it".to_string(),
+        status: status.to_string(),
+    }
+}
+
+#[test]
+fn a_pending_plan_is_approved_from_the_picker() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.apply_events(vec![proposed_plan("call_1", "pending")]);
+    assert_eq!(
+        app.state.picker_view.as_ref().map(|picker| picker.mode),
+        Some(PickerMode::Plan)
+    );
+
+    let now = Instant::now();
+    app.handle_key_at(KeyCode::Down, KeyModifiers::empty(), now);
+    app.handle_key_at(KeyCode::Enter, KeyModifiers::empty(), now);
+
+    assert_eq!(
+        app.runtime.commands.last().map(String::as_str),
+        Some("/plan call_1 approve manual")
+    );
+    assert!(app.state.picker_view.is_none());
+}
+
+#[test]
+fn revising_a_plan_takes_the_feedback_in_the_picker() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.apply_events(vec![proposed_plan("call_1", "pending")]);
+    let now = Instant::now();
+    for _ in 0..3 {
+        app.handle_key_at(KeyCode::Down, KeyModifiers::empty(), now);
+    }
+    app.handle_key_at(KeyCode::Enter, KeyModifiers::empty(), now);
+    assert!(app.runtime.commands.is_empty());
+    for ch in "keep it small".chars() {
+        app.handle_key_at(KeyCode::Char(ch), KeyModifiers::empty(), now);
+    }
+    app.handle_key_at(KeyCode::Enter, KeyModifiers::empty(), now);
+
+    assert_eq!(
+        app.runtime.commands,
+        vec!["/plan call_1 revise keep it small".to_string()]
+    );
+    assert!(app.state.picker_view.is_none());
+    assert!(app.runtime.submitted.is_empty());
+}
+
+#[test]
+fn a_plan_waits_behind_an_open_picker_and_only_while_pending() {
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.state.picker_view = Some(PickerState::trust("/w".to_string(), None));
+    app.apply_events(vec![proposed_plan("call_1", "pending")]);
+    app.handle_key_at(KeyCode::Esc, KeyModifiers::empty(), Instant::now());
+    assert_eq!(
+        app.state.picker_view.as_ref().map(|picker| picker.mode),
+        Some(PickerMode::Plan)
+    );
+
+    // Not pending (approved elsewhere, or replayed): no picker.
+    let mut app = TuiApp::new(TestRuntime::default());
+    app.apply_events(vec![proposed_plan("call_2", "approved")]);
+    assert!(app.state.picker_view.is_none());
 }
 
 #[test]

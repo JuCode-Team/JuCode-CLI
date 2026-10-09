@@ -464,16 +464,20 @@ fn a_proposed_plan_waits_then_runs_in_the_approved_mode() {
     let events = pump(&mut core, is_ready);
     let (id, title, status) = plan_event(&events).expect("proposed_plan event");
     assert_eq!((title.as_str(), status.as_str()), ("Add marker", "pending"));
+    // Bare `/plan` shows the waiting plan again.
+    let (_, events) = core.handle_command("/plan");
+    assert_eq!(plan_event(&events).map(|plan| plan.0), Some(id.clone()));
     // The turn ended at the plan: the model did not get to answer the tool.
     assert!(!assistant_text(&events).contains("tool said"));
 
-    // A revision keeps plan mode and asks the model again.
-    let events = core.approve_plan(&id, false, None, "also add a test");
+    // A revision keeps plan mode and asks the model again (the TUI's
+    // `/plan` command, the text twin of `approve_plan`).
+    let (_, events) = core.handle_command(&format!("/plan {id} revise also add a test"));
     assert_eq!(plan_event(&events).unwrap().2, "revising");
     let events = pump(&mut core, is_ready);
     assert!(assistant_text(&events).contains("also add a test"));
 
-    let events = core.approve_plan(&id, true, Some(ApprovalMode::FullAccess), "");
+    let (_, events) = core.handle_command(&format!("/plan {id} approve full-access keep it short"));
     assert_eq!(plan_event(&events).unwrap().2, "approved");
     assert!(events.iter().any(|event| matches!(
         event,
@@ -481,8 +485,11 @@ fn a_proposed_plan_waits_then_runs_in_the_approved_mode() {
     )));
     let events = pump(&mut core, is_ready);
     assert!(assistant_text(&events).contains("approved the plan"));
+    assert!(assistant_text(&events).contains("Their notes: keep it short"));
     let again = core.approve_plan(&id, true, None, "");
     assert!(matches!(again.as_slice(), [AgentEvent::Error(_)]));
+    let (_, events) = core.handle_command("/plan");
+    assert!(plan_event(&events).is_none());
 
     // Reloading the session shows the plan once, with its latest status.
     let transcript = core.transcript_event();

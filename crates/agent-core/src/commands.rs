@@ -109,9 +109,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         advanced: true,
     },
     CommandSpec {
+        name: "/plan",
+        aliases: &[],
+        args: "[<plan-id> approve [mode] [notes] | <plan-id> revise <feedback>]",
+        description: "Show the plan waiting for approval; approve it or ask for a revision",
+        advanced: false,
+    },
+    CommandSpec {
         name: "/permissions",
         aliases: &[],
-        args: "[manual|auto-edit|auto|full-access]",
+        args: "[manual|plan|auto-edit|auto|full-access]",
         description: "Show or switch the tool approval mode",
         advanced: false,
     },
@@ -285,7 +292,7 @@ mod tests {
     fn approvals_command_is_registered_and_in_help() {
         assert!(is_known("/permissions"));
         assert!(is_known("/effort"));
-        assert!(help_line().contains("/permissions [manual|auto-edit|auto|full-access]"));
+        assert!(help_line().contains("/permissions [manual|plan|auto-edit|auto|full-access]"));
     }
 
     #[test]

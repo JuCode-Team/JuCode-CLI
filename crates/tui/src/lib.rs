@@ -971,7 +971,10 @@ impl<R: TuiRuntime> TuiApp<R> {
             }
             KeyCode::Enter => {
                 let closes = self.state.picker_view.as_ref().is_some_and(|picker| {
-                    matches!(picker.mode, PickerMode::Login | PickerMode::LoginPaste)
+                    matches!(
+                        picker.mode,
+                        PickerMode::Login | PickerMode::LoginPaste | PickerMode::Plan
+                    )
                 });
                 let Some(command) = self
                     .state
@@ -1090,6 +1093,17 @@ impl<R: TuiRuntime> TuiApp<R> {
                     }
                     return false;
                 }
+                if self
+                    .state
+                    .picker_view
+                    .as_ref()
+                    .is_some_and(PickerState::selected_wants_feedback)
+                {
+                    if let Some(picker) = self.state.picker_view.as_mut() {
+                        picker.begin_feedback_prompt();
+                    }
+                    return false;
+                }
                 let Some(command) = self
                     .state
                     .picker_view
@@ -1176,8 +1190,7 @@ impl<R: TuiRuntime> TuiApp<R> {
     }
 
     fn cycle_approval_mode(&mut self) {
-        // Not plan mode: the TUI has no way to approve a proposed plan.
-        const ORDER: [&str; 4] = ["manual", "auto-edit", "auto", "full-access"];
+        const ORDER: [&str; 5] = ["manual", "plan", "auto-edit", "auto", "full-access"];
         let next = ORDER
             .iter()
             .position(|mode| *mode == self.state.approval_mode)

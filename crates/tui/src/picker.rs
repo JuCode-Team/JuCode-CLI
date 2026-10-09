@@ -48,6 +48,8 @@ pub(crate) enum PickerMode {
     Model,
     Trust,
     Approval,
+    /// A proposed plan: approve it in a mode, or type a revision.
+    Plan,
     Login,
     /// No rows: just the paste input for a manual-callback login.
     LoginPaste,
@@ -67,6 +69,8 @@ pub(crate) enum TreePromptAction {
     ApiKey,
     /// Paste the redirect URL or code for a manual-callback login.
     LoginPaste,
+    /// What to change in the proposed plan.
+    PlanRevise,
 }
 
 impl PickerState {
@@ -276,6 +280,45 @@ impl PickerState {
         }
     }
 
+    /// Rows are `<plan-id> approve <mode>` and `<plan-id> revise`.
+    pub(crate) fn plan(id: String, title: String) -> Self {
+        let row = |suffix: &str, label: &str| PickerRow {
+            id: format!("{id} {suffix}"),
+            parent_id: None,
+            depth: 0,
+            prefix: String::new(),
+            label: label.to_string(),
+            active: false,
+            has_children: false,
+            detail: String::new(),
+            reasoning_efforts: Vec::new(),
+        };
+        let rows = vec![
+            row(
+                "approve auto-edit",
+                "Approve, run with edits allowed (auto-edit)",
+            ),
+            row(
+                "approve manual",
+                "Approve, run asking before each change (manual)",
+            ),
+            row("approve auto", "Approve, run without asking (auto)"),
+            row("revise", "Revise: tell the agent what to change"),
+        ];
+        Self {
+            rows,
+            selected: 0,
+            mode: PickerMode::Plan,
+            tree: None,
+            efforts: Vec::new(),
+            selected_effort: 0,
+            title: Some("Proposed plan".to_string()),
+            context: (!title.is_empty()).then_some(title),
+            prompt: None,
+            key_rows: HashSet::new(),
+        }
+    }
+
     pub(crate) fn trust(cwd: String, repo_root: Option<String>) -> Self {
         let row = |id: &str, label: &str, detail: String| PickerRow {
             id: id.to_string(),
@@ -322,6 +365,7 @@ impl PickerState {
             PickerMode::Resume => Some(format!("/resume {id}")),
             PickerMode::Rewind => Some(format!("/rewind {id}")),
             PickerMode::Approval => Some(format!("/approve {id}")),
+            PickerMode::Plan => Some(format!("/plan {id}")),
             PickerMode::Model => {
                 let effort = self.efforts.get(self.selected_effort)?;
                 Some(format!("/model {id} {effort}"))
@@ -344,6 +388,20 @@ impl PickerState {
     pub(crate) fn begin_key_prompt(&mut self) {
         self.prompt = Some(TreePrompt {
             action: TreePromptAction::ApiKey,
+            input: String::new(),
+        });
+    }
+
+    /// Plan mode: the selected row is "revise", so Enter opens the feedback
+    /// prompt instead of running a command.
+    pub(crate) fn selected_wants_feedback(&self) -> bool {
+        self.mode == PickerMode::Plan
+            && self.selected_id().is_some_and(|id| id.ends_with(" revise"))
+    }
+
+    pub(crate) fn begin_feedback_prompt(&mut self) {
+        self.prompt = Some(TreePrompt {
+            action: TreePromptAction::PlanRevise,
             input: String::new(),
         });
     }
@@ -425,6 +483,9 @@ impl PickerState {
             TreePromptAction::Delete => Some(format!("/delete {label}")),
             TreePromptAction::ApiKey => self.selected_id().map(|id| format!("/login {id} {label}")),
             TreePromptAction::LoginPaste => Some(format!("/login-paste {label}")),
+            TreePromptAction::PlanRevise => {
+                self.selected_id().map(|id| format!("/plan {id} {label}"))
+            }
         }
     }
 

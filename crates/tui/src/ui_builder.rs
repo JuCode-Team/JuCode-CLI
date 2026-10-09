@@ -245,6 +245,9 @@ impl UiBuilder {
             PickerMode::Resume => "resume: arrows move, enter resume, esc close",
             PickerMode::Rewind => "rewind: arrows move, enter rewind to turn, esc close",
             PickerMode::Approval => "arrows move, enter select, esc deny",
+            PickerMode::Plan => {
+                "arrows move, enter select, esc decide later (/plan shows it again)"
+            }
             PickerMode::Model => "model: arrows move, tab effort, enter select, esc close",
             PickerMode::Trust => {
                 "arrows move, enter select (loads project skills & hooks if trusted)"
@@ -265,6 +268,7 @@ impl UiBuilder {
                 TreePromptAction::Delete => "delete branch",
                 TreePromptAction::ApiKey => "paste api key",
                 TreePromptAction::LoginPaste => "redirect url or code",
+                TreePromptAction::PlanRevise => "what to change",
             };
             // The `|` is the prompt's visible caret; the hardware cursor stays
             // in the composer below.

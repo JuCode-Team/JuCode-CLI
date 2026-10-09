@@ -114,14 +114,17 @@ File tools (read/write/edit/ls/outline/checkpoint/apply_patch) only operate on p
 
 ### Approval modes
 
-`approval_mode` in `config.json` (or `/permissions <mode>` in a session; `shift+tab` cycles modes) picks one of four levels:
+`approval_mode` in `config.json` (or `/permissions <mode>` in a session; `shift+tab` cycles modes) picks one of five levels:
 
 | Mode | File edits | Shell commands |
 |---|---|---|
 | `manual` (default) | ask | ask |
+| `plan` | refused | read-only commands only |
 | `auto-edit` | run freely | ask |
 | `auto` | run freely | a safety model auto-approves safe commands; the rest still ask |
 | `full-access` | run freely | run freely, no prompts |
+
+In `plan` mode the agent investigates and then proposes a plan. The TUI shows it with a choice: approve it and run in `auto-edit`, `manual` or `auto`, or type what to change and get a revised plan. Esc leaves it pending; `/plan` brings the choice back.
 
 Under `auto`, every shell command first goes through a one-shot safety classification in an isolated context — the classifier sees only the command, the working directory, and your request, never the conversation history. Commands it judges safe run immediately; anything unsafe, ambiguous, or a failed classification falls back to the interactive prompt. The classifier model is configured with `safety_model` (defaults to `compact_model`) and `safety_reasoning_effort` in `config.json`:
 

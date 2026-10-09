@@ -188,7 +188,8 @@ starts a turn that implements the plan (optional `feedback` is passed
 along as notes). `revise` re-emits it with `status:"revising"`, keeps
 plan mode, and starts a turn asking for a complete revised plan with the
 `feedback`, which is required. An unknown or already approved `id`
-returns an `error` event.
+returns an `error` event. The text command `/plan <id> approve [mode]
+[notes]` / `/plan <id> revise <feedback>` does the same (the TUI uses it).
 
 ### `set_attended`
 

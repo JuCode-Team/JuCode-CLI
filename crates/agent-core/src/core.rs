@@ -848,6 +848,7 @@ impl AgentCore {
                 Ok((call_id, allow, always, hunks)) => self.approve(&call_id, allow, always, hunks),
                 Err(error) => vec![AgentEvent::Error(error)],
             },
+            "/plan" => self.plan_command_events(args.trim()),
             "/permissions" => self.permissions_command_events(args.trim()),
             "/sandbox" => self.sandbox_command_events(args.trim()),
             "/effort" => self.effort_command_events(args.trim()),
@@ -2894,7 +2895,7 @@ impl AgentCore {
         match ApprovalMode::parse(arg) {
             Ok(mode) => self.set_approval_mode(mode),
             Err(error) => vec![AgentEvent::Error(format!(
-                "usage: /permissions [manual|auto-edit|auto|full-access] ({error})"
+                "usage: /permissions [manual|plan|auto-edit|auto|full-access] ({error})"
             ))],
         }
     }
@@ -3261,6 +3262,58 @@ impl AgentCore {
         }
         events.extend(self.save_session_event());
         events
+    }
+
+    /// `/plan <id> approve [mode] [notes]` or `/plan <id> revise <feedback>`:
+    /// the text twin of the `approve_plan` op, for the TUI. Bare `/plan`
+    /// shows the latest plan again while it waits for the user.
+    fn plan_command_events(&mut self, args: &str) -> Vec<AgentEvent> {
+        const USAGE: &str =
+            "usage: /plan <plan-id> approve [mode] [notes] | /plan <plan-id> revise <feedback>";
+        if args.is_empty() {
+            let latest =
+                self.session
+                    .branch()
+                    .into_iter()
+                    .rev()
+                    .find_map(|entry| match &entry.kind {
+                        EntryKind::ProposedPlan { id, .. } => Some(id.clone()),
+                        _ => None,
+                    });
+            return match latest.and_then(|id| self.find_plan(&id).map(|plan| (id, plan))) {
+                Some((id, (title, markdown, status))) if status == "pending" => {
+                    vec![AgentEvent::ProposedPlan {
+                        id,
+                        title,
+                        markdown,
+                        status,
+                    }]
+                }
+                _ => vec![AgentEvent::Info(
+                    "no plan is waiting for approval".to_string(),
+                )],
+            };
+        }
+        let (id, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+        let (decision, rest) = rest
+            .trim()
+            .split_once(char::is_whitespace)
+            .unwrap_or((rest.trim(), ""));
+        match (id, decision) {
+            ("", _) => vec![AgentEvent::Error(USAGE.to_string())],
+            (id, "approve") => {
+                let (first, notes) = rest
+                    .trim()
+                    .split_once(char::is_whitespace)
+                    .unwrap_or((rest.trim(), ""));
+                match ApprovalMode::parse(first) {
+                    Ok(mode) => self.approve_plan(id, true, Some(mode), notes),
+                    Err(_) => self.approve_plan(id, true, None, rest),
+                }
+            }
+            (id, "revise") => self.approve_plan(id, false, None, rest),
+            _ => vec![AgentEvent::Error(USAGE.to_string())],
+        }
     }
 
     fn handle_update_plan(&mut self, args: &Value) -> (ToolGoalResponse, Option<AgentEvent>) {
