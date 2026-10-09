@@ -83,6 +83,11 @@ same install code as `/skills`. The session's engine picks the directory: Claude
 install into `~/.claude/skills`, all others into `~/.jucode/skills`. A marketplace failure only
 adds a warning; the Anthropic catalog stays installable.
 
+Other GitHub skill repositories join the catalog only when the daemon runs with
+`JUCODE_SKILL_SOURCES="Name=https://github.com/owner/repo;…"`; none are listed by default. Their
+skills may sit in `skills/<slug>/` or at the repository's top level, and install from the default
+branch. JuCode does not review these repositories; their licenses are the user's to check.
+
 Desktop lists the source-available Anthropic document skills the same way: shown with their
 license and repository link, not installed (the daemon's `skill_install` refuses them).
 

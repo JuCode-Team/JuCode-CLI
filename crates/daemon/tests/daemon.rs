@@ -2539,8 +2539,6 @@ fn set_jucode_api_url(url: &str) {
 #[test]
 fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
     let _guard = setup();
-    // No community repositories: the test stays offline.
-    std::env::set_var("JUCODE_SKILL_SOURCES", "");
     let home = PathBuf::from(std::env::var_os("HOME").unwrap());
     set_jucode_api_url(&fake_jucode_api(json!({
         "skills": [{

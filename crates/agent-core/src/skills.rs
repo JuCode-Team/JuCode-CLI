@@ -19,18 +19,6 @@ const SKILL_STATE_FILE: &str = "skills-state.json";
 pub const ANTHROPIC_SKILLS_URL: &str = "https://github.com/anthropics/skills";
 const ANTHROPIC_SKILLS_INDEX: &str = include_str!("anthropic-skills.json");
 
-/// Public GitHub repositories of skills the desktop marketplace lists beside
-/// Anthropic's: (shown name, repository). Their skills sit in `skills/<id>/`
-/// or at the top level (`<id>/SKILL.md`); see [`fetch_github_source`].
-pub const COMMUNITY_SKILL_SOURCES: [(&str, &str); 3] = [
-    ("Ikaleio", "https://github.com/Ikaleio/skills"),
-    ("Superpowers", "https://github.com/obra/superpowers"),
-    (
-        "Composio",
-        "https://github.com/ComposioHQ/awesome-claude-skills",
-    ),
-];
-
 /// A skill in a GitHub repository's `<dir>/<id>/` directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceSkill {
@@ -1557,11 +1545,18 @@ mod tests {
         zip.finish().unwrap();
     }
 
-    /// Network: the community repositories list their skills with metadata.
+    /// Network: GitHub skill repositories of both layouts list their skills
+    /// with metadata.
     #[test]
     #[ignore]
-    fn community_sources_list_skills() {
-        for (name, repository) in COMMUNITY_SKILL_SOURCES {
+    fn github_sources_list_skills() {
+        for (name, repository) in [
+            ("Superpowers", "https://github.com/obra/superpowers"),
+            (
+                "Composio",
+                "https://github.com/ComposioHQ/awesome-claude-skills",
+            ),
+        ] {
             let source = fetch_github_source(name, repository).unwrap();
             eprintln!(
                 "{name}: dir={:?} {} skills",

@@ -1,7 +1,7 @@
 //! The skills marketplace for the desktop: the JuCode marketplace,
-//! github.com/anthropics/skills and community skill repositories in one
-//! catalog, installed into the personal skills directory of the session's
-//! engine.
+//! github.com/anthropics/skills and any skill repositories the user
+//! configured (`JUCODE_SKILL_SOURCES`) in one catalog, installed into the
+//! personal skills directory of the session's engine.
 
 use crate::engines;
 use jucode_agent_core::skills;
@@ -38,27 +38,21 @@ fn install_dir(backend: &str) -> Result<PathBuf, String> {
     Ok(home.join(".claude").join("skills"))
 }
 
-/// The community repositories, fetched at most once an hour: listing one
-/// reads every SKILL.md it has.
-fn community_sources() -> Vec<(String, Result<skills::SkillSource, String>)> {
+/// The skill repositories the user configured, fetched at most once an hour:
+/// listing one reads every SKILL.md it has.
+fn configured_sources() -> Vec<(String, Result<skills::SkillSource, String>)> {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     type Cached = (Instant, Result<skills::SkillSource, String>);
     static CACHE: Mutex<Vec<(String, Cached)>> = Mutex::new(Vec::new());
     const FRESH: Duration = Duration::from_secs(3600);
-    // `JUCODE_SKILL_SOURCES="Name=https://github.com/o/r;…"` replaces the
-    // list (empty: none, as the tests run offline).
-    let configured: Vec<(String, String)> = match std::env::var("JUCODE_SKILL_SOURCES") {
-        Ok(list) => list
-            .split(';')
-            .filter_map(|item| item.split_once('='))
-            .map(|(name, repository)| (name.trim().to_string(), repository.trim().to_string()))
-            .collect(),
-        Err(_) => skills::COMMUNITY_SKILL_SOURCES
-            .iter()
-            .map(|(name, repository)| (name.to_string(), repository.to_string()))
-            .collect(),
-    };
+    // `JUCODE_SKILL_SOURCES="Name=https://github.com/o/r;…"`; none unless set.
+    let configured: Vec<(String, String)> = std::env::var("JUCODE_SKILL_SOURCES")
+        .unwrap_or_default()
+        .split(';')
+        .filter_map(|item| item.split_once('='))
+        .map(|(name, repository)| (name.trim().to_string(), repository.trim().to_string()))
+        .collect();
     configured
         .iter()
         .map(|(name, repository)| {
@@ -83,7 +77,7 @@ fn community_sources() -> Vec<(String, Result<skills::SkillSource, String>)> {
         .collect()
 }
 
-/// A catalog entry's `source`: `jucode`, `anthropic`, or a community
+/// A catalog entry's `source`: `jucode`, `anthropic`, or a configured
 /// repository's `owner/repo`.
 fn source_key(repository: &str) -> String {
     repository
@@ -91,7 +85,7 @@ fn source_key(repository: &str) -> String {
         .to_string()
 }
 
-/// Anthropic's catalog is bundled; the JuCode marketplace or a community
+/// Anthropic's catalog is bundled; the JuCode marketplace or a configured
 /// repository that cannot be read is only a warning.
 fn catalog(dir: PathBuf) -> Result<Value, String> {
     let mut entries = Vec::new();
@@ -132,7 +126,7 @@ fn catalog(dir: PathBuf) -> Result<Value, String> {
         }))
     };
     add(&skills::anthropic_source()?, "anthropic", "Anthropic");
-    for (name, result) in community_sources() {
+    for (name, result) in configured_sources() {
         match result {
             Ok(source) => add(&source, &source_key(&source.repository), &source.name),
             Err(error) => warnings.push(format!("{name}: {error}")),
@@ -171,7 +165,7 @@ fn install(dir: PathBuf, source: &str, id: &str) -> Result<PathBuf, String> {
     let found = if source == "anthropic" {
         skills::anthropic_source()?
     } else {
-        community_sources()
+        configured_sources()
             .into_iter()
             .find_map(|(_, result)| result.ok().filter(|s| source_key(&s.repository) == source))
             .ok_or_else(|| format!("unknown skill source: {source}"))?
