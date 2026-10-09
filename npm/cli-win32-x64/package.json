@@ -1,6 +1,6 @@
 {
   "name": "@jucode/cli-win32-x64",
-  "version": "0.4.11",
+  "version": "0.4.12",
   "description": "JuCode native CLI for Windows x64",
   "license": "Apache-2.0",
   "publishConfig": {
