@@ -629,3 +629,44 @@ fn a_steered_message_joins_the_running_turn_without_stopping_its_tool() {
         .count();
     assert_eq!(turns, 1, "one turn, not a restart");
 }
+
+#[test]
+fn an_interrupt_requeues_unread_steers_ahead_of_later_messages() {
+    let _guard = setup();
+    let dir = temp_dir("steer-interrupt");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+
+    let slow = if cfg!(windows) {
+        "RUN: Start-Sleep -Seconds 5".to_string()
+    } else {
+        "RUN: sleep 5".to_string()
+    };
+    core.submit_user_message(slow);
+    pump(&mut core, |e| matches!(e, AgentEvent::ToolStart { .. }));
+    // Steered while the tool runs, so the model has not read it yet.
+    core.submit_user_message("first".to_string());
+    core.steer();
+    core.submit_user_message("second".to_string());
+    let events = core.interrupt();
+    // Shown again, ahead of the message sent after it.
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::PendingMessages(texts) if *texts == ["first", "second"]
+    )));
+
+    let mut seen = Vec::new();
+    while !seen
+        .iter()
+        .any(|e| matches!(e, AgentEvent::UserMessage(m) if m == "second"))
+    {
+        seen.extend(pump(&mut core, is_ready));
+    }
+    let order: Vec<&str> = seen
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::UserMessage(m) => Some(m.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, ["first", "second"]);
+}

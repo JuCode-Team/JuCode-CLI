@@ -669,6 +669,12 @@ impl AgentCore {
             let Some((next, _)) = self.queued.pop_front() else {
                 return Vec::new();
             };
+            if let Err(reason) = self.hooks.user_prompt_submit(&next, &self.cwd) {
+                return vec![
+                    AgentEvent::Error(format!("blocked by user_prompt_submit hook: {reason}")),
+                    AgentEvent::PendingMessages(self.pending_texts()),
+                ];
+            }
             self.subagent_manager.steer_main(&next);
             self.steered_pending.push(next);
             return vec![
@@ -695,6 +701,7 @@ impl AgentCore {
     fn stop_current_turn(&mut self) {
         self.interrupt_flag.store(true, Ordering::SeqCst);
         self.subagent_manager.close_all();
+        self.requeue_unread_steers();
         self.receiver = None;
         self.running = false;
         self.goal_tool_receiver = None;
@@ -726,6 +733,9 @@ impl AgentCore {
             AgentEvent::Info("request interrupted".to_string()),
             AgentEvent::Status("interrupted".to_string()),
         ];
+        if !self.queued.is_empty() {
+            events.push(AgentEvent::PendingMessages(self.pending_texts()));
+        }
         events.extend(self.drain_subagent_events());
         events
     }
@@ -1719,6 +1729,7 @@ impl AgentCore {
                     WorkerEvent::Error(error) => {
                         self.subagent_manager
                             .close_all_with_message("parent turn failed");
+                        self.requeue_unread_steers();
                         events.extend(self.finish_goal_turn());
                         self.running = false;
                         disconnected = true;
@@ -1907,11 +1918,13 @@ impl AgentCore {
     }
 
     /// A turn that ended before reading what was steered into it: those
-    /// messages run next, in order, instead of being lost.
+    /// messages run next, ahead of anything queued after them, instead of
+    /// being lost. `steered_pending` is what the session has not recorded,
+    /// including a message the worker read whose event the turn's end
+    /// dropped; the inbox is emptied with it.
     fn requeue_unread_steers(&mut self) {
-        let unread = self.subagent_manager.take_unread_steers();
-        self.steered_pending.clear();
-        for message in unread.into_iter().rev() {
+        self.subagent_manager.drain_user_inbox();
+        for message in self.steered_pending.drain(..).rev() {
             self.queued.push_front((message, Vec::new()));
         }
     }
@@ -2002,6 +2015,7 @@ impl AgentCore {
         if let Err(error) = self.ensure_provider_credentials() {
             self.subagent_manager
                 .close_all_with_message("parent turn failed");
+            self.requeue_unread_steers();
             let mut events = save_event;
             events.push(AgentEvent::Error(error));
             return events;

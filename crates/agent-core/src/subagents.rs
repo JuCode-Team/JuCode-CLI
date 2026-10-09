@@ -435,11 +435,6 @@ impl SubagentManager {
         state.user_inbox.drain(..).collect()
     }
 
-    /// Steered messages the turn ended before reading.
-    pub(crate) fn take_unread_steers(&self) -> Vec<String> {
-        self.drain_user_inbox()
-    }
-
     pub(crate) fn drain_messages(&self, path: &str) -> Vec<String> {
         let mut state = self.inner.state.lock().unwrap();
         let Some(agent) = state.agents.get_mut(path) else {
