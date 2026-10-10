@@ -117,6 +117,7 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
             }
         }
         "mcp_list" => vec![core.mcp_servers_event()],
+        "context_usage" => vec![core.context_breakdown_event()],
         "mcp_set" => match value.get("server") {
             Some(server) => core.mcp_set(server),
             None => vec![AgentEvent::Error(
@@ -250,6 +251,22 @@ pub fn event_json(event: AgentEvent) -> Value {
         } => {
             json!({ "type": "context_usage", "tokens": tokens, "tokenizer": tokenizer, "cost": cost })
         }
+        AgentEvent::ContextBreakdown {
+            total,
+            max,
+            categories,
+            memory_files,
+            error,
+        } => match error {
+            Some(error) => json!({ "type": "context_breakdown", "error": error }),
+            None => json!({
+                "type": "context_breakdown",
+                "total": total,
+                "max": max,
+                "categories": categories.iter().map(|c| json!({ "name": c.name, "tokens": c.tokens, "kind": c.kind })).collect::<Vec<_>>(),
+                "memory_files": memory_files.iter().map(|(path, tokens)| json!({ "path": path, "tokens": tokens })).collect::<Vec<_>>(),
+            }),
+        },
         AgentEvent::ThinkingStart => json!({ "type": "thinking_start" }),
         AgentEvent::ReasoningDelta(delta) => {
             json!({ "type": "reasoning_delta", "delta": delta })

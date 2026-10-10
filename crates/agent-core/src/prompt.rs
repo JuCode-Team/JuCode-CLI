@@ -67,7 +67,18 @@ pub struct SkillCommand {
     pub skill: SkillPromptItem,
 }
 
+/// The whole prompt, as a turn joins its parts (core::TurnPrompt).
+#[cfg(test)]
 pub fn build_system_prompt(base: &str, context: &PromptContext) -> String {
+    let mut prompt = runtime_prompt(base, context);
+    prompt.push_str(&project_section(&context.project_instructions));
+    prompt.push_str(&skills_section(&context.skills));
+    prompt
+}
+
+/// The base prompt and the runtime context (date, directory, tools): the
+/// system prompt without the project's instructions and the skills list.
+pub fn runtime_prompt(base: &str, context: &PromptContext) -> String {
     let mut prompt = base.trim_end().to_string();
     prompt.push_str("\n\n<runtime_context>\n");
     prompt.push_str(&format!("Current date: {}\n", context.date));
@@ -83,44 +94,56 @@ pub fn build_system_prompt(base: &str, context: &PromptContext) -> String {
     };
     prompt.push_str(&format!("Tool guidance: {guidance}\n"));
     prompt.push_str("</runtime_context>");
-
-    if !context.project_instructions.is_empty() {
-        prompt.push_str("\n\n<project_context>\n");
-        prompt.push_str("Project-specific instructions and guidelines:\n\n");
-        for instruction in &context.project_instructions {
-            prompt.push_str(&format!(
-                "<project_instructions path=\"{}\">\n{}\n</project_instructions>\n\n",
-                escape_xml(&instruction.path.display().to_string()),
-                instruction.content.trim_end()
-            ));
-        }
-        prompt.push_str("</project_context>");
-    }
-
-    if !context.skills.is_empty() {
-        prompt.push_str(
-            "\n\nThe following skills provide specialized instructions for specific tasks.\n",
-        );
-        prompt.push_str("Read the full skill file when the task matches its description.\n");
-        prompt.push_str("When a skill file references a relative path, resolve it against the skill directory.\n\n");
-        prompt.push_str("<available_skills>\n");
-        for skill in &context.skills {
-            prompt.push_str("  <skill>\n");
-            prompt.push_str(&format!("    <name>{}</name>\n", escape_xml(&skill.name)));
-            prompt.push_str(&format!(
-                "    <description>{}</description>\n",
-                escape_xml(&skill.description)
-            ));
-            prompt.push_str(&format!(
-                "    <location>{}</location>\n",
-                escape_xml(&skill.path.display().to_string())
-            ));
-            prompt.push_str("  </skill>\n");
-        }
-        prompt.push_str("</available_skills>");
-    }
-
     prompt
+}
+
+/// The project's instruction files (AGENTS.md, CLAUDE.md …) as the system
+/// prompt carries them; empty without any.
+pub fn project_section(instructions: &[ProjectInstruction]) -> String {
+    if instructions.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from("\n\n<project_context>\n");
+    section.push_str("Project-specific instructions and guidelines:\n\n");
+    for instruction in instructions {
+        section.push_str(&format!(
+            "<project_instructions path=\"{}\">\n{}\n</project_instructions>\n\n",
+            escape_xml(&instruction.path.display().to_string()),
+            instruction.content.trim_end()
+        ));
+    }
+    section.push_str("</project_context>");
+    section
+}
+
+/// The skills list as the system prompt carries it; empty without any.
+pub fn skills_section(skills: &[SkillPromptItem]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from(
+        "\n\nThe following skills provide specialized instructions for specific tasks.\n",
+    );
+    section.push_str("Read the full skill file when the task matches its description.\n");
+    section.push_str(
+        "When a skill file references a relative path, resolve it against the skill directory.\n\n",
+    );
+    section.push_str("<available_skills>\n");
+    for skill in skills {
+        section.push_str("  <skill>\n");
+        section.push_str(&format!("    <name>{}</name>\n", escape_xml(&skill.name)));
+        section.push_str(&format!(
+            "    <description>{}</description>\n",
+            escape_xml(&skill.description)
+        ));
+        section.push_str(&format!(
+            "    <location>{}</location>\n",
+            escape_xml(&skill.path.display().to_string())
+        ));
+        section.push_str("  </skill>\n");
+    }
+    section.push_str("</available_skills>");
+    section
 }
 
 pub fn discover_skills(
@@ -716,5 +739,38 @@ mod tests {
             ["home-agents"]
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_prompt_is_its_sections_joined() {
+        let context = PromptContext {
+            date: "2026-10-09".to_string(),
+            cwd: PathBuf::from("/p"),
+            tools: vec!["shell"],
+            edit_tools: Vec::new(),
+            project_instructions: vec![ProjectInstruction {
+                path: PathBuf::from("/p/AGENTS.md"),
+                content: "Be brief.".to_string(),
+            }],
+            skills: vec![SkillPromptItem {
+                name: "pdf".to_string(),
+                description: "PDFs".to_string(),
+                path: PathBuf::from("/s/pdf/SKILL.md"),
+            }],
+            chat: false,
+        };
+        let project = project_section(&context.project_instructions);
+        assert!(project.contains("Be brief."));
+        assert!(skills_section(&context.skills).contains("<name>pdf</name>"));
+        assert_eq!(
+            build_system_prompt("Base.", &context),
+            format!(
+                "{}{}{}",
+                runtime_prompt("Base.", &context),
+                project,
+                skills_section(&context.skills)
+            )
+        );
+        assert_eq!(project_section(&[]), "");
     }
 }

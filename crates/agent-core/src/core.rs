@@ -17,8 +17,8 @@ use crate::{
     mcp::McpManager,
     oauth::{self, OAuthLoginResult, OAuthModel},
     prompt::{
-        build_system_prompt, discover_project_instructions, discover_skills, skill_commands,
-        skill_message, skill_pin_message, PromptContext,
+        discover_project_instructions, discover_skills, skill_commands, skill_message,
+        skill_pin_message, PromptContext,
     },
     session::{
         compaction_summary_item, ContextStatistics, EntryKind, SessionLock, SessionStore,
@@ -2016,43 +2016,20 @@ impl AgentCore {
         self.spawn_current_context_turn(save_event)
     }
 
-    fn spawn_current_context_turn(&mut self, save_event: Vec<AgentEvent>) -> Vec<AgentEvent> {
-        let keep_subagents = std::mem::take(&mut self.keep_subagents);
-        if let Err(error) = self.ensure_provider_credentials() {
-            self.subagent_manager
-                .close_all_with_message("parent turn failed");
-            self.requeue_unread_steers();
-            let mut events = save_event;
-            events.push(AgentEvent::Error(error));
-            return events;
-        }
-        if !keep_subagents {
-            self.archive_subagents();
-            self.requeue_unread_steers();
-            self.subagent_manager = SubagentManager::default();
-        }
+    /// The system prompt a turn sends, in its parts (see TurnPrompt), with
+    /// what the turn needs alongside it. Reads prompt.txt, the skills and the
+    /// project's instruction files, and refreshes the web and image tools.
+    fn turn_prompt(&mut self) -> Result<TurnPrompt, String> {
         let base_prompt = match self.config.system_prompt() {
             Ok(_) if self.chat => crate::chat::CHAT_SYSTEM_PROMPT.to_string(),
             Ok(prompt) => prompt,
-            Err(error) => {
-                let mut events = save_event;
-                events.push(AgentEvent::Error(format!(
-                    "failed to read prompt.txt: {error}"
-                )));
-                return events;
-            }
+            Err(error) => return Err(format!("failed to read prompt.txt: {error}")),
         };
         // A chat directory holds no project skills; user skills still apply.
         let project_skills = self.project_trusted && !self.chat;
         let skills = match discover_skills(self.config.profile_dir(), &self.cwd, project_skills) {
             Ok(skills) => skills,
-            Err(error) => {
-                let mut events = save_event;
-                events.push(AgentEvent::Error(format!(
-                    "failed to discover skills: {error}"
-                )));
-                return events;
-            }
+            Err(error) => return Err(format!("failed to discover skills: {error}")),
         };
         let extra_read_roots = crate::prompt::skill_read_roots(&skills);
         // Chat directories live under the home directory, where discovery
@@ -2061,11 +2038,7 @@ impl AgentCore {
             match discover_project_instructions(&self.cwd) {
                 Ok(instructions) => instructions,
                 Err(error) => {
-                    let mut events = save_event;
-                    events.push(AgentEvent::Error(format!(
-                        "failed to discover project instructions: {error}"
-                    )));
-                    return events;
+                    return Err(format!("failed to discover project instructions: {error}"))
                 }
             }
         } else {
@@ -2099,18 +2072,24 @@ impl AgentCore {
             signed_in,
             images_enabled,
         );
-        let mut system_prompt = build_system_prompt(
-            &base_prompt,
-            &PromptContext {
-                date: current_utc_date(),
-                cwd: self.cwd.clone(),
-                tools: prompt_tools,
-                edit_tools: self.config.edit_tools.clone(),
-                project_instructions,
-                skills,
-                chat: self.chat,
-            },
-        );
+        let context = PromptContext {
+            date: current_utc_date(),
+            cwd: self.cwd.clone(),
+            tools: prompt_tools,
+            edit_tools: self.config.edit_tools.clone(),
+            project_instructions,
+            skills,
+            chat: self.chat,
+        };
+        let project_files = context
+            .project_instructions
+            .iter()
+            .map(|file| (file.path.display().to_string(), file.content.clone()))
+            .collect();
+        let head = crate::prompt::runtime_prompt(&base_prompt, &context);
+        let project = crate::prompt::project_section(&context.project_instructions);
+        let skills = crate::prompt::skills_section(&context.skills);
+        let mut system_prompt = String::new();
         if let Some(sandbox) = self.tool_state.sandbox() {
             let note = sandbox.prompt(&self.cwd);
             if !note.is_empty() {
@@ -2129,6 +2108,49 @@ impl AgentCore {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(crate::plan_mode::PROMPT_ADDENDUM);
         }
+        Ok(TurnPrompt {
+            head,
+            project,
+            project_files,
+            skills,
+            tail: system_prompt,
+            extra_read_roots,
+            model_headers,
+        })
+    }
+
+    fn spawn_current_context_turn(&mut self, save_event: Vec<AgentEvent>) -> Vec<AgentEvent> {
+        let keep_subagents = std::mem::take(&mut self.keep_subagents);
+        if let Err(error) = self.ensure_provider_credentials() {
+            self.subagent_manager
+                .close_all_with_message("parent turn failed");
+            self.requeue_unread_steers();
+            let mut events = save_event;
+            events.push(AgentEvent::Error(error));
+            return events;
+        }
+        if !keep_subagents {
+            self.archive_subagents();
+            self.requeue_unread_steers();
+            self.subagent_manager = SubagentManager::default();
+        }
+        let TurnPrompt {
+            head,
+            project,
+            skills,
+            tail,
+            extra_read_roots,
+            model_headers,
+            ..
+        } = match self.turn_prompt() {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                let mut events = save_event;
+                events.push(AgentEvent::Error(error));
+                return events;
+            }
+        };
+        let system_prompt = format!("{head}{project}{skills}{tail}");
 
         // Desktop edits subagent_models in config.json while engines run. An
         // unreadable file keeps the list this engine already has.
@@ -3443,6 +3465,164 @@ impl AgentCore {
         }
     }
 
+    /// What the next request's context holds, by category: the system
+    /// prompt, tool definitions (built-in, MCP), the project's instruction
+    /// files, the skills list, and the conversation by kind of item; then the
+    /// room kept for auto-compaction and the room left. Counted with the
+    /// same tokenizer as `context_usage`, so an estimate for non-OpenAI models.
+    pub fn context_breakdown_event(&mut self) -> AgentEvent {
+        use crate::event::ContextCategory;
+        let model = self.config.model.clone();
+        let text = |t: &str| crate::tokens::count_text(&model, t).tokens as u64;
+        let values = |v: &[Value]| crate::tokens::count_values(&model, v.iter()).tokens as u64;
+        let prompt = match self.turn_prompt() {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                return AgentEvent::ContextBreakdown {
+                    total: 0,
+                    max: 0,
+                    categories: Vec::new(),
+                    memory_files: Vec::new(),
+                    error: Some(error),
+                }
+            }
+        };
+        let (efforts, specs) = crate::llm::subagent_offer(
+            &self.config.model,
+            &self.config.provider,
+            &self.config.protocol,
+            &self.config.models,
+            &self.config.subagent_models,
+        );
+        let tools = crate::llm::request_tool_definitions(&crate::llm::ToolOffer {
+            host: self.host.as_ref(),
+            mcp: &self.mcp,
+            tool_state: &self.tool_state,
+            enabled_edit_tools: &self.config.edit_tools,
+            subagents: Some((model.as_str(), efforts.as_slice(), specs.as_slice())),
+            goals: true,
+            plan_mode: self.approval_mode.get() == ApprovalMode::Plan,
+        });
+        let mcp_names: HashSet<String> = self
+            .mcp
+            .definitions()
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        let (mcp_tools, builtin_tools): (Vec<Value>, Vec<Value>) =
+            tools.into_iter().partition(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| mcp_names.contains(name))
+            });
+
+        let mut categories = vec![
+            ContextCategory {
+                name: "System prompt",
+                tokens: text(&format!("{}{}", prompt.head, prompt.tail)),
+                kind: "used",
+            },
+            ContextCategory {
+                name: "System tools",
+                tokens: values(&builtin_tools),
+                kind: "used",
+            },
+            ContextCategory {
+                name: "MCP tools",
+                tokens: values(&mcp_tools),
+                kind: "used",
+            },
+            ContextCategory {
+                name: "Memory files",
+                tokens: text(&prompt.project),
+                kind: "used",
+            },
+            ContextCategory {
+                name: "Skills",
+                tokens: text(&prompt.skills),
+                kind: "used",
+            },
+        ];
+        const KINDS: [&str; 7] = [
+            "Compacted summary",
+            "User messages",
+            "Assistant messages",
+            "Reasoning",
+            "Tool calls",
+            "Tool results",
+            "Images",
+        ];
+        let mut conversation = [0u64; KINDS.len()];
+        for (index, item) in self.session.request_context_items().iter().enumerate() {
+            let tokens = crate::tokens::count_value(&model, item).tokens as u64;
+            let opens = |prefix: &str| {
+                item.pointer("/content/0/text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t.starts_with(prefix))
+            };
+            let image = item
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| part.get("type").and_then(Value::as_str) == Some("input_image"))
+                });
+            let kind = match (
+                item.get("type").and_then(Value::as_str),
+                item.get("role").and_then(Value::as_str),
+            ) {
+                (Some("reasoning"), _) => 3,
+                (Some("function_call" | "custom_tool_call"), _) => 4,
+                (Some("function_call_output" | "custom_tool_call_output"), _) => 5,
+                (_, Some("assistant")) => 2,
+                _ if index == 0 && opens(crate::session::COMPACTION_PREFIX) => 0,
+                _ if image => 6,
+                _ => 1,
+            };
+            conversation[kind] += tokens;
+        }
+        categories.extend(
+            KINDS
+                .iter()
+                .zip(conversation)
+                .map(|(name, tokens)| ContextCategory {
+                    name,
+                    tokens,
+                    kind: "used",
+                }),
+        );
+        categories.retain(|c| c.tokens > 0);
+
+        let total: u64 = categories.iter().map(|c| c.tokens).sum();
+        let window = self.config.current_model_config().context_window;
+        let limit = self.effective_context_limit().min(window);
+        if window > 0 {
+            categories.push(ContextCategory {
+                name: "Autocompact buffer",
+                tokens: window - limit,
+                kind: "buffer",
+            });
+            categories.push(ContextCategory {
+                name: "Free space",
+                tokens: limit.saturating_sub(total),
+                kind: "free",
+            });
+            categories.retain(|c| c.tokens > 0);
+        }
+        AgentEvent::ContextBreakdown {
+            total,
+            max: window,
+            categories,
+            memory_files: prompt
+                .project_files
+                .iter()
+                .map(|(path, content)| (path.clone(), text(content)))
+                .collect(),
+            error: None,
+        }
+    }
+
     fn context_usage_event(&self) -> AgentEvent {
         let (tokens, tokenizer) = self.session.context_token_usage(&self.config.model);
         AgentEvent::ContextUsage {
@@ -4576,6 +4756,20 @@ fn target_context_budget(model_config: &ModelConfig, threshold_percent: u64) -> 
 /// A budget of 0 means the window is unknown: never compact on a guess. An
 /// over-long request is then caught by the upstream's rejection instead
 /// (`is_context_overflow`).
+/// A turn's system prompt in its parts: the base prompt with the runtime
+/// context (`head`), the project's instruction files, the skills list, and
+/// what follows them (sandbox note, host prompt, plan-mode addendum).
+struct TurnPrompt {
+    head: String,
+    project: String,
+    /// The instruction files `project` carries: path and content.
+    project_files: Vec<(String, String)>,
+    skills: String,
+    tail: String,
+    extra_read_roots: Vec<std::path::PathBuf>,
+    model_headers: std::collections::HashMap<String, Vec<(String, String)>>,
+}
+
 fn should_auto_compact(context_tokens: usize, model_context_budget: usize) -> bool {
     model_context_budget > 0 && context_tokens > model_context_budget
 }

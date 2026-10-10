@@ -1499,6 +1499,9 @@ impl Claude {
                 "get_task_output" => {
                     vec![json!({ "type": "task_output", "task_id": tag, "error": message })]
                 }
+                "get_context_usage" => {
+                    vec![json!({ "type": "context_breakdown", "error": message })]
+                }
                 // Requests outside the turn: an `error` would end the one running.
                 "mcp_status"
                 | "mcp_toggle"
@@ -1618,6 +1621,7 @@ impl Claude {
                 vec![json!({ "type": "side_answer", "question": tag, "answer": answer })]
             }
             "mcp_status" => vec![mcp_servers(&response["response"]["mcpServers"])],
+            "get_context_usage" => vec![context_breakdown(&response["response"])],
             "list_permission_rules" => {
                 let state = &response["response"]["state"];
                 vec![
@@ -1771,6 +1775,41 @@ impl Claude {
 
 /// `mcp_servers` from the CLI's server statuses (`mcp_status`, or the
 /// names and states `system/init` lists).
+/// Claude Code's `get_context_usage` as the protocol's `context_breakdown`:
+/// the context by category (system prompt, tools, memory files, skills,
+/// messages, …), each of a `kind` — `used`, `deferred` (tools loaded only when
+/// called), `buffer` (kept free for auto-compaction) or `free` — and the
+/// memory files it read.
+fn context_breakdown(usage: &Value) -> Value {
+    let categories: Vec<Value> = usage["categories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            // Older CLIs say only isDeferred.
+            let kind = match text(&c["kind"]) {
+                "" if c["isDeferred"] == true => "deferred",
+                "" => "used",
+                kind => kind,
+            };
+            json!({ "name": c["name"], "tokens": c["tokens"].as_u64().unwrap_or(0), "kind": kind })
+        })
+        .collect();
+    let memory: Vec<Value> = usage["memoryFiles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|f| json!({ "path": f["path"], "tokens": f["tokens"].as_u64().unwrap_or(0) }))
+        .collect();
+    json!({
+        "type": "context_breakdown",
+        "total": usage["totalTokens"].as_u64().unwrap_or(0),
+        "max": usage["maxTokens"].as_u64().unwrap_or(0),
+        "categories": categories,
+        "memory_files": memory,
+    })
+}
+
 fn mcp_servers(servers: &Value) -> Value {
     let servers: Vec<Value> = servers
         .as_array()
@@ -2212,6 +2251,8 @@ impl Adapter for Claude {
                 text(&op["task_id"]),
             )],
             "mcp_list" => vec![self.control_request(json!({ "subtype": "mcp_status" }), "")],
+            // What the context holds, by kind (Claude Code's /context).
+            "context_usage" => vec![self.control_request(json!({ "subtype": "get_context_usage" }), "")],
             "mcp_toggle" | "mcp_reconnect" => {
                 let request = if op["op"] == "mcp_toggle" {
                     json!({ "subtype": "mcp_toggle", "serverName": op["name"], "enabled": op["enabled"] == true })
@@ -3235,6 +3276,49 @@ mod tests {
             json!({ "type": "control_response", "response": { "subtype": "error", "request_id": request_id(&toggle, "mcp_toggle"), "error": "no such server" } }),
         );
         assert_eq!(failed[0]["type"], "info");
+    }
+
+    #[test]
+    fn context_usage_is_the_breakdown_by_kind() {
+        let mut c = claude();
+        let asked = c.encode(&json!({ "op": "context_usage" })).unwrap().frames;
+        let out = frame(
+            &mut c,
+            reply(
+                request_id(&asked, "get_context_usage"),
+                json!({
+                    "categories": [
+                        { "name": "System prompt", "tokens": 3100, "color": "x", "kind": "used" },
+                        { "name": "MCP tools", "tokens": 900, "color": "x", "isDeferred": true },
+                        { "name": "Messages", "tokens": 41000, "color": "x" },
+                        { "name": "Free space", "tokens": 150000, "color": "x", "kind": "free" }
+                    ],
+                    "totalTokens": 45000, "maxTokens": 200000,
+                    "memoryFiles": [{ "path": "/p/CLAUDE.md", "type": "Project", "tokens": 600 }]
+                }),
+            ),
+        );
+        assert_eq!(out[0]["type"], "context_breakdown");
+        assert_eq!(out[0]["total"], 45000);
+        assert_eq!(out[0]["max"], 200000);
+        let kinds: Vec<&str> = out[0]["categories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["used", "deferred", "used", "free"]);
+        assert_eq!(out[0]["memory_files"][0]["tokens"], 600);
+        // An older CLI without it: the panel stops waiting, the turn goes on.
+        let asked = c.encode(&json!({ "op": "context_usage" })).unwrap().frames;
+        let failed = frame(
+            &mut c,
+            json!({ "type": "control_response", "response": { "subtype": "error", "request_id": request_id(&asked, "get_context_usage"), "error": "unsupported" } }),
+        );
+        assert_eq!(
+            failed[0],
+            json!({ "type": "context_breakdown", "error": "unsupported" })
+        );
     }
 
     #[test]

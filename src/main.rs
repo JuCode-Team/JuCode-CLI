@@ -691,6 +691,7 @@ fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
         AgentEvent::CompactionProgress { .. } => "compaction_progress",
         AgentEvent::CompactionEnd => "compaction_end",
         AgentEvent::CompactionFailed(_) => "compaction_failed",
+        AgentEvent::ContextBreakdown { .. } => "context_breakdown",
         AgentEvent::ContextUsage {
             tokens,
             tokenizer,

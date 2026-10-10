@@ -104,6 +104,16 @@ pub enum TranscriptItem {
     },
 }
 
+/// One category of the context (`ContextBreakdown`): its name (as Claude
+/// Code names them, so clients label both alike), tokens, and kind — `used`,
+/// `buffer` (kept free for auto-compaction) or `free`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextCategory {
+    pub name: &'static str,
+    pub tokens: u64,
+    pub kind: &'static str,
+}
+
 #[derive(Debug)]
 pub enum AgentEvent {
     Startup {
@@ -142,6 +152,15 @@ pub enum AgentEvent {
         tokenizer: String,
         /// Cumulative USD cost so far this session. 0 when prices are unconfigured.
         cost: f64,
+    },
+    /// What the context holds, by category (`context_usage` op); `error`
+    /// when it could not be worked out.
+    ContextBreakdown {
+        total: u64,
+        max: u64,
+        categories: Vec<ContextCategory>,
+        memory_files: Vec<(String, u64)>,
+        error: Option<String>,
     },
     ThinkingStart,
     ReasoningDelta(String),

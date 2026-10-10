@@ -22,6 +22,11 @@ const RESUME_SUMMARY_TOOL_TEXT_MAX_CHARS: usize = 240;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EntryId(u64);
 
+/// How the compaction summary item opens (the first context item after a
+/// compaction).
+pub(crate) const COMPACTION_PREFIX: &str =
+    "[Earlier conversation compacted to a summary for context efficiency]";
+
 impl EntryId {
     pub fn display(self) -> String {
         format!("e{}", self.0)
@@ -1467,7 +1472,7 @@ pub fn compaction_summary_item(summary: &str) -> Value {
         "role": "user",
         "content": [{
             "type": "input_text",
-            "text": format!("[Earlier conversation compacted to a summary for context efficiency]\n\n{summary}")
+            "text": format!("{COMPACTION_PREFIX}\n\n{summary}")
         }]
     })
 }

@@ -292,6 +292,7 @@ Claude Code sessions take more:
 | `stop_task` `task_id` | Stops a background task | `background_tasks`, then `task_done` |
 | `task_output` `task_id` | A background shell's or Monitor's output, its last 8 KiB | `task_output` with `task_id`, `output`, `truncated` (or `error`) |
 | `mcp_list`, `mcp_toggle` `name` `enabled`, `mcp_reconnect` `name` | Claude Code's own MCP servers, for this session | `mcp_servers` |
+| `context_usage` | What the context holds, by category (Claude Code's `/context`). JuCode sessions answer it too, counting with their own tokenizer; Codex sessions do not | `context_breakdown` with `total`, `max`, `categories: [{name, tokens, kind}]` (`kind`: `used`, `deferred` — tools loaded only when called —, `buffer` — kept free for auto-compaction — or `free`), `memory_files: [{path, tokens}]`; or `error` |
 | `agent_runs` | The agent trace: every Workflow and Task subagent of the conversation, live ones and those Claude Code saved before this process | `agent_runs` (below) |
 | `subagent_transcript` `agent_id` | One subagent's own conversation, read from the file Claude Code keeps for it | `subagent_transcript` with `agent_id` and `items` (`user`/`assistant`/`reasoning` with `content`; `tool` with `call_id`, `name`, `output`, `is_error`, `running`; the newest 600), or `error` |
 | `permission_rules` | The rules in effect, as `/permissions` lists them | `permission_rules` with `rules: [{behavior, source, rule, editability}]`, `directories` |
