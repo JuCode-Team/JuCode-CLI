@@ -4,6 +4,8 @@ JuCode CLI is a compact coding-agent CLI for repository work. It provides an int
 
 The project is intentionally small: the agent harness is designed to give the model enough autonomy to implement and verify tasks without loading a large framework prompt or exposing high-noise tools by default.
 
+For a window instead of a terminal, use [JuCode Desktop](https://github.com/JuCode-Team/JuCode-Desktop): it runs this agent next to Claude Code, Codex and ACP agents, with each project's files, git and terminal beside the conversation, and reaches your sessions from your phone. Its background service is this CLI's `jucode daemon`.
+
 ## Highlights
 
 - **Interactive TUI by default** for day-to-day coding tasks.
