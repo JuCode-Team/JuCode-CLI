@@ -1,10 +1,10 @@
 //! Tools a long-lived agent's sessions get from the daemon, added to the
-//! engine through `HostExtensions`: `message_agent`, `timer`, `schedule`,
-//! `brief`, `question`, `report`, `finish`, `open_items` and `requirements`.
+//! engine through `HostExtensions`: `message_agent`, `task`, `brief`,
+//! `question`, `finish`, `open_items` and `requirements`.
 
 use crate::{
     hub::Hub,
-    store::{now, ItemKind, Message, Question, Report, Timer},
+    store::{now, ItemKind, Message, Question, Timer},
 };
 use jucode_agent_core::host::HostExtensions;
 use serde_json::{json, Value};
@@ -30,7 +30,8 @@ pub fn extensions(hub: Arc<Hub>, agent: String, session: String) -> HostExtensio
             }
         }),
         prompt: Arc::new(move || {
-            let mut prompt = prompt_hub.agents.prompt(&prompt_agent, &prompt_session);
+            let recent = prompt_hub.recent_notes(&prompt_agent, &prompt_session);
+            let mut prompt = prompt_hub.agents.prompt(&prompt_agent, &recent);
             prompt.push_str(&project_prompt(&prompt_hub, &prompt_agent));
             prompt
         }),
@@ -140,61 +141,64 @@ fn run(
             })?;
             Ok(json!({ "sent": id, "to": to }))
         }
-        "timer" => match text("action").as_deref() {
-            Some("set") => {
-                let body = text("body").ok_or("timer set requires body")?;
+        "task" => match text("action").as_deref() {
+            Some("list") => Ok(json!(hub.tasks_json(Some(agent))["tasks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|task| json!({
+                    "id": task["id"], "title": task["title"], "state": task["state"],
+                    "trigger": task["trigger"], "next_at_unix": task["next_at"].as_u64().map(|at| at / 1000),
+                }))
+                .chain(hub.store.active_timers().into_iter().filter(|timer| timer.agent == agent).map(|timer| json!({
+                    "reminder": timer.id, "fire_at_unix": timer.fire_at / 1000, "body": timer.body,
+                })))
+                .collect::<Vec<_>>())),
+            Some("remind") => {
+                let body = text("body").ok_or("remind requires body")?;
                 let fire_at = match (args["in_seconds"].as_u64(), args["at"].as_u64()) {
                     (Some(seconds), _) => now() + seconds * 1000,
                     (None, Some(unix_seconds)) => unix_seconds * 1000,
-                    (None, None) => return Err("timer set requires in_seconds or at".to_string()),
+                    (None, None) => return Err("remind requires in_seconds or at".to_string()),
                 };
                 let timer = Timer {
                     id: hub.new_id("t"),
                     agent: agent.to_string(),
-                    // A new session only when asked: by default the timer
-                    // comes back to the conversation that set it.
-                    session: (args["new_session"] != true).then(|| session.to_string()),
+                    // A new task only when asked: by default the reminder
+                    // comes back to this task's conversation.
+                    session: (args["new_task"] != true).then(|| session.to_string()),
                     fire_at,
                     body,
                 };
                 hub.set_timer(&timer)?;
-                Ok(json!({ "timer": timer.id, "fire_at_unix": fire_at / 1000 }))
+                Ok(json!({ "reminder": timer.id, "fire_at_unix": fire_at / 1000 }))
             }
-            Some("list") => Ok(json!(hub
-                .store
-                .active_timers()
-                .into_iter()
-                .filter(|timer| timer.agent == agent)
-                .map(|timer| json!({
-                    "timer": timer.id,
-                    "fire_at_unix": timer.fire_at / 1000,
-                    "body": timer.body,
-                    "session": timer.session,
-                }))
-                .collect::<Vec<_>>())),
-            Some("cancel") => {
-                let id = text("timer").ok_or("timer cancel requires timer")?;
+            Some("cancel_reminder") => {
+                let id = text("reminder").ok_or("cancel_reminder requires reminder")?;
                 hub.cancel_timer(&id, Some(agent))?;
                 Ok(json!({ "cancelled": id }))
             }
-            _ => Err("timer action must be set, list or cancel".to_string()),
-        },
-        "schedule" => match text("action").as_deref() {
-            Some("list") => Ok(hub.schedules_json(Some(agent))["schedules"].clone()),
-            Some("create") if args["id"].is_null() => hub
+            Some("schedule") => hub
                 .propose_schedule(agent, args)
                 .map(|schedule| json!({ "proposed": schedule.to_json(), "note": "switched off until the user turns it on" })),
-            Some("create") => Err("create takes no id; use update".to_string()),
-            Some("update") if args["id"].is_string() => hub
-                .propose_schedule(agent, args)
-                .map(|schedule| json!({ "proposed": schedule.to_json(), "note": "switched off until the user turns it on again" })),
-            Some("update") => Err("update requires id".to_string()),
-            Some("delete") => {
-                let id = text("id").ok_or("delete requires id")?;
+            Some("unschedule") => {
+                let id = text("id").ok_or("unschedule requires id")?;
                 hub.delete_schedule_by(&id, Some(agent))?;
                 Ok(json!({ "deleted": id }))
             }
-            _ => Err("schedule action must be list, create, update or delete".to_string()),
+            Some("close") => {
+                let id = text("id").ok_or("close requires id")?;
+                let reason = text("reason").ok_or("close requires a reason the user will read")?;
+                let own = hub.tasks_json(Some(agent))["tasks"]
+                    .as_array()
+                    .is_some_and(|tasks| tasks.iter().any(|task| task["id"] == id.as_str()));
+                if !own {
+                    return Err(format!("{id} is not one of your tasks"));
+                }
+                hub.close_task(&id, &format!("agent:{agent}"), &reason)?;
+                Ok(json!({ "closed": id }))
+            }
+            _ => Err("task action must be list, remind, cancel_reminder, schedule, unschedule or close".to_string()),
         },
         "brief" => match text("action").as_deref() {
             Some("read") => {
@@ -257,23 +261,16 @@ fn run(
                 "note": "Recorded for the user. Carry on with work that does not depend on the answer, under your stated assumption; the answer (or the deadline passing) arrives in this conversation as a message."
             }))
         }
-        "report" => {
-            let report = Report {
-                id: hub.new_id("r"),
-                agent: agent.to_string(),
-                session: session.to_string(),
-                title: text("title").ok_or("report requires title")?,
-                body: text("body").unwrap_or_default(),
-                at: now(),
-                read: false,
-            };
-            hub.post_report(&report)?;
-            Ok(json!({ "report": report.id }))
-        }
         "finish" => {
             let verdict = text("verdict").ok_or("finish requires verdict")?;
             let summary = text("summary").ok_or("finish requires summary")?;
-            let run = hub.finish_run(session, &verdict, &summary, &text("next").unwrap_or_default())?;
+            let run = hub.finish_run(
+                session,
+                &verdict,
+                &summary,
+                &text("next").unwrap_or_default(),
+                &text("details").unwrap_or_default(),
+            )?;
             Ok(json!({ "run": run, "note": "Recorded. End your turn now." }))
         }
         "open_items" => match text("action").as_deref() {
@@ -323,20 +320,6 @@ fn definitions() -> Vec<Value> {
         }),
         json!({
             "type": "function",
-            "name": "report",
-            "description": "Tell the user what you finished or found, for them to read later on their desk. It wakes nobody. Report outcomes worth their attention (done, blocked, something they should know), not every step.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "title": { "type": "string", "description": "The outcome in one line." },
-                    "body": { "type": "string", "description": "Details: what changed, how it was checked, what is left." }
-                },
-                "required": ["title"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "type": "function",
             "name": "message_agent",
             "description": "Send a message to another long-lived agent (listed in <other_agents>; not a subagent). It is delivered into that agent's work, which starts or continues a session there. Use it to hand off work or ask for something in their area.",
             "parameters": {
@@ -352,37 +335,25 @@ fn definitions() -> Vec<Value> {
         }),
         json!({
             "type": "function",
-            "name": "timer",
-            "description": "Come back to something later. `set` delivers `body` to you as a message after `in_seconds` (or at unix time `at`), into this conversation unless `new_session` is true; it fires even if nobody has the app open. `list` shows your pending timers, `cancel` removes one.",
+            "name": "task",
+            "description": "Your tasks and when they run. `list`: your tasks with their state and trigger, and your pending reminders. `remind`: come back later; `body` arrives as a message after `in_seconds` (or at unix `at`), in this task unless `new_task` is true, even if nobody has the app open. `cancel_reminder` removes one. `schedule`: propose recurring work (`name`, `prompt`, `repeat`, `time`, `days` / `date`; with `id`, change one); it stays switched off until the user turns it on, so say why in your `finish` summary. `unschedule` deletes one of your scheduled tasks. `close` puts away one of your tasks that is no longer needed, with a `reason` the user reads.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["set", "list", "cancel"] },
+                    "action": { "type": "string", "enum": ["list", "remind", "cancel_reminder", "schedule", "unschedule", "close"] },
                     "in_seconds": { "type": "integer", "minimum": 0 },
                     "at": { "type": "integer", "description": "Unix time in seconds." },
-                    "body": { "type": "string", "description": "What to do when it fires." },
-                    "new_session": { "type": "boolean" },
-                    "timer": { "type": "string", "description": "Timer id, for cancel." }
-                },
-                "required": ["action"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "type": "function",
-            "name": "schedule",
-            "description": "Propose recurring work for yourself: a task that runs `prompt` at set local times, each run in a new session told what the last run concluded. What you create or update stays switched off until the user turns it on in the app, so tell them why in a `report`. Use `timer` for a one-off return instead. `list` shows your scheduled tasks; `delete` removes one of yours.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "enum": ["list", "create", "update", "delete"] },
-                    "id": { "type": "string", "description": "Schedule id, for update and delete." },
-                    "name": { "type": "string", "description": "Short name, e.g. 每日巡检." },
-                    "prompt": { "type": "string", "description": "The self-contained message each run receives." },
+                    "body": { "type": "string", "description": "remind: what to do when it fires." },
+                    "new_task": { "type": "boolean", "description": "remind: start a new task instead of continuing this one." },
+                    "reminder": { "type": "string", "description": "Reminder id, for cancel_reminder." },
+                    "id": { "type": "string", "description": "Task or schedule id, for schedule (to change one), unschedule and close." },
+                    "name": { "type": "string", "description": "schedule: short name, e.g. 每日巡检." },
+                    "prompt": { "type": "string", "description": "schedule: the self-contained message each run receives." },
                     "repeat": { "type": "string", "enum": ["once", "hourly", "daily", "weekdays", "weekly"] },
                     "time": { "type": "string", "description": "Local HH:MM (24-hour); hourly uses only the minute." },
                     "days": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 6 }, "description": "weekly: 0 is Sunday." },
-                    "date": { "type": "string", "description": "once: YYYY-MM-DD." }
+                    "date": { "type": "string", "description": "once: YYYY-MM-DD." },
+                    "reason": { "type": "string", "description": "close: why, in one line in the user's language." }
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -391,7 +362,7 @@ fn definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "name": "brief",
-            "description": "Read or rewrite your own brief: role.md, capabilities.md, policy.md, state.md, or a memory/<topic>.md note. `write` replaces the whole file. `list` shows your memory files.",
+            "description": "Read or rewrite your own brief: role.md, capabilities.md, policy.md (each under 4000 characters: they go into every turn), or a memory/<topic>.md note. `write` replaces the whole file. `list` shows your memory files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -412,7 +383,8 @@ fn definitions() -> Vec<Value> {
                 "properties": {
                     "verdict": { "type": "string", "enum": ["quiet", "done", "needs_you", "failed"] },
                     "summary": { "type": "string", "description": "For the user, in their language: at most five short lines on what happened and what matters." },
-                    "next": { "type": "string", "description": "For the next run of this task: what it should know or pick up. Omit when nothing." }
+                    "next": { "type": "string", "description": "For the next run of this task: what it should know or pick up. Omit when nothing." },
+                    "details": { "type": "string", "description": "A longer write-up the user may want to read (findings, a list, a plan); kept as a report of this run. Omit when the summary says it all." }
                 },
                 "required": ["verdict", "summary"],
                 "additionalProperties": false

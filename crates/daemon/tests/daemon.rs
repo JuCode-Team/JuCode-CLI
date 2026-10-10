@@ -407,23 +407,26 @@ fn each_user_task_gets_a_new_session_that_reads_the_last_handoff() {
     assert!(reply.contains("<agent id=\"route\""), "{reply}");
     assert!(reply.contains("Keeps the build green"), "{reply}");
 
-    // The turn's end has the title model write the session's handoff note
-    // (the test model echoes what it was asked).
-    let notes = daemon.agents.join("route/handoffs.json");
-    let mut written = String::new();
+    // The turn's end has the title model write the run's handoff note into
+    // its outcome (the test model echoes what it was asked).
+    let mut listed = Value::Null;
     for _ in 0..50 {
-        written = std::fs::read_to_string(&notes).unwrap_or_default();
-        if written.contains(session.as_str()) {
+        listed = request(
+            &mut client,
+            json!({ "op": "handoff_list", "agent": "route" }),
+        );
+        if listed["handoffs"][0]["session"] == session.as_str() {
             break;
         }
         thread::sleep(Duration::from_millis(100));
     }
-    assert!(written.contains("user said: Session:"), "{written}");
-    let listed = request(
-        &mut client,
-        json!({ "op": "handoff_list", "agent": "route" }),
+    assert_eq!(
+        listed["handoffs"][0]["session"],
+        session.as_str(),
+        "{listed}"
     );
-    assert_eq!(listed["handoffs"][0]["session"], session.as_str());
+    let note = listed["handoffs"][0]["text"].as_str().unwrap_or_default();
+    assert!(note.contains("user said: Session:"), "{note}");
 
     // A new task is a new session, told what the last one concluded.
     client.send(json!({ "op": "message_send", "agent": "route", "body": "SYSTEM" }));
@@ -435,10 +438,8 @@ fn each_user_task_gets_a_new_session_that_reads_the_last_handoff() {
     assert_ne!(next, session);
     let frames = client.until(ready(&next));
     let reply = reply_text(&frames, &next);
-    assert!(
-        reply.contains(&format!("<handoff session=\"{session}\"")),
-        "{reply}"
-    );
+    assert!(reply.contains("<handoff task=\"task-"), "{reply}");
+    assert!(reply.contains("user said: Session:"), "{reply}");
 
     // A reply names its session and continues it.
     client.send(json!({ "op": "message_send", "agent": "route", "body": "and another thing", "session": session }));
@@ -471,11 +472,11 @@ fn an_agent_proposes_a_schedule_that_stays_off_until_the_user_turns_it_on() {
     );
     let theirs = theirs["schedule"]["id"].as_str().unwrap().to_string();
 
-    let call = |body: Value| format!("CALL schedule {body}");
+    let call = |body: Value| format!("CALL task {body}");
     client.send(
         json!({ "op": "message_send", "agent": "planner", "body": call(json!({
         // Filled the way some models fill every optional field.
-        "action": "create", "id": "", "date": "", "days": [],
+        "action": "schedule", "id": "", "date": "", "days": [],
         "name": "每日巡检", "prompt": "check the deploys",
         "repeat": "daily", "time": "09:30",
     })) }),
@@ -498,9 +499,9 @@ fn an_agent_proposes_a_schedule_that_stays_off_until_the_user_turns_it_on() {
     let mine = mine["id"].as_str().unwrap().to_string();
 
     // Another agent's task is out of reach.
-    client.send(json!({ "op": "message_send", "agent": "planner", "body": call(json!({ "action": "delete", "id": theirs })) }));
+    client.send(json!({ "op": "message_send", "agent": "planner", "body": call(json!({ "action": "unschedule", "id": theirs })) }));
     let frames = client.until(|frame| {
-        frame["type"] == "tool_output" && frame["name"] == "schedule" && frame["is_error"] == true
+        frame["type"] == "tool_output" && frame["name"] == "task" && frame["is_error"] == true
     });
     assert!(
         frames
@@ -521,7 +522,7 @@ fn an_agent_proposes_a_schedule_that_stays_off_until_the_user_turns_it_on() {
     assert!(reply["schedule"]["next_run_at"].as_u64().is_some());
     client.send(
         json!({ "op": "message_send", "agent": "planner", "body": call(json!({
-        "action": "update", "id": mine, "time": "10:00", "enabled": true,
+        "action": "schedule", "id": mine, "time": "10:00", "enabled": true,
     })) }),
     );
     client.until(|frame| {
@@ -625,7 +626,7 @@ fn a_timer_set_by_an_agent_wakes_it_with_nobody_connected() {
     client.send(json!({
         "op": "message_send",
         "agent": "waker",
-        "body": r#"CALL timer {"action":"set","in_seconds":1,"body":"check the deploy"}"#,
+        "body": r#"CALL task {"action":"remind","in_seconds":1,"body":"check the deploy"}"#,
     }));
     let frames = client.until(delivered_to("waker"));
     let session = frames.last().unwrap()["session"]
@@ -856,22 +857,24 @@ fn an_unanswered_question_falls_back_to_its_default_at_the_deadline() {
 }
 
 #[test]
-fn a_report_is_listed_until_read_and_wakes_nobody() {
+fn a_runs_write_up_is_a_report_listed_until_read() {
     let _guard = setup();
     let daemon = start_daemon();
     let mut client = Client::connect(&daemon);
     create_agent(&mut client, "reporter", "Reports");
+    // A run's longer write-up (`finish` with details) is kept as a report.
     let (_, frames) = run_agent(
         &mut client,
         "reporter",
-        r#"CALL report {"title":"Login fixed","body":"tests: 12 pass"}"#,
+        r#"CALL finish {"verdict":"done","summary":"Login fixed","details":"tests: 12 pass"}"#,
     );
     let posted = frames
         .iter()
         .find(|frame| frame["type"] == "report_posted")
         .expect("the report is broadcast")["report"]
         .clone();
-    assert_eq!(posted["title"], "Login fixed");
+    assert_eq!(posted["body"], "tests: 12 pass");
+    assert!(!posted["title"].as_str().unwrap_or_default().is_empty());
     assert_eq!(posted["read"], false);
     // Posting a report started no further delivery.
     assert_eq!(

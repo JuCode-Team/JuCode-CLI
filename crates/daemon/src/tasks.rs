@@ -11,7 +11,10 @@ use crate::{
     store::{now, Message, Outcome, Question, Run, TaskRecord},
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 /// Runs of one agent working at once; more wait.
 pub const MAX_PER_AGENT: usize = 2;
@@ -23,6 +26,16 @@ const MIGRATE_SINCE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const MIGRATED: &str = "tasks_migrated";
 
 const VERDICTS: [&str; 4] = ["quiet", "done", "needs_you", "failed"];
+/// A run working longer than this is stopped and counted as failed.
+pub const RUN_TIMEOUT_MS: u64 = 2 * 60 * 60 * 1000;
+/// An agent session nobody watches has its engine closed this long after
+/// its last run ended; the next message to it opens it again.
+pub const IDLE_CLOSE_MS: u64 = 30 * 60 * 1000;
+/// How often `sweep` looks for runs to time out and sessions to close.
+const SWEEP_EVERY_MS: u64 = 60 * 1000;
+static LAST_SWEEP: AtomicU64 = AtomicU64::new(0);
+/// How many earlier runs' notes a prompt carries.
+const NOTES_IN_PROMPT: usize = 3;
 
 /// What started a run, from its message's origin.
 fn trigger(from: &str, task_exists: bool) -> &'static str {
@@ -181,20 +194,32 @@ impl Hub {
         let status = if failed { "failed" } else { "succeeded" };
         let _ = self.store.record_run_ended(&run.id, status);
         let by_agent = run.outcome.as_ref().is_some_and(|o| o.source == "agent");
-        if failed {
+        let verdict = if failed {
             let mut outcome = run
                 .outcome
                 .clone()
                 .unwrap_or_else(|| inferred("failed", ""));
             outcome.verdict = "failed".to_string();
             let _ = self.store.record_outcome(&run.id, &outcome);
-        } else if !by_agent {
+            "failed".to_string()
+        } else if by_agent {
+            run.outcome
+                .as_ref()
+                .map(|o| o.verdict.clone())
+                .unwrap_or_default()
+        } else {
             let verdict = if self.run_left_items(&run) {
                 "needs_you"
             } else {
                 "done"
             };
             let _ = self.store.record_outcome(&run.id, &inferred(verdict, ""));
+            verdict.to_string()
+        };
+        // The user hears of a run only when it needs them or failed; a
+        // turn that ended on an error is already told (`report_failed_turn`).
+        if verdict == "needs_you" || (verdict == "failed" && !failed) {
+            self.notify_run(&run, &verdict);
         }
         self.broadcast_tasks(&agent);
         Some((run.id, by_agent))
@@ -223,6 +248,7 @@ impl Hub {
         verdict: &str,
         summary: &str,
         next: &str,
+        details: &str,
     ) -> Result<String, String> {
         if !VERDICTS.contains(&verdict) {
             return Err(format!("verdict must be one of {}", VERDICTS.join(", ")));
@@ -243,8 +269,145 @@ impl Hub {
         self.store
             .record_outcome(&run.id, &outcome)
             .map_err(|error| error.to_string())?;
+        // A longer write-up stays readable as a report of the run.
+        if !details.trim().is_empty() {
+            let title = self
+                .task_title(&run.task)
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| summary.lines().next().unwrap_or_default().to_string());
+            self.post_report(&crate::store::Report {
+                id: self.new_id("r"),
+                agent: run.agent.clone(),
+                session: session.to_string(),
+                title,
+                body: details.trim().to_string(),
+                at: now(),
+                read: false,
+            })?;
+        }
         self.broadcast_tasks(&run.agent);
         Ok(run.id)
+    }
+
+    /// Tells the user's devices that a run needs them or failed.
+    fn notify_run(&self, run: &Run, verdict: &str) {
+        let title = self.task_title(&run.task).unwrap_or_default();
+        let summary = self
+            .store
+            .runs()
+            .into_iter()
+            .find(|r| r.id == run.id)
+            .and_then(|r| r.outcome)
+            .map(|o| o.summary)
+            .filter(|summary| !summary.is_empty());
+        // Inferred: what it asked is what the user needs to see.
+        let body = summary.unwrap_or_else(|| {
+            self.store
+                .open_questions()
+                .iter()
+                .filter(|q| Some(q.session.as_str()) == run.session.as_deref())
+                .map(|q| q.title.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        let head = if verdict == "failed" {
+            "失败"
+        } else {
+            "需要你"
+        };
+        self.notify(&format!("{head}：{title}"), &body, &run.id);
+    }
+
+    /// A task's title as the user sees it (its schedule's name, or its
+    /// session's title).
+    pub(crate) fn task_title(&self, id: &str) -> Option<String> {
+        if let Some(name) = lock(&self.schedules)
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.name.clone())
+        {
+            return Some(name);
+        }
+        let task = self.store.tasks().into_iter().find(|task| task.id == id)?;
+        let session_title = task.session.as_deref().and_then(|session| {
+            self.store
+                .sessions()
+                .into_iter()
+                .find(|record| record.id == session)
+                .and_then(|record| record.title)
+        });
+        Some(session_title.unwrap_or(task.title))
+    }
+
+    /// Stops a working run: its turn is interrupted and it ends `cancelled`
+    /// (by the user) or `failed` (it ran past `RUN_TIMEOUT_MS`).
+    pub fn cancel_run(&self, id: &str, timed_out: bool) -> Result<(), String> {
+        let run = self
+            .store
+            .runs()
+            .into_iter()
+            .find(|run| run.id == id)
+            .ok_or_else(|| format!("unknown run {id}"))?;
+        if run.status != "running" {
+            return Err(format!("run {id} is not working"));
+        }
+        let session = run.session.clone().ok_or("the run has no session")?;
+        let _ = self.forward(&session, json!({ "op": "interrupt" }));
+        let status = if timed_out { "failed" } else { "cancelled" };
+        self.store
+            .record_run_ended(id, status)
+            .map_err(|error| error.to_string())?;
+        if timed_out {
+            let summary = format!("运行超过 {} 小时，已停止。", RUN_TIMEOUT_MS / 3_600_000);
+            let mut outcome = run
+                .outcome
+                .clone()
+                .unwrap_or_else(|| inferred("failed", &summary));
+            outcome.verdict = "failed".to_string();
+            if outcome.summary.is_empty() {
+                outcome.summary = summary;
+            }
+            let _ = self.store.record_outcome(id, &outcome);
+            self.notify_run(&run, "failed");
+        }
+        self.broadcast_tasks(&run.agent);
+        Ok(())
+    }
+
+    /// Once a minute: runs working past `RUN_TIMEOUT_MS` are stopped, and
+    /// agent sessions idle (no watcher, nothing running) for `IDLE_CLOSE_MS`
+    /// since their last run have their engines closed.
+    pub(crate) fn sweep(&self) {
+        let at = now();
+        let last = LAST_SWEEP.load(Ordering::Relaxed);
+        if at.saturating_sub(last) < SWEEP_EVERY_MS
+            || LAST_SWEEP
+                .compare_exchange(last, at, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        let runs = self.store.runs();
+        for run in &runs {
+            if run.status == "running" && at.saturating_sub(run.started_at) > RUN_TIMEOUT_MS {
+                let _ = self.cancel_run(&run.id, true);
+            }
+        }
+        for session in self.idle_agent_sessions() {
+            let mine: Vec<&Run> = runs
+                .iter()
+                .filter(|run| run.session.as_deref() == Some(session.as_str()))
+                .collect();
+            let settled = !mine.is_empty() && mine.iter().all(|run| run.ended());
+            let ended = mine
+                .iter()
+                .filter_map(|run| run.ended_at)
+                .max()
+                .unwrap_or(0);
+            if settled && at.saturating_sub(ended) > IDLE_CLOSE_MS {
+                let _ = self.close_session(&session);
+            }
+        }
     }
 
     /// The runs of `session` still open when its engine stopped (closed,
@@ -261,6 +424,15 @@ impl Hub {
             // Queued for a session that is gone: its message was delivered,
             // so it will not come again.
             let _ = self.store.record_run_ended(&run.id, "interrupted");
+            // The daemon went down under it: nobody chose to stop it.
+            if session.is_none() && run.status == "running" {
+                let title = self.task_title(&run.task).unwrap_or_default();
+                self.notify(
+                    &format!("运行中断：{title}"),
+                    "后台服务重启，这次运行没有完成。",
+                    &run.id,
+                );
+            }
             if !agents.contains(&run.agent) {
                 agents.push(run.agent.clone());
             }
@@ -606,6 +778,57 @@ impl Hub {
         Ok(json!({ "type": "task", "task": task, "runs": runs, "questions": questions }))
     }
 
+    /// What `agent`'s latest runs of other tasks than `session`'s left for
+    /// the next run, newest first, one per task.
+    pub fn recent_notes(&self, agent: &str, session: &str) -> Vec<crate::agents::RecentNote> {
+        let current = self.task_of_session(session);
+        let mut seen: Vec<String> = Vec::new();
+        let mut notes = Vec::new();
+        for run in self.store.runs().into_iter().rev() {
+            if notes.len() == NOTES_IN_PROMPT {
+                break;
+            }
+            if run.agent != agent || Some(&run.task) == current.as_ref() || seen.contains(&run.task)
+            {
+                continue;
+            }
+            let Some(next) = run
+                .outcome
+                .map(|o| o.next)
+                .filter(|next| !next.trim().is_empty())
+            else {
+                continue;
+            };
+            seen.push(run.task.clone());
+            notes.push(crate::agents::RecentNote {
+                title: self.task_title(&run.task).unwrap_or_default(),
+                task: run.task,
+                text: next,
+            });
+        }
+        notes
+    }
+
+    /// `handoff_list` for older clients: each session's latest note.
+    pub fn handoffs_json(&self, agent: &str) -> Value {
+        let mut seen: Vec<String> = Vec::new();
+        let mut list = Vec::new();
+        for run in self.store.runs().into_iter().rev() {
+            let (Some(session), Some(outcome)) = (run.session.clone(), run.outcome.clone()) else {
+                continue;
+            };
+            if run.agent != agent || outcome.next.is_empty() || seen.contains(&session) {
+                continue;
+            }
+            seen.push(session.clone());
+            list.push(json!({
+                "session": session, "title": self.task_title(&run.task).unwrap_or_default(),
+                "at": outcome.at, "text": outcome.next,
+            }));
+        }
+        json!({ "type": "handoffs", "agent": agent, "handoffs": list })
+    }
+
     pub(crate) fn broadcast_tasks(&self, agent: &str) {
         self.broadcast(&self.tasks_json(Some(agent)));
     }
@@ -925,16 +1148,22 @@ mod tests {
             (runs.len(), runs[1].task.as_str(), runs[1].trigger.as_str()),
             (2, task.as_str(), "reply")
         );
-        hub.finish_run("s1", "done", "fixed", "").unwrap();
+        hub.finish_run("s1", "done", "fixed", "", "root cause: a stale cookie")
+            .unwrap();
+        let reports = hub.store.reports(5);
+        assert_eq!(
+            (reports[0].title.as_str(), reports[0].body.as_str()),
+            ("修复登录", "root cause: a stale cookie")
+        );
         assert_eq!(
             hub.end_run("s1", false).map(|(_, by_agent)| by_agent),
             Some(true)
         );
         assert!(
-            hub.finish_run("s1", "done", "x", "").is_err(),
+            hub.finish_run("s1", "done", "x", "", "").is_err(),
             "nothing is running"
         );
-        assert!(hub.finish_run("s1", "great", "x", "").is_err());
+        assert!(hub.finish_run("s1", "great", "x", "", "").is_err());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -990,7 +1219,7 @@ mod tests {
         let mut asked = question("q1", "run1", "Refund order 12?", Some("refund"));
         asked.task = Some("sch-1".into());
         hub.ask(&asked).unwrap();
-        hub.finish_run("run1", "needs_you", "asked", "look at order 12 again")
+        hub.finish_run("run1", "needs_you", "asked", "look at order 12 again", "")
             .unwrap();
         hub.end_run("run1", false);
 
@@ -1010,6 +1239,62 @@ mod tests {
         let (_, text) = hub.schedule_context("sch-1").unwrap();
         assert!(text.contains("look at order 12 again"), "{text}");
         assert!(text.contains("[q1] Refund order 12?"), "{text}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_working_run_is_cancelled_or_times_out_and_notes_cross_tasks() {
+        let (hub, dir) = hub("cancel");
+        for session in ["a", "b"] {
+            hub.store
+                .record_engine_session(session, &dir, Some("ops"), None, false)
+                .unwrap();
+        }
+        let send = |id: &str, session: &str, body: &str| {
+            let sent = Message {
+                id: id.into(),
+                to: "ops".into(),
+                from: "user".into(),
+                body: body.into(),
+                session: None,
+                reply_to: None,
+                dedupe_key: None,
+                at: now(),
+            };
+            let run = hub.queue_run(&sent, session).unwrap();
+            hub.run_took_message(session, body);
+            run
+        };
+        let first = send("m1", "a", "部署");
+        assert!(hub.cancel_run(&first, false).is_ok());
+        assert_eq!(hub.store.runs()[0].status, "cancelled");
+        assert!(hub.cancel_run(&first, false).is_err(), "no longer working");
+
+        let second = send("m2", "a", "部署");
+        hub.cancel_run(&second, true).unwrap();
+        let timed_out = hub
+            .store
+            .runs()
+            .into_iter()
+            .find(|r| r.id == second)
+            .unwrap();
+        assert_eq!(timed_out.status, "failed");
+        assert!(timed_out.outcome.unwrap().summary.contains("小时"));
+
+        // What task a's runs left reaches task b's prompt, not a's own.
+        let third = send("m3", "a", "部署");
+        hub.finish_run("a", "done", "deployed", "check the canary tomorrow", "")
+            .unwrap();
+        hub.end_run("a", false);
+        let _ = third;
+        send("m4", "b", "对账");
+        let notes = hub.recent_notes("ops", "b");
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            (notes[0].title.as_str(), notes[0].text.as_str()),
+            ("部署", "check the canary tomorrow")
+        );
+        assert!(hub.recent_notes("ops", "a").is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1034,9 +1319,12 @@ mod tests {
             "check",
             "sched",
         );
-        hub.agents
-            .save_handoff("ops", "mine", "修复登录", "已修复", now())
-            .unwrap();
+        fs::write(
+            dir.join("agents").join("ops").join("handoffs.json"),
+            json!([{ "session": "mine", "title": "修复登录", "at": 1, "text": "已修复" }])
+                .to_string(),
+        )
+        .unwrap();
         hub.store
             .record_session_meta("gone", &json!({ "archived": true }))
             .unwrap();

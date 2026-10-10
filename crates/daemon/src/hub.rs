@@ -821,6 +821,26 @@ impl Hub {
         self.fire_due_schedules();
         self.expire_questions();
         self.deliver_pending();
+        self.sweep();
+    }
+
+    /// Hosted agent sessions that nobody watches and that are not working.
+    pub(crate) fn idle_agent_sessions(&self) -> Vec<String> {
+        let agents: HashSet<String> = self
+            .store
+            .sessions()
+            .into_iter()
+            .filter(|record| record.agent.is_some())
+            .map(|record| record.id)
+            .collect();
+        let busy = lock(&self.busy).clone();
+        lock(&self.sessions)
+            .iter()
+            .filter(|(id, hosted)| {
+                hosted.watchers.is_empty() && agents.contains(*id) && !busy.contains(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     pub fn ask(&self, question: &Question) -> Result<(), String> {
@@ -828,6 +848,13 @@ impl Hub {
             .record_question(question)
             .map_err(|error| error.to_string())?;
         self.broadcast(&self.questions_json());
+        if question.importance == "high" {
+            self.notify(
+                &format!("提问：{}", question.title),
+                &question.body,
+                &question.id,
+            );
+        }
         Ok(())
     }
 
@@ -1362,52 +1389,37 @@ impl Hub {
         }
     }
 
-    /// An agent session's turn ended: the title model rewrites its handoff
-    /// note in the background (see `titles`). One at a time per session; a
-    /// turn that ends meanwhile is covered by the next.
+    /// A run of an agent session ended without the agent concluding it
+    /// (`finish`): the title model writes its handoff note into the run's
+    /// outcome in the background (see `titles`). One at a time per session;
+    /// a turn that ends meanwhile is covered by the next.
     fn write_handoff(&self, session: &str, run: Option<(String, bool)>) {
+        let Some((run, false)) = run else {
+            return;
+        };
         let Some(record) = self
             .store
             .sessions()
             .into_iter()
-            .find(|record| record.id == session)
+            .find(|record| record.id == session && record.agent.is_some())
         else {
-            return;
-        };
-        let Some(agent) = record.agent.clone() else {
             return;
         };
         let Some(hub) = self.me.upgrade() else {
             return;
         };
-        // The agent concluded the run itself: its note for the next run is
-        // the handoff, without asking the model.
-        if let Some((run, true)) = &run {
-            let next = self
-                .store
-                .runs()
-                .into_iter()
-                .find(|r| &r.id == run)
-                .and_then(|r| r.outcome)
-                .map(|o| if o.next.is_empty() { o.summary } else { o.next })
-                .unwrap_or_default();
-            if !next.is_empty() {
-                let title = record.title.clone().unwrap_or_default();
-                if let Err(error) = self
-                    .agents
-                    .save_handoff(&agent, session, &title, &next, now())
-                {
-                    jucode_agent_core::log_warn!("daemon", "handoff note not saved", error = error);
-                }
-                return;
-            }
-        }
-        let run = run.map(|(run, _)| run);
         if !lock(&self.handing_off).insert(session.to_string()) {
             return;
         }
         let title = record.title.clone().unwrap_or_default();
-        let previous = self.agents.handoff(&agent, session);
+        // What this session's earlier runs left, for the model to update.
+        let previous = self
+            .store
+            .runs()
+            .into_iter()
+            .rev()
+            .filter(|r| r.session.as_deref() == Some(session) && r.id != run)
+            .find_map(|r| r.outcome.map(|o| o.next).filter(|next| !next.is_empty()));
         let Some(prompt) = lock(&self.turns)
             .get(session)
             .map(|turns| turns.handoff_prompt(&title, previous.as_deref()))
@@ -1426,20 +1438,8 @@ impl Hub {
                     None
                 }
             };
-            let Some(note) = note else { return };
-            if let Some(run) = &run {
-                hub.note_run_handoff(run, &note);
-            }
-            // The title as it is now: the model may have renamed it meanwhile.
-            let title = hub
-                .store
-                .sessions()
-                .into_iter()
-                .find(|record| record.id == id)
-                .and_then(|record| record.title)
-                .unwrap_or(title);
-            if let Err(error) = hub.agents.save_handoff(&agent, &id, &title, &note, now()) {
-                jucode_agent_core::log_warn!("daemon", "handoff note not saved", error = error);
+            if let Some(note) = note {
+                hub.note_run_handoff(&run, &note);
             }
         });
     }
@@ -1582,6 +1582,19 @@ impl Hub {
     pub fn sessions_json(&self) -> Value {
         let records = self.store.sessions();
         let saved = saved_by_id(records.iter().map(|record| record.cwd.as_path()));
+        // The task each agent session carries (none for one from before
+        // tasks that was left out of the migration).
+        let mut task_of: HashMap<String, String> = self
+            .store
+            .tasks()
+            .into_iter()
+            .filter_map(|task| Some((task.session?, task.id)))
+            .collect();
+        for run in self.store.runs() {
+            if let Some(session) = run.session {
+                task_of.insert(session, run.task);
+            }
+        }
         let sessions = lock(&self.sessions);
         let list: Vec<Value> = records
             .into_iter()
@@ -1605,6 +1618,7 @@ impl Hub {
                     "gateway": record.gateway,
                     "engine": record.engine.as_deref().unwrap_or("jucode"),
                     "agent": record.agent,
+                    "task": task_of.get(&record.id),
                     "open": hosted.is_some(),
                     "watchers": hosted.map(|h| h.watchers.len()).unwrap_or(0),
                 })

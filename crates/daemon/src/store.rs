@@ -2,8 +2,9 @@
 //! writer (`Store::open` holds a lock on the directory), so each log is read
 //! from disk once and then kept in memory alongside its appends; every read
 //! folds the whole log. Opening compacts the logs that only ever grow: the
-//! session log down to one line per fact, and decided actions and finished
-//! timers out of theirs.
+//! session and run logs down to one line per fact, decided actions and
+//! finished timers out of theirs, and messages, questions and reports once
+//! they are settled and old.
 
 use jucode_agent_core::actions::DeferredAction;
 use serde_json::{json, Value};
@@ -35,6 +36,11 @@ const LOCK: &str = "lock";
 
 /// How long a closed question or action stays listed (and can be reopened).
 pub const CLOSED_KEEP_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+/// Settled messages and questions older than this leave their logs.
+const HISTORY_KEEP_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// Reports older than this leave theirs, except the newest `REPORTS_KEPT`.
+const REPORTS_KEEP_MS: u64 = 60 * 24 * 60 * 60 * 1000;
+const REPORTS_KEPT: usize = 100;
 
 /// What waits for the user: an agent's question or a deferred action.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -262,14 +268,25 @@ impl Store {
             .truncate(false)
             .write(true)
             .open(dir.join(LOCK))?;
-        if let Err(error) = lock.try_lock() {
-            return Err(match error {
-                fs::TryLockError::WouldBlock => io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("another daemon is using {}", dir.display()),
-                ),
-                fs::TryLockError::Error(error) => error,
-            });
+        // A child this process (or the previous holder) is spawning keeps the
+        // lock between fork and exec for a few milliseconds; another daemon
+        // keeps it for good.
+        let mut attempts = 0;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) if attempts < 25 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("another daemon is using {}", dir.display()),
+                    ))
+                }
+                Err(fs::TryLockError::Error(error)) => return Err(error),
+            }
         }
         let store = Self {
             dir,
@@ -342,7 +359,111 @@ impl Store {
             .filter(|entry| entry["id"].as_str().is_some_and(|id| active.contains(id)))
             .cloned()
             .collect();
-        self.rewrite(TIMERS, timers)
+        self.rewrite(TIMERS, timers)?;
+        self.compact_history()
+    }
+
+    /// Runs folded to their final state; settled messages and questions
+    /// older than `HISTORY_KEEP_MS`, and old reports, dropped.
+    fn compact_history(&self) -> io::Result<()> {
+        let since = now().saturating_sub(HISTORY_KEEP_MS);
+        let mut runs = Vec::new();
+        for run in self.runs() {
+            runs.push(json!({
+                "kind": "started", "id": run.id, "agent": run.agent, "task": run.task,
+                "session": run.session, "trigger": run.trigger, "message": run.message,
+                "status": run.status, "at": run.started_at, "ended_at": run.ended_at,
+            }));
+            if let Some(o) = &run.outcome {
+                runs.push(json!({
+                    "kind": "outcome", "id": run.id, "verdict": o.verdict, "summary": o.summary,
+                    "next": o.next, "source": o.source, "at": o.at,
+                }));
+            }
+        }
+        self.rewrite(RUNS, runs)?;
+
+        // A message stays while pending or settled lately.
+        let entries = self.read(MESSAGES);
+        let settled_at: HashMap<&str, u64> = entries
+            .iter()
+            .filter(|entry| entry["kind"] == "delivered" || entry["kind"] == "undeliverable")
+            .filter_map(|entry| {
+                Some((
+                    entry["id"].as_str()?,
+                    entry["at"].as_u64().unwrap_or_default(),
+                ))
+            })
+            .collect();
+        let gone: HashSet<&str> = settled_at
+            .iter()
+            .filter(|(_, at)| **at < since)
+            .map(|(id, _)| *id)
+            .collect();
+        let kept: Vec<Value> = entries
+            .iter()
+            .filter(|entry| !entry["id"].as_str().is_some_and(|id| gone.contains(id)))
+            .cloned()
+            .collect();
+        self.rewrite(MESSAGES, kept)?;
+
+        // A question stays while open, or answered / closed lately; only
+        // its latest wording is kept.
+        let entries = self.read(QUESTIONS);
+        let closed = closures(&entries);
+        let mut done_at: HashMap<&str, u64> = entries
+            .iter()
+            .filter(|entry| entry["kind"] == "answered")
+            .filter_map(|entry| {
+                Some((
+                    entry["id"].as_str()?,
+                    entry["at"].as_u64().unwrap_or_default(),
+                ))
+            })
+            .collect();
+        for (id, entry) in &closed {
+            done_at.insert(id, entry["at"].as_u64().unwrap_or_default());
+        }
+        let latest: HashSet<*const Value> = latest_asked(&entries)
+            .into_iter()
+            .map(|e| e as *const Value)
+            .collect();
+        let kept: Vec<Value> = entries
+            .iter()
+            .filter(|entry| {
+                let id = entry["id"].as_str().unwrap_or_default();
+                if done_at.get(id).is_some_and(|at| *at < since) {
+                    return false;
+                }
+                entry["kind"] != "asked" || latest.contains(&(*entry as *const Value))
+            })
+            .cloned()
+            .collect();
+        self.rewrite(QUESTIONS, kept)?;
+
+        // Reports: the newest REPORTS_KEPT, and any from the last 60 days.
+        let entries = self.read(REPORTS);
+        let report_since = now().saturating_sub(REPORTS_KEEP_MS);
+        let newest: HashSet<&str> = entries
+            .iter()
+            .rev()
+            .filter(|entry| entry["kind"] == "posted")
+            .take(REPORTS_KEPT)
+            .filter_map(|entry| entry["id"].as_str())
+            .collect();
+        let old: HashSet<&str> = entries
+            .iter()
+            .filter(|entry| entry["kind"] == "posted")
+            .filter(|entry| entry["at"].as_u64().unwrap_or_default() < report_since)
+            .filter_map(|entry| entry["id"].as_str())
+            .filter(|id| !newest.contains(id))
+            .collect();
+        let kept: Vec<Value> = entries
+            .iter()
+            .filter(|entry| !entry["id"].as_str().is_some_and(|id| old.contains(id)))
+            .cloned()
+            .collect();
+        self.rewrite(REPORTS, kept)
     }
 
     /// Replaces a log with `entries` (temp file + rename) when that drops
@@ -1497,6 +1618,89 @@ mod tests {
         let dir = store.dir.clone();
         drop(store);
         assert!(Store::open(dir).is_ok());
+    }
+
+    #[test]
+    fn old_settled_history_leaves_the_logs_and_runs_fold() {
+        let store = store("history");
+        let old = now() - HISTORY_KEEP_MS - 1000;
+        let message = |id: &str, at: u64| Message {
+            id: id.into(),
+            to: "ops".into(),
+            from: "user".into(),
+            body: id.into(),
+            session: None,
+            reply_to: None,
+            dedupe_key: None,
+            at,
+        };
+        for id in ["old", "recent", "waiting"] {
+            store.record_message(&message(id, old)).unwrap();
+        }
+        store
+            .append(
+                MESSAGES,
+                json!({ "kind": "delivered", "id": "old", "session": "s", "at": old }),
+            )
+            .unwrap();
+        store.record_delivered("recent", "s").unwrap();
+        let q = |id: &str| {
+            let mut asked = Question {
+                id: id.into(),
+                agent: "ops".into(),
+                session: "s".into(),
+                title: "first".into(),
+                body: String::new(),
+                assumption: String::new(),
+                default_action: String::new(),
+                importance: "normal".into(),
+                due_at: None,
+                asked_at: old,
+                task: None,
+                key: None,
+            };
+            store.record_question(&asked).unwrap();
+            asked.title = "asked again".into();
+            store.record_question(&asked).unwrap();
+        };
+        q("q-old");
+        q("q-open");
+        store
+            .append(QUESTIONS, json!({ "kind": "answered", "id": "q-old", "answer": "y", "by": "user", "at": old }))
+            .unwrap();
+        let run = Run {
+            id: "r1".into(),
+            agent: "ops".into(),
+            task: "t".into(),
+            session: Some("s".into()),
+            trigger: "user".into(),
+            message: None,
+            status: "queued".into(),
+            started_at: 1,
+            ended_at: None,
+            outcome: None,
+        };
+        store.record_run(&run).unwrap();
+        store.record_run_running("r1").unwrap();
+        store.record_run_ended("r1", "succeeded").unwrap();
+        let before_runs = store.runs();
+
+        let dir = store.dir.clone();
+        drop(store);
+        let store = Store::open(dir.clone()).unwrap();
+        let ids: Vec<String> = store
+            .message_log(None, 10)
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, ["waiting", "recent"]);
+        assert_eq!(store.pending_messages()[0].id, "waiting");
+        let open = store.open_questions();
+        assert_eq!((open.len(), open[0].title.as_str()), (1, "asked again"));
+        assert!(store.question("q-old").is_none());
+        assert_eq!(store.runs(), before_runs);
+        let lines = fs::read_to_string(dir.join(RUNS)).unwrap().lines().count();
+        assert_eq!(lines, 1);
     }
 
     #[test]

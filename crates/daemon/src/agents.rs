@@ -1,5 +1,5 @@
 //! Long-lived agents: `~/.jucode/agents/<id>/` holds an agent's brief
-//! (`role.md`, `capabilities.md`, `policy.md`, `state.md`), its `memory/`
+//! (`role.md`, `capabilities.md`, `policy.md`), its `memory/`
 //! notes, `agent.json` (name, working directory, settings) and
 //! `schedules.json` (its scheduled tasks, see `schedules`). The daemon
 //! reads the brief into every turn of the agent's sessions; the agent keeps
@@ -17,12 +17,18 @@ use std::{
     sync::Mutex,
 };
 
-pub const BRIEF_FILES: [&str; 4] = ["role.md", "capabilities.md", "policy.md", "state.md"];
+pub const BRIEF_FILES: [&str; 3] = ["role.md", "capabilities.md", "policy.md"];
+/// A brief file goes into every turn whole, so it stays short (characters).
+pub const BRIEF_LIMIT: usize = 4000;
+/// A memory note is read on demand; this only stops runaway writes.
+pub const MEMORY_LIMIT: usize = 20_000;
 
-/// Handoff notes kept per agent (`handoffs.json`), newest first.
-const HANDOFFS_KEPT: usize = 20;
-/// How many of them a session's prompt carries.
-const HANDOFFS_IN_PROMPT: usize = 3;
+/// What an earlier run left for the next one, for the prompt.
+pub struct RecentNote {
+    pub task: String,
+    pub title: String,
+    pub text: String,
+}
 
 pub struct Agents {
     dir: PathBuf,
@@ -340,55 +346,40 @@ impl Agents {
         .map_err(|error| error.to_string())
     }
 
-    /// Agent `id`'s handoff notes, newest first: `{session, title, at, text}`
-    /// (`at` in ms), one per session, rewritten as the session goes on.
-    pub fn handoffs(&self, id: &str) -> Vec<Value> {
-        fs::read_to_string(self.dir.join(id).join("handoffs.json"))
+    /// The handoff note `session` left in `handoffs.json`, written by
+    /// daemons before runs kept their outcomes; read when migrating.
+    pub fn handoff(&self, id: &str, session: &str) -> Option<String> {
+        let notes: Vec<Value> = fs::read_to_string(self.dir.join(id).join("handoffs.json"))
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
-    }
-
-    /// The handoff note `session` left, if any.
-    pub fn handoff(&self, id: &str, session: &str) -> Option<String> {
-        self.handoffs(id)
+            .unwrap_or_default();
+        notes
             .into_iter()
             .find(|note| note["session"] == session)
             .and_then(|note| note["text"].as_str().map(str::to_string))
     }
 
-    /// Replaces `session`'s note and moves it to the front.
-    pub fn save_handoff(
-        &self,
-        id: &str,
-        session: &str,
-        title: &str,
-        text: &str,
-        at: u64,
-    ) -> Result<(), String> {
-        let _guard = self
-            .removing
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if self.get(id).is_none() {
-            return Err(format!("unknown agent {id}"));
+    /// `state.md` is no longer part of the brief (what the next run needs
+    /// is its outcome now): an agent's non-empty one becomes the memory
+    /// note `memory/state.md`, unless one exists, and the file goes.
+    pub fn retire_state_files(&self) {
+        for agent in self.list() {
+            let dir = self.dir.join(&agent.id);
+            let Ok(text) = fs::read_to_string(dir.join("state.md")) else {
+                continue;
+            };
+            let note = dir.join("memory").join("state.md");
+            if !text.trim().is_empty() && !note.exists() {
+                let _ = fs::create_dir_all(dir.join("memory"));
+                if fs::write(&note, &text).is_err() {
+                    continue;
+                }
+            }
+            let _ = fs::remove_file(dir.join("state.md"));
         }
-        let mut notes = self.handoffs(id);
-        notes.retain(|note| note["session"] != session);
-        notes.insert(
-            0,
-            json!({ "session": session, "title": title, "at": at, "text": text }),
-        );
-        notes.truncate(HANDOFFS_KEPT);
-        let text = serde_json::to_string_pretty(&notes).map_err(|error| error.to_string())?;
-        write_private(
-            &self.dir.join(id).join("handoffs.json"),
-            (text + "\n").as_bytes(),
-        )
-        .map_err(|error| error.to_string())
     }
 
-    /// Reads a brief file (`role.md` … `state.md`) or `memory/<name>.md`.
+    /// Reads a brief file (`role.md` … `policy.md`) or `memory/<name>.md`.
     pub fn read_brief(&self, id: &str, file: &str) -> Result<String, String> {
         let path = self.brief_path(id, file)?;
         match fs::read_to_string(&path) {
@@ -400,6 +391,17 @@ impl Agents {
 
     pub fn write_brief(&self, id: &str, file: &str, content: &str) -> Result<(), String> {
         let path = self.brief_path(id, file)?;
+        let (limit, what) = if BRIEF_FILES.contains(&file) {
+            (BRIEF_LIMIT, "a brief file goes into every turn")
+        } else {
+            (MEMORY_LIMIT, "a memory note")
+        };
+        let length = content.chars().count();
+        if length > limit {
+            return Err(format!(
+                "{file} would be {length} characters; {what}, so keep it under {limit}: condense it, or move detail into memory/<topic>.md"
+            ));
+        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
@@ -447,26 +449,25 @@ impl Agents {
             .to_string()
     }
 
-    /// System prompt text for a session of agent `id`: who it is, its brief,
-    /// its memory index and the other agents it can message.
-    /// The agent's part of the system prompt for `session`: its brief, the
-    /// handoff notes of its latest other sessions, and the other agents.
-    pub fn prompt(&self, id: &str, session: &str) -> String {
+    /// The agent's part of the system prompt: who it is, its brief, its
+    /// memory index, what its recent runs left for the next (`recent`),
+    /// and the other agents.
+    pub fn prompt(&self, id: &str, recent: &[RecentNote]) -> String {
         let Some(agent) = self.get(id) else {
             return String::new();
         };
         let mut prompt = format!(
             "<agent id=\"{}\" name=\"{}\">\n\
-             You are a long-lived agent: each task runs in its own session, but your brief below persists \
-             and is yours to keep current with the `brief` tool. Record what the next session needs in \
-             state.md (progress, open threads) and durable knowledge in memory/<topic>.md; what your latest \
-             other sessions concluded is in <recent_handoffs>. Nobody may be watching: work on without \
-             waiting. When only the user can decide, `question` them and continue under your assumption; \
-             when something is done or blocked, `report` it. End every run with `finish`: whether it found \
-             anything for the user, a short summary, and what the next run of the task needs. Use `timer` to come back to something once, \
-             `schedule` to propose recurring work (the user switches it on), and `message_agent` to hand \
-             work to another agent. When the user answers or decides one of your open items, check \
-             `open_items` and close the ones that made unnecessary.\n",
+             You are a long-lived agent. Each task you are given runs in its own conversation; your brief \
+             below persists and is yours to keep current with `brief` (keep each file short), durable \
+             knowledge goes in memory/<topic>.md, and what your recent runs left for the next is in \
+             <recent_handoffs>. Nobody may be watching: work on without waiting. When only the user can \
+             decide, `question` them and continue under your assumption. End every run with `finish`: \
+             whether it found anything for the user, a short summary, what the next run of the task needs, \
+             and any longer write-up as `details`. Use `task` to come back to something later, to propose \
+             recurring work (the user switches it on) or to close a task that is no longer needed, and \
+             `message_agent` to hand work to another agent. When the user answers or decides one of your \
+             open items, check `open_items` and close the ones that made unnecessary.\n",
             agent.id, agent.name
         );
         for file in BRIEF_FILES {
@@ -483,17 +484,14 @@ impl Agents {
                 memory.join(", ")
             }
         ));
-        let notes: Vec<String> = self
-            .handoffs(id)
-            .into_iter()
-            .filter(|note| note["session"] != session)
-            .take(HANDOFFS_IN_PROMPT)
+        let notes: Vec<String> = recent
+            .iter()
             .map(|note| {
                 format!(
-                    "<handoff session=\"{}\" title=\"{}\">\n{}\n</handoff>",
-                    note["session"].as_str().unwrap_or_default(),
-                    note["title"].as_str().unwrap_or_default(),
-                    note["text"].as_str().unwrap_or_default().trim()
+                    "<handoff task=\"{}\" title=\"{}\">\n{}\n</handoff>",
+                    note.task,
+                    note.title,
+                    note.text.trim()
                 )
             })
             .collect();
@@ -833,13 +831,20 @@ mod tests {
         agents
             .create("ops", "Ops", &work, "role", &Value::Null)
             .unwrap();
-        agents.write_brief("ops", "state.md", "halfway").unwrap();
+        agents.write_brief("ops", "policy.md", "ask first").unwrap();
         agents
             .write_brief("ops", "memory/deploy.md", "use make ship")
             .unwrap();
-        assert_eq!(agents.read_brief("ops", "state.md").unwrap(), "halfway");
+        assert_eq!(agents.read_brief("ops", "policy.md").unwrap(), "ask first");
         assert_eq!(agents.memory_files("ops"), vec!["memory/deploy.md"]);
+        let long = "长".repeat(BRIEF_LIMIT + 1);
+        assert!(
+            agents.write_brief("ops", "policy.md", &long).is_err(),
+            "a brief file stays short"
+        );
+        agents.write_brief("ops", "memory/long.md", &long).unwrap();
         for bad in [
+            "state.md",
             "agent.json",
             "../x.md",
             "memory/../../x.md",
@@ -860,28 +865,55 @@ mod tests {
             .create("web", "Web", &work, "Owns the site", &Value::Null)
             .unwrap();
         agents
-            .write_brief("ops", "state.md", "waiting on CI")
+            .write_brief("ops", "policy.md", "ask before deploys")
             .unwrap();
         agents.write_brief("ops", "memory/ci.md", "x").unwrap();
-        agents
-            .save_handoff("ops", "s1", "Fix CI", "CI green again", 1)
-            .unwrap();
-        agents
-            .save_handoff("ops", "s2", "Deploy", "deployed v2", 2)
-            .unwrap();
-        let prompt = agents.prompt("ops", "s2");
+        let recent = [RecentNote {
+            task: "task-1".into(),
+            title: "Fix CI".into(),
+            text: "CI green again".into(),
+        }];
+        let prompt = agents.prompt("ops", &recent);
         assert!(prompt
-            .contains("<handoff session=\"s1\" title=\"Fix CI\">\nCI green again\n</handoff>"));
-        assert!(
-            !prompt.contains("deployed v2"),
-            "a session's own note stays out of its prompt"
-        );
-        assert_eq!(agents.handoff("ops", "s2").as_deref(), Some("deployed v2"));
-        assert_eq!(agents.handoffs("ops")[0]["session"], "s2");
+            .contains("<handoff task=\"task-1\" title=\"Fix CI\">\nCI green again\n</handoff>"));
         assert!(prompt.contains("<role>\nKeeps deploys green\n</role>"));
-        assert!(prompt.contains("<state>\nwaiting on CI\n</state>"));
+        assert!(prompt.contains("<policy>\nask before deploys\n</policy>"));
+        assert!(!prompt.contains("<state>"));
         assert!(prompt.contains("memory/ci.md"));
         assert!(prompt.contains("- web (Web): Owns the site"));
         assert!(!prompt.contains("- ops"));
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn a_state_file_becomes_a_memory_note() {
+        let dir = std::env::temp_dir().join(format!("jucode-agents-state-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let agents = Agents::open(dir.clone()).unwrap();
+        agents
+            .create("ops", "Ops", &dir, "role", &Value::Null)
+            .unwrap();
+        agents
+            .create("web", "Web", &dir, "role", &Value::Null)
+            .unwrap();
+        fs::write(
+            dir.join("ops").join("state.md"),
+            "halfway through the migration",
+        )
+        .unwrap();
+        fs::write(dir.join("web").join("state.md"), "").unwrap();
+        agents.retire_state_files();
+        assert!(!dir.join("ops").join("state.md").exists());
+        assert!(!dir.join("web").join("state.md").exists());
+        assert_eq!(
+            agents.read_memory("ops", "state.md").unwrap(),
+            "halfway through the migration"
+        );
+        assert!(agents.read_memory("web", "state.md").is_err());
+        let _ = fs::remove_dir_all(dir);
     }
 }

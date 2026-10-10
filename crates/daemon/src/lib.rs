@@ -81,6 +81,7 @@ pub fn serve(
     // Runs left open by the last daemon ended with it.
     hub.interrupt_runs(None);
     hub.migrate_tasks();
+    hub.agents.retire_state_files();
     if hub.relay.url().is_some() {
         let relay = Arc::clone(&hub);
         thread::spawn(move || relay::run(&relay));
@@ -636,6 +637,12 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 .map(|()| json!({ "type": "task_closed", "task": task })),
             None => Err("task_close requires task".to_string()),
         },
+        ("run_cancel", _) => match op["run"].as_str() {
+            Some(run) => hub
+                .cancel_run(run, false)
+                .map(|()| json!({ "type": "run_cancelled", "run": run })),
+            None => Err("run_cancel requires run".to_string()),
+        },
         ("task_reopen", _) => match op["task"].as_str() {
             Some(task) => hub
                 .reopen_task(task)
@@ -643,7 +650,7 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             None => Err("task_reopen requires task".to_string()),
         },
         ("handoff_list", _) => match op["agent"].as_str() {
-            Some(agent) => Ok(json!({ "type": "handoffs", "agent": agent, "handoffs": hub.agents.handoffs(agent) })),
+            Some(agent) => Ok(hub.handoffs_json(agent)),
             None => Err("handoff_list requires agent".to_string()),
         },
         ("usage_local", _) => Ok(hub.usage.local_json(
