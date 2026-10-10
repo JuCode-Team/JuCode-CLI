@@ -22,6 +22,7 @@ mod schedules;
 mod session;
 mod skills;
 mod store;
+mod tasks;
 mod terminal;
 mod titles;
 mod uploads;
@@ -77,6 +78,9 @@ pub fn serve(
         gateway::set_group(&record.id, record.group.as_deref());
     }
     let hub = Hub::new(store, agents, version, relay);
+    // Runs left open by the last daemon ended with it.
+    hub.interrupt_runs(None);
+    hub.migrate_tasks();
     if hub.relay.url().is_some() {
         let relay = Arc::clone(&hub);
         thread::spawn(move || relay::run(&relay));
@@ -580,11 +584,21 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         }),
         ("message_send", _) => {
             let text = |key: &str| op[key].as_str().map(str::to_string);
-            match (text("agent"), text("body")) {
+            // `task`: continue that task (its agent is implied).
+            let task = text("task").map(|task| hub.task_session(&task));
+            let agent = match &task {
+                Some(Ok((agent, _))) => Some(agent.clone()),
+                _ => text("agent"),
+            };
+            match (agent, text("body")) {
+                _ if matches!(task, Some(Err(_))) => Err(task.unwrap().unwrap_err()),
                 (Some(to), Some(body)) => {
+                    let task = task.and_then(Result::ok);
                     // `new_session`: start a fresh conversation instead of
                     // continuing the latest one.
-                    let session = if op["new_session"] == true {
+                    let session = if let Some((_, session)) = task {
+                        Ok(Some(session))
+                    } else if op["new_session"] == true {
                         hub.create_session(None, Some(&to), false).map(Some)
                     } else {
                         Ok(text("session"))
@@ -611,6 +625,23 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             "type": "messages",
             "messages": hub.store.message_log(op["agent"].as_str(), op["limit"].as_u64().unwrap_or(50) as usize),
         })),
+        ("task_list", _) => Ok(hub.tasks_json(op["agent"].as_str())),
+        ("task_get", _) => match op["task"].as_str() {
+            Some(task) => hub.task_json(task, op["limit"].as_u64().unwrap_or(50) as usize),
+            None => Err("task_get requires task".to_string()),
+        },
+        ("task_close", _) => match op["task"].as_str() {
+            Some(task) => hub
+                .close_task(task, "user", op["reason"].as_str().unwrap_or_default())
+                .map(|()| json!({ "type": "task_closed", "task": task })),
+            None => Err("task_close requires task".to_string()),
+        },
+        ("task_reopen", _) => match op["task"].as_str() {
+            Some(task) => hub
+                .reopen_task(task)
+                .map(|()| json!({ "type": "task_reopened", "task": task })),
+            None => Err("task_reopen requires task".to_string()),
+        },
         ("handoff_list", _) => match op["agent"].as_str() {
             Some(agent) => Ok(json!({ "type": "handoffs", "agent": agent, "handoffs": hub.agents.handoffs(agent) })),
             None => Err("handoff_list requires agent".to_string()),
@@ -648,7 +679,11 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             Some(report) => hub
                 .store
                 .record_report_read(report)
-                .map(|()| json!({ "type": "report_read", "report": report }))
+                .map(|()| {
+                    let frame = json!({ "type": "report_read", "report": report });
+                    hub.broadcast(&frame);
+                    frame
+                })
                 .map_err(|error| error.to_string()),
             None => Err("report_read requires report".to_string()),
         },

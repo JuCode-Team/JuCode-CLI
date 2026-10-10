@@ -937,12 +937,17 @@ fn the_agent_page_reads_the_brief_and_changes_settings() {
     let page = frames.last().unwrap();
     assert_eq!(page["agent"]["name"], "Paged");
     assert_eq!(page["brief"]["role.md"], "Has a page\n");
-    // A disabled agent takes no new messages.
+    // A disabled agent's messages wait, and go once it is enabled again.
     client.send(json!({ "op": "message_send", "agent": "paged", "body": "hi", "id": 3 }));
     client.until(|frame| frame["id"] == 3);
     thread::sleep(Duration::from_millis(1500));
     let log = fs::read_to_string(daemon.state.join("messages.jsonl")).unwrap();
-    assert!(log.contains("undeliverable"), "{log}");
+    assert!(
+        !log.contains("undeliverable") && !log.contains("delivered"),
+        "{log}"
+    );
+    client.send(json!({ "op": "agent_update", "agent": "paged", "enabled": true, "id": 4 }));
+    client.until(delivered_to("paged"));
 }
 
 /// Runs schedule `id` now and returns the session its message reached once
@@ -2962,4 +2967,122 @@ fn session_usage_restores_only_its_persisted_turns_with_correlated_replies() {
         client.until(|f| f["id"] == 82).last().unwrap()["type"],
         "error"
     );
+}
+
+/// `agent`'s tasks once `done` holds for them, waiting up to five seconds
+/// (a run ends just after its session reports ready).
+fn tasks_when(client: &mut Client, agent: &str, done: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+    let start = Instant::now();
+    loop {
+        let reply = request(client, json!({ "op": "task_list", "agent": agent }));
+        let tasks = reply["tasks"].as_array().cloned().unwrap_or_default();
+        if done(&tasks) {
+            return tasks;
+        }
+        assert!(start.elapsed() < Duration::from_secs(5), "{tasks:?}");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn every_message_is_a_run_of_a_task_that_concludes() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "worker", "Does tasks");
+
+    // A new task; the agent concludes its run itself.
+    let (session, _) = run_agent(
+        &mut client,
+        "worker",
+        r#"CALL finish {"verdict":"quiet","summary":"nothing new"}"#,
+    );
+    let tasks = tasks_when(&mut client, "worker", |tasks| {
+        tasks.len() == 1 && tasks[0]["latest_run"]["status"] == "succeeded"
+    });
+    let task = &tasks[0];
+    let id = task["id"].as_str().unwrap().to_string();
+    assert_eq!(task["session"], session.as_str());
+    assert_eq!(task["state"], "done");
+    assert_eq!(task["trigger"]["kind"], "manual");
+    assert_eq!(task["quiet_runs"], 1);
+    let outcome = &task["latest_run"]["outcome"];
+    assert_eq!(outcome["verdict"], "quiet");
+    assert_eq!(outcome["summary"], "nothing new");
+    assert_eq!(outcome["source"], "agent");
+
+    // A message to the task continues its session as another run.
+    client.send(json!({ "op": "message_send", "task": id, "body": "and the logs?" }));
+    let frames = client.until(delivered_to("worker"));
+    assert_eq!(frames.last().unwrap()["session"], session.as_str());
+    client.until(ready(&session));
+    let tasks = tasks_when(&mut client, "worker", |tasks| {
+        tasks[0]["runs"] == 2 && tasks[0]["latest_run"]["ended_at"].is_u64()
+    });
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["latest_run"]["trigger"], "reply");
+    assert_eq!(tasks[0]["latest_run"]["outcome"]["source"], "inferred");
+
+    // The same question asked twice stays one, and the task needs the user.
+    for _ in 0..2 {
+        client.send(json!({ "op": "message_send", "task": id,
+            "body": r#"CALL question {"title":"Refund this order?","key":"refund"}"# }));
+        client.until(delivered_to("worker"));
+        client.until(ready(&session));
+    }
+    let tasks = tasks_when(&mut client, "worker", |tasks| {
+        tasks[0]["runs"] == 4 && tasks[0]["latest_run"]["ended_at"].is_u64()
+    });
+    assert_eq!(tasks[0]["open_questions"], 1);
+    assert_eq!(tasks[0]["state"], "needs_you");
+    let detail = request(&mut client, json!({ "op": "task_get", "task": id }));
+    assert_eq!(detail["questions"].as_array().unwrap().len(), 1);
+    assert_eq!(detail["runs"].as_array().unwrap().len(), 4);
+
+    // Closed by the user, then reopened.
+    let reply = request(&mut client, json!({ "op": "task_close", "task": id }));
+    assert_eq!(reply["type"], "task_closed");
+    let tasks = tasks_when(&mut client, "worker", |tasks| tasks[0]["state"] == "closed");
+    assert_eq!(tasks[0]["closed_by"], "user");
+    let reply = request(&mut client, json!({ "op": "task_reopen", "task": id }));
+    assert_eq!(reply["type"], "task_reopened");
+    tasks_when(&mut client, "worker", |tasks| {
+        tasks[0]["state"] == "needs_you"
+    });
+}
+
+#[test]
+fn a_scheduled_run_is_a_run_of_its_schedule_named_after_it() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let mut client = Client::connect(&daemon);
+    create_agent(&mut client, "patrol", "Checks things");
+    let reply = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": {
+            "agent": "patrol", "name": "巡检（午夜）", "prompt": "check", "repeat": "daily", "time": "00:00",
+        } }),
+    );
+    let schedule = reply["schedule"]["id"].as_str().unwrap().to_string();
+    let (session, _) = run_schedule(&mut client, "patrol", &schedule);
+    let tasks = tasks_when(&mut client, "patrol", |tasks| {
+        tasks.len() == 1 && tasks[0]["latest_run"]["ended_at"].is_u64()
+    });
+    assert_eq!(tasks[0]["id"], schedule.as_str());
+    assert_eq!(tasks[0]["title"], "巡检（午夜）");
+    assert_eq!(tasks[0]["trigger"]["kind"], "repeat");
+    assert_eq!(tasks[0]["state"], "waiting");
+    assert_eq!(tasks[0]["latest_run"]["trigger"], "schedule");
+    assert_eq!(tasks[0]["latest_run"]["session"], session.as_str());
+    // The session keeps the task's name: the title model leaves it alone.
+    thread::sleep(Duration::from_millis(500));
+    let sessions = request(&mut client, json!({ "op": "session_list" }));
+    let record = sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == session.as_str() || s["session"] == session.as_str())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(record["title"], "巡检（午夜）", "{record}");
 }

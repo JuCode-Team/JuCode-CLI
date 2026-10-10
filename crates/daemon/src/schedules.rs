@@ -341,6 +341,9 @@ impl Hub {
                 }
                 Some(_) => {}
             }
+            if self.schedule_running(id) {
+                return Err("上一次运行还没结束".to_string());
+            }
             self.record_schedule_run(schedule, format!("schedule:{id}:run:{at}"))?;
             schedule.last_run_at = Some(at);
             let agent = schedule.agent.clone();
@@ -370,6 +373,15 @@ impl Hub {
             {
                 continue;
             }
+            // The last run is still going: this time is skipped, not queued.
+            if self.schedule_running(&schedule.id) {
+                self.skip_run(&schedule.agent, &schedule.id);
+                schedule.next_run_at = next_run_at(schedule, at);
+                if !fired.contains(&schedule.agent) {
+                    fired.push(schedule.agent.clone());
+                }
+                continue;
+            }
             let key = format!("schedule:{}:{due}", schedule.id);
             if let Err(error) = self.record_schedule_run(schedule, key) {
                 jucode_agent_core::log_warn!("daemon", "schedule not fired", error = error);
@@ -391,6 +403,9 @@ impl Hub {
         }
         drop(list);
         self.broadcast(&self.schedules_json(None));
+        for agent in &fired {
+            self.broadcast_tasks(agent);
+        }
     }
 
     /// A run of schedule `id` reached `session`: later runs that continue
@@ -429,13 +444,9 @@ impl Hub {
             });
         let mut body = format!("定时任务「{}」：\n{}", schedule.name, schedule.prompt);
         if session.is_none() {
-            let last = schedule
-                .last_session
-                .as_deref()
-                .and_then(|last| self.agents.handoff(&schedule.agent, last));
-            if let (Some(note), Some(at)) = (last, schedule.last_run_at) {
+            if let Some((at, note)) = self.schedule_context(&schedule.id) {
                 let at = Local
-                    .timestamp_opt(at as i64, 0)
+                    .timestamp_millis_opt(at as i64)
                     .single()
                     .map(|at| at.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or_default();

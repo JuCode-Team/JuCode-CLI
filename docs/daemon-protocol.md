@@ -162,13 +162,17 @@ every connected client.
 | `git_diff` | `path`, optional `file` | `git_diff` with `diff` (unified, untracked files included, first 1 MiB), `truncated` |
 | `agent_list` | — | `agents` |
 | `agent_create` | `agent` (the new agent's id), `name`, `cwd`, `role`, optional `icon`, `color`, `avatar_seed`, `project` (see "Agents") | `agent_created`; every client also receives the new `agents` list |
-| `message_send` | `agent`, `body`, optional `session`, `reply_to`, `dedupe_key` | `message_accepted` with `message` (the new message's id) and `duplicate` (a message with this `dedupe_key` was already recorded; nothing is sent). Routed as below; delivery is broadcast as `message_delivered` |
+| `message_send` | `agent` (or `task`), `body`, optional `session`, `reply_to`, `dedupe_key`; `task` continues that task (see "Tasks and runs") and implies its agent | `message_accepted` with `message` (the new message's id) and `duplicate` (a message with this `dedupe_key` was already recorded; nothing is sent). Routed as below; delivery is broadcast as `message_delivered` |
 | `timer_list` | optional `agent` | `timers: [{timer, agent, session, fire_at, body}]`: active timers (of all agents, or of `agent`), soonest first; `fire_at` in ms |
 | `timer_cancel` | `timer` (its id) | `timer_cancelled` with `timer`; persists cancellation so the reminder will not fire after a restart. Errors if it already fired or was cancelled |
 | `agent_get` | `agent` | `agent`: `agent` (settings), `brief` (`{"role.md": text, "capabilities.md": …, "policy.md": …, "state.md": …}`), `memory` (file names, `["memory/deploy.md", …]`) and the agent's `sessions` (as in `session_list`) |
 | `agent_update` | `agent`, optional `name` (not empty), `role` (rewrites `role.md`), `enabled`, `approval_mode`, `sandbox`, `network`, `directories`, `command_rules`, `icon`, `color`, `avatar_seed`, `project` (`null` clears `icon`, `color` or `project`; see "Agents") | `agent_updated` with `agent`; every client also receives the new `agents` list |
 | `agent_delete` | `agent` | `agent_deleted` with `agent`; an error while any of its sessions is running. See "Agents" |
 | `agent_memory_read` | `agent`, `file` (`deploy.md`, or `memory/deploy.md` as `agent_get` lists it) | `agent_memory` with `agent`, `file`, `content`; an error for anything but an existing `memory/<name>.md` (letters, digits, `-`, `_`) |
+| `task_list` | optional `agent` | `tasks` with `agent` and `tasks`, most recently active first. See "Tasks and runs" |
+| `task_get` | `task`, optional `limit` (50) | `task` with `task`, its `runs` (newest first) and its open `questions` |
+| `task_close` | `task`, optional `reason` | `task_closed` with `task`; a scheduled task is also switched off |
+| `task_reopen` | `task` | `task_reopened` with `task` |
 | `schedule_list` | optional `agent` | `schedules`: all scheduled tasks, or `agent`'s. See "Scheduled tasks" |
 | `session_usage` | `session` (its id) | `session_usage` with `totals`, `sessions` and `turns`: persisted and live usage, with settled gateway charges |
 | `schedule_usage` | `schedule` (its id) | `schedule_usage` with `totals` and `sessions`: token counts and costs of the task's run sessions, including follow-ups; reused sessions count once |
@@ -180,7 +184,7 @@ every connected client.
 | `item_close` | `kind` (`question` or `action`), `item` (its id), optional `reason` | `item_closed` with `item`; closes an open question or deferred action without answering it, then broadcasts `questions` / `actions`. Nothing is sent to the agent |
 | `item_reopen` | `kind`, `item` | `item_reopened` with `item`; puts a closed item back among the open ones and takes its session out of the archive |
 | `report_list` | optional `limit` (50) | `reports`, newest first, with `read` |
-| `report_read` | `report` | `report_read` |
+| `report_read` | `report` | `report_read` with `report`, also sent to every client |
 | `skills_catalog` | optional `backend` (`jucode`, default, or `claude`) | `skills_catalog` with `skills: [{id, name, description, tags, source, sourceName, isDefault, installed, license, redistributable, homepage}]`, `warnings` and `installDir` (local clients only). See "Skills" |
 | `skill_install` | `source` (`jucode`, `anthropic` or a configured repository's `owner/repo`), `skill` (its `id` in the catalog), optional `backend` | `skill_installed` with `path` (local clients only) |
 
@@ -357,7 +361,8 @@ notes and `agent.json`:
 
 `agent_delete` removes `~/.jucode/agents/<id>/` (brief, memory, settings,
 scheduled tasks), cancels the agent's active timers, closes its open
-questions and its open sessions. It is refused while one of its sessions is
+questions (`closed_by`: `agent_deleted`; they leave the closed list) and its
+open sessions. It is refused while one of its sessions is
 running. Its sessions stay in `session_list` with their `agent`; a message
 still waiting for it becomes undeliverable, and new messages to it are
 refused. Every client receives the new `agents`, `schedules` and `questions`
@@ -386,21 +391,23 @@ command that must leave it (commit to git, write elsewhere) is called with
 session defers it. Command rules come first: `forbid` never runs, `ask`
 always asks a person, `allow` lets an escalation run without asking;
 `forbid` wins over other matches, otherwise the longest prefix. Every turn of an agent session gets the brief, the memory index and
-the other agents in its system prompt, and three tools:
+the other agents in its system prompt, and these tools:
 
 | Tool | Does |
 | --- | --- |
 | `message_agent` | Sends a message to another agent. |
 | `timer` | `set` (after `in_seconds` or at unix `at`), `list`, `cancel`. A timer wakes the session that set it unless `new_session` is true, whether or not a client is connected. |
 | `brief` | Reads or rewrites the agent's own brief and memory files. |
-| `question` | Records a question for the user (`title`, `body`, `assumption`, `default`, `due_in_seconds`, `importance`) and returns at once. The answer, or the deadline passing (the agent then goes with `default`), is delivered to the session that asked. |
+| `question` | Records a question for the user (`title`, `body`, `assumption`, `default`, `due_in_seconds`, `importance`, `key`) and returns at once. The answer, or the deadline passing (the agent then goes with `default`), is delivered to the session that asked. Asking again in the same task with the same `key` (or, without one, the same title) while the question is open updates it instead (`updated: true`); a task has at most 5 open questions. |
+| `finish` | Concludes the working run: `verdict` (`quiet`, `done`, `needs_you`, `failed`), `summary` for the user, optional `next` for the task's next run. |
 | `report` | Records a report (`title`, `body`) for the user to read; wakes nobody. |
 | `open_items` | `list`: the agent's open questions and the open actions of its sessions. `close` (`item`, `reason`): closes one of them unanswered; the user's phone is told, the desk lists it with the reason and can reopen it. An answer to a question tells the agent when it has other open items. |
 | `requirements` | `list`, `get`, `progress`, `propose_create`, `propose_close`: see "Agents and requirements". Noting and closing a requirement are only proposals the user accepts. |
 
 When a scheduled task's run starts in a new session, its earlier runs that are
-not working close their open questions and actions (`closed_by`:
-`superseded`) and are archived; reopening an item takes its session out of the
+not working close their open actions (`closed_by`: `superseded`) and are
+archived. Their open questions stay open for the user, and a run that still
+has one is not archived; reopening an item takes its session out of the
 archive.
 
 Messages (from `message_send`, `message_agent`, a fired timer or a scheduled
@@ -409,8 +416,10 @@ recorded in `messages.jsonl` before delivery and routed to a session:
 
 1. the `session` the message names;
 2. the session that received the message it replies to (`reply_to`);
-3. for a message from the user, the agent's most recently active session;
-4. otherwise a new session.
+3. otherwise a new session.
+
+A message to a disabled agent waits, and is delivered once the agent is
+enabled again.
 
 A delivered message is a user message in that session: it starts a run, or
 queues behind the running one. At most 4 runs are in progress at once; a
@@ -418,10 +427,65 @@ message that would start a fifth waits. Messages are retried every second,
 including ones left over from before a restart, and a fired timer is
 delivered once (its id is the message's dedupe key). Every client receives
 `message_delivered` (`id`, `agent`, `from`, `session`) and an updated
-`agents` list when an agent starts or stops working, an updated `schedules`
+`agents` list when an agent starts or stops working, an agent's `tasks`
+when its tasks or runs change, an updated `schedules`
 list when a scheduled task changes or runs, an updated `questions`
-list when a question is asked or answered, `report_posted` for a new report,
-and an updated `actions` list when an action is deferred or decided.
+list when a question is asked, answered, closed or reopened, `report_posted`
+for a new report, `report_read` (`report`) when one is read, and an updated
+`actions` list when an action is deferred, decided, closed or reopened.
+
+### Tasks and runs
+
+Every message delivered to an agent is a **run** of a **task**:
+
+- a message from a scheduled task is a run of that scheduled task (the task
+  id is the schedule id);
+- a message into a session that already belongs to a task is a run of that
+  task (a reply, an answer, a timer);
+- anything else opens a new session and a new task (`task-…`), titled after
+  the first line of the message. A message the user types into an agent
+  session directly is a run too.
+
+Runs are kept in `~/.jucode/daemon/runs.jsonl`, tasks of the last kind in
+`tasks.jsonl`. A run is `queued` until its session takes the message,
+`running` until that turn ends, then `succeeded` or `failed`; `interrupted`
+when its session stops (or the daemon restarts) first. A scheduled task that
+comes due while its last run is still waiting or working records a
+`skipped` run and does not send; `schedule_run` is refused then. At most 2
+runs of one agent work at once (and 4 in all); messages the user sent go
+before scheduled and automatic ones.
+
+A run's `outcome` (`verdict`, `summary`, `next`, `source`) is what the agent
+gave with `finish` (`source: agent`), or else inferred when the turn ends:
+`failed` for an error, `needs_you` when the run left a question or action
+open, `done` otherwise, with the handoff note as `summary` and `next`
+(`source: inferred`). A new scheduled run in its own session is told the
+last run's `next` and the task's questions still open; its session is named
+after the task and keeps that name. Any other agent session is named once,
+after its first turn.
+
+`task_list` describes each task with `id`, `agent`, `title`, `instruction`,
+`origin` (`user`, `agent`, `agent:<id>`), `session` (for a task of its own),
+`trigger` (`{kind: "manual"}`, `{kind: "once", at}` for a pending timer, or
+the schedule as `{kind: "repeat" | "once", repeat, time, days, date, enabled,
+next_run_at}`), `runs` (count, skipped ones excluded), `quiet_runs` (runs in a
+row with verdict `quiet`, newest first), `open_questions`, `open_actions`,
+`next_at`, `latest_run`, `updated_at` (ms), the closure fields when closed,
+and `state`, read from those:
+
+| `state` | When |
+| --- | --- |
+| `closed` | closed by `task_close` (until `task_reopen`) |
+| `running` | a run is queued or working |
+| `needs_you` | an open question or action, or the latest run's verdict is `needs_you` / `failed`, or it was interrupted |
+| `paused` | a scheduled task switched off |
+| `waiting` | it will run again by itself (a schedule, a timer) |
+| `done` | otherwise |
+
+Every change to an agent's tasks or runs is broadcast as that agent's
+`tasks` list (as `task_list` with `agent`). When the daemon first starts with
+tasks, the agent sessions not archived or from the last 30 days become tasks
+with one run each, concluded with their handoff notes.
 
 ### Scheduled tasks
 
@@ -742,7 +806,8 @@ the JuCode Android app its 个推 (Getui) client id with
 A client id registered again by another device moves to that device. The daemon notifies when a
 dispatch's plan waits for the user, a task waits for an approval, a
 dispatch is done, an open requirement turns to `review`, `confirm` or
-`approval`, and an agent proposes to note or close a requirement,
+`approval`, an agent proposes to note or close a requirement, an agent's
+run ends on an error (a `运行中断` report) and an agent closes an open item,
 through the relay (relay-protocol.md, Web Push). `{"op":"push_test"}` (paired devices
 only) sends a test notification to that device's browsers now and replies
 `push_tested` with `results: [{service, status}]` (or `error`): the push

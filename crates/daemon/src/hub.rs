@@ -522,6 +522,7 @@ impl Hub {
         lock(&self.busy).remove(id);
         lock(&self.claims).remove(id);
         self.usage.close(id);
+        self.interrupt_runs(Some(id));
         self.broadcast(&json!({ "type": "session_closed", "session": id }));
     }
 
@@ -753,7 +754,12 @@ impl Hub {
         }
         for question in self.store.open_questions() {
             if question.agent == id {
-                let _ = self.store.record_answer(&question.id, "", "agent_deleted");
+                let _ = self.store.close_item(
+                    ItemKind::Question,
+                    &question.id,
+                    "agent_deleted",
+                    "Agent 已删除",
+                );
             }
         }
         self.broadcast(&self.agents_json());
@@ -911,6 +917,8 @@ impl Hub {
             .store
             .closed_questions(now().saturating_sub(CLOSED_KEEP_MS))
             .iter()
+            // A deleted agent's questions have nobody to reopen them for.
+            .filter(|(_, closure)| closure.by != "agent_deleted")
             .map(|(question, closure)| with_closure(question_json(question), closure))
             .collect();
         json!({ "type": "questions", "questions": list, "closed": closed })
@@ -1052,9 +1060,11 @@ impl Hub {
     }
 
     /// A scheduled task started a new run in `current`: its earlier runs
-    /// are done with. Their open questions and actions close (the new run
-    /// asks again if it still needs to) and the runs are archived, so the
-    /// agent's page shows the latest run. A run still working is left.
+    /// are done with. Their waiting actions close (the approval belongs to a
+    /// run that is over; the new run acts again if it still needs to) and
+    /// the runs are archived, so the agent's page shows the latest run.
+    /// Questions stay open for the user to answer, and a run with one stays
+    /// out of the archive; a run still working is left.
     pub(crate) fn retire_schedule_runs(&self, schedule: &str, name: &str, current: &str) {
         let earlier: Vec<String> = self
             .store
@@ -1066,19 +1076,20 @@ impl Hub {
             return;
         }
         let reason = format!("定时任务「{name}」已开始新一次运行");
-        for question in self.store.open_questions() {
-            if earlier.contains(&question.session) {
-                let _ = self.close_item(ItemKind::Question, &question.id, "superseded", &reason);
-            }
-        }
         for action in self.store.open_actions() {
             if earlier.contains(&action.session_id) {
                 let _ = self.close_item(ItemKind::Action, &action.id, "superseded", &reason);
             }
         }
+        let asking: Vec<String> = self
+            .store
+            .open_questions()
+            .into_iter()
+            .map(|question| question.session)
+            .collect();
         let mut archived = false;
         for record in self.store.sessions() {
-            if earlier.contains(&record.id) && !record.archived {
+            if earlier.contains(&record.id) && !record.archived && !asking.contains(&record.id) {
                 archived |= self
                     .store
                     .record_session_meta(&record.id, &json!({ "archived": true }))
@@ -1128,16 +1139,30 @@ impl Hub {
 
     /// Delivers every pending message that can go now, oldest first. A
     /// message that would start a new run waits while `MAX_RUNNING` runs are
-    /// in progress; one for a busy session joins that session's queue.
+    /// in progress; one for a busy session joins that session's queue. One
+    /// for a disabled agent waits until the agent is enabled again.
     pub fn deliver_pending(self: &Arc<Self>) {
         let _guard = lock(&self.delivering);
-        for message in self.store.pending_messages() {
+        let mut pending = self.store.pending_messages();
+        // What the user sent goes before scheduled and automatic work.
+        pending.sort_by_key(|message| message.from != "user");
+        for message in pending {
+            if self
+                .agents
+                .get(&message.to)
+                .is_some_and(|agent| !agent.enabled)
+            {
+                continue;
+            }
             match self.route(&message) {
                 Ok(target) => {
                     let busy = target
                         .as_deref()
                         .is_some_and(|session| lock(&self.busy).contains(session));
-                    if !busy && lock(&self.busy).len() >= MAX_RUNNING {
+                    if !busy
+                        && (lock(&self.busy).len() >= MAX_RUNNING
+                            || self.working_runs_of(&message.to) >= crate::tasks::MAX_PER_AGENT)
+                    {
                         continue;
                     }
                     if let Err(error) = self.deliver(&message, target) {
@@ -1151,6 +1176,16 @@ impl Hub {
         }
     }
 
+    /// Sessions of `agent` working now.
+    fn working_runs_of(&self, agent: &str) -> usize {
+        let busy = lock(&self.busy).clone();
+        self.store
+            .sessions()
+            .iter()
+            .filter(|record| record.agent.as_deref() == Some(agent) && busy.contains(&record.id))
+            .count()
+    }
+
     /// The session a message goes to (None: a new session). Errors mean it
     /// can never be delivered.
     fn route(&self, message: &Message) -> Result<Option<String>, String> {
@@ -1158,9 +1193,6 @@ impl Hub {
             .agents
             .get(&message.to)
             .ok_or_else(|| format!("unknown agent {}", message.to))?;
-        if !agent.enabled {
-            return Err(format!("agent {} is disabled", agent.id));
-        }
         let own: Vec<_> = self
             .store
             .sessions()
@@ -1186,6 +1218,7 @@ impl Hub {
     }
 
     fn deliver(self: &Arc<Self>, message: &Message, target: Option<String>) -> Result<(), String> {
+        let fresh = target.is_none();
         let session = match target {
             Some(session) => {
                 self.open_session(&session, None)?;
@@ -1193,6 +1226,20 @@ impl Hub {
             }
             None => self.create_session(None, Some(&message.to), false)?,
         };
+        // A scheduled run in a session of its own is named after its task,
+        // and keeps that name.
+        if let (true, Some(schedule)) = (fresh, message.from.strip_prefix("schedule:")) {
+            let name = lock(&self.schedules)
+                .iter()
+                .find(|s| s.id == schedule)
+                .map(|s| s.name.clone());
+            if let Some(name) = name {
+                let _ = self
+                    .store
+                    .record_session_meta(&session, &json!({ "title": name }));
+            }
+        }
+        let run = self.queue_run(message, &session);
         // A delivered message starts (or queues) a run: claim the slot before
         // forwarding, so the next message sees it taken.
         *lock(&self.claims).entry(session.clone()).or_default() += 1;
@@ -1202,6 +1249,9 @@ impl Hub {
             json!({ "op": "user_message", "content": delivery_text(message), "claimed": true }),
         ) {
             self.release_claim(&session);
+            if let Some(run) = run {
+                self.discard_run(&run);
+            }
             return Err(error);
         }
         self.store
@@ -1237,28 +1287,41 @@ impl Hub {
             })
         });
         if event["type"] == "user_message" {
-            self.note_user_message(session, event["content"].as_str().unwrap_or_default());
+            let content = event["content"].as_str().unwrap_or_default();
+            self.note_user_message(session, content);
+            self.run_took_message(session, content);
         }
         // A name the session has in Claude Code (given there, or the one we
         // gave it) is the user's.
         if event["type"] == "session_title" {
             self.adopt_engine_title(session, event["title"].as_str().unwrap_or_default());
         }
-        let (due, ended, failed) = {
+        let (due, ended, failed, turn) = {
             let mut turns = lock(&self.turns);
             let turns = turns.entry(session.to_string()).or_default();
             let before = turns.done();
             let due = turns.observe(event);
-            (due, turns.done() != before, turns.take_failed())
+            (
+                due,
+                turns.done() != before,
+                turns.take_failed(),
+                turns.done(),
+            )
         };
-        if due {
+        // An agent's task keeps the title its first turn gave it.
+        if due && (turn == 1 || self.session_agent(session).is_none()) {
             self.retitle(session);
         }
+        let run = if ended {
+            self.end_run(session, failed.is_some())
+        } else {
+            None
+        };
         if let Some(error) = failed {
             self.report_failed_turn(session, &error);
         }
         if ended {
-            self.write_handoff(session);
+            self.write_handoff(session, run);
         }
         if let Some(hub) = self.me.upgrade() {
             crate::dispatch::observe(&hub, session, event);
@@ -1302,7 +1365,7 @@ impl Hub {
     /// An agent session's turn ended: the title model rewrites its handoff
     /// note in the background (see `titles`). One at a time per session; a
     /// turn that ends meanwhile is covered by the next.
-    fn write_handoff(&self, session: &str) {
+    fn write_handoff(&self, session: &str, run: Option<(String, bool)>) {
         let Some(record) = self
             .store
             .sessions()
@@ -1317,6 +1380,29 @@ impl Hub {
         let Some(hub) = self.me.upgrade() else {
             return;
         };
+        // The agent concluded the run itself: its note for the next run is
+        // the handoff, without asking the model.
+        if let Some((run, true)) = &run {
+            let next = self
+                .store
+                .runs()
+                .into_iter()
+                .find(|r| &r.id == run)
+                .and_then(|r| r.outcome)
+                .map(|o| if o.next.is_empty() { o.summary } else { o.next })
+                .unwrap_or_default();
+            if !next.is_empty() {
+                let title = record.title.clone().unwrap_or_default();
+                if let Err(error) = self
+                    .agents
+                    .save_handoff(&agent, session, &title, &next, now())
+                {
+                    jucode_agent_core::log_warn!("daemon", "handoff note not saved", error = error);
+                }
+                return;
+            }
+        }
+        let run = run.map(|(run, _)| run);
         if !lock(&self.handing_off).insert(session.to_string()) {
             return;
         }
@@ -1341,6 +1427,9 @@ impl Hub {
                 }
             };
             let Some(note) = note else { return };
+            if let Some(run) = &run {
+                hub.note_run_handoff(run, &note);
+            }
             // The title as it is now: the model may have renamed it meanwhile.
             let title = hub
                 .store
@@ -1899,9 +1988,25 @@ mod tests {
             importance: "normal".into(),
             due_at: None,
             asked_at: 1,
+            task: None,
+            key: None,
         };
         hub.ask(&ask("q1", "run1")).unwrap();
         hub.ask(&ask("q3", "run3")).unwrap();
+        let act = |id: &str, session: &str| jucode_agent_core::actions::DeferredAction {
+            id: id.into(),
+            session_id: session.into(),
+            cwd: dir.clone(),
+            call_id: id.into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+            summary: id.into(),
+            subagent_id: None,
+            digest: id.into(),
+            created_at: 1,
+        };
+        hub.store.record_deferred(&act("a1", "run1")).unwrap();
+        hub.store.record_deferred(&act("a2", "run2")).unwrap();
         // run2 is still working: left alone.
         lock(&hub.busy).insert("run2".into());
 
@@ -1912,21 +2017,27 @@ mod tests {
             .into_iter()
             .map(|q| q.id)
             .collect();
-        assert_eq!(open, ["q3"]);
-        assert_eq!(hub.store.closed_questions(0)[0].1.by, "superseded");
+        assert_eq!(open, ["q1", "q3"], "questions stay for the user");
+        let actions: Vec<String> = hub.store.open_actions().into_iter().map(|a| a.id).collect();
+        assert_eq!(actions, ["a2"], "a finished run's approval closes");
         let archived = |id: &str| {
             hub.store
                 .sessions()
                 .iter()
                 .any(|r| r.id == id && r.archived)
         };
-        assert!(archived("run1") && !archived("run2") && !archived("run3"));
-        assert_eq!(hub.open_items_of("ops").len(), 1);
+        // run1 still asks a question, run2 is working: neither is archived.
+        assert!(!archived("run1") && !archived("run2") && !archived("run3"));
+
+        // Once its question is closed, the next run archives it.
+        hub.close_item(ItemKind::Question, "q1", "user", "")
+            .unwrap();
+        hub.retire_schedule_runs("sch-1", "巡检", "run3");
+        assert!(archived("run1"));
 
         // Reopening brings its run back out of the archive.
         hub.reopen_item(ItemKind::Question, "q1").unwrap();
         assert!(!archived("run1"));
-        assert_eq!(hub.open_items_of("ops").len(), 2);
         assert!(hub.reopen_item(ItemKind::Question, "q1").is_err());
         let _ = fs::remove_dir_all(dir);
     }

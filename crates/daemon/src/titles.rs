@@ -178,15 +178,42 @@ pub fn clean_handoff(reply: &str) -> Option<String> {
     (!note.is_empty()).then_some(note)
 }
 
+/// Paired marks a title may be wrapped in, or end with when they close a
+/// name (`定时任务「巡检」`).
+const PAIRS: [(char, char); 4] = [('「', '」'), ('《', '》'), ('“', '”'), ('‘', '’')];
+
 /// The model's reply as a title: its first line, without surrounding quotes
-/// or trailing punctuation.
+/// or trailing punctuation. A closing mark stays when it closes an opening
+/// one inside the title.
 pub fn clean(reply: &str) -> Option<String> {
-    let line = reply.trim().lines().next()?.trim();
-    let line = line
-        .trim_start_matches(|c: char| "\"'“”‘’「」《》*#".contains(c) || c.is_whitespace())
-        .trim_end_matches(|c: char| {
-            "\"'“”‘’「」《》*.。!！?？,，;；:：".contains(c) || c.is_whitespace()
-        });
+    let mut line = reply.trim().lines().next()?.trim();
+    loop {
+        let before = line;
+        line = line
+            .trim_start_matches(|c: char| "\"'*#".contains(c) || c.is_whitespace())
+            .trim_end_matches(|c: char| "\"'*.。!！?？,，;；:：".contains(c) || c.is_whitespace());
+        for (open, close) in PAIRS {
+            let opens = line.matches(open).count();
+            let closes = line.matches(close).count();
+            if let Some(inner) = line
+                .strip_prefix(open)
+                .and_then(|rest| rest.strip_suffix(close))
+            {
+                if balanced(inner, open, close) {
+                    line = inner;
+                    continue;
+                }
+            }
+            if closes > opens {
+                line = line.strip_suffix(close).unwrap_or(line);
+            } else if opens > closes {
+                line = line.strip_prefix(open).unwrap_or(line);
+            }
+        }
+        if line == before {
+            break;
+        }
+    }
     let line = line
         .strip_prefix("Title:")
         .or_else(|| line.strip_prefix("标题："))
@@ -194,6 +221,22 @@ pub fn clean(reply: &str) -> Option<String> {
         .trim();
     let title = clip(line, TITLE_LIMIT);
     (!title.is_empty()).then_some(title)
+}
+
+/// Every `close` in `text` closes an earlier `open`, and none is left open.
+fn balanced(text: &str, open: char, close: char) -> bool {
+    let mut depth = 0i32;
+    for c in text.chars() {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth < 0 {
+                return false;
+            }
+        }
+    }
+    depth == 0
 }
 
 #[cfg(test)]
@@ -287,5 +330,21 @@ mod tests {
         );
         assert_eq!(clean("  \n"), None);
         assert_eq!(clean(&"长".repeat(50)).unwrap().chars().count(), 30);
+    }
+
+    #[test]
+    fn a_closing_mark_that_closes_a_name_stays() {
+        assert_eq!(
+            clean("定时任务「工单巡检（午夜）」").as_deref(),
+            Some("定时任务「工单巡检（午夜）」")
+        );
+        assert_eq!(
+            clean("「巡检」和「对账」").as_deref(),
+            Some("「巡检」和「对账」")
+        );
+        assert_eq!(clean("读《设计》。").as_deref(), Some("读《设计》"));
+        assert_eq!(clean("“修复登录”").as_deref(), Some("修复登录"));
+        assert_eq!(clean("修复登录」").as_deref(), Some("修复登录"));
+        assert_eq!(clean("「修复登录").as_deref(), Some("修复登录"));
     }
 }

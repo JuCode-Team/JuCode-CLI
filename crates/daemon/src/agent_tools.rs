@@ -1,6 +1,6 @@
 //! Tools a long-lived agent's sessions get from the daemon, added to the
 //! engine through `HostExtensions`: `message_agent`, `timer`, `schedule`,
-//! `brief`, `question`, `report`, `open_items` and `requirements`.
+//! `brief`, `question`, `report`, `finish`, `open_items` and `requirements`.
 
 use crate::{
     hub::Hub,
@@ -216,7 +216,8 @@ fn run(
             if !matches!(importance.as_str(), "low" | "normal" | "high") {
                 return Err("importance must be low, normal or high".to_string());
             }
-            let question = Question {
+            let task = hub.task_of_session(session);
+            let mut question = Question {
                 id: hub.new_id("q"),
                 agent: agent.to_string(),
                 session: session.to_string(),
@@ -232,10 +233,27 @@ fn run(
                     .filter(|seconds| *seconds > 0)
                     .map(|seconds| now() + seconds * 1000),
                 asked_at: now(),
+                task: task.clone(),
+                key: text("key"),
             };
+            // Asked again (same key, or same title) while still open: the
+            // open one now says this and is answered here.
+            let again = hub.same_question(task.as_deref(), &question);
+            if let Some(open) = &again {
+                question.id = open.id.clone();
+                question.key = question.key.take().or_else(|| open.key.clone());
+            } else if let Some(task) = &task {
+                if hub.open_questions_of_task(agent, task) >= crate::tasks::OPEN_QUESTIONS_PER_TASK {
+                    return Err(format!(
+                        "this task already has {} questions waiting for the user; close the ones no longer needed with open_items, or ask again with the key of one to update it",
+                        crate::tasks::OPEN_QUESTIONS_PER_TASK
+                    ));
+                }
+            }
             hub.ask(&question)?;
             Ok(json!({
                 "question": question.id,
+                "updated": again.is_some(),
                 "note": "Recorded for the user. Carry on with work that does not depend on the answer, under your stated assumption; the answer (or the deadline passing) arrives in this conversation as a message."
             }))
         }
@@ -251,6 +269,12 @@ fn run(
             };
             hub.post_report(&report)?;
             Ok(json!({ "report": report.id }))
+        }
+        "finish" => {
+            let verdict = text("verdict").ok_or("finish requires verdict")?;
+            let summary = text("summary").ok_or("finish requires summary")?;
+            let run = hub.finish_run(session, &verdict, &summary, &text("next").unwrap_or_default())?;
+            Ok(json!({ "run": run, "note": "Recorded. End your turn now." }))
         }
         "open_items" => match text("action").as_deref() {
             Some("list") => Ok(json!(hub.open_items_of(agent))),
@@ -290,7 +314,8 @@ fn definitions() -> Vec<Value> {
                     "assumption": { "type": "string", "description": "What you assume while waiting." },
                     "default": { "type": "string", "description": "What you will do if nobody answers in time." },
                     "due_in_seconds": { "type": "integer", "minimum": 0, "description": "Deadline; omit (or 0) to wait indefinitely." },
-                    "importance": { "type": "string", "enum": ["low", "normal", "high"] }
+                    "importance": { "type": "string", "enum": ["low", "normal", "high"] },
+                    "key": { "type": "string", "description": "A short stable name for this question (like `refund-policy`). Asking again with the same key, in this or a later run of the task, updates the open question instead of adding one." }
                 },
                 "required": ["title"],
                 "additionalProperties": false
@@ -379,6 +404,22 @@ fn definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "type": "function",
+            "name": "finish",
+            "description": "Conclude this run before ending your turn: what came of it, for the user and for the next run of the task. `quiet`: nothing worth the user's attention (a routine check that found nothing); `done`: work finished or something to report; `needs_you`: the user has to answer or decide something; `failed`: it could not be done.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "verdict": { "type": "string", "enum": ["quiet", "done", "needs_you", "failed"] },
+                    "summary": { "type": "string", "description": "For the user, in their language: at most five short lines on what happened and what matters." },
+                    "next": { "type": "string", "description": "For the next run of this task: what it should know or pick up. Omit when nothing." }
+                },
+                "required": ["verdict", "summary"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
             "name": "open_items",
             "description": "Your questions and approval-waiting actions that still wait for the user, across all your sessions. `list` shows them; `close` puts one away unanswered, with a `reason` the user reads (they are told and can reopen it). When the user answers or decides one item, check the rest: close the ones that answer made unnecessary or that newer work already settled. Never close one only because it is old.",
             "parameters": {

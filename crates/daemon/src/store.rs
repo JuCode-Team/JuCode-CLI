@@ -22,6 +22,8 @@ const MESSAGES: &str = "messages.jsonl";
 const TIMERS: &str = "timers.jsonl";
 const QUESTIONS: &str = "questions.jsonl";
 const REPORTS: &str = "reports.jsonl";
+const TASKS: &str = "tasks.jsonl";
+const RUNS: &str = "runs.jsonl";
 const DEVICES: &str = "devices.jsonl";
 /// The computer this state belongs to (see `claim_machine`).
 const MACHINE: &str = "machine";
@@ -153,6 +155,69 @@ pub struct Question {
     pub importance: String,
     pub due_at: Option<u64>,
     pub asked_at: u64,
+    /// The task it was asked for (see `tasks`); it stays open across runs.
+    pub task: Option<String>,
+    /// The agent's name for the question: asking again with the same key
+    /// in the same task updates the open one instead of adding another.
+    pub key: Option<String>,
+}
+
+/// A task of an agent that is not a scheduled one (those are their
+/// schedule): what the user, another agent or the agent's own session set
+/// it to do. It has one session; every message into it is one of its runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskRecord {
+    pub id: String,
+    pub agent: String,
+    pub title: String,
+    pub instruction: String,
+    /// `user`, `agent:<id>` or another message origin.
+    pub origin: String,
+    pub session: Option<String>,
+    pub created_at: u64,
+    pub closed: Option<Closure>,
+}
+
+/// What a run concluded: by the agent (`finish`) or inferred afterwards.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Outcome {
+    /// `quiet`, `done`, `needs_you` or `failed`.
+    pub verdict: String,
+    /// For the user, a few lines.
+    pub summary: String,
+    /// For the next run of the task.
+    pub next: String,
+    /// `agent` or `inferred`.
+    pub source: String,
+    pub at: u64,
+}
+
+/// One execution of a task: a message delivered into its session (or a
+/// scheduled time that was skipped), from start to the end of the turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Run {
+    pub id: String,
+    pub agent: String,
+    /// A task id or a schedule id.
+    pub task: String,
+    /// None: skipped before it reached a session.
+    pub session: Option<String>,
+    /// `user`, `schedule`, `reply`, `answer`, `timer`, `agent` or `other`.
+    pub trigger: String,
+    /// The message that started it.
+    pub message: Option<String>,
+    /// `queued`, `running`, `succeeded`, `failed`, `interrupted`,
+    /// `skipped` or `cancelled`.
+    pub status: String,
+    pub started_at: u64,
+    pub ended_at: Option<u64>,
+    pub outcome: Option<Outcome>,
+}
+
+impl Run {
+    pub fn ended(&self) -> bool {
+        self.ended_at.is_some()
+    }
 }
 
 /// Something an agent reports for the user to read; wakes nobody.
@@ -793,6 +858,8 @@ impl Store {
         timers
     }
 
+    /// Records a question; recording one with the id of an earlier one
+    /// replaces what it says (asked again).
     pub fn record_question(&self, question: &Question) -> io::Result<()> {
         self.append(
             QUESTIONS,
@@ -801,7 +868,7 @@ impl Store {
                 "session": question.session, "title": question.title, "body": question.body,
                 "assumption": question.assumption, "default": question.default_action,
                 "importance": question.importance, "due_at": question.due_at,
-                "at": question.asked_at,
+                "at": question.asked_at, "task": question.task, "key": question.key,
             }),
         )
     }
@@ -831,6 +898,7 @@ impl Store {
     pub fn question(&self, id: &str) -> Option<Question> {
         self.read(QUESTIONS)
             .iter()
+            .rev()
             .find(|entry| entry["kind"] == "asked" && entry["id"] == id)
             .and_then(question_from_json)
     }
@@ -840,9 +908,8 @@ impl Store {
         let entries = self.read(QUESTIONS);
         let answered = settled_ids(&entries, ItemKind::Question);
         let closed = closures(&entries);
-        entries
-            .iter()
-            .filter(|entry| entry["kind"] == "asked")
+        latest_asked(&entries)
+            .into_iter()
             .filter(|entry| {
                 !entry["id"]
                     .as_str()
@@ -856,9 +923,8 @@ impl Store {
     pub fn closed_questions(&self, since: u64) -> Vec<(Question, Closure)> {
         let entries = self.read(QUESTIONS);
         let closed = closures(&entries);
-        let mut list: Vec<(Question, Closure)> = entries
-            .iter()
-            .filter(|entry| entry["kind"] == "asked")
+        let mut list: Vec<(Question, Closure)> = latest_asked(&entries)
+            .into_iter()
             .filter_map(|entry| {
                 let closure = closure_from(closed.get(entry["id"].as_str()?)?)?;
                 (closure.at >= since).then_some((question_from_json(entry)?, closure))
@@ -909,6 +975,185 @@ impl Store {
                 })
             })
             .take(limit)
+            .collect()
+    }
+
+    pub fn record_task(&self, task: &TaskRecord) -> io::Result<()> {
+        self.append(
+            TASKS,
+            json!({
+                "kind": "created", "id": task.id, "agent": task.agent, "title": task.title,
+                "instruction": task.instruction, "origin": task.origin,
+                "session": task.session, "at": task.created_at,
+            }),
+        )
+    }
+
+    /// Closes a task (one of `tasks` or a scheduled one, by id); false when
+    /// it is closed already.
+    pub fn close_task(&self, id: &str, by: &str, reason: &str) -> io::Result<bool> {
+        let _guard = self.lock();
+        if closures(&self.read(TASKS)).contains_key(id) {
+            return Ok(false);
+        }
+        self.append_locked(
+            TASKS,
+            json!({ "kind": "closed", "id": id, "by": by, "reason": reason, "at": now() }),
+        )?;
+        Ok(true)
+    }
+
+    /// Reopens a closed task; false when it is open.
+    pub fn reopen_task(&self, id: &str) -> io::Result<bool> {
+        let _guard = self.lock();
+        if !closures(&self.read(TASKS)).contains_key(id) {
+            return Ok(false);
+        }
+        self.append_locked(TASKS, json!({ "kind": "reopened", "id": id, "at": now() }))?;
+        Ok(true)
+    }
+
+    /// Closed tasks (scheduled ones too) by id.
+    pub fn task_closures(&self) -> HashMap<String, Closure> {
+        closures(&self.read(TASKS))
+            .into_iter()
+            .filter_map(|(id, entry)| Some((id.to_string(), closure_from(entry)?)))
+            .collect()
+    }
+
+    /// Takes a run out of the log: it never reached its session.
+    pub fn discard_run(&self, id: &str) -> io::Result<()> {
+        self.append(RUNS, json!({ "kind": "discarded", "id": id, "at": now() }))
+    }
+
+    /// Every task, oldest first.
+    pub fn tasks(&self) -> Vec<TaskRecord> {
+        let entries = self.read(TASKS);
+        let closed = closures(&entries);
+        entries
+            .iter()
+            .filter(|entry| entry["kind"] == "created")
+            .filter_map(|entry| {
+                let text = |key: &str| entry[key].as_str().map(str::to_string);
+                let id = text("id")?;
+                Some(TaskRecord {
+                    closed: closed
+                        .get(id.as_str())
+                        .and_then(|entry| closure_from(entry)),
+                    agent: text("agent")?,
+                    title: text("title").unwrap_or_default(),
+                    instruction: text("instruction").unwrap_or_default(),
+                    origin: text("origin").unwrap_or_else(|| "user".to_string()),
+                    session: text("session"),
+                    created_at: entry["at"].as_u64().unwrap_or_default(),
+                    id,
+                })
+            })
+            .collect()
+    }
+
+    pub fn record_run(&self, run: &Run) -> io::Result<()> {
+        self.append(
+            RUNS,
+            json!({
+                "kind": "started", "id": run.id, "agent": run.agent, "task": run.task,
+                "session": run.session, "trigger": run.trigger, "message": run.message,
+                "status": run.status, "at": run.started_at, "ended_at": run.ended_at,
+            }),
+        )?;
+        if let Some(outcome) = &run.outcome {
+            self.record_outcome(&run.id, outcome)?;
+        }
+        Ok(())
+    }
+
+    /// A queued run started working.
+    pub fn record_run_running(&self, id: &str) -> io::Result<()> {
+        self.append(RUNS, json!({ "kind": "running", "id": id, "at": now() }))
+    }
+
+    pub fn record_run_ended(&self, id: &str, status: &str) -> io::Result<()> {
+        self.append(
+            RUNS,
+            json!({ "kind": "ended", "id": id, "status": status, "at": now() }),
+        )
+    }
+
+    /// Sets what a run concluded, replacing an earlier outcome.
+    pub fn record_outcome(&self, id: &str, outcome: &Outcome) -> io::Result<()> {
+        self.append(
+            RUNS,
+            json!({
+                "kind": "outcome", "id": id, "verdict": outcome.verdict,
+                "summary": outcome.summary, "next": outcome.next,
+                "source": outcome.source, "at": outcome.at,
+            }),
+        )
+    }
+
+    /// Every run, oldest first.
+    pub fn runs(&self) -> Vec<Run> {
+        let entries = self.read(RUNS);
+        let mut runs: Vec<Run> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+        for entry in entries.iter() {
+            let Some(id) = entry["id"].as_str() else {
+                continue;
+            };
+            let text = |key: &str| entry[key].as_str().map(str::to_string);
+            let at = entry["at"].as_u64().unwrap_or_default();
+            if entry["kind"] == "started" {
+                let (Some(agent), Some(task)) = (text("agent"), text("task")) else {
+                    continue;
+                };
+                index.insert(id.to_string(), runs.len());
+                runs.push(Run {
+                    id: id.to_string(),
+                    agent,
+                    task,
+                    session: text("session"),
+                    trigger: text("trigger").unwrap_or_else(|| "other".to_string()),
+                    message: text("message"),
+                    status: text("status").unwrap_or_else(|| "queued".to_string()),
+                    started_at: at,
+                    ended_at: entry["ended_at"].as_u64(),
+                    outcome: None,
+                });
+                continue;
+            }
+            if entry["kind"] == "discarded" {
+                index.remove(id);
+                continue;
+            }
+            let Some(run) = index.get(id).map(|&i| &mut runs[i]) else {
+                continue;
+            };
+            match entry["kind"].as_str() {
+                Some("running") if !run.ended() => {
+                    run.status = "running".to_string();
+                    run.started_at = at;
+                }
+                Some("ended") if !run.ended() => {
+                    run.status = text("status").unwrap_or_else(|| "succeeded".to_string());
+                    run.ended_at = Some(at);
+                }
+                Some("outcome") => {
+                    run.outcome = Some(Outcome {
+                        verdict: text("verdict").unwrap_or_else(|| "done".to_string()),
+                        summary: text("summary").unwrap_or_default(),
+                        next: text("next").unwrap_or_default(),
+                        source: text("source").unwrap_or_else(|| "inferred".to_string()),
+                        at,
+                    });
+                }
+                _ => {}
+            }
+        }
+        let kept: HashSet<usize> = index.into_values().collect();
+        runs.into_iter()
+            .enumerate()
+            .filter(|(i, _)| kept.contains(i))
+            .map(|(_, run)| run)
             .collect()
     }
 
@@ -1016,6 +1261,21 @@ impl Store {
     }
 }
 
+/// Each question's latest `asked` entry, in the order first asked.
+fn latest_asked(entries: &[Value]) -> Vec<&Value> {
+    let mut order: Vec<&str> = Vec::new();
+    let mut latest: HashMap<&str, &Value> = HashMap::new();
+    for entry in entries.iter().filter(|entry| entry["kind"] == "asked") {
+        let Some(id) = entry["id"].as_str() else {
+            continue;
+        };
+        if latest.insert(id, entry).is_none() {
+            order.push(id);
+        }
+    }
+    order.into_iter().map(|id| latest[id]).collect()
+}
+
 /// Ids of items answered (questions) or decided (actions).
 fn settled_ids(entries: &[Value], kind: ItemKind) -> HashSet<&str> {
     entries
@@ -1067,6 +1327,8 @@ fn question_from_json(entry: &Value) -> Option<Question> {
         importance: text("importance").unwrap_or_else(|| "normal".to_string()),
         due_at: entry["due_at"].as_u64(),
         asked_at: entry["at"].as_u64().unwrap_or_default(),
+        task: text("task"),
+        key: text("key"),
     })
 }
 
@@ -1464,6 +1726,8 @@ mod tests {
             importance: "normal".to_string(),
             due_at: Some(5),
             asked_at: 1,
+            task: None,
+            key: None,
         }
     }
 

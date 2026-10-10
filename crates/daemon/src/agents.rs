@@ -462,7 +462,8 @@ impl Agents {
              state.md (progress, open threads) and durable knowledge in memory/<topic>.md; what your latest \
              other sessions concluded is in <recent_handoffs>. Nobody may be watching: work on without \
              waiting. When only the user can decide, `question` them and continue under your assumption; \
-             when something is done or blocked, `report` it. Use `timer` to come back to something once, \
+             when something is done or blocked, `report` it. End every run with `finish`: whether it found \
+             anything for the user, a short summary, and what the next run of the task needs. Use `timer` to come back to something once, \
              `schedule` to propose recurring work (the user switches it on), and `message_agent` to hand \
              work to another agent. When the user answers or decides one of your open items, check \
              `open_items` and close the ones that made unnecessary.\n",
