@@ -2299,7 +2299,10 @@ mod tests {
         assert_eq!(closed["type"], "session_closed");
         assert_eq!(closed["reason"], "idle");
         assert!(lock(&hub.close_reasons).is_empty());
-        assert!(lock(&hub.asleep).contains_key("old"), "a message may open it again");
+        assert!(
+            lock(&hub.asleep).contains_key("old"),
+            "a message may open it again"
+        );
         // An open that fails leaves it asleep.
         assert!(hub.open_session("old", None).is_err());
         assert!(lock(&hub.asleep).contains_key("old"));
@@ -2356,7 +2359,11 @@ mod tests {
         }
         let mut closed = hub.close_idle(at, &HashSet::new());
         closed.sort();
-        assert_eq!(closed, ["s0", "s1"], "only sessions idle past CAP_MIN_IDLE_MS");
+        assert_eq!(
+            closed,
+            ["s0", "s1"],
+            "only sessions idle past CAP_MIN_IDLE_MS"
+        );
         assert_eq!(lock(&hub.sessions).len(), MAX_LIVE_ENGINES + 1);
         let _ = fs::remove_dir_all(dir);
     }
