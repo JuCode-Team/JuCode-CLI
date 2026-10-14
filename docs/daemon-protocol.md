@@ -236,13 +236,17 @@ refuses.
 Other GitHub skill repositories are listed only when the daemon's environment
 sets `JUCODE_SKILL_SOURCES` (`Name=https://github.com/owner/repo`, separated
 by `;`); none are listed by default. Their entries have `source`
-`owner/repo` and `sourceName` the configured name, and install from the
-repository's default branch. A repository that cannot be read is one of
-`warnings`.
+`owner/repo` and `sourceName` the configured name; a repository is read at
+its default branch's current commit and installs from that commit.
+`redistributable` is true only for an open-source license (the skill's
+frontmatter `license`, else the repository's). A repository that cannot be
+read is one of `warnings` and is retried after five minutes.
 
 `backend` picks the directory: `claude` installs into `~/.claude/skills`,
 anything else into `~/.jucode/skills`. `installed` means
-`<installDir>/<id>/SKILL.md` exists. `skill_install` looks the skill up again
+`<installDir>/<id>/SKILL.md` exists and, for a skill from a GitHub
+repository, that it came from this entry's repository; installing a skill
+whose name another repository's installed skill already has is an error. `skill_install` looks the skill up again
 in its source, then downloads it: a JuCode skill's inline content or
 checksummed package, or an Anthropic skill's whole directory at the index's
 pinned commit. The new install replaces an old one only once complete. Both

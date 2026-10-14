@@ -38,14 +38,16 @@ fn install_dir(backend: &str) -> Result<PathBuf, String> {
     Ok(home.join(".claude").join("skills"))
 }
 
-/// The skill repositories the user configured, fetched at most once an hour:
-/// listing one reads every SKILL.md it has.
+/// The skill repositories the user configured, fetched at most once an hour
+/// (listing one reads every SKILL.md it has); one that could not be read is
+/// tried again after five minutes, not on every catalog request.
 fn configured_sources() -> Vec<(String, Result<skills::SkillSource, String>)> {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     type Cached = (Instant, Result<skills::SkillSource, String>);
     static CACHE: Mutex<Vec<(String, Cached)>> = Mutex::new(Vec::new());
     const FRESH: Duration = Duration::from_secs(3600);
+    const RETRY: Duration = Duration::from_secs(300);
     // `JUCODE_SKILL_SOURCES="Name=https://github.com/o/r;…"`; none unless set.
     let configured: Vec<(String, String)> = std::env::var("JUCODE_SKILL_SOURCES")
         .unwrap_or_default()
@@ -60,7 +62,8 @@ fn configured_sources() -> Vec<(String, Result<skills::SkillSource, String>)> {
                 cache
                     .iter()
                     .find(|(repo, (at, result))| {
-                        repo == repository && (result.is_ok() && at.elapsed() < FRESH)
+                        repo == repository
+                            && at.elapsed() < if result.is_ok() { FRESH } else { RETRY }
                     })
                     .map(|(_, (_, result))| result.clone())
             });
@@ -100,7 +103,8 @@ fn catalog(dir: PathBuf) -> Result<Value, String> {
                 "source": "jucode",
                 "sourceName": "JuCode",
                 "isDefault": market.default_skill_ids.contains(&skill.id),
-                "installed": skills::skill_installed(&dir, &skill.id),
+                "installed": skills::skill_installed(&dir, &skill.id)
+                    && skills::installed_source(&dir, &skill.id).is_none(),
                 "license": "",
                 "redistributable": true,
                 "homepage": "",
@@ -118,7 +122,7 @@ fn catalog(dir: PathBuf) -> Result<Value, String> {
                 "source": key,
                 "sourceName": shown,
                 "isDefault": false,
-                "installed": skills::skill_installed(&dir, &skill.id),
+                "installed": installed_from(&dir, &skill.id, &source.repository),
                 "license": skill.license,
                 "redistributable": skill.redistributable,
                 "homepage": source.homepage(&skill.id),
@@ -147,6 +151,14 @@ fn catalog(dir: PathBuf) -> Result<Value, String> {
         "warnings": warnings,
         "installDir": dir,
     }))
+}
+
+/// Whether `id` is installed from `repository`: a skill another source
+/// installed under the same name is not this one. One installed before
+/// sources were recorded counts for every source.
+fn installed_from(dir: &std::path::Path, id: &str, repository: &str) -> bool {
+    skills::skill_installed(dir, id)
+        && skills::installed_source(dir, id).is_none_or(|source| source == repository)
 }
 
 /// The skill is looked up again here rather than trusting anything the

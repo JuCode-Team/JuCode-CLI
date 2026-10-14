@@ -55,9 +55,9 @@ Set `extra_skills_source` to the built-in name `anthropic` or to an HTTPS GitHub
 The built-in source points to <https://github.com/anthropics/skills>. Its vendored index,
 `crates/agent-core/src/anthropic-skills.json`, carries each skill's name, description, tags and
 license and is pinned to a reviewed Git commit, so listing works without a GitHub request. A custom
-repository URL is expected to contain skills at `skills/<slug>/`; JuCode reads its directory
-through the public GitHub API and installs from the default branch. `/skills list` groups available
-skills by source.
+repository is read through the public GitHub API at its default branch's current commit, and
+installs come from that commit. Its skills may sit in `skills/<slug>/` or at the top level.
+`/skills list` groups available skills by source.
 
 `/skills install <slug>` or `/skills update <slug>` reads the repository tree from the GitHub API
 and downloads the whole `skills/<slug>/` directory from `raw.githubusercontent.com`. Every path is
@@ -85,8 +85,18 @@ adds a warning; the Anthropic catalog stays installable.
 
 Other GitHub skill repositories join the catalog only when the daemon runs with
 `JUCODE_SKILL_SOURCES="Name=https://github.com/owner/repo;…"`; none are listed by default. Their
-skills may sit in `skills/<slug>/` or at the repository's top level, and install from the default
-branch. JuCode does not review these repositories; their licenses are the user's to check.
+skills may sit in `skills/<slug>/` or at the repository's top level. A repository is read at its
+default branch's current commit (again after an hour; after five minutes when it could not be
+read), and its skills install from that commit. JuCode does not review these repositories.
+
+A skill from a custom repository is offered only under an open-source license: the `license` in
+its `SKILL.md` frontmatter, or else the repository's license as GitHub detects it. A skill
+without one, or with terms such as "Complete terms in LICENSE.txt", is listed with its license
+and repository link but not installed.
+
+An installed source skill records its repository in `.jucode-source`. Installing a skill of the
+same name from another repository is refused until the installed one is removed, and the catalog
+marks a skill installed only for the repository it came from.
 
 Desktop lists the source-available Anthropic document skills the same way: shown with their
 license and repository link, not installed (the daemon's `skill_install` refuses them).
