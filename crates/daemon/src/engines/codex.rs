@@ -2038,6 +2038,10 @@ impl Adapter for Codex {
         self.thread.clone()
     }
 
+    fn model(&self) -> Option<String> {
+        (!self.model.is_empty()).then(|| self.model.clone())
+    }
+
     fn approval_mode(&self) -> Option<String> {
         Some(self.mode.to_string())
     }

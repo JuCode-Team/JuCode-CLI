@@ -146,6 +146,7 @@ fn run(hub: &Hub, mut core: AgentCore, id: &str, ops: Receiver<Value>) {
         // Reconciled every tick, so a message that never started a run (an
         // engine error) does not hold a running slot.
         hub.set_busy(id, status["state"] != "ready");
+        hub.set_held(id, core.has_background_work());
         if last_status.as_ref() != Some(&status) {
             hub.broadcast(&status);
             last_status = Some(status);
@@ -209,6 +210,8 @@ fn terminal(
     let tui = crate::terminal::tui(&command, &cwd);
     match crate::terminal::open_command(&arc, client, request, tui, Some(on_exit)) {
         Ok(term) => {
+            // The conversation is in the TUI until it exits: never idle.
+            hub.set_held(id, true);
             let surface = json!({ "type": "surface", "surface": "tui", "term": term, "client": client, "session": id });
             hub.broadcast(&surface);
             loop {

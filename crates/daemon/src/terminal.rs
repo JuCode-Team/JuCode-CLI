@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn a_shell_runs_in_the_project_and_reports_its_exit() {
         let (hub, project, dir) = hub("run");
-        let (outbox, frames) = mpsc::channel();
+        let (outbox, frames) = Hub::outbox();
         let client = hub.add_client(outbox, None);
         let op = json!({ "op": "term_open", "cwd": project, "cols": 100, "rows": 30, "id": 7 });
         assert_eq!(handle(&hub, client, "term_open", &op), Ok(Value::Null));
@@ -396,7 +396,7 @@ mod tests {
         let term = opened["term"].as_str().unwrap().to_string();
 
         // Another client can neither type into it nor close it.
-        let (other_outbox, _other) = mpsc::channel();
+        let (other_outbox, _other) = Hub::outbox();
         let other = hub.add_client(other_outbox, None);
         let close = json!({ "term": term });
         assert!(handle(&hub, other, "term_close", &close).is_err());
@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn terminals_stay_in_known_directories_and_are_capped() {
         let (hub, project, dir) = hub("cap");
-        let (outbox, frames) = mpsc::channel();
+        let (outbox, frames) = Hub::outbox();
         let client = hub.add_client(outbox, None);
         let outside = json!({ "cwd": std::env::temp_dir() });
         assert!(handle(&hub, client, "term_open", &outside).is_err());

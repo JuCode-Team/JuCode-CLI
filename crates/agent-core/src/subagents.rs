@@ -572,6 +572,16 @@ impl SubagentManager {
     }
 
     /// Every agent of this session as an `agent_runs` row (oldest first).
+    /// A subagent has not finished (waiting to start or running).
+    pub(crate) fn has_unfinished(&self) -> bool {
+        self.inner.state.lock().unwrap().agents.values().any(|agent| {
+            matches!(
+                agent.status,
+                SubagentStatus::Pending | SubagentStatus::Running
+            )
+        })
+    }
+
     pub(crate) fn runs_json(&self) -> Vec<Value> {
         let state = self.inner.state.lock().unwrap();
         let now = now_ms();

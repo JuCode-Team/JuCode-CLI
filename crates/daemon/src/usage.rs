@@ -199,6 +199,12 @@ impl Usage {
         }
     }
 
+    /// The session's engine stopped: its model route goes (a reopened
+    /// engine announces it again).
+    pub fn forget(&self, session: &str) {
+        self.lock().routes.remove(session);
+    }
+
     /// The session is ready again: its turns are written.
     pub fn close(&self, session: &str) {
         // Keep the move from open turns to the file atomic for ledger snapshots.

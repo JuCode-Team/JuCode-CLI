@@ -192,6 +192,21 @@ every connected client.
 `decide_action` (a session op) also works for a session that is closed or
 was hosted before a restart: the daemon reopens it first.
 
+A hosted session with nothing going on has its engine closed: 30 minutes
+after its last activity (an op from a client, a turn starting or ending,
+background work ending), or sooner, least recently active first, while more
+than 16 engines are open (never one active in the last 2 minutes). Nothing is
+going on when no turn runs, no message waits, no background task, subagent or
+approval is open, the conversation is not in its TUI and no agent run is
+unfinished. Clients get `session_closed` with `reason: "idle"`; the session
+is not removed, and `session_open` resumes it when the user next sends to it.
+A `session_open` without `options` opens it as it last ran (model, effort,
+approval mode). A `user_message`, `command`, `continue` or `approve_plan` sent
+to such a session opens it first, and the sender watches it again, so clients
+that do not reopen it themselves keep working. Every client then gets
+`session_reopened` with `session`, so one that put it to sleep can watch it
+again. `session_closed` for any other close has no `reason`.
+
 `session_create` also accepts `agent` instead of `cwd`: the session runs in
 the agent's directory as that agent. With `chat: true` instead, the session is
 a chat: it runs in `~/.jucode/chats` with the chat prompt (conversation and

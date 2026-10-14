@@ -465,6 +465,12 @@ impl AgentCore {
             .unwrap_or_else(|| efforts[efforts.len() / 2].clone())
     }
 
+    /// Work still going outside a turn: a background shell running or a
+    /// subagent not finished. A host keeps such a session open.
+    pub fn has_background_work(&self) -> bool {
+        self.tool_state.has_running_shell() || self.subagent_manager.has_unfinished()
+    }
+
     pub fn model_status_event(&self) -> AgentEvent {
         let state = if self.running {
             "streaming".to_string()

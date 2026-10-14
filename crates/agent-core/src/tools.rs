@@ -1416,7 +1416,7 @@ fn run_command_session(
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to start {program}: {error}"))?;
-    track_tool_group(child.id());
+    track_process_group(child.id());
 
     let stdin = child.stdin.take();
     let started = SystemTime::now();
@@ -1638,7 +1638,9 @@ fn kill_child(child: &mut Child) {
 /// a stale entry whose pid was reused is skipped.
 static TOOL_GROUPS: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
 
-fn track_tool_group(pid: u32) {
+/// Puts a process group this process started (a tool command, or a host's
+/// engine process) on the list `terminate_tool_processes` ends.
+pub fn track_process_group(pid: u32) {
     if let Ok(mut groups) = TOOL_GROUPS.get_or_init(|| Mutex::new(Vec::new())).lock() {
         groups.push(pid);
     }
@@ -1649,6 +1651,20 @@ fn track_tool_group(pid: u32) {
 /// with their descendants: SIGTERM to each group, SIGKILL to what is left
 /// after half a second. Call when the engine process is about to exit, so
 /// nothing it started outlives it.
+/// Signals the process group `pid` leads (one `track_process_group` knows):
+/// SIGKILL when `kill`, else SIGTERM. Nothing on Windows, where children
+/// are ended one by one.
+pub fn signal_process_group(pid: u32, kill: bool) {
+    #[cfg(unix)]
+    {
+        let signal = if kill { libc::SIGKILL } else { libc::SIGTERM };
+        // SAFETY: plain kill(2) on a process group id.
+        unsafe { libc::killpg(pid as libc::pid_t, signal) };
+    }
+    #[cfg(not(unix))]
+    let _ = (pid, kill);
+}
+
 pub fn terminate_tool_processes() {
     let pids = TOOL_GROUPS
         .get()
@@ -2648,6 +2664,27 @@ impl ToolState {
         }
     }
 
+    /// A background shell of this engine's is still running (one past its
+    /// timeout is not: the next poll ends it).
+    pub fn has_running_shell(&self) -> bool {
+        let owned: Vec<u64> = match self.inner.lock() {
+            Ok(inner) => inner.shells.iter().copied().collect(),
+            Err(_) => return false,
+        };
+        if owned.is_empty() {
+            return false;
+        }
+        let Ok(mut sessions) = shell_sessions().lock() else {
+            return false;
+        };
+        owned.iter().any(|id| {
+            sessions.get_mut(id).is_some_and(|session| {
+                session.started.elapsed().unwrap_or_default() < session.timeout
+                    && matches!(session.child.try_wait(), Ok(None))
+            })
+        })
+    }
+
     fn owns_shell(&self, session_id: u64) -> bool {
         self.inner
             .lock()
@@ -3001,7 +3038,7 @@ fn run_command_events(
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to start {program}: {error}"))?;
-    track_tool_group(child.id());
+    track_process_group(child.id());
 
     if let Some(input) = stdin {
         if let Some(mut child_stdin) = child.stdin.take() {

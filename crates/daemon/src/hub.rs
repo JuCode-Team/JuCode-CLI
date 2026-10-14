@@ -21,7 +21,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::Sender,
+        mpsc::{Sender, SyncSender, TrySendError},
         Arc, Mutex, MutexGuard, Weak,
     },
     thread,
@@ -35,6 +35,23 @@ const PAIRING_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 /// Runs that may be in progress at once across all sessions; messages that
 /// would start another run wait for a free slot.
 pub const MAX_RUNNING: usize = 4;
+
+/// A hosted session with nothing going on (see `Hub::idle_sessions`) has its
+/// engine closed this long after its last activity; the client opens it
+/// again, resuming, when the user next sends to it.
+pub const IDLE_CLOSE_MS: u64 = 30 * 60 * 1000;
+/// Engines kept open at most: past this, idle sessions are closed, least
+/// recently active first, before their `IDLE_CLOSE_MS` is up.
+pub const MAX_LIVE_ENGINES: usize = 16;
+/// A session idle this briefly is not closed for the cap: it was just
+/// opened or just used, and closing it would only start it again.
+const CAP_MIN_IDLE_MS: u64 = 2 * 60 * 1000;
+/// Frames a client may have waiting: a client that falls this far behind
+/// (a stalled connection) is dropped rather than queued for without end.
+const OUTBOX_LIMIT: usize = 10_000;
+/// How long a pending daemon update waits for held work (a TUI, background
+/// tasks) to end before it restarts anyway; running turns it always waits for.
+const RESTART_HOLD_MS: u64 = 10 * 60 * 1000;
 
 pub struct Hub {
     pub store: Store,
@@ -65,6 +82,12 @@ pub struct Hub {
     next_id: AtomicU64,
     next_generation: AtomicU64,
     clients: Mutex<HashMap<u64, Client>>,
+    /// Why the daemon closed a session, until its engine thread ends and
+    /// `session_ended` tells the clients (`session_closed`'s `reason`).
+    close_reasons: Mutex<HashMap<String, &'static str>>,
+    /// Sessions closed for idleness, with the options their engine ran with:
+    /// a message to one opens it again (`wake`), as it ran.
+    asleep: Mutex<HashMap<String, engines::Options>>,
     /// Pairing code → expiry (ms). Single use.
     pairings: Mutex<HashMap<String, u64>>,
     next_client: AtomicU64,
@@ -87,7 +110,7 @@ pub struct Hub {
 }
 
 struct Client {
-    outbox: Sender<String>,
+    outbox: SyncSender<String>,
     /// The paired device this connection authenticated as; None for a local
     /// client holding the daemon token.
     device: Option<String>,
@@ -99,6 +122,12 @@ struct Hosted {
     watchers: HashSet<u64>,
     /// Which engine thread backs this entry (see `session_ended`).
     generation: u64,
+    /// When something last happened in the session (ms): an op from a
+    /// client, a turn starting or ending, background work ending.
+    last_active: u64,
+    /// Work outside a turn keeps the engine open: background tasks or
+    /// subagents, an approval waiting, the conversation in its TUI.
+    held: bool,
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -148,6 +177,8 @@ impl Hub {
             next_id: AtomicU64::new(0),
             next_generation: AtomicU64::new(0),
             clients: Mutex::new(HashMap::new()),
+            close_reasons: Mutex::new(HashMap::new()),
+            asleep: Mutex::new(HashMap::new()),
             pairings: Mutex::new(HashMap::new()),
             next_client: AtomicU64::new(1),
             untitled: Mutex::new(HashSet::new()),
@@ -155,7 +186,7 @@ impl Hub {
         })
     }
 
-    pub fn add_client(&self, outbox: Sender<String>, device: Option<String>) -> u64 {
+    pub fn add_client(&self, outbox: SyncSender<String>, device: Option<String>) -> u64 {
         let id = self.next_client.fetch_add(1, Ordering::SeqCst);
         lock(&self.clients).insert(id, Client { outbox, device });
         id
@@ -268,14 +299,31 @@ impl Hub {
         }
     }
 
+    /// The channel a connection's frames wait in (`OUTBOX_LIMIT`).
+    pub fn outbox() -> (SyncSender<String>, std::sync::mpsc::Receiver<String>) {
+        std::sync::mpsc::sync_channel(OUTBOX_LIMIT)
+    }
+
+    /// Queues `text` for a client; false when the client is gone or so far
+    /// behind that it is dropped (it reconnects and gets a fresh snapshot).
+    fn queue(client: &Client, text: String) -> bool {
+        match client.outbox.try_send(text) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+        }
+    }
+
     pub fn broadcast(&self, frame: &Value) {
         let text = frame.to_string();
-        lock(&self.clients).retain(|_, client| client.outbox.send(text.clone()).is_ok());
+        lock(&self.clients).retain(|_, client| Self::queue(client, text.clone()));
     }
 
     pub fn send_to(&self, client: u64, frame: &Value) {
-        if let Some(client) = lock(&self.clients).get(&client) {
-            let _ = client.outbox.send(frame.to_string());
+        let mut clients = lock(&self.clients);
+        if let Some(queued) = clients.get(&client) {
+            if !Self::queue(queued, frame.to_string()) {
+                clients.remove(&client);
+            }
         }
     }
 
@@ -371,6 +419,14 @@ impl Hub {
         if lock(&self.sessions).contains_key(id) {
             return Ok(());
         }
+        // Closed for idleness: a client that does not say how (a phone, an
+        // agent's delivery) opens it as it last ran. The entry goes once it
+        // is open (a failed open leaves it asleep).
+        let kept = lock(&self.asleep).get(id).cloned();
+        let options = match kept {
+            Some(kept) if options == engines::Options::default() => kept,
+            _ => options,
+        };
         let known = self
             .store
             .sessions()
@@ -471,6 +527,7 @@ impl Hub {
                 .map_err(|error| error.to_string())?;
         }
         self.host(id.to_string(), ops, record.cwd, generation);
+        lock(&self.asleep).remove(id);
         Ok(())
     }
 
@@ -482,6 +539,8 @@ impl Hub {
                 cwd,
                 watchers: HashSet::new(),
                 generation,
+                last_active: now(),
+                held: false,
             },
         );
     }
@@ -495,10 +554,114 @@ impl Hub {
         let hosted = lock(&self.sessions)
             .remove(id)
             .ok_or_else(|| format!("session {id} is not open"))?;
-        let _ = hosted.ops.send(json!({ "op": "shutdown" }));
+        self.shut(id, hosted)
+    }
+
+    fn shut(&self, id: &str, hosted: Hosted) -> Result<(), String> {
+        // An idle close keeps the engine's options for the next open.
+        let keep = lock(&self.close_reasons).get(id) == Some(&"idle");
+        let _ = hosted.ops.send(json!({ "op": "shutdown", "keep": keep }));
         self.store
             .record_session_closed(id)
             .map_err(|error| error.to_string())
+    }
+
+    /// Something happened in a hosted session: its idle time starts again.
+    fn touch(&self, id: &str) {
+        if let Some(hosted) = lock(&self.sessions).get_mut(id) {
+            hosted.last_active = now();
+        }
+    }
+
+    /// Called by a session thread every tick: whether work outside a turn
+    /// keeps its engine open (see `Hosted::held`). Work ending counts as
+    /// activity, so the idle time runs from then.
+    pub fn set_held(&self, id: &str, held: bool) {
+        if let Some(hosted) = lock(&self.sessions).get_mut(id) {
+            if hosted.held != held {
+                hosted.held = held;
+                hosted.last_active = now();
+            }
+        }
+    }
+
+    /// Closes the engines of sessions with nothing going on: those idle for
+    /// `IDLE_CLOSE_MS`, then, while more than `MAX_LIVE_ENGINES` are open,
+    /// the least recently active ones idle for `CAP_MIN_IDLE_MS`. A session
+    /// is idle when it runs no turn, has no message waiting, holds no work
+    /// (`Hosted::held`) and has no agent run in `open_runs`. Clients get
+    /// `session_closed` with reason `idle`. Returns the closed sessions.
+    pub(crate) fn close_idle(&self, at: u64, open_runs: &HashSet<String>) -> Vec<String> {
+        let busy = lock(&self.busy).clone();
+        let claimed: HashSet<String> = lock(&self.claims)
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut closing = Vec::new();
+        {
+            // Checked and removed under one lock: an op that reaches the
+            // session first has made it active (`forward`), and one that
+            // comes after finds it closed.
+            let mut sessions = lock(&self.sessions);
+            let mut idle: Vec<(String, u64)> = sessions
+                .iter()
+                .filter(|(id, hosted)| {
+                    !hosted.held
+                        && !busy.contains(*id)
+                        && !claimed.contains(*id)
+                        && !open_runs.contains(*id)
+                })
+                .map(|(id, hosted)| (id.clone(), at.saturating_sub(hosted.last_active)))
+                .collect();
+            // Longest idle first.
+            idle.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+            let mut live = sessions.len();
+            for (id, idle_for) in idle {
+                let over = live > MAX_LIVE_ENGINES && idle_for >= CAP_MIN_IDLE_MS;
+                if idle_for < IDLE_CLOSE_MS && !over {
+                    continue;
+                }
+                if let Some(hosted) = sessions.remove(&id) {
+                    live -= 1;
+                    // Before the lock goes: a message right after finds it
+                    // asleep (`wake`), never just gone.
+                    lock(&self.asleep).insert(id.clone(), engines::Options::default());
+                    closing.push((id, hosted));
+                }
+            }
+        }
+        let mut closed = Vec::new();
+        for (id, hosted) in closing {
+            lock(&self.close_reasons).insert(id.clone(), "idle");
+            if self.shut(&id, hosted).is_ok() {
+                closed.push(id);
+            }
+        }
+        closed
+    }
+
+    /// The options an engine closed for idleness ran with (sent by its
+    /// thread as it stops), for its next open.
+    pub(crate) fn keep_options(&self, id: &str, options: engines::Options) {
+        if let Some(kept) = lock(&self.asleep).get_mut(id) {
+            *kept = options;
+        }
+    }
+
+    /// Before a message goes to `session`: one closed for idleness is
+    /// opened again, as it ran, and `client` (which watched it) watches it
+    /// again. Clients that know `session_closed`'s `reason` open it
+    /// themselves first; this keeps those that do not (older apps) working.
+    pub fn wake(self: &Arc<Self>, client: u64, session: &str) -> Result<(), String> {
+        if lock(&self.sessions).contains_key(session) || !lock(&self.asleep).contains_key(session) {
+            return Ok(());
+        }
+        self.open_session(session, None)?;
+        self.set_watch(client, session, true);
+        // Clients that put it to sleep watch it again.
+        self.broadcast(&json!({ "type": "session_reopened", "session": session }));
+        Ok(())
     }
 
     /// Called by a session thread when its engine stops on its own (`/quit`
@@ -515,15 +678,27 @@ impl Hub {
                     sessions.remove(id);
                     let _ = self.store.record_session_closed(id);
                 }
-                Some(_) => return,
+                // Reopened while this engine was stopping: the new one is
+                // live, and why the old one closed says nothing about it.
+                Some(_) => {
+                    lock(&self.close_reasons).remove(id);
+                    return;
+                }
                 None => {}
             }
         }
         lock(&self.busy).remove(id);
         lock(&self.claims).remove(id);
+        // Images waiting for an echo the closed engine will not send.
+        lock(&self.sent_images).remove(id);
         self.usage.close(id);
+        self.usage.forget(id);
         self.interrupt_runs(Some(id));
-        self.broadcast(&json!({ "type": "session_closed", "session": id }));
+        let mut closed = json!({ "type": "session_closed", "session": id });
+        if let Some(reason) = lock(&self.close_reasons).remove(id) {
+            closed["reason"] = json!(reason);
+        }
+        self.broadcast(&closed);
     }
 
     /// Sends `op` to every open JuCode session (other engines have no MCP
@@ -547,10 +722,11 @@ impl Hub {
         if op["op"] == "set_approval_mode" && crate::requirements::gated(self, session) {
             op["mode"] = json!(crate::requirements::read_only(self, session));
         }
-        let sessions = lock(&self.sessions);
+        let mut sessions = lock(&self.sessions);
         let hosted = sessions
-            .get(session)
+            .get_mut(session)
             .ok_or_else(|| format!("session {session} is not open"))?;
+        hosted.last_active = now();
         hosted
             .ops
             .send(op)
@@ -564,6 +740,7 @@ impl Hub {
         };
         let before = !hosted.watchers.is_empty();
         if watch {
+            hosted.last_active = now();
             hosted.watchers.insert(client);
         } else {
             hosted.watchers.remove(&client);
@@ -592,10 +769,17 @@ impl Hub {
         let Some(hub) = self.me.upgrade() else {
             return;
         };
+        let asked = now();
         thread::spawn(move || loop {
-            if lock(&hub.busy).is_empty() {
+            // Nothing running, and nothing held (a TUI, background work) or
+            // held too long: exiting ends everything the daemon started.
+            let held = lock(&hub.sessions).values().any(|hosted| hosted.held)
+                && now().saturating_sub(asked) < RESTART_HOLD_MS;
+            if lock(&hub.busy).is_empty() && !held {
                 hub.broadcast(&json!({ "type": "daemon_restarting" }));
                 thread::sleep(std::time::Duration::from_millis(300));
+                // As on a signal: nothing this daemon started outlives it.
+                jucode_agent_core::terminate_tool_processes();
                 std::process::exit(0);
             }
             thread::sleep(std::time::Duration::from_secs(1));
@@ -614,6 +798,7 @@ impl Hub {
             lock(&self.busy).remove(session)
         };
         if changed {
+            self.touch(session);
             self.broadcast(&self.agents_json());
         }
     }
@@ -822,25 +1007,6 @@ impl Hub {
         self.expire_questions();
         self.deliver_pending();
         self.sweep();
-    }
-
-    /// Hosted agent sessions that nobody watches and that are not working.
-    pub(crate) fn idle_agent_sessions(&self) -> Vec<String> {
-        let agents: HashSet<String> = self
-            .store
-            .sessions()
-            .into_iter()
-            .filter(|record| record.agent.is_some())
-            .map(|record| record.id)
-            .collect();
-        let busy = lock(&self.busy).clone();
-        lock(&self.sessions)
-            .iter()
-            .filter(|(id, hosted)| {
-                hosted.watchers.is_empty() && agents.contains(*id) && !busy.contains(*id)
-            })
-            .map(|(id, _)| id.clone())
-            .collect()
     }
 
     pub fn ask(&self, question: &Question) -> Result<(), String> {
@@ -2082,6 +2248,148 @@ mod tests {
         assert!(lock(&hub.sessions).contains_key("s1"));
         hub.session_ended("s1", new);
         assert!(!lock(&hub.sessions).contains_key("s1"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn idle_hub(label: &str) -> (Arc<Hub>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "jucode-idle-{label}-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let hub = Hub::new(
+            Store::open(dir.join("daemon")).unwrap(),
+            Agents::open(dir.join("agents")).unwrap(),
+            "test",
+            None,
+        );
+        (hub, dir)
+    }
+
+    /// Hosts `id` as last active `idle_ms` before `at`; the receiver sees its ops.
+    fn host_idle(hub: &Hub, id: &str, at: u64, idle_ms: u64) -> mpsc::Receiver<Value> {
+        let (ops, rx) = mpsc::channel();
+        hub.host(id.into(), ops, "/tmp".into(), hub.next_generation());
+        lock(&hub.sessions).get_mut(id).unwrap().last_active = at - idle_ms;
+        rx
+    }
+
+    #[test]
+    fn idle_sessions_close_after_the_idle_time_and_say_why() {
+        let (hub, dir) = idle_hub("time");
+        let at = now();
+        let old = host_idle(&hub, "old", at, IDLE_CLOSE_MS);
+        let _recent = host_idle(&hub, "recent", at, IDLE_CLOSE_MS - 1);
+        let (outbox, frames) = Hub::outbox();
+        hub.add_client(outbox, None);
+
+        assert_eq!(hub.close_idle(at, &HashSet::new()), ["old"]);
+        assert_eq!(old.try_recv().unwrap()["op"], "shutdown");
+        assert!(lock(&hub.sessions).contains_key("recent"));
+
+        lock(&hub.turns).insert("old".into(), Turns::default());
+        // The engine thread ends: clients learn it was closed for idleness.
+        let generation = 0;
+        hub.session_ended("old", generation);
+        assert!(
+            lock(&hub.turns).contains_key("old"),
+            "titles and last replies outlive the engine"
+        );
+        let closed: Value = serde_json::from_str(&frames.try_recv().unwrap()).unwrap();
+        assert_eq!(closed["type"], "session_closed");
+        assert_eq!(closed["reason"], "idle");
+        assert!(lock(&hub.close_reasons).is_empty());
+        assert!(lock(&hub.asleep).contains_key("old"), "a message may open it again");
+        // An open that fails leaves it asleep.
+        assert!(hub.open_session("old", None).is_err());
+        assert!(lock(&hub.asleep).contains_key("old"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_reopened_session_does_not_inherit_the_idle_reason() {
+        let (hub, dir) = idle_hub("reopen");
+        let at = now();
+        let _old = host_idle(&hub, "s", at, IDLE_CLOSE_MS);
+        let old_generation = lock(&hub.sessions)["s"].generation;
+        hub.close_idle(at, &HashSet::new());
+        // Opened again before the old engine thread finished.
+        let _new = host_idle(&hub, "s", at, 0);
+        hub.session_ended("s", old_generation);
+        assert!(lock(&hub.sessions).contains_key("s"));
+        assert!(lock(&hub.close_reasons).is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn work_in_progress_keeps_a_session_open() {
+        let (hub, dir) = idle_hub("work");
+        let at = now();
+        let long = IDLE_CLOSE_MS * 4;
+        let _busy = host_idle(&hub, "busy", at, long);
+        let _claimed = host_idle(&hub, "claimed", at, long);
+        let _held = host_idle(&hub, "held", at, long);
+        let _run = host_idle(&hub, "run", at, long);
+        lock(&hub.busy).insert("busy".into());
+        lock(&hub.claims).insert("claimed".into(), 1);
+        lock(&hub.sessions).get_mut("held").unwrap().held = true;
+        let open_runs: HashSet<String> = ["run".to_string()].into();
+
+        assert!(hub.close_idle(at, &open_runs).is_empty());
+        assert_eq!(lock(&hub.sessions).len(), 4);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn past_the_cap_the_least_recently_active_idle_sessions_close() {
+        let (hub, dir) = idle_hub("cap");
+        let at = now();
+        let mut rx = Vec::new();
+        // Over the cap by three: two idle long enough, the rest just used.
+        for i in 0..MAX_LIVE_ENGINES + 3 {
+            let idle = match i {
+                0 => CAP_MIN_IDLE_MS * 3,
+                1 => CAP_MIN_IDLE_MS * 2,
+                _ => CAP_MIN_IDLE_MS - 1,
+            };
+            rx.push(host_idle(&hub, &format!("s{i}"), at, idle));
+        }
+        let mut closed = hub.close_idle(at, &HashSet::new());
+        closed.sort();
+        assert_eq!(closed, ["s0", "s1"], "only sessions idle past CAP_MIN_IDLE_MS");
+        assert_eq!(lock(&hub.sessions).len(), MAX_LIVE_ENGINES + 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_op_or_a_turn_restarts_the_idle_time() {
+        let (hub, dir) = idle_hub("touch");
+        let at = now();
+        let _sent = host_idle(&hub, "sent", at, IDLE_CLOSE_MS * 2);
+        let _turned = host_idle(&hub, "turned", at, IDLE_CLOSE_MS * 2);
+        let _released = host_idle(&hub, "released", at, IDLE_CLOSE_MS * 2);
+        hub.forward("sent", json!({ "op": "user_message", "content": "hi" }))
+            .unwrap();
+        hub.set_busy("turned", true);
+        hub.set_busy("turned", false);
+        lock(&hub.sessions).get_mut("released").unwrap().held = true;
+        hub.set_held("released", false);
+
+        assert!(hub.close_idle(now(), &HashSet::new()).is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_client_that_falls_too_far_behind_is_dropped() {
+        let (hub, dir) = idle_hub("outbox");
+        let (outbox, _frames) = Hub::outbox();
+        let client = hub.add_client(outbox, None);
+        for _ in 0..OUTBOX_LIMIT {
+            hub.broadcast(&json!({ "type": "x" }));
+        }
+        assert!(lock(&hub.clients).contains_key(&client));
+        hub.broadcast(&json!({ "type": "x" }));
+        assert!(!lock(&hub.clients).contains_key(&client));
         let _ = fs::remove_dir_all(dir);
     }
 }

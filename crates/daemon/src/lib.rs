@@ -221,7 +221,7 @@ impl Link for WebSocket<TcpStream> {
 /// `device` is the paired device it authenticated as; None for a local
 /// client.
 fn attach(hub: &Arc<Hub>, link: &mut impl Link, device: Option<String>) -> Result<(), String> {
-    let (outbox, inbox) = mpsc::channel();
+    let (outbox, inbox) = Hub::outbox();
     let client = hub.add_client(outbox, device);
     let result = pump(hub, client, link, &inbox);
     hub.remove_client(client);
@@ -826,6 +826,11 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             .map(|()| Value::Null),
         // Ops the daemon sends a session itself.
         ("tui" | "tui_exit", Some(_)) => Err(format!("{name} is not a client op")),
+        // A message to a session closed for idleness opens it again first.
+        ("user_message" | "command" | "continue" | "approve_plan", Some(session)) => hub
+            .wake(client, &session)
+            .and_then(|()| hub.forward(&session, op.clone()))
+            .map(|()| Value::Null),
         (_, Some(session)) => hub.forward(&session, op.clone()).map(|()| Value::Null),
         (name, None) => Err(format!("{name} requires session")),
     };

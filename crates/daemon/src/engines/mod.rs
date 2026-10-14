@@ -193,6 +193,10 @@ pub trait Adapter: Send {
     fn approval_mode(&self) -> Option<String> {
         None
     }
+    /// The model it runs now (a switch mid-session included).
+    fn model(&self) -> Option<String> {
+        None
+    }
     /// A mode switch reaches the running turn (else it applies to the next).
     fn mode_applies_live(&self) -> bool {
         true
@@ -303,9 +307,16 @@ impl Process {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Its own process group: stopping the engine ends what it started
+        // (MCP servers, shells) with it, and the daemon ends the group when
+        // it exits (`terminate_tool_processes`).
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
         let mut child = command
             .spawn()
             .map_err(|error| format!("cannot start {program}: {error}"))?;
+        #[cfg(unix)]
+        jucode_agent_core::track_process_group(child.id());
         let (lines_tx, lines) = mpsc::channel();
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let stderr = child.stderr.take().ok_or("no stderr")?;
@@ -356,17 +367,19 @@ impl Process {
     }
 
     /// Closes stdin and kills the process if it has not exited after a grace
-    /// period. Returns how it ended.
+    /// period; what it started goes with it (`end_group`).
     fn stop(mut self) {
         self.stdin = None;
         thread::spawn(move || {
             let deadline = std::time::Instant::now() + EXIT_GRACE;
             while std::time::Instant::now() < deadline {
                 if matches!(self.child.try_wait(), Ok(Some(_))) {
+                    self.end_group(false);
                     return;
                 }
                 thread::sleep(Duration::from_millis(50));
             }
+            self.end_group(true);
             let _ = self.child.kill();
             let _ = self.child.wait();
         });
@@ -374,8 +387,15 @@ impl Process {
 
     /// Ends the engine now, without the grace `stop` gives it.
     fn kill(mut self) {
+        self.end_group(true);
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    /// Signals the engine's process group: what it started and left running
+    /// (MCP servers, shells) ends with it. `now`: SIGKILL, else SIGTERM.
+    fn end_group(&self, now: bool) {
+        jucode_agent_core::signal_process_group(self.child.id(), now);
     }
 
     fn exit_reason(&mut self) -> String {
@@ -387,6 +407,27 @@ impl Process {
             Err(error) => error.to_string(),
         }
     }
+}
+
+/// How an engine closed for idleness opens again: as it runs now (model and
+/// approval mode switched mid-session, the settings `keep` carries), on its
+/// conversation as a whole (no rewind point from an earlier open).
+fn asleep_options(adapter: &dyn Adapter, current: &Options) -> Options {
+    Options {
+        model: adapter.model().or(current.model.clone()),
+        approval_mode: adapter.approval_mode().or(current.approval_mode.clone()),
+        resume: None,
+        resume_at: None,
+        ..adapter.keep(current.clone())
+    }
+}
+
+/// Whether a subagent or workflow in this state is working or about to.
+fn running(state: &str) -> bool {
+    matches!(
+        state,
+        "running" | "pending" | "queued" | "start" | "started" | "async_launched" | "in_progress"
+    )
 }
 
 /// The state a client needs when it starts watching.
@@ -486,6 +527,38 @@ impl Snapshot {
             }
             _ => {}
         }
+    }
+
+    /// Work outside a turn keeps the engine open (`Hub::set_held`):
+    /// background tasks, subagents or workflows running, approvals waiting.
+    /// Claude Code's run list is rebuilt from its transcript (a run that
+    /// never ended stays "running" there); its live background work is in
+    /// `background_tasks`, so only other engines' runs count.
+    fn holds(&self, kind: Kind) -> bool {
+        let tasks = self
+            .state
+            .get("background_tasks")
+            .and_then(|event| event["tasks"].as_array())
+            .is_some_and(|tasks| !tasks.is_empty());
+        let runs = kind != Kind::Claude
+            && self.state.get("agent_runs").is_some_and(|event| {
+                let workflows = event["workflows"].as_array().into_iter().flatten();
+                let nested = workflows
+                    .clone()
+                    .flat_map(|workflow| workflow["agents"].as_array().into_iter().flatten());
+                event["agents"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(workflows)
+                    .chain(nested)
+                    .any(|run| {
+                        // Runs say `status`; a workflow's agents say `state`.
+                        let state = run["status"].as_str().or(run["state"].as_str());
+                        running(state.unwrap_or_default())
+                    })
+            });
+        tasks || runs || !self.approvals.is_empty()
     }
 
     fn answered(&mut self, call: &str) {
@@ -669,6 +742,13 @@ impl Session<'_> {
                 match ops.try_recv() {
                     Ok(op) => {
                         if self.apply(&mut process, adapter.as_mut(), &op) {
+                            // Closed for idleness: the next open starts it
+                            // as it runs now (model, effort, mode).
+                            if op["keep"] == true {
+                                if let Some(id) = &self.id {
+                                    self.hub.keep_options(id, asleep_options(adapter.as_ref(), &current));
+                                }
+                            }
                             process.stop();
                             return;
                         }
@@ -715,6 +795,8 @@ impl Session<'_> {
                     }
                     Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {
                         let reason = process.exit_reason();
+                        // What it started does not outlive it.
+                        process.end_group(false);
                         let message = self
                             .stopped_message(&format!("{} stopped ({reason})", self.kind.name()));
                         self.publish(vec![json!({ "type": "error", "message": message })]);
@@ -726,6 +808,11 @@ impl Session<'_> {
             let busy = adapter.busy();
             if let Some(id) = &self.id {
                 self.hub.set_busy(id, busy);
+                // A switch or a TUI waiting for the turn to end is work too.
+                let held = self.snapshot.holds(self.kind)
+                    || self.restart.is_some()
+                    || self.tui_request.is_some();
+                self.hub.set_held(id, held);
             }
             if !busy && self.pending_mode.take().is_some() {
                 self.publish(vec![
@@ -879,6 +966,8 @@ impl Session<'_> {
         match opened {
             Ok(term) => {
                 self.hub.set_busy(&session, false);
+                // The conversation is in the TUI until it exits: never idle.
+                self.hub.set_held(&session, true);
                 self.publish(vec![
                     json!({ "type": "surface", "surface": "tui", "term": term, "client": client }),
                 ]);
@@ -1255,6 +1344,46 @@ fn full_access(mode: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_idle_closed_engine_reopens_on_its_whole_conversation() {
+        let current = Options {
+            model: Some("started-with".into()),
+            resume: Some("conv".into()),
+            resume_at: Some("rewind-point".into()),
+            bin: Some("/opt/claude".into()),
+            ..Options::default()
+        };
+        let engine = adapter(Kind::Claude, Path::new("/tmp"), &current);
+        let kept = asleep_options(engine.as_ref(), &current);
+        assert_eq!(kept.resume_at, None, "a rewind applies to the open that asked");
+        assert_eq!(kept.resume, None);
+        assert_eq!(kept.bin.as_deref(), Some("/opt/claude"));
+        assert_eq!(kept.model.as_deref(), Some("started-with"));
+    }
+
+    #[test]
+    fn background_work_and_waiting_approvals_hold_the_engine() {
+        let mut snapshot = Snapshot::default();
+        assert!(!snapshot.holds(Kind::Codex));
+        snapshot.apply(&json!({ "type": "background_tasks", "tasks": [{ "id": "t1" }] }));
+        assert!(snapshot.holds(Kind::Claude));
+        snapshot.apply(&json!({ "type": "background_tasks", "tasks": [] }));
+        assert!(!snapshot.holds(Kind::Claude));
+        // As Codex reports a subagent still working after its turn.
+        snapshot.apply(&json!({ "type": "agent_runs", "workflows": [], "agents": [{ "id": "a", "status": "running" }, { "id": "b", "status": "completed" }] }));
+        assert!(snapshot.holds(Kind::Codex));
+        // Claude's run list comes from its transcript: not trusted to hold.
+        assert!(!snapshot.holds(Kind::Claude));
+        snapshot.apply(&json!({ "type": "agent_runs", "workflows": [{ "status": "completed", "agents": [{ "state": "async_launched" }] }], "agents": [] }));
+        assert!(snapshot.holds(Kind::Codex), "a workflow's agent still running");
+        snapshot.apply(&json!({ "type": "agent_runs", "workflows": [{ "status": "completed", "agents": [{ "state": "done" }] }], "agents": [{ "status": "failed" }, { "status": "" }] }));
+        assert!(!snapshot.holds(Kind::Codex));
+        snapshot.apply(&json!({ "type": "approval_request", "call_id": "c1" }));
+        assert!(snapshot.holds(Kind::Codex));
+        snapshot.apply(&json!({ "type": "status", "message": "ready" }));
+        assert!(!snapshot.holds(Kind::Codex));
+    }
 
     #[test]
     fn the_snapshot_rebuilds_the_conversation_and_open_approvals() {

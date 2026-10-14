@@ -12,7 +12,7 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -28,9 +28,6 @@ const MIGRATED: &str = "tasks_migrated";
 const VERDICTS: [&str; 4] = ["quiet", "done", "needs_you", "failed"];
 /// A run working longer than this is stopped and counted as failed.
 pub const RUN_TIMEOUT_MS: u64 = 2 * 60 * 60 * 1000;
-/// An agent session nobody watches has its engine closed this long after
-/// its last run ended; the next message to it opens it again.
-pub const IDLE_CLOSE_MS: u64 = 30 * 60 * 1000;
 /// How often `sweep` looks for runs to time out and sessions to close.
 const SWEEP_EVERY_MS: u64 = 60 * 1000;
 static LAST_SWEEP: AtomicU64 = AtomicU64::new(0);
@@ -375,8 +372,7 @@ impl Hub {
     }
 
     /// Once a minute: runs working past `RUN_TIMEOUT_MS` are stopped, and
-    /// agent sessions idle (no watcher, nothing running) for `IDLE_CLOSE_MS`
-    /// since their last run have their engines closed.
+    /// idle sessions have their engines closed (`Hub::close_idle`).
     pub(crate) fn sweep(&self) {
         let at = now();
         let last = LAST_SWEEP.load(Ordering::Relaxed);
@@ -393,21 +389,16 @@ impl Hub {
                 let _ = self.cancel_run(&run.id, true);
             }
         }
-        for session in self.idle_agent_sessions() {
-            let mine: Vec<&Run> = runs
-                .iter()
-                .filter(|run| run.session.as_deref() == Some(session.as_str()))
-                .collect();
-            let settled = !mine.is_empty() && mine.iter().all(|run| run.ended());
-            let ended = mine
-                .iter()
-                .filter_map(|run| run.ended_at)
-                .max()
-                .unwrap_or(0);
-            if settled && at.saturating_sub(ended) > IDLE_CLOSE_MS {
-                let _ = self.close_session(&session);
-            }
-        }
+        // A run not ended yet (queued for a free slot, say) will need its
+        // session: it stays open.
+        let open_runs: HashSet<String> = self
+            .store
+            .runs()
+            .into_iter()
+            .filter(|run| !run.ended())
+            .filter_map(|run| run.session)
+            .collect();
+        self.close_idle(at, &open_runs);
     }
 
     /// The runs of `session` still open when its engine stopped (closed,

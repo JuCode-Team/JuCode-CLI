@@ -2334,6 +2334,12 @@ impl Adapter for Claude {
         (!self.conversation.is_empty()).then(|| self.conversation.clone())
     }
 
+    fn model(&self) -> Option<String> {
+        (!self.model.is_empty())
+            .then(|| self.model.clone())
+            .or(self.requested_model.clone())
+    }
+
     fn approval_mode(&self) -> Option<String> {
         Some(from_claude_mode(self.mode).to_string())
     }
