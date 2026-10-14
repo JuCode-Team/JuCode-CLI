@@ -62,6 +62,8 @@ pub struct Hub {
     pub push: crate::push::Push,
     /// Remote terminals, each owned by the client that opened it.
     pub terminals: crate::terminal::Terminals,
+    /// Dev servers the sessions' commands started.
+    pub dev_servers: crate::devservers::DevServers,
     pub version: &'static str,
     pub relay: Relay,
     sessions: Mutex<HashMap<String, Hosted>>,
@@ -166,6 +168,7 @@ impl Hub {
             uploads,
             push: crate::push::Push::load(store.dir()),
             terminals: Default::default(),
+            dev_servers: Default::default(),
             store,
             agents,
             version,
@@ -1007,6 +1010,29 @@ impl Hub {
         self.expire_questions();
         self.deliver_pending();
         self.sweep();
+        self.scan_dev_servers();
+    }
+
+    /// Looks for dev servers when a scan is due, off the scheduler thread
+    /// (listing sockets takes a moment), and tells the clients of changes.
+    fn scan_dev_servers(self: &Arc<Self>) {
+        if !self.dev_servers.due(now()) {
+            return;
+        }
+        let sessions: Vec<crate::devservers::SessionDir> = lock(&self.sessions)
+            .iter()
+            .map(|(id, hosted)| crate::devservers::SessionDir {
+                id: id.clone(),
+                cwd: hosted.cwd.clone(),
+                last_active: hosted.last_active,
+            })
+            .collect();
+        let hub = Arc::clone(self);
+        thread::spawn(move || {
+            if let Some(servers) = hub.dev_servers.scan(&sessions) {
+                hub.broadcast(&crate::devservers::servers_json(&servers));
+            }
+        });
     }
 
     pub fn ask(&self, question: &Question) -> Result<(), String> {
@@ -1467,6 +1493,7 @@ impl Hub {
     /// Every event a session publishes: its title follows the conversation
     /// (see `titles`).
     pub fn observe(&self, session: &str, event: &Value) {
+        self.dev_servers.observe(event, now());
         self.usage.observe(session, event, || {
             let record = self
                 .store
