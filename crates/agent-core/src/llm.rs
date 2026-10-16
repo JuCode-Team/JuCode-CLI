@@ -113,8 +113,6 @@ pub struct OpenAiClient {
     extra_read_roots: Vec<PathBuf>,
     /// The engine's tool state (see `tools::ToolState`), shared with its subagents.
     tool_state: tools::ToolState,
-    /// Tools and prompt text added by the host process (main agent only).
-    host: Option<crate::host::HostExtensions>,
     hooks: Hooks,
     /// Independent one-shot model used by `auto` mode to classify shell
     /// commands. None disables classification (shell calls then always ask).
@@ -179,7 +177,6 @@ pub struct OpenAiClientConfig<'a> {
     pub extra_read_roots: Vec<PathBuf>,
     /// The engine's tool state (see `tools::ToolState`).
     pub tool_state: tools::ToolState,
-    pub host: Option<crate::host::HostExtensions>,
     pub subagent_manager: Option<SubagentManager>,
     pub hooks: Hooks,
 }
@@ -414,10 +411,9 @@ enum ParallelToolMessage {
     },
 }
 
-/// What decides the tools a request offers: the host's, MCP servers', the
-/// built-ins this engine has (edit tools, web, images), subagents, goals.
+/// What decides the tools a request offers: MCP servers', the built-ins
+/// this engine has (edit tools, web, images), subagents, goals.
 pub(crate) struct ToolOffer<'a> {
-    pub host: Option<&'a crate::host::HostExtensions>,
     pub mcp: &'a McpManager,
     pub tool_state: &'a tools::ToolState,
     pub enabled_edit_tools: &'a [String],
@@ -429,9 +425,6 @@ pub(crate) struct ToolOffer<'a> {
 }
 
 pub(crate) fn request_tool_definitions(offer: &ToolOffer<'_>) -> Vec<Value> {
-    if let Some(host) = offer.host.filter(|host| host.exclusive) {
-        return host.tools.clone();
-    }
     let mut definitions = tools::definitions()
         .into_iter()
         .filter(|definition| {
@@ -447,9 +440,6 @@ pub(crate) fn request_tool_definitions(offer: &ToolOffer<'_>) -> Vec<Value> {
         definitions.extend(subagent_definitions(model, efforts, models));
     }
     definitions.extend(offer.mcp.definitions());
-    if let Some(host) = offer.host {
-        definitions.extend(host.tools.iter().cloned());
-    }
     if offer
         .tool_state
         .sandbox()
@@ -627,7 +617,6 @@ impl OpenAiClient {
             write_root: None,
             extra_read_roots: config.extra_read_roots,
             tool_state: config.tool_state,
-            host: config.host,
             hooks: config.hooks,
             safety,
         })
@@ -1134,7 +1123,6 @@ impl OpenAiClient {
 
     fn tool_definitions(&self) -> Vec<Value> {
         request_tool_definitions(&ToolOffer {
-            host: self.host.as_ref(),
             mcp: &self.mcp,
             tool_state: &self.tool_state,
             enabled_edit_tools: &self.enabled_edit_tools,
@@ -1203,16 +1191,7 @@ impl OpenAiClient {
                 );
             }
         }
-        let exclusive = self
-            .host
-            .as_ref()
-            .is_some_and(|host| host.exclusive && !host.has_tool(&request.name));
-        let result = if exclusive {
-            json_tool_result(
-                json!({ "error": format!("unknown tool: {}", request.name) }),
-                true,
-            )
-        } else if let Some(result) = self.run_goal_tool(&request.name, &request.arguments) {
+        let result = if let Some(result) = self.run_goal_tool(&request.name, &request.arguments) {
             result
         } else if let Some(result) = self.run_subagent_tool(
             &request.call_id,
@@ -1223,17 +1202,6 @@ impl OpenAiClient {
             pending_call_ids,
         ) {
             result
-        } else if let Some(host) = self
-            .host
-            .as_ref()
-            .filter(|host| host.has_tool(&request.name))
-        {
-            let (output, is_error) = (host.run_tool)(&request.name, &request.arguments);
-            tools::ToolExecutionResult {
-                model_output: tools::project_model_output(&request.name, &output, cwd),
-                output,
-                is_error,
-            }
         } else if request.name.starts_with("mcp__") {
             match self.mcp.run_tool(&request.name, &request.arguments) {
                 Some((output, is_error)) => tools::ToolExecutionResult {
@@ -1473,7 +1441,6 @@ impl OpenAiClient {
             // Own read record: the child must read what it edits, and its
             // edits fail on files changed since (by the parent or siblings).
             tool_state: self.tool_state.for_subagent(),
-            host: None,
             hooks: self.hooks.clone(),
             safety: self.safety.clone(),
         };
@@ -2890,7 +2857,6 @@ mod tests {
             edit_tools: crate::config::default_edit_tools(),
             extra_read_roots: Vec::new(),
             tool_state: tools::ToolState::default(),
-            host: None,
             subagent_manager: None,
             hooks: Hooks::default(),
         }

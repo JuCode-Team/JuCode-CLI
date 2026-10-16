@@ -216,8 +216,6 @@ pub struct AgentCore {
     hooks: Hooks,
     /// Files read and shells started by this engine (see `tools::ToolState`).
     tool_state: crate::tools::ToolState,
-    /// Tools and prompt text added by a host process (the daemon).
-    host: Option<crate::host::HostExtensions>,
     /// Chat session (cwd under `~/.jucode/chats/`): chat prompt, no project
     /// instructions or project skills.
     chat: bool,
@@ -314,7 +312,6 @@ impl AgentCore {
             project_trusted,
             hooks,
             tool_state,
-            host: None,
             chat,
             plan: Vec::new(),
             approval_receiver: None,
@@ -365,11 +362,6 @@ impl AgentCore {
             .unwrap_or_else(|| self.config.sandbox.clone());
         sandbox.writable_dirs.extend_from_slice(dirs);
         self.tool_state.set_sandbox(Some(sandbox));
-    }
-
-    /// Adds host tools and prompt text; they apply from the next turn.
-    pub fn set_host_extensions(&mut self, host: crate::host::HostExtensions) {
-        self.host = Some(host);
     }
 
     /// Writes the session to disk now, even before its first message, so a
@@ -2103,13 +2095,6 @@ impl AgentCore {
                 system_prompt.push_str(&note);
             }
         }
-        if let Some(host) = &self.host {
-            let extra = (host.prompt)();
-            if !extra.trim().is_empty() {
-                system_prompt.push_str("\n\n");
-                system_prompt.push_str(extra.trim_end());
-            }
-        }
         if self.approval_mode.get() == ApprovalMode::Plan && !self.chat {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(crate::plan_mode::PROMPT_ADDENDUM);
@@ -2202,7 +2187,6 @@ impl AgentCore {
             edit_tools: self.config.edit_tools.clone(),
             extra_read_roots,
             tool_state: self.tool_state.clone(),
-            host: self.host.clone(),
             subagent_manager: Some(self.subagent_manager.clone()),
             hooks: self.hooks.clone(),
         }) else {
@@ -2473,7 +2457,6 @@ impl AgentCore {
             edit_tools: Vec::new(),
             extra_read_roots: Vec::new(),
             tool_state: crate::tools::ToolState::default(),
-            host: None,
             subagent_manager: None,
             hooks: Hooks::default(),
         })
@@ -2526,7 +2509,6 @@ impl AgentCore {
             edit_tools: Vec::new(),
             extra_read_roots: Vec::new(),
             tool_state: crate::tools::ToolState::default(),
-            host: None,
             subagent_manager: None,
             hooks: Hooks::default(),
         })
@@ -3501,7 +3483,6 @@ impl AgentCore {
             &self.config.subagent_models,
         );
         let tools = crate::llm::request_tool_definitions(&crate::llm::ToolOffer {
-            host: self.host.as_ref(),
             mcp: &self.mcp,
             tool_state: &self.tool_state,
             enabled_edit_tools: &self.config.edit_tools,
@@ -4764,7 +4745,7 @@ fn target_context_budget(model_config: &ModelConfig, threshold_percent: u64) -> 
 /// (`is_context_overflow`).
 /// A turn's system prompt in its parts: the base prompt with the runtime
 /// context (`head`), the project's instruction files, the skills list, and
-/// what follows them (sandbox note, host prompt, plan-mode addendum).
+/// what follows them (sandbox note, plan-mode addendum).
 struct TurnPrompt {
     head: String,
     project: String,
@@ -5148,7 +5129,6 @@ fn title_request(
         edit_tools: Vec::new(),
         extra_read_roots: Vec::new(),
         tool_state: crate::tools::ToolState::default(),
-        host: None,
         subagent_manager: None,
         hooks: Hooks::default(),
     })?;
