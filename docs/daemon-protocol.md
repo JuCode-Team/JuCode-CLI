@@ -6,8 +6,6 @@ remote web page) connect over a WebSocket and speak the `jucode serve`
 protocol version 2 (`docs/serve-protocol.md`), with a `session` field that
 says which hosted session an op or event belongs to.
 
-Background and roadmap: `docs/agent-daemon-plan.md`.
-
 ## Running
 
 ```sh
@@ -39,10 +37,7 @@ State lives in `~/.jucode/daemon/`:
 | `token` | Client token, created on first start, mode 0600. |
 | `sessions.jsonl` | Append log of sessions opened and closed. |
 | `actions.jsonl` | Append log of deferred actions and their decisions. |
-| `messages.jsonl` | Append log of messages to agents and their delivery. |
-| `timers.jsonl` | Append log of agent timers set, fired and cancelled. |
-| `questions.jsonl` | Append log of questions asked and answered. |
-| `reports.jsonl` | Append log of reports posted and read. |
+| `schedules.json` | Scheduled tasks (see "Scheduled tasks"). |
 | `devices.jsonl` | Paired devices (a hash of each token, never the token) and revocations. |
 | `settings.json` | Daemon settings: `relay` (whether the relay connection is on). |
 | `workspaces.json` | Workspaces and their projects, with a save counter `rev`. |
@@ -116,8 +111,7 @@ Each WebSocket text message is one JSON frame. The daemon first sends:
 {"type":"workspaces","rev":1,"workspaces":[...]}
 ```
 
-followed by the current `agents`, `schedules`, `questions` and `actions`
-lists.
+followed by the current `schedules`, `actions` and `requirements` lists.
 
 A client that does not speak `protocol` 2 must disconnect.
 
@@ -132,16 +126,16 @@ every connected client.
 
 | Op | Fields | Reply |
 | --- | --- | --- |
-| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `agent`, `open`, `watchers`, `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at` |
+| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `schedule` (the scheduled task it is a run of, or null), `open`, `watchers`, `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at` |
 | `gateway_catalog` | — | `gateway_catalog`: `models` (the JuCode models the user chose to show, `jucode_models` in config.json) and `groups` (the gateway's groups with their models and multipliers); empty when not signed in or offline. For clients that cannot read this machine's login (the remote page) |
 | `restart_when_idle` | — | none. Desktop only: this daemon exits once no session is running (after a `daemon_restarting` broadcast), so the desktop can start a newer one without cutting off a task |
 | `session_meta` | `session`, and any of `title`, `archived`, `hidden`, `group` | none; every client receives the new `sessions` list. An empty title goes back to the engine's label; a hidden session leaves `session_list` and `session_history` (its conversation stays on disk). A session created here is titled after its first user message (first line, 40 characters) unless a client titled it first. After its 1st and 3rd turns, then every 5th, the title model (`title_model` in config.json, else the main `model`) renames it from the project name, the current title, the first and latest requests and the start of the latest reply. A title a client set with `session_meta` is never replaced |
-| `session_history` | `cwd` | `session_history`: every session saved in `cwd`, newest first, whoever ran it (daemon, TUI, `jucode serve`), with `title`, `updated_at`, `entries`, `archived`, `agent`, `open` |
+| `session_history` | `cwd` | `session_history`: every session saved in `cwd`, newest first, whoever ran it (daemon, TUI, `jucode serve`), with `title`, `updated_at`, `entries`, `archived`, `schedule`, `open` |
 | `session_create` | `cwd`, optional `engine` (`jucode`, default, `claude`, `codex` or `acp`) and `options` | `session_created` with `session`; the session's startup events follow. See "Other engines" |
 | `session_open` | `session`, optional `cwd`, `engine`, `options` | `session_opened`; with `cwd`, also opens a session saved there that the daemon never hosted. Reopens a closed session (or one from before a restart), resuming its transcript and its undecided deferred actions |
 | `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped |
 | `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `approval_mode_pending`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
-| `actions_list` | — | `actions`: undecided deferred actions across all sessions, and in `closed` the ones closed lately (as in `questions`) |
+| `actions_list` | — | `actions`: undecided deferred actions across all sessions, and in `closed` the ones closed in the last 7 days (each with `closed_by`, `closed_reason`, `closed_at`) |
 | `pair_start` | — | `pairing` with `code` and `expires_at` (local clients only) |
 | `device_list` | — | `devices`: paired, unrevoked devices (local clients only) |
 | `device_revoke` | `device` | `device_revoked` (local clients only) |
@@ -150,7 +144,7 @@ every connected client.
 | `mcp_set` / `mcp_remove` / `mcp_toggle` | as the session ops (`server`; `name`; `name`, `enabled`), with no `session` | `mcp_saved`; saves the change to `config.json` and sends the op to every open JuCode session, which answers with `mcp_servers`. Local clients only, with or without `session` |
 | `pair_link` | — | `pair_link` with `link`, `code` and `expires_at`; an error while the relay is off (local clients only) |
 | `ping` | — | `pong`. Clients behind the relay send it every minute so an idle stream is not closed |
-| `workspaces` | — | `workspaces` with `rev` and `workspaces: [{id, name, is_default?, color?, icon?, projects: [{id, name, path, dirs?, chats?, worktree?, color?, icon?}]}]`. A project's `color` and `icon` are kept as the client sent them (shaped as an agent's, see "Agents"). `dirs`: the project's extra directories (absolute paths, not including `path`); remote clients may read them, and an engine started in `path` may work in those that exist: Claude Code gets one `--add-dir` each, Codex has them as writable roots of its workspace-write sandbox (and `--add-dir` in its TUI), and a JuCode session's file tools and sandbox treat them as writable workspace (ACP agents get nothing) |
+| `workspaces` | — | `workspaces` with `rev` and `workspaces: [{id, name, is_default?, color?, icon?, projects: [{id, name, path, dirs?, chats?, worktree?, color?, icon?}]}]`. A project's `color` and `icon` are kept as the client sent them (`{kind, id | value | markup}`, as the clients' tab icons). `dirs`: the project's extra directories (absolute paths, not including `path`); remote clients may read them, and an engine started in `path` may work in those that exist: Claude Code gets one `--add-dir` each, Codex has them as writable roots of its workspace-write sandbox (and `--add-dir` in its TUI), and a JuCode session's file tools and sandbox treat them as writable workspace (ACP agents get nothing) |
 | `workspaces_set` | `rev`, `workspaces` | `workspaces`; replaces the list when `rev` is the current one, else an error (another client changed it). A project's `dirs`, when present, must be a list of absolute paths. Desktop imports its list with `rev: 0` into an empty daemon |
 | `project_add` | `path`, optional `workspace`, `project_name`, `workspace_name` | `workspaces`; adds an existing directory. With no workspaces yet, one named `workspace_name` is created |
 | `project_create` | `parent`, `name`, optional `git_init`, `workspace`, `workspace_name` | `workspaces`; makes the folder `parent/name` (optionally `git init`) and adds it |
@@ -160,32 +154,14 @@ every connected client.
 | `fs_image` | `path` (a png/jpeg/gif/webp in a known directory or an upload, up to 16 MiB) | `fs_image` with `data`, a data URL: how the remote page shows a message's images |
 | `git_status` | `path` | `git_status` with `repo`, `branch`, `files: [{path, status, from}]` (porcelain codes) |
 | `git_diff` | `path`, optional `file` | `git_diff` with `diff` (unified, untracked files included, first 1 MiB), `truncated` |
-| `agent_list` | — | `agents` |
-| `agent_create` | `agent` (the new agent's id), `name`, `cwd`, `role`, optional `icon`, `color`, `avatar_seed`, `project` (see "Agents") | `agent_created`; every client also receives the new `agents` list |
-| `message_send` | `agent` (or `task`), `body`, optional `session`, `reply_to`, `dedupe_key`; `task` continues that task (see "Tasks and runs") and implies its agent | `message_accepted` with `message` (the new message's id) and `duplicate` (a message with this `dedupe_key` was already recorded; nothing is sent). Routed as below; delivery is broadcast as `message_delivered` |
-| `timer_list` | optional `agent` | `timers: [{timer, agent, session, fire_at, body}]`: active timers (of all agents, or of `agent`), soonest first; `fire_at` in ms |
-| `timer_cancel` | `timer` (its id) | `timer_cancelled` with `timer`; persists cancellation so the reminder will not fire after a restart. Errors if it already fired or was cancelled |
-| `agent_get` | `agent` | `agent`: `agent` (settings), `brief` (`{"role.md": text, "capabilities.md": …, "policy.md": …}`), `memory` (file names, `["memory/deploy.md", …]`) and the agent's `sessions` (as in `session_list`) |
-| `agent_update` | `agent`, optional `name` (not empty), `role` (rewrites `role.md`), `enabled`, `approval_mode`, `sandbox`, `network`, `directories`, `command_rules`, `icon`, `color`, `avatar_seed`, `project` (`null` clears `icon`, `color` or `project`; see "Agents") | `agent_updated` with `agent`; every client also receives the new `agents` list |
-| `agent_delete` | `agent` | `agent_deleted` with `agent`; an error while any of its sessions is running. See "Agents" |
-| `agent_memory_read` | `agent`, `file` (`deploy.md`, or `memory/deploy.md` as `agent_get` lists it) | `agent_memory` with `agent`, `file`, `content`; an error for anything but an existing `memory/<name>.md` (letters, digits, `-`, `_`) |
-| `task_list` | optional `agent` | `tasks` with `agent` and `tasks`, most recently active first. See "Tasks and runs" |
-| `task_get` | `task`, optional `limit` (50) | `task` with `task`, its `runs` (newest first) and its open `questions` |
-| `task_close` | `task`, optional `reason` | `task_closed` with `task`; a scheduled task is also switched off |
-| `task_reopen` | `task` | `task_reopened` with `task` |
-| `run_cancel` | `run` | `run_cancelled` with `run`; interrupts a working run, which ends `cancelled` |
-| `schedule_list` | optional `agent` | `schedules`: all scheduled tasks, or `agent`'s. See "Scheduled tasks" |
 | `session_usage` | `session` (its id) | `session_usage` with `totals`, `sessions` and `turns`: persisted and live usage, with settled gateway charges |
-| `schedule_usage` | `schedule` (its id) | `schedule_usage` with `totals` and `sessions`: token counts and costs of the task's run sessions, including follow-ups; reused sessions count once |
-| `schedule_save` | `schedule`: without `id` creates one (`agent`, `name`, `prompt`, `repeat`, `time`, and `days` / `date` as `repeat` needs; optional `enabled`, `new_session`, both default `true`); with `id` changes the fields present among `name`, `prompt`, `enabled`, `repeat`, `time`, `days`, `date`, `new_session` | `schedule_saved` with `schedule`; `next_run_at` is computed again |
-| `schedule_delete` | `schedule` (its id) | `schedule_deleted` with `schedule` |
-| `schedule_run` | `schedule` (its id) | `schedule_started` with `schedule`; runs it now, enabled or not (an error when its agent is disabled), without changing `next_run_at` |
-| `question_list` | — | `questions`: unanswered questions, and in `closed` the ones closed in the last 7 days (each with `closed_by`, `closed_reason`, `closed_at`) |
-| `question_answer` | `question`, `answer` | `question_answered`; the answer is delivered to the session that asked |
-| `item_close` | `kind` (`question` or `action`), `item` (its id), optional `reason` | `item_closed` with `item`; closes an open question or deferred action without answering it, then broadcasts `questions` / `actions`. Nothing is sent to the agent |
-| `item_reopen` | `kind`, `item` | `item_reopened` with `item`; puts a closed item back among the open ones and takes its session out of the archive |
-| `report_list` | optional `limit` (50) | `reports`, newest first, with `read` |
-| `report_read` | `report` | `report_read` with `report`, also sent to every client |
+| `schedule_list` | — | `schedules`. See "Scheduled tasks" |
+| `schedule_usage` | `schedule` (its id) | `schedule_usage` with `totals` and `sessions`: token counts and costs of the task's run sessions, including follow-ups |
+| `schedule_save` | `schedule`: without `id` creates one (`name`, `prompt`, `cwd`, `repeat`, `time`, and `days` / `date` as `repeat` needs; optional `engine`, `mode`, `options`, `enabled`); with `id` changes the fields present. A paired device may only send `id` and `enabled` | `schedule_saved` with `schedule`; `next_run_at` is computed again. An enabled task needs a `cwd` that is a directory |
+| `schedule_delete` | `schedule` (its id) | `schedule_deleted` with `schedule`; its runs' sessions stay |
+| `schedule_run` | `schedule` (its id) | `schedule_started` with `schedule` and `session`; runs it now, enabled or not, without changing `next_run_at`. An error while its last run is still going |
+| `item_close` | `kind` (`action`), `item` (its id), optional `reason` | `item_closed` with `item`; closes an open deferred action without deciding it, then broadcasts `actions` |
+| `item_reopen` | `kind` (`action`), `item` | `item_reopened` with `item`; puts a closed action back among the open ones and takes its session out of the archive |
 | `skills_catalog` | optional `backend` (`jucode`, default, or `claude`) | `skills_catalog` with `skills: [{id, name, description, tags, source, sourceName, isDefault, installed, license, redistributable, homepage}]`, `warnings` and `installDir` (local clients only). See "Skills" |
 | `skill_install` | `source` (`jucode`, `anthropic` or a configured repository's `owner/repo`), `skill` (its `id` in the catalog), optional `backend` | `skill_installed` with `path` (local clients only) |
 
@@ -197,8 +173,7 @@ after its last activity (an op from a client, a turn starting or ending,
 background work ending), or sooner, least recently active first, while more
 than 16 engines are open (never one active in the last 2 minutes). Nothing is
 going on when no turn runs, no message waits, no background task, subagent or
-approval is open, the conversation is not in its TUI and no agent run is
-unfinished. Clients get `session_closed` with `reason: "idle"`; the session
+approval is open and the conversation is not in its TUI. Clients get `session_closed` with `reason: "idle"`; the session
 is not removed, and `session_open` resumes it when the user next sends to it.
 A `session_open` without `options` opens it as it last ran (model, effort,
 approval mode). A `user_message`, `command`, `continue` or `approve_plan` sent
@@ -207,8 +182,7 @@ that do not reopen it themselves keep working. Every client then gets
 `session_reopened` with `session`, so one that put it to sleep can watch it
 again. `session_closed` for any other close has no `reason`.
 
-`session_create` also accepts `agent` instead of `cwd`: the session runs in
-the agent's directory as that agent. With `chat: true` instead, the session is
+With `chat: true` instead of `cwd`, `session_create` makes the session
 a chat: it runs in `~/.jucode/chats` with the chat prompt (conversation and
 web research) and without project instructions or project skills. Any session
 whose directory is `~/.jucode/chats` or lies inside it is a chat session, so
@@ -216,8 +190,8 @@ reopening one keeps it a chat.
 
 Changes to workspaces are broadcast to every client as a `workspaces` frame.
 
-`fs_*` and `git_*` read only inside known directories: projects, session
-directories and agent directories. `fs_list` with `dirs_only` may browse
+`fs_*` and `git_*` read only inside known directories: projects and session
+directories. `fs_list` with `dirs_only` may browse
 folders anywhere under the home directory (for picking a new project).
 Credentials (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.jucode/auth.json`,
 `~/.jucode/daemon`) are never readable. Paths are resolved (symlinks
@@ -357,236 +331,75 @@ to Read). A session's name is shared both ways: a `session_meta` title is
 sent to Claude Code (`claude --resume` lists it), and a name Claude Code
 has for the session becomes its title.
 
-## Agents
+## Scheduled tasks
 
-A long-lived agent is a directory `~/.jucode/agents/<id>/`: its brief
-(`role.md`, `capabilities.md`, `policy.md`, each under 4000 characters since
-every turn carries them), `memory/<topic>.md` notes (under 20000) and
-`agent.json`. What a run leaves for the next one is its outcome (see "Tasks
-and runs"): an older agent's `state.md` becomes the note `memory/state.md` on
-start, and `handoffs.json` is only read once, by the migration.
-
-| Field | Default | Meaning |
-| --- | --- | --- |
-| `name`, `cwd`, `enabled` | | Display name, working directory, whether it takes messages (and runs its scheduled tasks). |
-| `approval_mode` | `auto` | `manual`, `auto-edit`, `auto` or `full-access`. |
-| `sandbox` | `workspace-write` (`full-access` on Windows) | Where its shell commands run; see below. |
-| `network` | `true` | Whether sandboxed commands may connect out. |
-| `directories` | `[]` | `[{"path": "/abs/dir", "mode": "ro" \| "rw"}]`: directories outside `cwd` it may read, or read and write. |
-| `command_rules` | `git add`/`git commit` allow, `git push` ask | `[{"prefix": "git push", "action": "allow" \| "ask" \| "forbid"}]`. |
-| `icon` | none | `{"kind": "builtin", "id": "rocket"}`, `{"kind": "slug", "value": "…"}` (32 UTF-16 units at most) or `{"kind": "svg", "markup": "<svg…>"}` (8192 bytes at most). The daemon checks only the shape and size: clients sanitize an SVG before drawing it. |
-| `color` | none | `#rrggbb`. |
-| `avatar_seed` | random hex at creation | Seeds the generated avatar clients draw when there is no `icon`. Agents created before it have none; clients then use the id. |
-| `project` | `null` | The project it belongs to (an id from `workspaces`; a project has any number of agents). Setting it moves `cwd` to the project's main directory (an unknown project is an error); the agent's prompt names the project and its directories. |
-
-`agent_update` changes any of these fields except `cwd` (which follows
-`project`), and rewrites `role.md` from `role`.
-
-`agent_delete` removes `~/.jucode/agents/<id>/` (brief, memory, settings,
-scheduled tasks), cancels the agent's active timers, closes its open
-questions (`closed_by`: `agent_deleted`; they leave the closed list) and its
-open sessions. It is refused while one of its sessions is
-running. Its sessions stay in `session_list` with their `agent`; a message
-still waiting for it becomes undeliverable, and new messages to it are
-refused. Every client receives the new `agents`, `schedules` and `questions`
-lists.
-
-### Sandbox
-
-An agent's shell commands run in an OS sandbox (Seatbelt on macOS,
-`bwrap` on Linux; a session does not start when the sandbox is missing):
-
-- `read-only`: nothing is writable.
-- `workspace-write`: `cwd`, the `rw` directories, temp and package-cache
-  directories are writable; `.git` (and a worktree's real git directory),
-  `.jucode`, `.agents` inside them and the `ro` directories stay read-only.
-- `full-access`: no sandbox.
-
-`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.jucode/auth.json` and
-`~/.jucode/daemon` are unreadable in every sandboxed mode. File tools check
-writes against the same rules and can also read and write the agent's
-directories.
-
-A command inside the sandbox needs no approval (except under `manual`). A
-command that must leave it (commit to git, write elsewhere) is called with
-`escalate: true` and a `justification` and goes through the approval mode:
-`auto` asks the safety model, the others ask a person, and an unattended
-session defers it. Command rules come first: `forbid` never runs, `ask`
-always asks a person, `allow` lets an escalation run without asking;
-`forbid` wins over other matches, otherwise the longest prefix. Every turn of an agent session gets the brief, the memory index and
-the other agents in its system prompt, and these tools:
-
-| Tool | Does |
-| --- | --- |
-| `message_agent` | Sends a message to another agent. |
-| `task` | `list`: the agent's tasks and pending reminders. `remind` (after `in_seconds` or at unix `at`, `body`): wakes this task's session (a new task with `new_task: true`), whether or not a client is connected; `cancel_reminder`. `schedule`: proposes a scheduled task (`name`, `prompt`, `repeat`, `time`, `days` / `date`; with `id`, changes one of its own), switched off until the user turns it on; `unschedule` deletes one of its own. `close` (`id`, `reason`): closes one of its tasks. |
-| `brief` | Reads or rewrites the agent's own brief and memory files. |
-| `question` | Records a question for the user (`title`, `body`, `assumption`, `default`, `due_in_seconds`, `importance`, `key`) and returns at once. The answer, or the deadline passing (the agent then goes with `default`), is delivered to the session that asked. Asking again in the same task with the same `key` (or, without one, the same title) while the question is open updates it instead (`updated: true`); a task has at most 5 open questions. |
-| `finish` | Concludes the working run: `verdict` (`quiet`, `done`, `needs_you`, `failed`), `summary` for the user, optional `next` for the task's next run and `details`, a longer write-up kept as a report of the run (`report_posted`). |
-| `open_items` | `list`: the agent's open questions and the open actions of its sessions. `close` (`item`, `reason`): closes one of them unanswered; the user's phone is told, the desk lists it with the reason and can reopen it. An answer to a question tells the agent when it has other open items. |
-| `requirements` | `list`, `get`, `progress`, `propose_create`, `propose_close`: see "Agents and requirements". Noting and closing a requirement are only proposals the user accepts. |
-
-When a scheduled task's run starts in a new session, its earlier runs that are
-not working close their open actions (`closed_by`: `superseded`) and are
-archived. Their open questions stay open for the user, and a run that still
-has one is not archived; reopening an item takes its session out of the
-archive.
-
-Messages (from `message_send`, `message_agent`, a fired timer or a scheduled
-task) are
-recorded in `messages.jsonl` before delivery and routed to a session:
-
-1. the `session` the message names;
-2. the session that received the message it replies to (`reply_to`);
-3. otherwise a new session.
-
-A message to a disabled agent waits, and is delivered once the agent is
-enabled again.
-
-A delivered message is a user message in that session: it starts a run, or
-queues behind the running one. At most 4 runs are in progress at once; a
-message that would start a fifth waits. Messages are retried every second,
-including ones left over from before a restart, and a fired timer is
-delivered once (its id is the message's dedupe key). Every client receives
-`message_delivered` (`id`, `agent`, `from`, `session`) and an updated
-`agents` list when an agent starts or stops working, an agent's `tasks`
-when its tasks or runs change, an updated `schedules`
-list when a scheduled task changes or runs, an updated `questions`
-list when a question is asked, answered, closed or reopened, `report_posted`
-for a new report, `report_read` (`report`) when one is read, and an updated
-`actions` list when an action is deferred, decided, closed or reopened.
-
-### Tasks and runs
-
-Every message delivered to an agent is a **run** of a **task**:
-
-- a message from a scheduled task is a run of that scheduled task (the task
-  id is the schedule id);
-- a message into a session that already belongs to a task is a run of that
-  task (a reply, an answer, a timer);
-- anything else opens a new session and a new task (`task-…`), titled after
-  the first line of the message. A message the user types into an agent
-  session directly is a run too.
-
-Runs are kept in `~/.jucode/daemon/runs.jsonl`, tasks of the last kind in
-`tasks.jsonl`. A run is `queued` until its session takes the message,
-`running` until that turn ends, then `succeeded` or `failed`; `interrupted`
-when its session stops (or the daemon restarts) first. A scheduled task that
-comes due while its last run is still waiting or working records a
-`skipped` run and does not send; `schedule_run` is refused then. At most 2
-runs of one agent work at once (and 4 in all); messages the user sent go
-before scheduled and automatic ones.
-
-A run's `outcome` (`verdict`, `summary`, `next`, `source`) is what the agent
-gave with `finish` (`source: agent`), or else inferred when the turn ends:
-`failed` for an error, `needs_you` when the run left a question or action
-open, `done` otherwise, with the handoff note as `summary` and `next`
-(`source: inferred`). A new scheduled run in its own session is told the
-last run's `next` and the task's questions still open; its session is named
-after the task and keeps that name. Any other agent session is named once,
-after its first turn.
-
-`task_list` describes each task with `id`, `agent`, `title`, `instruction`,
-`origin` (`user`, `agent`, `agent:<id>`), `session` (for a task of its own),
-`trigger` (`{kind: "manual"}`, `{kind: "once", at}` for a pending timer, or
-the schedule as `{kind: "repeat" | "once", repeat, time, days, date, enabled,
-next_run_at}`), `runs` (count, skipped ones excluded), `quiet_runs` (runs in a
-row with verdict `quiet`, newest first), `open_questions`, `open_actions`,
-`next_at`, `latest_run`, `updated_at` (ms), the closure fields when closed,
-and `state`, read from those:
-
-| `state` | When |
-| --- | --- |
-| `closed` | closed by `task_close` (until `task_reopen`) |
-| `running` | a run is queued or working |
-| `needs_you` | an open question or action, or the latest run's verdict is `needs_you` / `failed`, or it was interrupted |
-| `paused` | a scheduled task switched off |
-| `waiting` | it will run again by itself (a schedule, a timer) |
-| `done` | otherwise |
-
-Every change to an agent's tasks or runs is broadcast as that agent's
-`tasks` list (as `task_list` with `agent`). When the daemon first starts with
-tasks, the agent sessions not archived or from the last 30 days become tasks
-with one run each, concluded with their handoff notes; `session_list` gives
-each agent session its `task` (none for older ones, kept as history).
-
-Each turn's prompt carries, as `<recent_handoffs>`, the `next` of the latest
-runs of up to 3 other tasks of the agent. `handoff_list` (for older clients)
-lists each session's latest `next`.
-
-A run working for more than 2 hours is interrupted and ends `failed`. An
-agent session that nobody watches has its engine closed 30 minutes after its
-last run ended; the next message to it opens it again.
-
-The user's devices are notified when a run's verdict is `needs_you`, when it
-fails (a turn ending on an error is reported as `运行中断`), when the daemon
-restarted under a working run, and when an agent asks a question of
-`importance: high`. Runs that are `quiet` or `done` notify nobody.
-
-On start the daemon folds `runs.jsonl` to one line per fact and drops from
-the message and question logs what was settled more than 30 days ago, and
-from the report log what is older than 60 days beyond the newest 100.
-
-### Scheduled tasks
-
-A scheduled task sends its prompt to an agent at set local times. Each
-agent's tasks are saved in `~/.jucode/agents/<id>/schedules.json`.
+A scheduled task sends its prompt to a new session at set local times: in a
+directory, on an engine and in a permission mode. The tasks are saved in
+`~/.jucode/daemon/schedules.json`.
 
 ```json
 {
-  "id": "sch-1a2b3c4d5e6f7a8b",
-  "agent": "ops",
+  "id": "sch-1a2b3c4d",
   "name": "aicare 工单处理",
   "prompt": "处理新工单 …",
+  "cwd": "/Users/me/aicare",
+  "engine": "claude",
+  "mode": "auto",
+  "options": { "gateway": true },
   "enabled": true,
   "repeat": "weekly",
   "time": "11:00",
   "days": [1, 3, 5],
   "date": null,
-  "new_session": true,
-  "created_at": 1790812800,
-  "last_run_at": null,
-  "last_session": null,
-  "next_run_at": 1790996400
+  "created_at": 1790812800000,
+  "next_run_at": 1790996400000,
+  "last_run": { "at": 1790910000000, "session": "s…", "status": "done", "error": null },
+  "skipped": 0
 }
 ```
 
 | Field | Meaning |
 | --- | --- |
-| `repeat` | `once`, `hourly`, `daily`, `weekdays` (Monday to Friday) or `weekly`. |
+| `cwd` | Where each run starts (null until set: an enabled task needs one). The project's extra directories come along as for any session. |
+| `engine` | `jucode`, `claude` or `codex`. |
+| `mode` | The permission mode of its runs: `ask`, `edits`, `auto` or `all`, translated for the engine (`ask` is `manual` on jucode, `read-only` on Claude Code and Codex). |
+| `options` | Start options as `session_create` takes them (`gateway`, `model`, …), saved by the desktop. |
+| `repeat` | `once`, `hourly`, `daily`, `weekdays` (Monday to Friday) or `weekly`. A `once` task switches itself off when it fires. |
 | `time` | Local `HH:MM`, 24-hour. `hourly` uses only the minute. |
 | `days` | `weekly` only, not empty: 0 = Sunday … 6 = Saturday. |
 | `date` | `once` only: local `YYYY-MM-DD`. |
-| `new_session` | `true`: each run starts a new session. `false`: a run continues `last_session`, or starts a new one when that session is gone or no longer the agent's. |
-| `created_at`, `last_run_at`, `next_run_at` | Unix **seconds** (other daemon times are milliseconds). `next_run_at` is null for a disabled task and for a `once` task whose time has passed. |
-| `last_session` | The session the last run was delivered to, filled in once it is delivered. |
+| `next_run_at` | ms; null for a disabled task and for a `once` task whose time has passed. |
+| `last_run` | The latest run: `status` `running`, `waiting` (an approval waits), `done` or `failed` (with `error`). |
+| `skipped` | Times skipped in a row since the last run started. |
 
 Times follow this machine's time zone, daylight saving included: a local
 time skipped by a clock change runs an hour later, one that occurs twice
-runs at the first.
+runs at the first. The scheduler checks every second. A due task's
+`next_run_at` moves to the next time after now, so runs missed while the
+daemon or the computer was off fire once when it starts again, not once per
+missed time.
 
-The scheduler checks every second. A due task (`next_run_at` ≤ now) is
-recorded as a message from `schedule:<id>` with dedupe key
-`schedule:<id>:<next_run_at>`, then `last_run_at` becomes now and
-`next_run_at` the next time after now. Runs missed while the daemon or the
-computer was off therefore fire once when it starts again, not once per
-missed time. A task of a disabled agent neither fires nor moves on; it fires
-once when the agent is enabled again. `schedule_run` uses the dedupe key
-`schedule:<id>:run:<unix seconds>`, so a second run within the same second is
-dropped.
+A run is a new session (its `schedule` is the task's id) named
+`<name> · MM-DD HH:mm`, switched to the task's mode and sent its prompt.
+Earlier runs of the task are archived then, unless they are running or have
+a deferred action open. A time that comes while the last run is `running`
+or `waiting` is skipped. A run going for more than 2 hours, working or
+waiting, is interrupted and counts as failed; a deferred action it left
+stays open. A run working when the daemon stopped counts as failed.
 
-The agent receives the prompt after one line naming the task:
-`定时任务「<name>」：`, under the usual delivery line
-(`[scheduled task <id> · <message id>]`).
-
-Every client receives the full `schedules` list after any change, run or
-delivery.
+The user hears of a run when it fails (it could not start, its turn ended on
+an error, or it timed out), when it waits for an approval, and when a time
+is skipped (the first in a row): every client gets
+`{"type":"schedule_event","schedule":"sch-…","name":"…","kind":"failed","detail":"…","session":"s…"}`
+(`kind`: `failed`, `waiting` or `skipped`), and the paired phones a
+notification that opens the session. Every client receives the full
+`schedules` list after any change.
 
 `schedule_delete` and `schedule_run` also take the task's id as `id` when
 `schedule` is absent; that `id` is then the request id too, echoed in the
 reply.
 
-`schedule_usage` joins the task's delivered sessions with persisted turns in
+`schedule_usage` joins the task's run sessions with persisted turns in
 `usage.jsonl`, including any turn still running. Each unique session is counted
 once, including follow-up turns. `totals` and each row in `sessions` carry the
 five token counters, `turns`, `gateway_cost` (settled points, including group
@@ -611,38 +424,6 @@ run off the connection's input thread, so an unavailable billing server cannot
 hold up user input or interrupts. Clients should coalesce refreshes, recheck
 pending charges while watching, and retain settled values with an explicit error
 when a subsequent lookup fails.
-
-## Dispatch
-
-A dispatch hands the daemon a batch of requests without a project or
-session. A reserved agent, `dispatch` (never listed), splits it into tasks,
-sends each to a session in one of the user's projects, and reports back.
-Each dispatch is one session of that agent; `id` is that session.
-`agent_create` refuses the id `dispatch`. A session runs one dispatch task at
-a time: a session that is busy, or running another dispatch's task, is not
-given one.
-
-| Op | Reply | |
-| --- | --- | --- |
-| `{"op":"dispatch_send","text":"…","plan":false,"approval_mode":"auto"}` | `dispatch_started` | `approval_mode`: `manual`, `auto-edit`, `auto` or `full-access`; every task runs in it. With `plan`, no task starts before `dispatch_confirm`. |
-| `{"op":"dispatch_confirm","dispatch":"…","approve":true,"note":"…"}` | `dispatch_confirmed` | Only while the dispatch is `awaiting`. |
-| `{"op":"dispatch_list"}` | `dispatches` | |
-
-`dispatches` is also sent on connect and broadcast on every change:
-
-```json
-{"type":"dispatches","dispatches":[{
-  "id":"s…","text":"…","plan":true,"mode":"auto","status":"running",
-  "tasks":[{"id":1,"title":"…","project":"/path","session":"s…","engine":"jucode",
-            "status":"running","reply":"…"}],
-  "summary":"","created_at":0,"updated_at":0}]}
-```
-
-Dispatch `status`: `planning`, `awaiting` (plan mode, waiting for the user),
-`running`, `done`, `cancelled`, `failed` (the dispatcher's turn failed).
-Task `status`: `planned`, `sent`, `running`,
-`waiting` (an approval in its session waits for the user), `done`, `failed`.
-`reply` is the end of the task session's last reply.
 
 ## Uploads
 
@@ -706,7 +487,7 @@ requesting client gets its output and may type into it, `term_close` ends
 it). It is refused while a turn runs unless the op has `"force":true`
 (the user agreed to stop it: a jucode turn is interrupted, a claude or codex
 engine is killed and every client gets `{"type":"status","message":"interrupted"}`),
-for an ACP engine, and for an agent's session.
+and for an ACP engine.
 
 The engine process stops first, background tasks with it (clients get an
 empty `background_tasks`), and the TUI resumes the same conversation
@@ -741,7 +522,7 @@ where the last one stopped. The requirement's id comes as `requirement`
 | --- | --- | --- |
 | `{"op":"requirement_list"}` | `requirements` | |
 | `{"op":"requirement_create","text":"…","project":"p…","images":["/…/.jucode/uploads/…/u-…-shot.png"],"source":"phone","session":"s…"}` | `requirement_created` with `requirement` | All but `text` optional. `project`: a known project's id, or `null` for none; left out, a requirement noted in `session` belongs to the project whose main directory is that session's `cwd`. `images`: up to 4 uploaded images (see "Uploads"; any other path is refused), moved to `~/.jucode/uploads/requirements/<id>/`. |
-| `{"op":"requirement_update","requirement":"R-1","text":"…","project":"p…","state":"done"}` | `requirement_saved` | Any of the fields. `project: null` leaves it unassigned. `state`: `idea`, `open`, `done`, `parked`, `proposed`. |
+| `{"op":"requirement_update","requirement":"R-1","text":"…","project":"p…","state":"done"}` | `requirement_saved` | Any of the fields. `project: null` leaves it unassigned. `state`: `idea`, `open`, `done`, `parked`. |
 | `{"op":"requirement_delete","requirement":"R-1"}` | `requirement_deleted` | Its sessions stay. |
 | `{"op":"requirement_link","requirement":"R-1","session":"s…"}` | `requirement_linked` | The session leaves any other requirement (and its gate); the requirement becomes `open`. |
 | `{"op":"requirement_unlink","requirement":"R-1","session":"s…"}` | `requirement_unlinked` | A gate on that session ends. |
@@ -749,9 +530,6 @@ where the last one stopped. The requirement's id comes as `requirement`
 | `{"op":"requirement_begin","requirement":"R-1","session":"s…","plan":false,"mode":"edits","text":"…","lang":"zh"}` | `requirement_begun` with `requirement`, `session` | Starts work behind the gate (below): links the session, switches it to read-only and sends the requirement with the ask to only explain its understanding. `text`: the user's added words (optional). `lang`: `zh` (default) or `en`. |
 | `{"op":"requirement_confirm","requirement":"R-1","text":"…","lang":"zh"}` | `requirement_confirmed` with `requirement`, `stage` (`plan` or `go`) | The user confirms the gate's current step; an error without a gate or while its session runs a turn. `text` (optional) goes with the next message. |
 | `{"op":"requirement_reply","requirement":"R-1","text":"…","new_session":false,"cwd":"/path","engine":"claude","plan":false,"mode":"auto","lang":"zh"}` | `requirement_replied` with `session` | Sends `text` to its latest session (reopened if closed). With `new_session`, or no session yet, starts one in `cwd` (default: the latest session's, else the project's main directory; neither is an error) on `engine` (default: the latest session's, else jucode) and runs `requirement_begin` on it with `plan` (default `false`), `mode` (default `auto`) and `text`. |
-| `{"op":"requirement_proposal","requirement":"R-1","accept":true}` | `requirement_proposal_decided` with `requirement`, `accept` | Decides an agent's proposal: a proposed requirement accepted becomes `idea`, turned down is deleted; a close proposal accepted sets `state` to its `outcome` (and ends any gate), turned down is dropped. The agent is not told. |
-
-`dispatch_send` also takes `requirement`: its tasks' sessions are linked to it.
 
 ### The start gate
 
@@ -784,23 +562,6 @@ session's engine (`plan` is `manual` on jucode). A user who replies in the
 session instead of confirming has it revise its understanding or plan; the
 gate stays at its step.
 
-### Agents and requirements
-
-An agent's sessions have a `requirements` tool: `list` (the requirements of
-the agent's project, or all when it has none; filters `project`, with
-`none` for unassigned ones, and `state`), `get`, `progress` (appends items
-to `decided`, `done`, `doing`, `blocked`, `next` once each, replaces
-`note`, and sets `progress_at`), and two proposals the user decides with
-`requirement_proposal`:
-
-- `propose_create` (`text`, `reason`): a new requirement in the agent's
-  project with `state: "proposed"`, `source: "agent"` and
-  `proposal: {kind: "create", agent, session, reason, at}`.
-- `propose_close` (`requirement`, `reason`, `outcome`: `done` or `parked`):
-  on an `idea` or `open` requirement, sets
-  `proposal: {kind: "close", outcome, agent, session, reason, at}`,
-  replacing an earlier one.
-
 `requirements` is also sent on connect and broadcast on every change:
 
 ```json
@@ -810,22 +571,17 @@ to `decided`, `done`, `doing`, `blocked`, `next` once each, replaces
   "progress":{"goal":"…","decided":[],"done":[],"doing":[],"blocked":[],"next":[],"files":[],"note":"…"},
   "progress_at":0,"source":"desktop","source_session":null,
   "gate":{"session":"s…","stage":"understand","plan":false,"mode":"auto"},
-  "proposal":{"kind":"close","outcome":"done","agent":"ops","session":"s…","reason":"…","at":0},
   "status":"confirm","session_states":{"s…":"idle"},"last_reply":"…",
   "created_at":0,"updated_at":0}]}
 ```
 
 Words longer than 40 characters get a title from the title model
-(`title_auto`). `source` is `desktop`, `phone`, `session` or `agent`.
-`status` is `state` (`proposed` while an agent's proposal to note it
-waits), except:
-
-- `proposal`: an `idea` or `open` requirement with a close proposal.
-- While `open`: `approval` (a session waits for an approval), `confirm`
-  (the gate's session is idle: the user confirms its understanding or
-  plan), `failed` (the latest session's turn failed), `running`, else
-  `review` (the user's turn: the work is done or the agent asks
-  something), or `open` with no session.
+(`title_auto`). `source` is `desktop`, `phone` or `session` (`agent` on
+ones long-lived agents noted). `status` is `state`, except while `open`:
+`approval` (a session waits for an approval), `confirm` (the gate's session
+is idle: the user confirms its understanding or plan), `failed` (the latest
+session's turn failed), `running`, else `review` (the user's turn: the work
+is done or the agent asks something), or `open` with no session.
 
 `session_states`: `running`, `waiting`, `failed`, `idle`. `last_reply` (the
 end of the latest session's reply) comes with `review`, `confirm` and
@@ -833,7 +589,9 @@ end of the latest session's reply) comes with `review`, `confirm` and
 
 Requirements saved before projects had ids carry `projects: ["/path"]`;
 once the workspaces have projects, the daemon replaces it with the `project`
-whose main directory is the first path (or `null`).
+whose main directory is the first path (or `null`). A requirement a
+long-lived agent proposed (`state: "proposed"`, `proposal`) becomes an
+`idea` without the proposal.
 
 ## Notifications
 
@@ -843,13 +601,9 @@ the JuCode Android app its 个推 (Getui) client id with
 `{"op":"push_subscribe","subscription":{"provider":"getui","client_id":"…"}}`
 (only paired devices; dropped when the device is revoked) and removes it with
 `{"op":"push_unsubscribe","endpoint":"…"}` or `{"op":"push_unsubscribe","client_id":"…"}`.
-A client id registered again by another device moves to that device. The daemon notifies when a
-dispatch's plan waits for the user, a task waits for an approval, a
-dispatch is done, an open requirement turns to `review`, `confirm` or
-`approval`, an agent proposes to note or close a requirement, an agent
-closes an open item, and for an agent's runs as described in "Tasks and
-runs",
-through the relay (relay-protocol.md, Web Push). `{"op":"push_test"}` (paired devices
+A client id registered again by another device moves to that device. The daemon notifies when an
+open requirement turns to `review`, `confirm` or `approval`, and for
+scheduled runs as described in "Scheduled tasks", through the relay (relay-protocol.md, Web Push). `{"op":"push_test"}` (paired devices
 only) sends a test notification to that device's browsers now and replies
 `push_tested` with `results: [{service, status}]` (or `error`): the push
 service's host (`getui` for the Android app) and its answer, as the relay passed it on. A notification's `url` is

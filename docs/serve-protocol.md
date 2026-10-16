@@ -35,7 +35,7 @@ This document describes protocol version 2. The first line on stdout is
 A client that does not support `protocol` must stop instead of guessing.
 Every later event carries a `session` field with the engine's current
 session id, the same shape the daemon uses to multiplex several sessions on
-one connection (`docs/agent-daemon-plan.md`). Ops may carry a `session`
+one connection (`docs/daemon-protocol.md`). Ops may carry a `session`
 field; `jucode serve` hosts exactly one session and ignores it.
 
 ## Lifecycle

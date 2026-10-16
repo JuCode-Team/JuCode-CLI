@@ -4,8 +4,8 @@
 //! renames it as the conversation moves on: after turns 1 and 3, then every
 //! fifth. A title a client set by hand is never replaced.
 //!
-//! The same model writes an agent session's handoff note after each turn:
-//! what was asked, done and concluded, for the agent's next sessions.
+//! The same model keeps a requirement's progress from an excerpt of its
+//! sessions (`Turns::excerpt`, see `requirements`).
 
 use serde_json::Value;
 
@@ -15,16 +15,8 @@ const LATEST_LIMIT: usize = 600;
 const REPLY_LIMIT: usize = 800;
 /// Longest title kept from the model's reply.
 const TITLE_LIMIT: usize = 30;
-/// The end of the latest reply a handoff note is written from (where the
-/// conclusion is).
+/// The end of the latest reply an excerpt carries (where the conclusion is).
 const TAIL_LIMIT: usize = 1500;
-/// Longest handoff note kept.
-const HANDOFF_LIMIT: usize = 600;
-
-pub const HANDOFF_SYSTEM: &str = "You write the handoff note a long-lived coding agent leaves \
-for its next sessions. From the excerpt, write at most 5 short lines in the language the user \
-writes in: what was asked, what was done, the conclusion, and what is left open. Plain lines, \
-no headings, no preamble. If a previous note is given, update it rather than repeat it.";
 
 pub const SYSTEM: &str = "You name conversations between a user and a coding assistant. \
 Reply with the title only: a short phrase naming the task (at most 20 Chinese characters \
@@ -122,13 +114,18 @@ impl Turns {
         self.failed.take()
     }
 
+    /// A turn is going: a message went in and the engine is not ready yet.
+    pub fn running(&self) -> bool {
+        self.running
+    }
+
     /// Turns ended so far.
     pub fn done(&self) -> u32 {
         self.done
     }
 
-    /// The request for a handoff note; `previous` is the session's last one.
-    pub fn handoff_prompt(&self, title: &str, previous: Option<&str>) -> String {
+    /// What the session was asked and how its latest reply ended.
+    pub fn excerpt(&self, title: &str) -> String {
         let mut text = format!("Session: {title}\n\nFirst request:\n{}\n", self.first);
         if self.latest != self.first {
             text.push_str(&format!("\nLatest request:\n{}\n", self.latest));
@@ -137,9 +134,6 @@ impl Turns {
             "\nEnd of the latest reply:\n{}\n",
             self.tail.trim()
         ));
-        if let Some(previous) = previous.filter(|p| !p.trim().is_empty()) {
-            text.push_str(&format!("\nPrevious note:\n{}\n", previous.trim()));
-        }
         text
     }
 
@@ -170,12 +164,6 @@ fn due(turn: u32) -> bool {
 
 fn clip(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect()
-}
-
-/// The model's reply as a handoff note: trimmed and bounded.
-pub fn clean_handoff(reply: &str) -> Option<String> {
-    let note = clip(reply.trim(), HANDOFF_LIMIT);
-    (!note.is_empty()).then_some(note)
 }
 
 /// Paired marks a title may be wrapped in, or end with when they close a
@@ -302,14 +290,13 @@ mod tests {
     }
 
     #[test]
-    fn the_handoff_prompt_carries_the_end_of_the_reply() {
+    fn the_excerpt_carries_the_end_of_the_reply() {
         let mut turns = Turns::default();
         let long = format!("{}结论：已修复", "过程".repeat(1000));
         turn(&mut turns, "修复登录页跳转", &long);
         assert_eq!(turns.done(), 1);
-        let prompt = turns.handoff_prompt("修复登录跳转", Some("旧的交接"));
+        let prompt = turns.excerpt("修复登录跳转");
         assert!(prompt.contains("结论：已修复"));
-        assert!(prompt.contains("Previous note:\n旧的交接"));
         let tail = prompt.split("End of the latest reply:\n").nth(1).unwrap();
         assert!(tail.chars().count() < TAIL_LIMIT + 100);
     }

@@ -638,7 +638,7 @@ impl Drop for Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{store::now, Agents};
+    use crate::store::now;
 
     fn hub(label: &str) -> Arc<Hub> {
         let dir = std::env::temp_dir().join(format!(
@@ -649,7 +649,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         Hub::new(
             Store::open(dir.join("daemon")).unwrap(),
-            Agents::open(dir.join("agents")).unwrap(),
             "test",
             Some("wss://relay.example/relay/v1/".to_string()),
         )

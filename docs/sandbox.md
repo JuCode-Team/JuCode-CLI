@@ -3,8 +3,7 @@
 JuCode runs the model's shell commands in an OS sandbox: Seatbelt
 (`sandbox-exec`) on macOS, `bwrap` (bubblewrap) on Linux. It applies to every
 engine: the TUI, `jucode serve`, `--headless`, Desktop sessions and daemon
-sessions. A daemon agent uses its own settings from `agent.json`
-(`docs/daemon-protocol.md`).
+sessions.
 
 ## Modes
 

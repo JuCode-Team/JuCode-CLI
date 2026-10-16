@@ -2,18 +2,16 @@
 //! and serves them to clients (Desktop, the remote web page) over a
 //! WebSocket. Frames are the `jucode serve` JSON protocol, version 2, with a
 //! `session` field on every session op and event. See
-//! `docs/agent-daemon-plan.md` and `docs/daemon-protocol.md`.
+//! `docs/daemon-protocol.md`.
 
-mod agent_tools;
-mod agents;
 mod devservers;
-mod dispatch;
 mod engines;
 mod files;
 mod gateway;
 mod http;
 mod hub;
 pub mod install;
+mod migrate;
 pub mod noise;
 mod projects;
 mod push;
@@ -23,13 +21,11 @@ mod schedules;
 mod session;
 mod skills;
 mod store;
-mod tasks;
 mod terminal;
 mod titles;
 mod uploads;
 mod usage;
 
-pub use agents::Agents;
 pub use store::Store;
 
 use hub::Hub;
@@ -43,7 +39,6 @@ use std::{
     thread,
     time::Duration,
 };
-use store::now;
 use tungstenite::{
     handshake::server::{ErrorResponse, Request, Response},
     Message, WebSocket,
@@ -61,7 +56,6 @@ pub const DEFAULT_RELAY: &str = "wss://app.jucode.net/relay/v1";
 pub fn serve(
     listener: TcpListener,
     store: Store,
-    agents: Agents,
     web: Option<PathBuf>,
     version: &'static str,
     relay: Option<String>,
@@ -78,19 +72,17 @@ pub fn serve(
     for record in store.sessions() {
         gateway::set_group(&record.id, record.group.as_deref());
     }
-    let hub = Hub::new(store, agents, version, relay);
-    // Runs left open by the last daemon ended with it.
-    hub.interrupt_runs(None);
-    hub.migrate_tasks();
-    hub.agents.retire_state_files();
+    let hub = Hub::new(store, version, relay);
+    // Runs left going by the last daemon ended with it.
+    hub.interrupt_schedule_runs();
     if hub.relay.url().is_some() {
         let relay = Arc::clone(&hub);
         thread::spawn(move || relay::run(&relay));
     }
-    // Fires due timers and retries messages waiting for a free run slot,
-    // including ones left over from before a restart.
     let uploads = Arc::clone(&hub);
     thread::spawn(move || uploads.usage.run_uploads());
+    // Starts due scheduled tasks, including ones that came due while the
+    // daemon was down.
     let scheduler = Arc::clone(&hub);
     thread::spawn(move || loop {
         scheduler.tick();
@@ -113,11 +105,6 @@ pub fn serve(
 /// State directory: `~/.jucode/daemon`.
 pub fn state_dir() -> io::Result<PathBuf> {
     Ok(jucode_dir()?.join("daemon"))
-}
-
-/// Agents directory: `~/.jucode/agents`.
-pub fn agents_dir() -> io::Result<PathBuf> {
-    Ok(jucode_dir()?.join("agents"))
 }
 
 fn jucode_dir() -> io::Result<PathBuf> {
@@ -239,11 +226,8 @@ fn pump(
         protocol::hello_json(hub.version),
         hub.sessions_json(),
         projects::workspaces_json(hub),
-        hub.agents_json(),
-        hub.schedules_json(None),
-        hub.questions_json(),
+        hub.schedules_json(),
         hub.actions_json(),
-        hub.dispatch.json(),
         hub.requirements.json(hub),
         hub.dev_servers.json(),
     ] {
@@ -378,7 +362,12 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                     let sessions = if key == "session" {
                         vec![id.to_string()]
                     } else {
-                        hub.store.sessions_reached_from(&format!("schedule:{id}"))
+                        hub.store
+                            .sessions()
+                            .into_iter()
+                            .filter(|record| record.schedule.as_deref() == Some(id))
+                            .map(|record| record.id)
+                            .collect()
                     };
                     let mut usage = hub.usage.sessions_json(&sessions);
                     usage["type"] = json!(name);
@@ -501,28 +490,13 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             .and_then(|engine| {
                 hub.create_engine_session(
                     op["cwd"].as_str().map(PathBuf::from),
-                    op["agent"].as_str(),
+                    None,
                     op["chat"].as_bool().unwrap_or(false),
                     engine,
                     engines::Options::from_json(&op["options"]),
                 )
             })
             .map(|session| json!({ "type": "session_created", "session": session })),
-        ("agent_list", _) => Ok(hub.agents_json()),
-        ("dispatch_send", _) => dispatch::start(
-            hub,
-            op["text"].as_str().unwrap_or_default(),
-            op["plan"] == true,
-            op["approval_mode"].as_str().unwrap_or("auto"),
-            op["requirement"].as_str(),
-        ),
-        ("dispatch_confirm", _) => dispatch::confirm(
-            hub,
-            op["dispatch"].as_str().unwrap_or_default(),
-            op["approve"] == true,
-            op["note"].as_str().unwrap_or_default(),
-        ),
-        ("dispatch_list", _) => Ok(hub.dispatch.json()),
         // The requirement's id comes as `requirement` (`id` is the request's).
         ("requirement_list", _) => Ok(hub.requirements.json(hub)),
         ("requirement_create", _) => requirements::create(hub, &op),
@@ -548,7 +522,6 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         ("requirement_reply", _) => requirements::reply(hub, &op),
         ("requirement_begin", _) => requirements::begin(hub, &op),
         ("requirement_confirm", _) => requirements::confirm(hub, &op),
-        ("requirement_proposal", _) => requirements::decide_proposal(hub, &op),
         ("upload", _) => hub.uploads.receive(&op, || hub.new_id("u")),
         // A phone's browser or the Android app asks to be notified (see `push`).
         ("push_subscribe", _) => match hub.device_of(client) {
@@ -567,94 +540,6 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                     .unwrap_or_default(),
             )
             .map(|()| json!({ "type": "push_unsubscribed" })),
-        ("agent_create", _) if op["agent"] == dispatch::AGENT => {
-            Err(format!("the agent id {} is reserved", dispatch::AGENT))
-        }
-        ("agent_create", _) => projects::with_project_cwd(hub, op.clone()).and_then(|op| {
-            let text = |key: &str| op[key].as_str().unwrap_or_default();
-            hub.agents
-                .create(
-                    text("agent"),
-                    text("name"),
-                    &PathBuf::from(text("cwd")),
-                    text("role"),
-                    &op,
-                )
-                .map(|agent| {
-                    hub.broadcast(&hub.agents_json());
-                    json!({ "type": "agent_created", "agent": agent.to_json() })
-                })
-        }),
-        ("message_send", _) => {
-            let text = |key: &str| op[key].as_str().map(str::to_string);
-            // `task`: continue that task (its agent is implied).
-            let task = text("task").map(|task| hub.task_session(&task));
-            let agent = match &task {
-                Some(Ok((agent, _))) => Some(agent.clone()),
-                _ => text("agent"),
-            };
-            match (agent, text("body")) {
-                _ if matches!(task, Some(Err(_))) => Err(task.unwrap().unwrap_err()),
-                (Some(to), Some(body)) => {
-                    let task = task.and_then(Result::ok);
-                    // `new_session`: start a fresh conversation instead of
-                    // continuing the latest one.
-                    let session = if let Some((_, session)) = task {
-                        Ok(Some(session))
-                    } else if op["new_session"] == true {
-                        hub.create_session(None, Some(&to), false).map(Some)
-                    } else {
-                        Ok(text("session"))
-                    };
-                    session.and_then(|session| {
-                        let id = hub.new_id("m");
-                        hub.send_message(store::Message {
-                            id: id.clone(),
-                            to,
-                            from: "user".to_string(),
-                            body,
-                            session,
-                            reply_to: text("reply_to"),
-                            dedupe_key: text("dedupe_key"),
-                            at: now(),
-                        })
-                        .map(|fresh| json!({ "type": "message_accepted", "message": id, "duplicate": !fresh }))
-                    })
-                }
-                _ => Err("message_send requires agent and body".to_string()),
-            }
-        }
-        ("message_list", _) => Ok(json!({
-            "type": "messages",
-            "messages": hub.store.message_log(op["agent"].as_str(), op["limit"].as_u64().unwrap_or(50) as usize),
-        })),
-        ("task_list", _) => Ok(hub.tasks_json(op["agent"].as_str())),
-        ("task_get", _) => match op["task"].as_str() {
-            Some(task) => hub.task_json(task, op["limit"].as_u64().unwrap_or(50) as usize),
-            None => Err("task_get requires task".to_string()),
-        },
-        ("task_close", _) => match op["task"].as_str() {
-            Some(task) => hub
-                .close_task(task, "user", op["reason"].as_str().unwrap_or_default())
-                .map(|()| json!({ "type": "task_closed", "task": task })),
-            None => Err("task_close requires task".to_string()),
-        },
-        ("run_cancel", _) => match op["run"].as_str() {
-            Some(run) => hub
-                .cancel_run(run, false)
-                .map(|()| json!({ "type": "run_cancelled", "run": run })),
-            None => Err("run_cancel requires run".to_string()),
-        },
-        ("task_reopen", _) => match op["task"].as_str() {
-            Some(task) => hub
-                .reopen_task(task)
-                .map(|()| json!({ "type": "task_reopened", "task": task })),
-            None => Err("task_reopen requires task".to_string()),
-        },
-        ("handoff_list", _) => match op["agent"].as_str() {
-            Some(agent) => Ok(hub.handoffs_json(agent)),
-            None => Err("handoff_list requires agent".to_string()),
-        },
         ("usage_local", _) => Ok(hub.usage.local_json(
             op["days"].as_u64().unwrap_or(30),
             op["tz_offset"].as_i64().unwrap_or(0),
@@ -663,100 +548,31 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             .usage
             .import_legacy(&hub.store, &op["days"])
             .map(|imported| json!({ "type": "usage_imported", "imported": imported })),
-        ("question_list", _) => Ok(hub.questions_json()),
-        ("question_answer", _) => match (op["question"].as_str(), op["answer"].as_str()) {
-            (Some(question), Some(answer)) if !answer.trim().is_empty() => hub
-                .answer_question(question, answer.trim(), "user")
-                .map(|()| json!({ "type": "question_answered", "question": question })),
-            _ => Err("question_answer requires question and a non-empty answer".to_string()),
+        // The item's id travels as `item`: `id` is the request id. Actions
+        // are the only items.
+        ("item_close" | "item_reopen", _) => match (op["kind"].as_str(), op["item"].as_str()) {
+            (Some("action"), Some(item)) if name == "item_close" => hub
+                .close_action(item, "user", op["reason"].as_str().unwrap_or_default())
+                .map(|()| json!({ "type": "item_closed", "item": item })),
+            (Some("action"), Some(item)) => hub
+                .reopen_action(item)
+                .map(|()| json!({ "type": "item_reopened", "item": item })),
+            _ => Err(format!("{name} requires kind (action) and item")),
         },
-        // The item's id travels as `item`: `id` is the request id.
-        ("item_close" | "item_reopen", _) => {
-            match (op["kind"].as_str().map(store::ItemKind::parse), op["item"].as_str()) {
-                (Some(Ok(kind)), Some(item)) if name == "item_close" => hub
-                    .close_item(kind, item, "user", op["reason"].as_str().unwrap_or_default())
-                    .map(|()| json!({ "type": "item_closed", "item": item })),
-                (Some(Ok(kind)), Some(item)) => hub
-                    .reopen_item(kind, item)
-                    .map(|()| json!({ "type": "item_reopened", "item": item })),
-                (Some(Err(error)), _) => Err(error),
-                _ => Err(format!("{name} requires kind (question or action) and item")),
-            }
-        }
-        ("report_list", _) => Ok(hub.reports_json(op["limit"].as_u64().unwrap_or(50) as usize)),
-        ("report_read", _) => match op["report"].as_str() {
-            Some(report) => hub
-                .store
-                .record_report_read(report)
-                .map(|()| {
-                    let frame = json!({ "type": "report_read", "report": report });
-                    hub.broadcast(&frame);
-                    frame
-                })
-                .map_err(|error| error.to_string()),
-            None => Err("report_read requires report".to_string()),
-        },
-        ("agent_get", _) => match op["agent"].as_str().and_then(|id| hub.agents.get(id)) {
-            Some(agent) => {
-                let brief: serde_json::Map<String, Value> = agents::BRIEF_FILES
-                    .iter()
-                    .map(|file| {
-                        let text = hub.agents.read_brief(&agent.id, file).unwrap_or_default();
-                        (file.to_string(), json!(text))
-                    })
-                    .collect();
-                let sessions: Vec<Value> = hub.sessions_json()["sessions"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|session| session["agent"] == agent.id.as_str())
-                    .cloned()
-                    .collect();
-                Ok(json!({
-                    "type": "agent",
-                    "agent": agent.to_json(),
-                    "brief": brief,
-                    "memory": hub.agents.memory_files(&agent.id),
-                    "sessions": sessions,
-                }))
-            }
-            None => Err("agent_get requires a known agent".to_string()),
-        },
-        ("agent_update", _) => match op["agent"].as_str() {
-            Some(id) => projects::with_project_cwd(hub, op.clone())
-                .and_then(|op| hub.agents.update(id, &op))
-                .map(|agent| {
-                hub.broadcast(&hub.agents_json());
-                json!({ "type": "agent_updated", "agent": agent.to_json() })
-            }),
-            None => Err("agent_update requires agent".to_string()),
-        },
-        ("agent_delete", _) => match op["agent"].as_str() {
-            Some(id) => hub
-                .delete_agent(id)
-                .map(|()| json!({ "type": "agent_deleted", "agent": id })),
-            None => Err("agent_delete requires agent".to_string()),
-        },
-        ("agent_memory_read", _) => match (op["agent"].as_str(), op["file"].as_str()) {
-            (Some(agent), Some(file)) => hub.agents.read_memory(agent, file).map(|content| {
-                json!({ "type": "agent_memory", "agent": agent, "file": file, "content": content })
-            }),
-            _ => Err("agent_memory_read requires agent and file".to_string()),
-        },
-        ("schedule_list", _) => Ok(hub.schedules_json(op["agent"].as_str())),
+        ("schedule_list", _) => Ok(hub.schedules_json()),
         ("schedule_save", _) => hub
-            .save_schedule(&op["schedule"])
+            .save_schedule(&op["schedule"], hub.is_local(client))
             .map(|schedule| json!({ "type": "schedule_saved", "schedule": schedule.to_json() })),
         // The schedule's id comes as `schedule`, or as `id`, which then also
         // serves as the request id.
         ("schedule_delete" | "schedule_run", _) => {
             match op["schedule"].as_str().or(op["id"].as_str()) {
                 Some(id) if name == "schedule_delete" => hub
-                    .delete_schedule(id)
+                    .delete_schedule(id, hub.is_local(client))
                     .map(|()| json!({ "type": "schedule_deleted", "schedule": id, "id": id })),
-                Some(id) => hub
-                    .run_schedule(id)
-                    .map(|()| json!({ "type": "schedule_started", "schedule": id, "id": id })),
+                Some(id) => hub.run_schedule(id).map(|session| {
+                    json!({ "type": "schedule_started", "schedule": id, "id": id, "session": session })
+                }),
                 None => Err(format!("{name} requires schedule")),
             }
         }
@@ -766,24 +582,6 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             .open_session(&session, None)
             .and_then(|()| hub.forward(&session, op.clone()))
             .map(|()| Value::Null),
-        ("timer_cancel", _) => match op["timer"].as_str() {
-            Some(timer) => hub
-                .cancel_timer(timer, None)
-                .map(|()| json!({ "type": "timer_cancelled", "timer": timer })),
-            None => Err("timer_cancel requires timer".to_string()),
-        },
-        ("timer_list", _) => Ok(json!({
-            "type": "timers",
-            "timers": hub.store.active_timers().iter()
-                .filter(|timer| op["agent"].as_str().is_none_or(|agent| timer.agent == agent))
-                .map(|timer| json!({
-                "timer": timer.id,
-                "agent": timer.agent,
-                "session": timer.session,
-                "fire_at": timer.fire_at,
-                "body": timer.body,
-            })).collect::<Vec<_>>(),
-        })),
         ("session_open", Some(session)) => engines::Kind::parse(op["engine"].as_str().unwrap_or_default())
             .and_then(|engine| {
                 hub.open_engine_session(

@@ -20,35 +20,31 @@ struct Daemon {
     address: String,
     token: String,
     state: PathBuf,
-    agents: PathBuf,
 }
 
-/// A daemon on a free loopback port with its own state and agents
-/// directories. Daemons from earlier tests keep running in this process, so
-/// sharing directories would let their schedulers act on this test's data.
+/// A daemon on a free loopback port with its own state directory. Daemons
+/// from earlier tests keep running in this process, so sharing directories
+/// would let their schedulers act on this test's data.
 fn start_daemon() -> Daemon {
-    let root = temp_dir("daemon-state");
-    start_daemon_on(root.join("daemon"), root.join("agents"))
+    start_daemon_on(temp_dir("daemon-state").join("daemon"))
 }
 
-/// A daemon on existing directories, standing in for a restart.
-fn start_daemon_on(state: PathBuf, agents: PathBuf) -> Daemon {
-    start_daemon_with(state, agents, None)
+/// A daemon on an existing directory, standing in for a restart.
+fn start_daemon_on(state: PathBuf) -> Daemon {
+    start_daemon_with(state, None)
 }
 
-fn start_daemon_with(state: PathBuf, agents: PathBuf, relay: Option<String>) -> Daemon {
+fn start_daemon_with(state: PathBuf, relay: Option<String>) -> Daemon {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let store = Store::open(state.clone()).unwrap();
     let token = store.token().unwrap();
-    let agent_store = jucode_daemon::Agents::open(agents.clone()).unwrap();
     let web = state.parent().map(|root| root.join("web"));
-    thread::spawn(move || jucode_daemon::serve(listener, store, agent_store, web, "test", relay));
+    thread::spawn(move || jucode_daemon::serve(listener, store, web, "test", relay));
     Daemon {
         address,
         token,
         state,
-        agents,
     }
 }
 
@@ -251,7 +247,7 @@ fn a_closed_session_reopens_with_its_open_actions() {
             fs::copy(entry.path(), state.join(entry.file_name())).unwrap();
         }
     }
-    let restarted = start_daemon_on(state, daemon.agents.clone());
+    let restarted = start_daemon_on(state);
     let mut client = Client::connect(&restarted);
     client.send(json!({ "op": "session_open", "session": session }));
     client.until(|frame| frame["type"] == "session_opened");
@@ -366,19 +362,6 @@ fn session_switching_commands_are_refused() {
         .contains("session_create"));
 }
 
-fn create_agent(client: &mut Client, id: &str, role: &str) -> PathBuf {
-    let dir = temp_dir(&format!("agent-{id}"));
-    client.send(json!({
-        "op": "agent_create", "agent": id, "name": id, "cwd": dir, "role": role,
-    }));
-    client.until(|frame| frame["type"] == "agent_created" && frame["agent"]["id"] == id);
-    dir
-}
-
-fn delivered_to(agent: &str) -> impl Fn(&Value) -> bool + '_ {
-    move |frame| frame["type"] == "message_delivered" && frame["agent"] == agent
-}
-
 /// Text the model streamed in `frames` for `session`.
 fn reply_text(frames: &[Value], session: &str) -> String {
     frames
@@ -389,532 +372,21 @@ fn reply_text(frames: &[Value], session: &str) -> String {
 }
 
 #[test]
-fn each_user_task_gets_a_new_session_that_reads_the_last_handoff() {
-    let _guard = setup();
-    let daemon = start_daemon();
-    let mut client = Client::connect(&daemon);
-    create_agent(&mut client, "route", "Keeps the build green");
-
-    client.send(json!({ "op": "message_send", "agent": "route", "body": "SYSTEM" }));
-    let frames = client.until(delivered_to("route"));
-    let session = frames.last().unwrap()["session"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let frames = client.until(ready(&session));
-    // The agent's brief is part of every turn's system prompt.
-    let reply = reply_text(&frames, &session);
-    assert!(reply.contains("<agent id=\"route\""), "{reply}");
-    assert!(reply.contains("Keeps the build green"), "{reply}");
-
-    // The turn's end has the title model write the run's handoff note into
-    // its outcome (the test model echoes what it was asked).
-    let mut listed = Value::Null;
-    for _ in 0..50 {
-        listed = request(
-            &mut client,
-            json!({ "op": "handoff_list", "agent": "route" }),
-        );
-        if listed["handoffs"][0]["session"] == session.as_str() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    assert_eq!(
-        listed["handoffs"][0]["session"],
-        session.as_str(),
-        "{listed}"
-    );
-    let note = listed["handoffs"][0]["text"].as_str().unwrap_or_default();
-    assert!(note.contains("user said: Session:"), "{note}");
-
-    // A new task is a new session, told what the last one concluded.
-    client.send(json!({ "op": "message_send", "agent": "route", "body": "SYSTEM" }));
-    let frames = client.until(delivered_to("route"));
-    let next = frames.last().unwrap()["session"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_ne!(next, session);
-    let frames = client.until(ready(&next));
-    let reply = reply_text(&frames, &next);
-    assert!(reply.contains("<handoff task=\"task-"), "{reply}");
-    assert!(reply.contains("user said: Session:"), "{reply}");
-
-    // A reply names its session and continues it.
-    client.send(json!({ "op": "message_send", "agent": "route", "body": "and another thing", "session": session }));
-    let frames = client.until(delivered_to("route"));
-    assert_eq!(frames.last().unwrap()["session"], session.as_str());
-
-    // Hidden from a session list, it stays on its agent's page.
-    client.send(json!({ "op": "session_meta", "session": session, "hidden": true }));
-    // Ops of one client run in order: the list comes after the change.
-    let listed = request(&mut client, json!({ "op": "session_list" }));
-    assert!(listed["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|s| s["session"] == session.as_str() && s["agent"] == "route"));
-}
-
-#[test]
-fn an_agent_proposes_a_schedule_that_stays_off_until_the_user_turns_it_on() {
-    let _guard = setup();
-    let daemon = start_daemon();
-    let mut client = Client::connect(&daemon);
-    create_agent(&mut client, "planner", "Plans the week");
-    create_agent(&mut client, "other", "Someone else");
-    let theirs = request(
-        &mut client,
-        json!({ "op": "schedule_save", "schedule": {
-            "agent": "other", "name": "theirs", "prompt": "x", "repeat": "daily", "time": "08:00",
-        } }),
-    );
-    let theirs = theirs["schedule"]["id"].as_str().unwrap().to_string();
-
-    let call = |body: Value| format!("CALL task {body}");
-    client.send(
-        json!({ "op": "message_send", "agent": "planner", "body": call(json!({
-        // Filled the way some models fill every optional field.
-        "action": "schedule", "id": "", "date": "", "days": [],
-        "name": "每日巡检", "prompt": "check the deploys",
-        "repeat": "daily", "time": "09:30",
-    })) }),
-    );
-    let proposed = client.until(|frame| {
-        frame["type"] == "schedules"
-            && frame["schedules"]
-                .as_array()
-                .is_some_and(|list| list.iter().any(|s| s["agent"] == "planner"))
-    });
-    let list = proposed.last().unwrap()["schedules"]
-        .as_array()
-        .unwrap()
-        .clone();
-    let mine = list.iter().find(|s| s["agent"] == "planner").unwrap();
-    assert_eq!(mine["name"], "每日巡检");
-    assert_eq!(mine["enabled"], false);
-    assert_eq!(mine["by_agent"], true);
-    assert!(mine["next_run_at"].is_null());
-    let mine = mine["id"].as_str().unwrap().to_string();
-
-    // Another agent's task is out of reach.
-    client.send(json!({ "op": "message_send", "agent": "planner", "body": call(json!({ "action": "unschedule", "id": theirs })) }));
-    let frames = client.until(|frame| {
-        frame["type"] == "tool_output" && frame["name"] == "task" && frame["is_error"] == true
-    });
-    assert!(
-        frames
-            .last()
-            .unwrap()
-            .to_string()
-            .contains("unknown schedule"),
-        "{:?}",
-        frames.last()
-    );
-
-    // The user turns it on; an agent's later change switches it off again.
-    let reply = request(
-        &mut client,
-        json!({ "op": "schedule_save", "schedule": { "id": mine, "enabled": true } }),
-    );
-    assert_eq!(reply["schedule"]["enabled"], true);
-    assert!(reply["schedule"]["next_run_at"].as_u64().is_some());
-    client.send(
-        json!({ "op": "message_send", "agent": "planner", "body": call(json!({
-        "action": "schedule", "id": mine, "time": "10:00", "enabled": true,
-    })) }),
-    );
-    client.until(|frame| {
-        frame["type"] == "schedules"
-            && frame["schedules"].as_array().is_some_and(|list| {
-                list.iter()
-                    .any(|s| s["id"] == mine.as_str() && s["time"] == "10:00")
-            })
-    });
-    let list = request(
-        &mut client,
-        json!({ "op": "schedule_list", "agent": "planner" }),
-    );
-    assert_eq!(list["schedules"][0]["enabled"], false);
-}
-
-#[test]
-fn a_new_session_message_starts_a_conversation_and_the_log_shows_both() {
-    let _guard = setup();
-    let daemon = start_daemon();
-    let mut client = Client::connect(&daemon);
-    create_agent(&mut client, "fresh", "Starts over when asked");
-    client.send(json!({ "op": "message_send", "agent": "fresh", "body": "first" }));
-    let frames = client.until(delivered_to("fresh"));
-    let first = frames.last().unwrap()["session"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    client.until(ready(&first));
-
-    client.send(
-        json!({ "op": "message_send", "agent": "fresh", "body": "second", "new_session": true }),
-    );
-    let frames = client.until(delivered_to("fresh"));
-    let second = frames.last().unwrap()["session"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_ne!(first, second);
-
-    client.send(json!({ "op": "message_list", "agent": "fresh" }));
-    let frames = client.until(|frame| frame["type"] == "messages");
-    let log = frames.last().unwrap()["messages"]
-        .as_array()
-        .unwrap()
-        .clone();
-    assert_eq!(log.len(), 2);
-    assert_eq!(
-        (log[0]["body"].as_str(), log[0]["session"].as_str()),
-        (Some("second"), Some(second.as_str()))
-    );
-    assert_eq!(
-        (log[1]["status"].as_str(), log[1]["from"].as_str()),
-        (Some("delivered"), Some("user"))
-    );
-}
-
-#[test]
-fn a_timer_can_be_cancelled_from_the_desk_and_stays_cancelled() {
-    let _guard = setup();
-    let root = temp_dir("desk-cancel-timer");
-    let state = root.join("daemon");
-    fs::create_dir_all(&state).unwrap();
-    let timers: String = ["t-cancel", "t-keep"]
-        .iter()
-        .map(|id| {
-            format!(
-                "{}\n",
-                json!({
-                    "kind": "set", "id": id, "agent": "ops", "session": "s1",
-                    "fire_at": 4_000_000_000_000u64, "body": id, "at": 1,
-                })
-            )
-        })
-        .collect();
-    fs::write(state.join("timers.jsonl"), timers).unwrap();
-    let daemon = start_daemon_on(state.clone(), root.join("agents"));
-    let mut client = Client::connect(&daemon);
-    client.send(json!({ "op": "timer_cancel", "timer": "t-cancel", "id": 71 }));
-    let frames = client.until(|frame| frame["id"] == 71);
-    assert_eq!(frames.last().unwrap()["type"], "timer_cancelled");
-    assert_eq!(frames.last().unwrap()["timer"], "t-cancel");
-    client.send(json!({ "op": "timer_cancel", "timer": "t-cancel", "id": 72 }));
-    let frames = client.until(|frame| frame["id"] == 72);
-    assert_eq!(frames.last().unwrap()["type"], "error");
-    drop(client);
-    let mut client = Client::connect(&daemon);
-    client.send(json!({ "op": "timer_list", "id": 73 }));
-    let frames = client.until(|frame| frame["id"] == 73);
-    let active = frames.last().unwrap()["timers"].as_array().unwrap();
-    assert_eq!(active.len(), 1);
-    assert_eq!(active[0]["timer"], "t-keep");
-}
-
-#[test]
-fn a_timer_set_by_an_agent_wakes_it_with_nobody_connected() {
-    let _guard = setup();
-    let daemon = start_daemon();
-    let mut client = Client::connect(&daemon);
-    create_agent(&mut client, "waker", "Checks back later");
-    client.send(json!({
-        "op": "message_send",
-        "agent": "waker",
-        "body": r#"CALL task {"action":"remind","in_seconds":1,"body":"check the deploy"}"#,
-    }));
-    let frames = client.until(delivered_to("waker"));
-    let session = frames.last().unwrap()["session"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    client.until(ready(&session));
-    drop(client);
-
-    // Nobody is connected when the timer fires; a client that attaches
-    // afterwards finds the timer's message answered in the same session.
-    thread::sleep(Duration::from_millis(3500));
-    let mut late = Client::connect(&daemon);
-    late.send(json!({ "op": "watch", "session": session }));
-    let frames =
-        late.until(|frame| frame["type"] == "transcript" && frame["session"] == session.as_str());
-    let transcript = frames.last().unwrap()["items"].to_string();
-    assert!(transcript.contains("fired"), "{transcript}");
-    assert!(transcript.contains("check the deploy"), "{transcript}");
-    late.send(json!({ "op": "timer_list" }));
-    let timers = late.until(|frame| frame["type"] == "timers");
-    assert!(!timers.last().unwrap()["timers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|timer| timer["agent"] == "waker"));
-}
-
-#[test]
-fn agents_message_each_other_into_a_new_session() {
-    let _guard = setup();
-    let daemon = start_daemon();
-    let mut client = Client::connect(&daemon);
-    create_agent(&mut client, "asker", "Asks for help");
-    create_agent(&mut client, "helper", "Helps");
-    client.send(json!({
-        "op": "message_send",
-        "agent": "asker",
-        "body": r#"CALL message_agent {"to":"helper","body":"please look at the logs"}"#,
-    }));
-    let frames = client.until(delivered_to("helper"));
-    let delivery = frames.last().unwrap().clone();
-    assert_eq!(delivery["from"], "agent:asker");
-    let session = delivery["session"].as_str().unwrap().to_string();
-    let frames = client.until(ready(&session));
-    let reply = reply_text(&frames, &session);
-    assert!(reply.contains("message from agent asker"), "{reply}");
-    assert!(reply.contains("please look at the logs"), "{reply}");
-}
-
-#[test]
-fn a_message_with_a_seen_dedupe_key_is_delivered_once() {
-    let _guard = setup();
-    let daemon = start_daemon();
-    let mut client = Client::connect(&daemon);
-    create_agent(&mut client, "once", "Does things once");
-    for expected in [false, true] {
-        client.send(json!({
-            "op": "message_send", "agent": "once", "body": "hi", "dedupe_key": "im-42", "id": 9,
-        }));
-        let frames = client.until(|frame| frame["id"] == 9);
-        assert_eq!(frames.last().unwrap()["duplicate"], expected);
-    }
-    let sessions = fs::read_to_string(daemon.state.join("messages.jsonl"))
-        .unwrap()
-        .lines()
-        .filter(|line| line.contains("\"delivered\"") || line.contains("im-42"))
-        .count();
-    // One message line and one delivery line.
-    assert_eq!(sessions, 2);
-}
-
-#[test]
-fn a_timer_due_while_the_daemon_was_down_fires_on_start() {
-    let _guard = setup();
-    // An agent and a timer written before this daemon starts, already due.
-    let root = temp_dir("daemon-down");
-    let agents = jucode_daemon::Agents::open(root.join("agents")).unwrap();
-    agents
-        .create(
-            "sleeper",
-            "sleeper",
-            &temp_dir("agent-sleeper"),
-            "Was asleep",
-            &Value::Null,
-        )
-        .unwrap();
-    let timers = root.join("daemon").join("timers.jsonl");
-    fs::create_dir_all(timers.parent().unwrap()).unwrap();
-    let line = json!({
-        "kind": "set", "id": "t-overdue", "agent": "sleeper", "session": null,
-        "fire_at": 1, "body": "catch up", "at": 1,
-    });
-    let mut existing = fs::read_to_string(&timers).unwrap_or_default();
-    existing.push_str(&format!("{line}\n"));
-    fs::write(&timers, existing).unwrap();
-
-    let daemon = start_daemon_on(root.join("daemon"), root.join("agents"));
-    let mut client = Client::connect(&daemon);
-    let frames = client.until(delivered_to("sleeper"));
-    assert_eq!(frames.last().unwrap()["from"], "timer:t-overdue");
-}
-
-#[test]
-fn at_most_four_runs_are_in_progress_at_once() {
-    let _guard = setup();
-    let root = temp_dir("daemon-slots");
-    let agents = jucode_daemon::Agents::open(root.join("agents")).unwrap();
-    let ids = ["slot-a", "slot-b", "slot-c", "slot-d", "slot-e"];
-    for id in ids {
-        agents
-            .create(id, id, &temp_dir(id), "Waits", &Value::Null)
-            .unwrap();
-        // Run shell commands without asking, so each run takes real time.
-        let settings = root.join("agents").join(id).join("agent.json");
-        let text = fs::read_to_string(&settings).unwrap();
-        fs::write(&settings, text.replace("\"auto\"", "\"full-access\"")).unwrap();
-    }
-    let daemon = start_daemon_on(root.join("daemon"), root.join("agents"));
-    let mut client = Client::connect(&daemon);
-    for id in ids {
-        client.send(json!({ "op": "message_send", "agent": id, "body": "RUN: sleep 2" }));
-    }
-    let mut delivered = Vec::new();
-    let mut finished = 0;
-    let mut finished_before_fifth = 0;
-    client.until(|frame| {
-        if frame["type"] == "message_delivered" {
-            delivered.push(frame["session"].as_str().unwrap().to_string());
-            if delivered.len() == 5 {
-                finished_before_fifth = finished;
-            }
-        }
-        if frame["type"] == "status" && frame["message"] == "ready" {
-            finished += 1;
-        }
-        delivered.len() == 5
-    });
-    // The fifth message waited for one of the first four runs to end.
-    assert!(
-        finished_before_fifth >= 1,
-        "fifth delivered with {finished_before_fifth} runs finished"
-    );
-}
-
-/// Sends `body` to a fresh agent and returns the session it landed in once
-/// that run has finished.
-fn run_agent(client: &mut Client, agent: &str, body: &str) -> (String, Vec<Value>) {
-    client.send(json!({ "op": "message_send", "agent": agent, "body": body }));
-    let frames = client.until(delivered_to(agent));
-    let session = frames.last().unwrap()["session"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let mut all = frames;
-    all.extend(client.until(ready(&session)));
-    (session, all)
-}
-
-#[test]
-fn an_answered_question_wakes_the_session_that_asked() {
-    let _guard = setup();
-    let daemon = start_daemon();
-    let mut client = Client::connect(&daemon);
-    create_agent(&mut client, "asks", "Needs decisions");
-    let (session, frames) = run_agent(
-        &mut client,
-        "asks",
-        r#"CALL question {"title":"Ship to prod?","assumption":"not yet","default":"wait","importance":"high"}"#,
-    );
-    let listed = frames
-        .iter()
-        .rev()
-        .find(|frame| frame["type"] == "questions")
-        .expect("the new question is broadcast");
-    let question = listed["questions"][0].clone();
-    assert_eq!(question["title"], "Ship to prod?");
-    assert_eq!(question["session"], session.as_str());
-    assert_eq!(question["importance"], "high");
-
-    client.send(json!({
-        "op": "question_answer", "question": question["id"], "answer": "yes, ship it", "id": 3,
-    }));
-    let mut frames = client.until(|frame| frame["id"] == 3 && frame["type"] == "question_answered");
-    frames.extend(client.until(ready(&session)));
-    let delivery = frames
-        .iter()
-        .find(|frame| frame["type"] == "message_delivered")
-        .expect("the answer is delivered");
-    assert_eq!(delivery["session"], session.as_str());
-    let reply = reply_text(&frames, &session);
-    assert!(reply.contains("A: yes, ship it"), "{reply}");
-
-    client.send(
-        json!({ "op": "question_answer", "question": question["id"], "answer": "no", "id": 4 }),
-    );
-    let frames = client.until(|frame| frame["id"] == 4);
-    assert_eq!(frames.last().unwrap()["type"], "error");
-}
-
-#[test]
-fn an_unanswered_question_falls_back_to_its_default_at_the_deadline() {
-    let _guard = setup();
-    let daemon = start_daemon();
-    let mut client = Client::connect(&daemon);
-    create_agent(&mut client, "waits", "Waits politely");
-    let (session, _) = run_agent(
-        &mut client,
-        "waits",
-        r#"CALL question {"title":"Which region?","default":"use eu","due_in_seconds":1}"#,
-    );
-    let frames = client.until(delivered_to("waits"));
-    assert_eq!(
-        frames.last().unwrap()["from"]
-            .as_str()
-            .unwrap()
-            .split(':')
-            .next(),
-        Some("question")
-    );
-    let frames = client.until(ready(&session));
-    let reply = reply_text(&frames, &session);
-    assert!(reply.contains("No answer by the deadline"), "{reply}");
-    assert!(reply.contains("use eu"), "{reply}");
-    client.send(json!({ "op": "question_list", "id": 5 }));
-    let frames = client.until(|frame| frame["id"] == 5);
-    assert_eq!(frames.last().unwrap()["questions"], json!([]));
-}
-
-#[test]
-fn a_runs_write_up_is_a_report_listed_until_read() {
-    let _guard = setup();
-    let daemon = start_daemon();
-    let mut client = Client::connect(&daemon);
-    create_agent(&mut client, "reporter", "Reports");
-    // A run's longer write-up (`finish` with details) is kept as a report.
-    let (_, frames) = run_agent(
-        &mut client,
-        "reporter",
-        r#"CALL finish {"verdict":"done","summary":"Login fixed","details":"tests: 12 pass"}"#,
-    );
-    let posted = frames
-        .iter()
-        .find(|frame| frame["type"] == "report_posted")
-        .expect("the report is broadcast")["report"]
-        .clone();
-    assert_eq!(posted["body"], "tests: 12 pass");
-    assert!(!posted["title"].as_str().unwrap_or_default().is_empty());
-    assert_eq!(posted["read"], false);
-    // Posting a report started no further delivery.
-    assert_eq!(
-        frames
-            .iter()
-            .filter(|frame| frame["type"] == "message_delivered")
-            .count(),
-        1
-    );
-
-    client.send(json!({ "op": "report_read", "report": posted["id"], "id": 6 }));
-    client.until(|frame| frame["id"] == 6);
-    client.send(json!({ "op": "report_list", "id": 7 }));
-    let frames = client.until(|frame| frame["id"] == 7);
-    let reports = frames.last().unwrap()["reports"]
-        .as_array()
-        .unwrap()
-        .clone();
-    assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0]["read"], true);
-}
-
-#[test]
 fn an_action_can_be_decided_after_its_session_closed() {
     let _guard = setup();
     let daemon = start_daemon();
+    let dir = temp_dir("daemon-decide-closed");
     let mut client = Client::connect(&daemon);
-    let dir = create_agent(&mut client, "careful", "Asks before shell commands");
-    client.send(
-        json!({ "op": "agent_update", "agent": "careful", "approval_mode": "manual", "id": 8 }),
-    );
-    client.until(|frame| frame["id"] == 8);
-    let (session, frames) = run_agent(&mut client, "careful", "RUN: printf later > marker.txt");
-    let actions = frames
+    let session = client.create_session(&dir);
+    client.send(json!({
+        "op": "user_message", "session": session, "content": "RUN: printf later > marker.txt",
+    }));
+    let frames = client.until(ready(&session));
+    let action = frames
         .iter()
-        .rev()
-        .find(|frame| frame["type"] == "actions")
-        .expect("the deferred action is broadcast");
-    let action = actions["actions"][0].clone();
-    assert_eq!(action["session_id"], session.as_str());
+        .find(|frame| frame["type"] == "action_deferred")
+        .expect("nobody watches, so the call is deferred")
+        .clone();
     client.send(json!({ "op": "session_close", "session": session }));
     client.until(|frame| frame["type"] == "session_closed");
 
@@ -926,302 +398,6 @@ fn an_action_can_be_decided_after_its_session_closed() {
     assert_eq!(fs::read_to_string(dir.join("marker.txt")).unwrap(), "later");
 }
 
-#[test]
-fn the_agent_page_reads_the_brief_and_changes_settings() {
-    let _guard = setup();
-    let daemon = start_daemon();
-    let mut client = Client::connect(&daemon);
-    create_agent(&mut client, "paged", "Has a page");
-    client.send(json!({ "op": "agent_update", "agent": "paged", "name": "Paged", "enabled": false, "id": 1 }));
-    let frames = client.until(|frame| frame["id"] == 1);
-    assert_eq!(frames.last().unwrap()["agent"]["enabled"], false);
-    client.send(json!({ "op": "agent_get", "agent": "paged", "id": 2 }));
-    let frames = client.until(|frame| frame["id"] == 2);
-    let page = frames.last().unwrap();
-    assert_eq!(page["agent"]["name"], "Paged");
-    assert_eq!(page["brief"]["role.md"], "Has a page\n");
-    // A disabled agent's messages wait, and go once it is enabled again.
-    client.send(json!({ "op": "message_send", "agent": "paged", "body": "hi", "id": 3 }));
-    client.until(|frame| frame["id"] == 3);
-    thread::sleep(Duration::from_millis(1500));
-    let log = fs::read_to_string(daemon.state.join("messages.jsonl")).unwrap();
-    assert!(
-        !log.contains("undeliverable") && !log.contains("delivered"),
-        "{log}"
-    );
-    client.send(json!({ "op": "agent_update", "agent": "paged", "enabled": true, "id": 4 }));
-    client.until(delivered_to("paged"));
-}
-
-/// Runs schedule `id` now and returns the session its message reached once
-/// that run has finished.
-fn run_schedule(client: &mut Client, agent: &str, id: &str) -> (String, Vec<Value>) {
-    client.send(json!({ "op": "schedule_run", "schedule": id, "id": "run" }));
-    let mut replied = false;
-    let mut session: Option<String> = None;
-    let frames = client.until(|frame| {
-        if frame["id"] == "run" {
-            assert_eq!(frame["type"], "schedule_started", "{frame}");
-            assert_eq!(frame["schedule"], id);
-            replied = true;
-        }
-        if delivered_to(agent)(frame) {
-            assert_eq!(frame["from"], format!("schedule:{id}"));
-            session = frame["session"].as_str().map(str::to_string);
-        }
-        replied
-            && session
-                .as_deref()
-                .is_some_and(|session| ready(session)(frame))
-    });
-    (session.unwrap(), frames)
-}
-
-#[test]
-fn a_schedule_runs_now_into_a_new_session_or_the_last_one() {
-    let _guard = setup();
-    let daemon = start_daemon();
-    let mut client = Client::connect(&daemon);
-    create_agent(&mut client, "tickets", "Works the ticket queue");
-    let reply = request(
-        &mut client,
-        json!({ "op": "schedule_save", "schedule": { "agent": "nobody", "name": "x", "prompt": "x", "repeat": "daily", "time": "11:00" } }),
-    );
-    assert_eq!(reply["type"], "error");
-    let reply = request(
-        &mut client,
-        json!({ "op": "schedule_save", "schedule": {
-            "agent": "tickets", "name": "工单处理", "prompt": "work the queue",
-            "repeat": "weekly", "time": "11:00", "days": [],
-        } }),
-    );
-    assert_eq!(reply["type"], "error", "a weekly schedule needs days");
-    let reply = request(
-        &mut client,
-        json!({ "op": "schedule_save", "schedule": {
-            "agent": "tickets", "name": "工单处理", "prompt": "work the queue",
-            "repeat": "daily", "time": "11:00",
-        } }),
-    );
-    assert_eq!(reply["type"], "schedule_saved", "{reply}");
-    let schedule = reply["schedule"].clone();
-    let id = schedule["id"].as_str().unwrap().to_string();
-    assert!(id.starts_with("sch-"));
-    assert_eq!(schedule["new_session"], true);
-    assert!(schedule["next_run_at"].as_u64().unwrap() > 0);
-    assert!(daemon.agents.join("tickets/schedules.json").exists());
-    let list = request(
-        &mut client,
-        json!({ "op": "schedule_list", "agent": "tickets" }),
-    );
-    assert_eq!(list["schedules"].as_array().unwrap().len(), 1);
-    // A client that connects now gets the list right away.
-    let mut late = Client::connect(&daemon);
-    late.until(|frame| frame["type"] == "schedules" && frame["schedules"][0]["id"] == id.as_str());
-
-    let (first, frames) = run_schedule(&mut client, "tickets", &id);
-    let reply = reply_text(&frames, &first);
-    assert!(reply.contains("定时任务「工单处理」"), "{reply}");
-    assert!(reply.contains("work the queue"), "{reply}");
-    let list = request(&mut client, json!({ "op": "schedule_list" }));
-    let listed = &list["schedules"][0];
-    assert_eq!(listed["last_session"], first.as_str());
-    assert!(listed["last_run_at"].as_u64().is_some());
-    assert_eq!(listed["next_run_at"], schedule["next_run_at"]);
-
-    // Continuing: the next run goes into the last run's session.
-    let reply = request(
-        &mut client,
-        json!({ "op": "schedule_save", "schedule": { "id": id, "new_session": false } }),
-    );
-    assert_eq!(reply["schedule"]["name"], "工单处理");
-    // Runs are told apart by the second they start in.
-    thread::sleep(Duration::from_millis(1100));
-    let (second, _) = run_schedule(&mut client, "tickets", &id);
-    assert_eq!(second, first);
-
-    request(
-        &mut client,
-        json!({ "op": "schedule_save", "schedule": { "id": id, "new_session": true } }),
-    );
-    thread::sleep(Duration::from_millis(1100));
-    let (third, _) = run_schedule(&mut client, "tickets", &id);
-    assert_ne!(third, first);
-
-    // `id` alone names the schedule (and is echoed as the request id).
-    client.send(json!({ "op": "schedule_delete", "id": id }));
-    let frames = client.until(|frame| frame["type"] == "schedule_deleted");
-    assert_eq!(frames.last().unwrap()["id"], id.as_str());
-    let list = request(&mut client, json!({ "op": "schedule_list" }));
-    assert_eq!(list["schedules"], json!([]));
-}
-
-#[test]
-fn a_schedule_due_while_the_daemon_was_down_fires_once_on_start() {
-    let _guard = setup();
-    let root = temp_dir("schedule-down");
-    let agents = jucode_daemon::Agents::open(root.join("agents")).unwrap();
-    agents
-        .create(
-            "nightly",
-            "nightly",
-            &temp_dir("agent-nightly"),
-            "Runs at night",
-            &Value::Null,
-        )
-        .unwrap();
-    // Due long ago: many runs were missed.
-    let saved = json!([{
-        "id": "sch-missed", "agent": "nightly", "name": "nightly", "prompt": "catch up",
-        "enabled": true, "repeat": "hourly", "time": "00:00", "days": [], "date": null,
-        "new_session": true, "created_at": 1, "last_run_at": null, "last_session": null,
-        "next_run_at": 1,
-    }]);
-    fs::write(
-        root.join("agents/nightly/schedules.json"),
-        saved.to_string(),
-    )
-    .unwrap();
-
-    let daemon = start_daemon_on(root.join("daemon"), root.join("agents"));
-    let mut client = Client::connect(&daemon);
-    let frames = client.until(delivered_to("nightly"));
-    assert_eq!(frames.last().unwrap()["from"], "schedule:sch-missed");
-    let list = request(&mut client, json!({ "op": "schedule_list" }));
-    let schedule = &list["schedules"][0];
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    assert!(schedule["next_run_at"].as_u64().unwrap() > now);
-    thread::sleep(Duration::from_millis(1500));
-    let fired = fs::read_to_string(daemon.state.join("messages.jsonl"))
-        .unwrap()
-        .lines()
-        .filter(|line| line.contains("\"kind\":\"message\"") && line.contains("sch-missed"))
-        .count();
-    assert_eq!(fired, 1);
-}
-
-#[test]
-fn an_agent_is_deleted_only_while_idle_and_takes_its_schedules_along() {
-    let _guard = setup();
-    let daemon = start_daemon();
-    let mut client = Client::connect(&daemon);
-    create_agent(&mut client, "doomed", "Goes away");
-    create_agent(&mut client, "stays", "Stays");
-    request(
-        &mut client,
-        json!({ "op": "agent_update", "agent": "doomed", "approval_mode": "full-access" }),
-    );
-    for agent in ["doomed", "stays"] {
-        let reply = request(
-            &mut client,
-            json!({ "op": "schedule_save", "schedule": {
-                "agent": agent, "name": "n", "prompt": "p", "repeat": "hourly", "time": "00:30",
-            } }),
-        );
-        assert_eq!(reply["type"], "schedule_saved", "{reply}");
-    }
-    let reply = request(
-        &mut client,
-        json!({ "op": "timer_list", "agent": "doomed" }),
-    );
-    assert_eq!(reply["timers"], json!([]));
-
-    client.send(json!({ "op": "message_send", "agent": "doomed", "body": "RUN: sleep 3" }));
-    let frames = client.until(delivered_to("doomed"));
-    let session = frames.last().unwrap()["session"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let reply = request(
-        &mut client,
-        json!({ "op": "agent_delete", "agent": "doomed" }),
-    );
-    assert_eq!(reply["type"], "error", "refused while running: {reply}");
-    assert!(daemon.agents.join("doomed").exists());
-    client.until(ready(&session));
-
-    let reply = request(
-        &mut client,
-        json!({ "op": "agent_delete", "agent": "doomed" }),
-    );
-    assert_eq!(reply["type"], "agent_deleted", "{reply}");
-    assert_eq!(reply["agent"], "doomed");
-    assert!(!daemon.agents.join("doomed").exists());
-    let list = request(&mut client, json!({ "op": "schedule_list" }));
-    let owners: Vec<&Value> = list["schedules"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|schedule| &schedule["agent"])
-        .collect();
-    assert_eq!(owners, vec!["stays"]);
-    let agents = request(&mut client, json!({ "op": "agent_list" }));
-    assert!(!agents["agents"].to_string().contains("doomed"));
-
-    // A message for the deleted agent is refused; its old sessions stay listed.
-    let reply = request(
-        &mut client,
-        json!({ "op": "message_send", "agent": "doomed", "body": "hi" }),
-    );
-    assert_eq!(reply["type"], "error");
-    let sessions = request(&mut client, json!({ "op": "session_list" }));
-    assert!(sessions["sessions"].to_string().contains(&session));
-}
-
-#[test]
-fn agent_memory_is_read_by_file_name_only() {
-    let _guard = setup();
-    let daemon = start_daemon();
-    let mut client = Client::connect(&daemon);
-    create_agent(&mut client, "keeper", "Keeps notes");
-    fs::write(
-        daemon.agents.join("keeper/memory/deploy.md"),
-        "use make ship",
-    )
-    .unwrap();
-    fs::write(daemon.agents.join("keeper/secret.md"), "nope").unwrap();
-    let page = request(&mut client, json!({ "op": "agent_get", "agent": "keeper" }));
-    assert_eq!(page["memory"], json!(["memory/deploy.md"]));
-    let reply = request(
-        &mut client,
-        json!({ "op": "agent_memory_read", "agent": "keeper", "file": "deploy.md" }),
-    );
-    assert_eq!(reply["type"], "agent_memory", "{reply}");
-    assert_eq!(reply["content"], "use make ship");
-    assert_eq!(reply["file"], "deploy.md");
-    for bad in [
-        "../x",
-        "../secret.md",
-        "../../keeper/secret.md",
-        "missing.md",
-        "deploy",
-    ] {
-        let reply = request(
-            &mut client,
-            json!({ "op": "agent_memory_read", "agent": "keeper", "file": bad }),
-        );
-        assert_eq!(reply["type"], "error", "{bad}: {reply}");
-    }
-
-    // Renaming and rewriting the role.
-    let reply = request(
-        &mut client,
-        json!({ "op": "agent_update", "agent": "keeper", "name": " " }),
-    );
-    assert_eq!(reply["type"], "error");
-    let reply = request(
-        &mut client,
-        json!({ "op": "agent_update", "agent": "keeper", "name": "Keeper", "role": "Keeps better notes" }),
-    );
-    assert_eq!(reply["agent"]["name"], "Keeper");
-    let page = request(&mut client, json!({ "op": "agent_get", "agent": "keeper" }));
-    assert_eq!(page["brief"]["role.md"], "Keeps better notes\n");
-}
-
-/// One plain HTTP request; returns (status, headers and body as text).
 fn http(daemon: &Daemon, request: &str) -> (u16, String) {
     use std::io::{Read, Write};
     let mut stream = TcpStream::connect(&daemon.address).unwrap();
@@ -1293,12 +469,12 @@ fn a_device_pairs_with_a_code_from_the_desktop_until_revoked() {
     let (status, _) = http(&daemon, &pair_request(&code));
     assert_eq!(status, 403);
 
-    // The phone reaches sessions and agents, but cannot pair more devices.
+    // The phone reaches sessions, but cannot pair more devices.
     let mut phone = Client::connect_with(&daemon, &token);
-    phone.send(json!({ "op": "agent_list", "id": 2 }));
+    phone.send(json!({ "op": "session_list", "id": 2 }));
     assert_eq!(
         phone.until(|frame| frame["id"] == 2).last().unwrap()["type"],
-        "agents"
+        "sessions"
     );
     phone.send(json!({ "op": "pair_start", "id": 3 }));
     assert_eq!(
@@ -1332,59 +508,22 @@ fn a_device_pairs_with_a_code_from_the_desktop_until_revoked() {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn an_agent_writes_its_rw_directories_and_not_its_ro_ones() {
-    let _guard = setup();
-    let daemon = start_daemon();
-    let mut client = Client::connect(&daemon);
-    let dir = create_agent(&mut client, "deployer", "Deploys");
-    fs::create_dir_all(dir.join(".git")).unwrap();
-    let deploy = temp_dir("deploy-scripts");
-    let logs = temp_dir("prod-logs");
-    fs::write(logs.join("app.log"), "boot ok").unwrap();
-    client.send(json!({
-        "op": "agent_update", "agent": "deployer", "id": 1,
-        "directories": [{ "path": deploy, "mode": "rw" }, { "path": logs, "mode": "ro" }],
-    }));
-    let frames = client.until(|frame| frame["id"] == 1);
-    assert_eq!(
-        frames.last().unwrap()["agent"]["sandbox"],
-        "workspace-write"
-    );
-
-    let script = format!(
-        "RUN: printf a > src.txt; printf b > {}/run.sh; printf c > {}/app.log; printf d > .git/config; cat {}/app.log > seen.txt",
-        deploy.display(),
-        logs.display(),
-        logs.display()
-    );
-    let (_, frames) = run_agent(&mut client, "deployer", &script);
-    // auto mode, inside the sandbox: nothing asked, nothing deferred.
-    assert!(!frames
-        .iter()
-        .any(|frame| frame["type"] == "approval_request" || frame["type"] == "action_deferred"));
-    assert_eq!(fs::read_to_string(dir.join("src.txt")).unwrap(), "a");
-    assert_eq!(fs::read_to_string(deploy.join("run.sh")).unwrap(), "b");
-    assert_eq!(fs::read_to_string(logs.join("app.log")).unwrap(), "boot ok");
-    assert!(!dir.join(".git/config").exists());
-    assert_eq!(fs::read_to_string(dir.join("seen.txt")).unwrap(), "boot ok");
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[test]
 fn an_unattended_escalation_becomes_a_pending_action() {
     let _guard = setup();
     let daemon = start_daemon();
     let mut client = Client::connect(&daemon);
-    let dir = create_agent(&mut client, "escalator", "Needs git");
+    let dir = temp_dir("daemon-escalator");
     fs::create_dir_all(dir.join(".git")).unwrap();
+    let session = client.create_session(&dir);
     // auto-edit: an escalation asks a person (no safety model involved).
-    client.send(json!({ "op": "agent_update", "agent": "escalator", "approval_mode": "auto-edit", "id": 1 }));
-    client.until(|frame| frame["id"] == 1);
-    let (_, frames) = run_agent(
-        &mut client,
-        "escalator",
-        r#"CALL bash {"command":"printf x > .git/config","escalate":true,"justification":"set up the repo"}"#,
-    );
+    client.send(json!({ "op": "set_approval_mode", "session": session, "mode": "auto-edit" }));
+    client.until(|frame| frame["type"] == "approval_mode" && frame["mode"] == "auto-edit");
+    client.send(json!({
+        "op": "user_message",
+        "session": session,
+        "content": r#"CALL bash {"command":"printf x > .git/config","escalate":true,"justification":"set up the repo"}"#,
+    }));
+    let frames = client.until(ready(&session));
     let deferred = frames
         .iter()
         .find(|frame| frame["type"] == "action_deferred")
@@ -1512,7 +651,6 @@ fn a_relay_client_pairs_gets_hello_and_is_dropped_on_revoke() {
     let root = temp_dir("relay-state");
     let daemon = start_daemon_with(
         root.join("daemon"),
-        root.join("agents"),
         Some(format!("ws://{}/relay/v1", relay.local_addr().unwrap())),
     );
     let mut desktop = Client::connect(&daemon);
@@ -2972,120 +2110,147 @@ fn session_usage_restores_only_its_persisted_turns_with_correlated_replies() {
     );
 }
 
-/// `agent`'s tasks once `done` holds for them, waiting up to five seconds
-/// (a run ends just after its session reports ready).
-fn tasks_when(client: &mut Client, agent: &str, done: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+/// Scheduled task `id` once `done` holds for it, waiting up to ten seconds.
+fn schedule_when(client: &mut Client, id: &str, done: impl Fn(&Value) -> bool) -> Value {
     let start = Instant::now();
     loop {
-        let reply = request(client, json!({ "op": "task_list", "agent": agent }));
-        let tasks = reply["tasks"].as_array().cloned().unwrap_or_default();
-        if done(&tasks) {
-            return tasks;
+        let listed = request(client, json!({ "op": "schedule_list" }));
+        let entry = listed["schedules"]
+            .as_array()
+            .and_then(|list| list.iter().find(|s| s["id"] == id))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if done(&entry) {
+            return entry;
         }
-        assert!(start.elapsed() < Duration::from_secs(5), "{tasks:?}");
+        assert!(start.elapsed() < Duration::from_secs(10), "{entry}");
         thread::sleep(Duration::from_millis(50));
     }
 }
 
-#[test]
-fn every_message_is_a_run_of_a_task_that_concludes() {
-    let _guard = setup();
-    let daemon = start_daemon();
-    let mut client = Client::connect(&daemon);
-    create_agent(&mut client, "worker", "Does tasks");
-
-    // A new task; the agent concludes its run itself.
-    let (session, _) = run_agent(
-        &mut client,
-        "worker",
-        r#"CALL finish {"verdict":"quiet","summary":"nothing new"}"#,
-    );
-    let tasks = tasks_when(&mut client, "worker", |tasks| {
-        tasks.len() == 1 && tasks[0]["latest_run"]["status"] == "succeeded"
-    });
-    let task = &tasks[0];
-    let id = task["id"].as_str().unwrap().to_string();
-    assert_eq!(task["session"], session.as_str());
-    assert_eq!(task["state"], "done");
-    assert_eq!(task["trigger"]["kind"], "manual");
-    assert_eq!(task["quiet_runs"], 1);
-    let outcome = &task["latest_run"]["outcome"];
-    assert_eq!(outcome["verdict"], "quiet");
-    assert_eq!(outcome["summary"], "nothing new");
-    assert_eq!(outcome["source"], "agent");
-
-    // A message to the task continues its session as another run.
-    client.send(json!({ "op": "message_send", "task": id, "body": "and the logs?" }));
-    let frames = client.until(delivered_to("worker"));
-    assert_eq!(frames.last().unwrap()["session"], session.as_str());
-    client.until(ready(&session));
-    let tasks = tasks_when(&mut client, "worker", |tasks| {
-        tasks[0]["runs"] == 2 && tasks[0]["latest_run"]["ended_at"].is_u64()
-    });
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0]["latest_run"]["trigger"], "reply");
-    assert_eq!(tasks[0]["latest_run"]["outcome"]["source"], "inferred");
-
-    // The same question asked twice stays one, and the task needs the user.
-    for _ in 0..2 {
-        client.send(json!({ "op": "message_send", "task": id,
-            "body": r#"CALL question {"title":"Refund this order?","key":"refund"}"# }));
-        client.until(delivered_to("worker"));
-        client.until(ready(&session));
-    }
-    let tasks = tasks_when(&mut client, "worker", |tasks| {
-        tasks[0]["runs"] == 4 && tasks[0]["latest_run"]["ended_at"].is_u64()
-    });
-    assert_eq!(tasks[0]["open_questions"], 1);
-    assert_eq!(tasks[0]["state"], "needs_you");
-    let detail = request(&mut client, json!({ "op": "task_get", "task": id }));
-    assert_eq!(detail["questions"].as_array().unwrap().len(), 1);
-    assert_eq!(detail["runs"].as_array().unwrap().len(), 4);
-
-    // Closed by the user, then reopened.
-    let reply = request(&mut client, json!({ "op": "task_close", "task": id }));
-    assert_eq!(reply["type"], "task_closed");
-    let tasks = tasks_when(&mut client, "worker", |tasks| tasks[0]["state"] == "closed");
-    assert_eq!(tasks[0]["closed_by"], "user");
-    let reply = request(&mut client, json!({ "op": "task_reopen", "task": id }));
-    assert_eq!(reply["type"], "task_reopened");
-    tasks_when(&mut client, "worker", |tasks| {
-        tasks[0]["state"] == "needs_you"
-    });
+/// Every frame up to the reply to `op`, the reply last.
+fn request_frames(client: &mut Client, mut op: Value) -> Vec<Value> {
+    op["id"] = json!("frames");
+    client.send(op);
+    client.until(|frame| frame["id"] == "frames")
 }
 
-#[test]
-fn a_scheduled_run_is_a_run_of_its_schedule_named_after_it() {
-    let _guard = setup();
-    let daemon = start_daemon();
-    let mut client = Client::connect(&daemon);
-    create_agent(&mut client, "patrol", "Checks things");
-    let reply = request(
-        &mut client,
-        json!({ "op": "schedule_save", "schedule": {
-            "agent": "patrol", "name": "巡检（午夜）", "prompt": "check", "repeat": "daily", "time": "00:00",
-        } }),
-    );
-    let schedule = reply["schedule"]["id"].as_str().unwrap().to_string();
-    let (session, _) = run_schedule(&mut client, "patrol", &schedule);
-    let tasks = tasks_when(&mut client, "patrol", |tasks| {
-        tasks.len() == 1 && tasks[0]["latest_run"]["ended_at"].is_u64()
-    });
-    assert_eq!(tasks[0]["id"], schedule.as_str());
-    assert_eq!(tasks[0]["title"], "巡检（午夜）");
-    assert_eq!(tasks[0]["trigger"]["kind"], "repeat");
-    assert_eq!(tasks[0]["state"], "waiting");
-    assert_eq!(tasks[0]["latest_run"]["trigger"], "schedule");
-    assert_eq!(tasks[0]["latest_run"]["session"], session.as_str());
-    // The session keeps the task's name: the title model leaves it alone.
-    thread::sleep(Duration::from_millis(500));
-    let sessions = request(&mut client, json!({ "op": "session_list" }));
-    let record = sessions["sessions"]
+fn session_entry(client: &mut Client, session: &str) -> Value {
+    let listed = request(client, json!({ "op": "session_list" }));
+    listed["sessions"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|s| s["id"] == session.as_str() || s["session"] == session.as_str())
+        .find(|entry| entry["session"] == session)
         .cloned()
-        .unwrap_or_default();
-    assert_eq!(record["title"], "巡检（午夜）", "{record}");
+        .unwrap_or(Value::Null)
+}
+
+#[test]
+fn a_scheduled_task_runs_in_a_new_session_and_archives_the_last_run() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-schedule");
+    let mut client = Client::connect(&daemon);
+    let fields =
+        json!({ "name": "巡检", "prompt": "check the logs", "repeat": "daily", "time": "09:00" });
+    // It cannot be switched on before it has a directory to run in.
+    let refused = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": fields }),
+    );
+    assert_eq!(refused["type"], "error");
+    let mut with_dir = fields.clone();
+    with_dir["cwd"] = json!(dir);
+    let saved = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": with_dir }),
+    );
+    let id = saved["schedule"]["id"].as_str().unwrap().to_string();
+    assert_eq!(saved["schedule"]["engine"], "jucode");
+    assert!(saved["schedule"]["next_run_at"].is_u64());
+
+    let run = |client: &mut Client| {
+        let started = request(client, json!({ "op": "schedule_run", "schedule": id }));
+        assert_eq!(started["type"], "schedule_started", "{started}");
+        let session = started["session"].as_str().unwrap().to_string();
+        let frames = client.until(ready(&session));
+        assert_eq!(reply_text(&frames, &session), "user said: check the logs");
+        schedule_when(client, &id, |s| {
+            s["last_run"]["session"] == session.as_str() && s["last_run"]["status"] == "done"
+        });
+        session
+    };
+    let first = run(&mut client);
+    let entry = session_entry(&mut client, &first);
+    assert_eq!(entry["schedule"], id.as_str());
+    assert!(entry["title"].as_str().unwrap().starts_with("巡检 · "));
+
+    // The next run archives this one, which has nothing left to do.
+    let second = run(&mut client);
+    assert_eq!(session_entry(&mut client, &first)["archived"], true);
+    assert_eq!(session_entry(&mut client, &second)["archived"], false);
+
+    let usage = request(
+        &mut client,
+        json!({ "op": "schedule_usage", "schedule": id }),
+    );
+    assert_eq!(usage["type"], "schedule_usage");
+}
+
+#[test]
+fn a_run_waiting_for_an_approval_says_so_and_holds_the_next_time() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-schedule-wait");
+    let mut client = Client::connect(&daemon);
+    let saved = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": {
+            "name": "清理", "prompt": "RUN: printf x > marker.txt", "repeat": "hourly",
+            "time": "00:30", "cwd": dir, "mode": "ask",
+        } }),
+    );
+    let id = saved["schedule"]["id"].as_str().unwrap().to_string();
+    let started = request(&mut client, json!({ "op": "schedule_run", "schedule": id }));
+    let session = started["session"].as_str().unwrap().to_string();
+    let frames = client.until(|frame| frame["type"] == "schedule_event");
+    let event = frames.last().unwrap();
+    assert_eq!(
+        (event["kind"].as_str(), event["session"].as_str()),
+        (Some("waiting"), Some(session.as_str()))
+    );
+    client.until(ready(&session));
+    schedule_when(&mut client, &id, |s| s["last_run"]["status"] == "waiting");
+    assert!(!dir.join("marker.txt").exists());
+    let again = request(&mut client, json!({ "op": "schedule_run", "schedule": id }));
+    assert_eq!(again["type"], "error", "the last run still waits");
+}
+
+#[test]
+fn a_run_that_cannot_start_fails_and_tells_the_clients() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-schedule-gone");
+    let mut client = Client::connect(&daemon);
+    let saved = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": {
+            "name": "日报", "prompt": "write", "repeat": "daily", "time": "18:00", "cwd": dir,
+        } }),
+    );
+    let id = saved["schedule"]["id"].as_str().unwrap().to_string();
+    fs::remove_dir_all(&dir).unwrap();
+    let frames = request_frames(&mut client, json!({ "op": "schedule_run", "schedule": id }));
+    assert_eq!(frames.last().unwrap()["type"], "error");
+    let event = frames
+        .iter()
+        .find(|frame| frame["type"] == "schedule_event")
+        .expect("the clients hear of it");
+    assert_eq!(event["kind"], "failed");
+    let failed = schedule_when(&mut client, &id, |s| s["last_run"]["status"] == "failed");
+    assert!(failed["last_run"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("not a directory"));
 }

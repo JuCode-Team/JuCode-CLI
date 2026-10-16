@@ -1,17 +1,13 @@
 //! Shared daemon state: hosted sessions, connected clients and who watches
-//! what, plus message routing and timers for long-lived agents. A session is
-//! attended while at least one client watches it.
+//! what, plus the scheduler. A session is attended while at least one
+//! client watches it.
 
 use crate::{
-    agents::Agents,
     engines,
     relay::Relay,
     schedules::{self, Schedule},
     session,
-    store::{
-        now, random_hex, token_hash, Closure, Device, ItemKind, Message, Question, Report,
-        SessionRecord, Store, Timer, CLOSED_KEEP_MS,
-    },
+    store::{now, random_hex, token_hash, Closure, Device, SessionRecord, Store, CLOSED_KEEP_MS},
     titles::{self, Turns},
     usage::{SessionInfo, Usage},
 };
@@ -32,10 +28,6 @@ const PAIRING_TTL_MS: u64 = 5 * 60 * 1000;
 /// Pairing codes avoid characters that are easy to misread (0/O, 1/I).
 const PAIRING_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
-/// Runs that may be in progress at once across all sessions; messages that
-/// would start another run wait for a free slot.
-pub const MAX_RUNNING: usize = 4;
-
 /// A hosted session with nothing going on (see `Hub::idle_sessions`) has its
 /// engine closed this long after its last activity; the client opens it
 /// again, resuming, when the user next sends to it.
@@ -52,11 +44,11 @@ const OUTBOX_LIMIT: usize = 10_000;
 /// How long a pending daemon update waits for held work (a TUI, background
 /// tasks) to end before it restarts anyway; running turns it always waits for.
 const RESTART_HOLD_MS: u64 = 10 * 60 * 1000;
+/// How often `sweep` looks for runs to time out and sessions to close.
+const SWEEP_EVERY_MS: u64 = 60 * 1000;
 
 pub struct Hub {
     pub store: Store,
-    pub agents: Agents,
-    pub dispatch: crate::dispatch::Dispatches,
     pub requirements: crate::requirements::Requirements,
     pub uploads: crate::uploads::Uploads,
     pub push: crate::push::Push,
@@ -71,16 +63,14 @@ pub struct Hub {
     busy: Mutex<HashSet<String>>,
     /// A newer daemon waits to replace this one (`restart_when_idle`).
     restart_pending: AtomicBool,
-    /// Delivered messages a session thread has not processed yet. They hold
-    /// a running slot: the engine still reports "ready" until it has read
-    /// the message, and that must not free the slot early.
+    /// Messages the daemon sent (`send_to_session`) that a session thread
+    /// has not processed yet: the session stays busy, since the engine
+    /// still reports "ready" until it has read the message.
     claims: Mutex<HashMap<String, usize>>,
-    /// Every agent's scheduled tasks (see `schedules`).
+    /// The scheduled tasks (see `schedules`).
     pub(crate) schedules: Mutex<Vec<Schedule>>,
-    /// Cancellation and firing must not both succeed for the same timer.
-    timer_updates: Mutex<()>,
-    /// Serializes message delivery (scheduler ticks, sends, tool calls).
-    delivering: Mutex<()>,
+    /// When `sweep` last ran (ms).
+    last_sweep: AtomicU64,
     next_id: AtomicU64,
     next_generation: AtomicU64,
     clients: Mutex<HashMap<u64, Client>>,
@@ -103,8 +93,6 @@ pub struct Hub {
     turns: Mutex<HashMap<String, Turns>>,
     /// Sessions whose title is being written now.
     titling: Mutex<HashSet<String>>,
-    /// Agent sessions whose handoff note is being written now.
-    handing_off: Mutex<HashSet<String>>,
     /// This hub, for the threads it starts.
     me: Weak<Hub>,
     /// Each turn's token usage (see `usage`).
@@ -139,13 +127,8 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Hub {
     /// `relay` is the relay base URL; None turns the relay off whatever the
     /// setting says (`--no-relay`).
-    pub fn new(
-        store: Store,
-        agents: Agents,
-        version: &'static str,
-        relay: Option<String>,
-    ) -> Arc<Self> {
-        let schedules = Mutex::new(schedules::load(&agents));
+    pub fn new(store: Store, version: &'static str, relay: Option<String>) -> Arc<Self> {
+        let schedules = Mutex::new(schedules::load(store.dir()));
         // `~/.jucode`: uploads live beside the daemon's state, not in it.
         let jucode_dir = store.dir().parent().unwrap_or(store.dir()).to_path_buf();
         let uploads = crate::uploads::Uploads::load(&jucode_dir);
@@ -157,26 +140,22 @@ impl Hub {
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
             schedules,
-            timer_updates: Mutex::new(()),
+            last_sweep: AtomicU64::new(0),
             turns: Mutex::new(HashMap::new()),
             titling: Mutex::new(HashSet::new()),
-            handing_off: Mutex::new(HashSet::new()),
             relay: Relay::new(relay, &store),
             usage: Usage::new(&store),
-            dispatch: crate::dispatch::Dispatches::load(store.dir()),
             requirements,
             uploads,
             push: crate::push::Push::load(store.dir()),
             terminals: Default::default(),
             dev_servers: Default::default(),
             store,
-            agents,
             version,
             sessions: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashSet::new()),
             restart_pending: AtomicBool::new(false),
             claims: Mutex::new(HashMap::new()),
-            delivering: Mutex::new(()),
             next_id: AtomicU64::new(0),
             next_generation: AtomicU64::new(0),
             clients: Mutex::new(HashMap::new()),
@@ -330,53 +309,30 @@ impl Hub {
         }
     }
 
-    /// Starts a new session in `cwd`, in the agent's directory for an agent
-    /// session, or in the chats directory for a chat.
-    pub fn create_session(
-        self: &Arc<Self>,
-        cwd: Option<PathBuf>,
-        agent: Option<&str>,
-        chat: bool,
-    ) -> Result<String, String> {
-        self.create_engine_session(cwd, agent, chat, None, engines::Options::default())
-    }
-
-    /// `create_session` with the engine to run (None: jucode) and its start
-    /// options.
+    /// Starts a new session in `cwd`, or in the chats directory for a chat,
+    /// on `engine` (None: jucode) with its start options; `schedule`: it is
+    /// a run of that scheduled task.
     pub fn create_engine_session(
         self: &Arc<Self>,
         cwd: Option<PathBuf>,
-        agent: Option<&str>,
+        schedule: Option<&str>,
         chat: bool,
         engine: Option<engines::Kind>,
         options: engines::Options,
     ) -> Result<String, String> {
-        if engine.is_some() && agent.is_some() {
-            return Err("agents run on the jucode engine".to_string());
-        }
-        let cwd = match agent {
+        let cwd = match cwd {
             None if chat => {
                 jucode_agent_core::chat::ensure_chats_dir().map_err(|error| error.to_string())?
             }
-            Some(id) => {
-                let agent = self
-                    .agents
-                    .get(id)
-                    .ok_or_else(|| format!("unknown agent {id}"))?;
-                if !agent.enabled {
-                    return Err(format!("agent {id} is disabled"));
-                }
-                agent.cwd
-            }
-            None => cwd.ok_or_else(|| "session_create requires cwd or agent".to_string())?,
+            Some(cwd) => cwd,
+            None => return Err("session_create requires cwd".to_string()),
         };
         if !cwd.is_dir() {
             return Err(format!("not a directory: {}", cwd.display()));
         }
-        let agent = agent.map(str::to_string);
         let gateway = options.gateway == Some(true);
         let (id, ops, generation) = match engine {
-            None => session::spawn(Arc::clone(self), cwd.clone(), None, agent.clone())?,
+            None => session::spawn(Arc::clone(self), cwd.clone(), None)?,
             Some(kind) => {
                 // Claude Code takes its conversation id from us; others name it.
                 let id = match kind {
@@ -390,14 +346,13 @@ impl Hub {
             .record_engine_session(
                 &id,
                 &cwd,
-                agent.as_deref(),
+                schedule,
                 engine.map(engines::Kind::name),
                 gateway,
             )
             .map_err(|error| error.to_string())?;
         lock(&self.untitled).insert(id.clone());
         self.host(id.clone(), ops, cwd, generation);
-        self.broadcast(&self.agents_json());
         Ok(id)
     }
 
@@ -422,8 +377,8 @@ impl Hub {
         if lock(&self.sessions).contains_key(id) {
             return Ok(());
         }
-        // Closed for idleness: a client that does not say how (a phone, an
-        // agent's delivery) opens it as it last ran. The entry goes once it
+        // Closed for idleness: a client that does not say how (a phone)
+        // opens it as it last ran. The entry goes once it
         // is open (a failed open leaves it asleep).
         let kept = lock(&self.asleep).get(id).cloned();
         let options = match kept {
@@ -458,7 +413,7 @@ impl Hub {
                 SessionRecord {
                     id: id.to_string(),
                     cwd,
-                    agent: None,
+                    schedule: None,
                     created_at: now(),
                     closed: true,
                     title: None,
@@ -476,12 +431,8 @@ impl Hub {
         let mut gateway = false;
         let (ops, generation) = match kind {
             None => {
-                let (_, ops, generation) = session::spawn(
-                    Arc::clone(self),
-                    record.cwd.clone(),
-                    Some(id.to_string()),
-                    record.agent.clone(),
-                )?;
+                let (_, ops, generation) =
+                    session::spawn(Arc::clone(self), record.cwd.clone(), Some(id.to_string()))?;
                 (ops, generation)
             }
             Some(kind) => {
@@ -523,7 +474,7 @@ impl Hub {
                 .record_engine_session(
                     id,
                     &record.cwd,
-                    record.agent.as_deref(),
+                    record.schedule.as_deref(),
                     record.engine.as_deref(),
                     gateway,
                 )
@@ -591,10 +542,10 @@ impl Hub {
     /// Closes the engines of sessions with nothing going on: those idle for
     /// `IDLE_CLOSE_MS`, then, while more than `MAX_LIVE_ENGINES` are open,
     /// the least recently active ones idle for `CAP_MIN_IDLE_MS`. A session
-    /// is idle when it runs no turn, has no message waiting, holds no work
-    /// (`Hosted::held`) and has no agent run in `open_runs`. Clients get
-    /// `session_closed` with reason `idle`. Returns the closed sessions.
-    pub(crate) fn close_idle(&self, at: u64, open_runs: &HashSet<String>) -> Vec<String> {
+    /// is idle when it runs no turn, has no message waiting and holds no
+    /// work (`Hosted::held`). Clients get `session_closed` with reason
+    /// `idle`. Returns the closed sessions.
+    pub(crate) fn close_idle(&self, at: u64) -> Vec<String> {
         let busy = lock(&self.busy).clone();
         let claimed: HashSet<String> = lock(&self.claims)
             .iter()
@@ -610,10 +561,7 @@ impl Hub {
             let mut idle: Vec<(String, u64)> = sessions
                 .iter()
                 .filter(|(id, hosted)| {
-                    !hosted.held
-                        && !busy.contains(*id)
-                        && !claimed.contains(*id)
-                        && !open_runs.contains(*id)
+                    !hosted.held && !busy.contains(*id) && !claimed.contains(*id)
                 })
                 .map(|(id, hosted)| (id.clone(), at.saturating_sub(hosted.last_active)))
                 .collect();
@@ -696,7 +644,7 @@ impl Hub {
         lock(&self.sent_images).remove(id);
         self.usage.close(id);
         self.usage.forget(id);
-        self.interrupt_runs(Some(id));
+        self.run_session_ended(id);
         let mut closed = json!({ "type": "session_closed", "session": id });
         if let Some(reason) = lock(&self.close_reasons).remove(id) {
             closed["reason"] = json!(reason);
@@ -802,7 +750,6 @@ impl Hub {
         };
         if changed {
             self.touch(session);
-            self.broadcast(&self.agents_json());
         }
     }
 
@@ -818,8 +765,8 @@ impl Hub {
         (!tail.is_empty()).then(|| tail.to_string())
     }
 
-    /// Sends `content` to a session as the user's next message, holding its
-    /// running slot like a delivered message (see `deliver`).
+    /// Sends `content` to a session as the user's next message; it is busy
+    /// until the engine has read it (see `claims`).
     pub fn send_to_session(&self, session: &str, content: &str) -> Result<(), String> {
         *lock(&self.claims).entry(session.to_string()).or_default() += 1;
         lock(&self.busy).insert(session.to_string());
@@ -861,7 +808,7 @@ impl Hub {
             .unwrap_or_default();
         lock(&self.turns)
             .get(session)
-            .map(|turns| turns.handoff_prompt(&title, None))
+            .map(|turns| turns.excerpt(&title))
     }
 
     /// The session thread has handed a delivered message to its engine.
@@ -875,87 +822,6 @@ impl Hub {
         }
     }
 
-    pub fn agents_json(&self) -> Value {
-        let records = self.store.sessions();
-        let busy = lock(&self.busy).clone();
-        let list: Vec<Value> = self
-            .agents
-            .list()
-            .into_iter()
-            .map(|agent| {
-                let sessions: Vec<&str> = records
-                    .iter()
-                    .filter(|record| record.agent.as_deref() == Some(agent.id.as_str()))
-                    .map(|record| record.id.as_str())
-                    .collect();
-                let mut value = agent.to_json();
-                value["summary"] = json!(self.agents.summary(&agent.id));
-                value["sessions"] = json!(sessions.len());
-                let running: Vec<&str> = sessions
-                    .iter()
-                    .copied()
-                    .filter(|id| busy.contains(*id))
-                    .collect();
-                value["busy"] = json!(!running.is_empty());
-                value["running"] = json!(running);
-                value
-            })
-            .collect();
-        json!({ "type": "agents", "agents": list })
-    }
-
-    /// Deletes an agent none of whose sessions is running: its folder
-    /// (brief, memory, schedules), its timers and its open questions. Its
-    /// open sessions close; their records stay. Messages still waiting for
-    /// it become undeliverable on the next delivery pass.
-    pub fn delete_agent(&self, id: &str) -> Result<(), String> {
-        // No message reaches the agent (or starts a session of it) meanwhile.
-        let _guard = lock(&self.delivering);
-        if self.agents.get(id).is_none() {
-            return Err(format!("unknown agent {id}"));
-        }
-        let own: Vec<String> = self
-            .store
-            .sessions()
-            .into_iter()
-            .filter(|record| record.agent.as_deref() == Some(id))
-            .map(|record| record.id)
-            .collect();
-        if own.iter().any(|session| lock(&self.busy).contains(session)) {
-            return Err(format!(
-                "agent {id} is working; delete it once its sessions are idle"
-            ));
-        }
-        // Holding the schedules while the folder goes keeps a run that fires
-        // meanwhile from writing schedules.json back into it.
-        let mut schedules = lock(&self.schedules);
-        self.agents.delete(id)?;
-        schedules.retain(|schedule| schedule.agent != id);
-        drop(schedules);
-        for session in &own {
-            let _ = self.close_session(session);
-        }
-        for timer in self.store.active_timers() {
-            if timer.agent == id {
-                let _ = self.cancel_timer(&timer.id, None);
-            }
-        }
-        for question in self.store.open_questions() {
-            if question.agent == id {
-                let _ = self.store.close_item(
-                    ItemKind::Question,
-                    &question.id,
-                    "agent_deleted",
-                    "Agent 已删除",
-                );
-            }
-        }
-        self.broadcast(&self.agents_json());
-        self.broadcast(&self.schedules_json(None));
-        self.broadcast(&self.questions_json());
-        Ok(())
-    }
-
     /// A fresh id with a readable prefix (`m-…`, `t-…`).
     pub fn new_id(&self, prefix: &str) -> String {
         format!(
@@ -965,52 +831,28 @@ impl Hub {
         )
     }
 
-    /// Records a message and tries to deliver it right away. Returns false
-    /// when a message with the same dedupe key was already recorded.
-    pub fn send_message(self: &Arc<Self>, message: Message) -> Result<bool, String> {
-        if self.agents.get(&message.to).is_none() {
-            return Err(format!("unknown agent {}", message.to));
-        }
-        let fresh = self
-            .store
-            .record_message(&message)
-            .map_err(|error| error.to_string())?;
-        if fresh {
-            self.deliver_pending();
-        }
-        Ok(fresh)
-    }
-
-    pub fn set_timer(&self, timer: &Timer) -> Result<(), String> {
-        self.store
-            .record_timer(timer)
-            .map_err(|error| error.to_string())
-    }
-
-    pub fn cancel_timer(&self, id: &str, agent: Option<&str>) -> Result<(), String> {
-        let _guard = lock(&self.timer_updates);
-        if !self
-            .store
-            .active_timers()
-            .iter()
-            .any(|timer| timer.id == id && agent.is_none_or(|agent| timer.agent == agent))
-        {
-            return Err(format!("no active timer {id}"));
-        }
-        self.store
-            .record_timer_done(id, "cancelled")
-            .map_err(|error| error.to_string())
-    }
-
-    /// One scheduler pass: due timers, due schedules and overdue questions
-    /// become messages, then everything pending is delivered.
+    /// One scheduler pass, every second.
     pub fn tick(self: &Arc<Self>) {
-        self.fire_due_timers();
         self.fire_due_schedules();
-        self.expire_questions();
-        self.deliver_pending();
         self.sweep();
         self.scan_dev_servers();
+    }
+
+    /// Once a minute: scheduled runs past their time are stopped, and idle
+    /// sessions have their engines closed.
+    fn sweep(&self) {
+        let at = now();
+        let last = self.last_sweep.load(Ordering::Relaxed);
+        if at.saturating_sub(last) < SWEEP_EVERY_MS
+            || self
+                .last_sweep
+                .compare_exchange(last, at, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        self.time_out_runs(at);
+        self.close_idle(at);
     }
 
     /// Looks for dev servers when a scan is due, off the scheduler thread
@@ -1035,119 +877,6 @@ impl Hub {
         });
     }
 
-    pub fn ask(&self, question: &Question) -> Result<(), String> {
-        self.store
-            .record_question(question)
-            .map_err(|error| error.to_string())?;
-        self.broadcast(&self.questions_json());
-        if question.importance == "high" {
-            self.notify(
-                &format!("提问：{}", question.title),
-                &question.body,
-                &question.id,
-            );
-        }
-        Ok(())
-    }
-
-    /// Answers a question: the answer goes back to the session that asked,
-    /// waking it. `by` is `user` or `deadline`. Errors when the question is
-    /// unknown or already answered.
-    pub fn answer_question(
-        self: &Arc<Self>,
-        id: &str,
-        answer: &str,
-        by: &str,
-    ) -> Result<(), String> {
-        let question = self
-            .store
-            .question(id)
-            .ok_or_else(|| format!("unknown question {id}"))?;
-        if !self
-            .store
-            .record_answer(id, answer, by)
-            .map_err(|error| error.to_string())?
-        {
-            return Err(format!("question {id} is already answered"));
-        }
-        self.broadcast(&self.questions_json());
-        let body = if by == "deadline" {
-            format!(
-                "Q: {}\nNo answer by the deadline. Go ahead with your default: {}",
-                question.title, question.default_action
-            )
-        } else {
-            format!("Q: {}\nA: {answer}", question.title)
-        };
-        // The dispatcher has no `open_items` tool.
-        let others = match question.agent.as_str() {
-            crate::dispatch::AGENT => 0,
-            agent => self.open_items_of(agent).len(),
-        };
-        let body = if others > 0 {
-            format!(
-                "{body}\n\nYou have {others} other open item(s) waiting for the user. Check them with `open_items` and close any this answer made unnecessary."
-            )
-        } else {
-            body
-        };
-        self.store
-            .record_message(&Message {
-                id: self.new_id("m"),
-                to: question.agent,
-                from: format!("question:{id}"),
-                body,
-                session: Some(question.session),
-                reply_to: None,
-                dedupe_key: Some(format!("question:{id}")),
-                at: now(),
-            })
-            .map_err(|error| error.to_string())?;
-        self.deliver_pending();
-        Ok(())
-    }
-
-    fn expire_questions(self: &Arc<Self>) {
-        for question in self.store.open_questions() {
-            if question.due_at.is_some_and(|due| due <= now()) {
-                let _ = self.answer_question(&question.id, "", "deadline");
-            }
-        }
-    }
-
-    pub fn post_report(&self, report: &Report) -> Result<(), String> {
-        self.store
-            .record_report(report)
-            .map_err(|error| error.to_string())?;
-        self.broadcast(&json!({ "type": "report_posted", "report": report_json(report) }));
-        Ok(())
-    }
-
-    /// Open questions, and the ones closed lately (each with who closed it,
-    /// why and when) so a client can offer to reopen them.
-    pub fn questions_json(&self) -> Value {
-        let list: Vec<Value> = self
-            .store
-            .open_questions()
-            .iter()
-            .map(question_json)
-            .collect();
-        let closed: Vec<Value> = self
-            .store
-            .closed_questions(now().saturating_sub(CLOSED_KEEP_MS))
-            .iter()
-            // A deleted agent's questions have nobody to reopen them for.
-            .filter(|(_, closure)| closure.by != "agent_deleted")
-            .map(|(question, closure)| with_closure(question_json(question), closure))
-            .collect();
-        json!({ "type": "questions", "questions": list, "closed": closed })
-    }
-
-    pub fn reports_json(&self, limit: usize) -> Value {
-        let list: Vec<Value> = self.store.reports(limit).iter().map(report_json).collect();
-        json!({ "type": "reports", "reports": list })
-    }
-
     /// Open actions, and the ones closed lately (see `questions_json`).
     pub fn actions_json(&self) -> Value {
         let list: Vec<Value> = self
@@ -1165,96 +894,35 @@ impl Hub {
         json!({ "type": "actions", "actions": list, "closed": closed })
     }
 
-    /// `agent`'s open questions and the open actions of its sessions, as
-    /// its `open_items` tool lists them.
-    pub fn open_items_of(&self, agent: &str) -> Vec<Value> {
-        let own: HashSet<String> = self
-            .store
-            .sessions()
-            .into_iter()
-            .filter(|record| record.agent.as_deref() == Some(agent))
-            .map(|record| record.id)
-            .collect();
-        let questions = self
-            .store
-            .open_questions()
-            .into_iter()
-            .filter(|question| question.agent == agent)
-            .map(|question| {
-                json!({
-                    "kind": "question", "id": question.id, "session": question.session,
-                    "title": question.title, "assumption": question.assumption,
-                    "asked_at_unix": question.asked_at / 1000,
-                })
-            });
-        let actions = self
-            .store
-            .open_actions()
-            .into_iter()
-            .filter(|action| own.contains(&action.session_id))
-            .map(|action| {
-                json!({
-                    "kind": "action", "id": action.id, "session": action.session_id,
-                    "tool": action.name, "summary": action.summary,
-                    "asked_at_unix": action.created_at / 1000,
-                })
-            });
-        questions.chain(actions).collect()
-    }
-
-    /// Closes an open question or action without answering it. `by` is
-    /// `user`, `agent:<id>` or `superseded`; an agent closing one tells the
-    /// user's phone, since nobody asked for it.
-    pub fn close_item(
-        &self,
-        kind: ItemKind,
-        id: &str,
-        by: &str,
-        reason: &str,
-    ) -> Result<(), String> {
-        let title = match kind {
-            ItemKind::Question => self.store.question(id).map(|q| q.title),
-            ItemKind::Action => self
-                .store
-                .open_actions()
-                .into_iter()
-                .find(|action| action.id == id)
-                .map(|action| format!("{} {}", action.name, action.summary)),
-        };
+    /// Closes an open action without deciding it.
+    pub fn close_action(&self, id: &str, by: &str, reason: &str) -> Result<(), String> {
         if !self
             .store
-            .close_item(kind, id, by, reason.trim())
+            .close_action(id, by, reason.trim())
             .map_err(|error| error.to_string())?
         {
             return Err(format!("{id} is not open"));
         }
-        self.broadcast_items(kind);
-        if by.starts_with("agent:") {
-            let title = title.unwrap_or_else(|| id.to_string());
-            self.notify(&format!("已关闭：{title}"), reason, &format!("closed:{id}"));
-        }
+        self.broadcast(&self.actions_json());
         Ok(())
     }
 
-    /// Reopens a closed item; its session comes back out of the archive.
-    pub fn reopen_item(&self, kind: ItemKind, id: &str) -> Result<(), String> {
-        let session = match kind {
-            ItemKind::Question => self.store.question(id).map(|q| q.session),
-            ItemKind::Action => self
-                .store
-                .closed_actions(0)
-                .into_iter()
-                .find(|(action, _)| action.id == id)
-                .map(|(action, _)| action.session_id),
-        };
+    /// Reopens a closed action; its session comes back out of the archive.
+    pub fn reopen_action(&self, id: &str) -> Result<(), String> {
+        let session = self
+            .store
+            .closed_actions(0)
+            .into_iter()
+            .find(|(action, _)| action.id == id)
+            .map(|(action, _)| action.session_id);
         if !self
             .store
-            .reopen_item(kind, id)
+            .reopen_action(id)
             .map_err(|error| error.to_string())?
         {
             return Err(format!("{id} is not closed"));
         }
-        self.broadcast_items(kind);
+        self.broadcast(&self.actions_json());
         let archived = self
             .store
             .sessions()
@@ -1268,224 +936,6 @@ impl Hub {
                 self.broadcast(&self.sessions_json());
             }
         }
-        Ok(())
-    }
-
-    fn broadcast_items(&self, kind: ItemKind) {
-        self.broadcast(&match kind {
-            ItemKind::Question => self.questions_json(),
-            ItemKind::Action => self.actions_json(),
-        });
-    }
-
-    /// A scheduled task started a new run in `current`: its earlier runs
-    /// are done with. Their waiting actions close (the approval belongs to a
-    /// run that is over; the new run acts again if it still needs to) and
-    /// the runs are archived, so the agent's page shows the latest run.
-    /// Questions stay open for the user to answer, and a run with one stays
-    /// out of the archive; a run still working is left.
-    pub(crate) fn retire_schedule_runs(&self, schedule: &str, name: &str, current: &str) {
-        let earlier: Vec<String> = self
-            .store
-            .sessions_reached_from(&format!("schedule:{schedule}"))
-            .into_iter()
-            .filter(|session| session != current && !self.is_busy(session))
-            .collect();
-        if earlier.is_empty() {
-            return;
-        }
-        let reason = format!("定时任务「{name}」已开始新一次运行");
-        for action in self.store.open_actions() {
-            if earlier.contains(&action.session_id) {
-                let _ = self.close_item(ItemKind::Action, &action.id, "superseded", &reason);
-            }
-        }
-        let asking: Vec<String> = self
-            .store
-            .open_questions()
-            .into_iter()
-            .map(|question| question.session)
-            .collect();
-        let mut archived = false;
-        for record in self.store.sessions() {
-            if earlier.contains(&record.id) && !record.archived && !asking.contains(&record.id) {
-                archived |= self
-                    .store
-                    .record_session_meta(&record.id, &json!({ "archived": true }))
-                    .unwrap_or(false);
-            }
-        }
-        if archived {
-            self.broadcast(&self.sessions_json());
-        }
-    }
-
-    /// Turns due timers into messages. The timer id is the message's dedupe
-    /// key, so a timer that fired just before a crash fires only once.
-    fn fire_due_timers(self: &Arc<Self>) {
-        let _guard = lock(&self.timer_updates);
-        let due: Vec<Timer> = self
-            .store
-            .active_timers()
-            .into_iter()
-            .filter(|timer| timer.fire_at <= now())
-            .collect();
-        for timer in due {
-            let message = Message {
-                id: self.new_id("m"),
-                to: timer.agent.clone(),
-                from: format!("timer:{}", timer.id),
-                body: timer.body.clone(),
-                session: timer.session.clone(),
-                reply_to: None,
-                dedupe_key: Some(format!("timer:{}", timer.id)),
-                at: now(),
-            };
-            match self.store.record_message(&message) {
-                Ok(_) => {
-                    let _ = self.store.record_timer_done(&timer.id, "fired");
-                }
-                Err(error) => {
-                    jucode_agent_core::log_warn!(
-                        "daemon",
-                        "timer not fired",
-                        error = error.to_string()
-                    );
-                }
-            }
-        }
-    }
-
-    /// Delivers every pending message that can go now, oldest first. A
-    /// message that would start a new run waits while `MAX_RUNNING` runs are
-    /// in progress; one for a busy session joins that session's queue. One
-    /// for a disabled agent waits until the agent is enabled again.
-    pub fn deliver_pending(self: &Arc<Self>) {
-        let _guard = lock(&self.delivering);
-        let mut pending = self.store.pending_messages();
-        // What the user sent goes before scheduled and automatic work.
-        pending.sort_by_key(|message| message.from != "user");
-        for message in pending {
-            if self
-                .agents
-                .get(&message.to)
-                .is_some_and(|agent| !agent.enabled)
-            {
-                continue;
-            }
-            match self.route(&message) {
-                Ok(target) => {
-                    let busy = target
-                        .as_deref()
-                        .is_some_and(|session| lock(&self.busy).contains(session));
-                    if !busy
-                        && (lock(&self.busy).len() >= MAX_RUNNING
-                            || self.working_runs_of(&message.to) >= crate::tasks::MAX_PER_AGENT)
-                    {
-                        continue;
-                    }
-                    if let Err(error) = self.deliver(&message, target) {
-                        jucode_agent_core::log_warn!("daemon", "delivery failed", error = error);
-                    }
-                }
-                Err(reason) => {
-                    let _ = self.store.record_undeliverable(&message.id, &reason);
-                }
-            }
-        }
-    }
-
-    /// Sessions of `agent` working now.
-    fn working_runs_of(&self, agent: &str) -> usize {
-        let busy = lock(&self.busy).clone();
-        self.store
-            .sessions()
-            .iter()
-            .filter(|record| record.agent.as_deref() == Some(agent) && busy.contains(&record.id))
-            .count()
-    }
-
-    /// The session a message goes to (None: a new session). Errors mean it
-    /// can never be delivered.
-    fn route(&self, message: &Message) -> Result<Option<String>, String> {
-        let agent = self
-            .agents
-            .get(&message.to)
-            .ok_or_else(|| format!("unknown agent {}", message.to))?;
-        let own: Vec<_> = self
-            .store
-            .sessions()
-            .into_iter()
-            .filter(|record| record.agent.as_deref() == Some(agent.id.as_str()))
-            .collect();
-        let owned = |session: &str| own.iter().any(|record| record.id == session);
-        if let Some(session) = &message.session {
-            return if owned(session) {
-                Ok(Some(session.clone()))
-            } else {
-                Err(format!("session {session} does not belong to {}", agent.id))
-            };
-        }
-        if let Some(earlier) = &message.reply_to {
-            if let Some(session) = self.store.delivered_session(earlier).filter(|s| owned(s)) {
-                return Ok(Some(session));
-            }
-        }
-        // Anything else is a new task, in a new session; what earlier
-        // sessions concluded reaches it through their handoff notes.
-        Ok(None)
-    }
-
-    fn deliver(self: &Arc<Self>, message: &Message, target: Option<String>) -> Result<(), String> {
-        let fresh = target.is_none();
-        let session = match target {
-            Some(session) => {
-                self.open_session(&session, None)?;
-                session
-            }
-            None => self.create_session(None, Some(&message.to), false)?,
-        };
-        // A scheduled run in a session of its own is named after its task,
-        // and keeps that name.
-        if let (true, Some(schedule)) = (fresh, message.from.strip_prefix("schedule:")) {
-            let name = lock(&self.schedules)
-                .iter()
-                .find(|s| s.id == schedule)
-                .map(|s| s.name.clone());
-            if let Some(name) = name {
-                let _ = self
-                    .store
-                    .record_session_meta(&session, &json!({ "title": name }));
-            }
-        }
-        let run = self.queue_run(message, &session);
-        // A delivered message starts (or queues) a run: claim the slot before
-        // forwarding, so the next message sees it taken.
-        *lock(&self.claims).entry(session.clone()).or_default() += 1;
-        lock(&self.busy).insert(session.clone());
-        if let Err(error) = self.forward(
-            &session,
-            json!({ "op": "user_message", "content": delivery_text(message), "claimed": true }),
-        ) {
-            self.release_claim(&session);
-            if let Some(run) = run {
-                self.discard_run(&run);
-            }
-            return Err(error);
-        }
-        self.store
-            .record_delivered(&message.id, &session)
-            .map_err(|error| error.to_string())?;
-        if let Some(schedule) = message.from.strip_prefix("schedule:") {
-            self.schedule_delivered(schedule, &session);
-        }
-        self.broadcast(&json!({
-            "type": "message_delivered",
-            "id": message.id,
-            "agent": message.to,
-            "from": message.from,
-            "session": session,
-        }));
         Ok(())
     }
 
@@ -1507,134 +957,33 @@ impl Hub {
             })
         });
         if event["type"] == "user_message" {
-            let content = event["content"].as_str().unwrap_or_default();
-            self.note_user_message(session, content);
-            self.run_took_message(session, content);
+            self.note_user_message(session, event["content"].as_str().unwrap_or_default());
         }
         // A name the session has in Claude Code (given there, or the one we
         // gave it) is the user's.
         if event["type"] == "session_title" {
             self.adopt_engine_title(session, event["title"].as_str().unwrap_or_default());
         }
-        let (due, ended, failed, turn) = {
+        // `ended`: a turn with a reply ended; `over`: any turn did.
+        let (due, ended, over, failed) = {
             let mut turns = lock(&self.turns);
             let turns = turns.entry(session.to_string()).or_default();
-            let before = turns.done();
+            let (done, running) = (turns.done(), turns.running());
             let due = turns.observe(event);
             (
                 due,
-                turns.done() != before,
+                turns.done() != done,
+                running && !turns.running(),
                 turns.take_failed(),
-                turns.done(),
             )
         };
-        // An agent's task keeps the title its first turn gave it.
-        if due && (turn == 1 || self.session_agent(session).is_none()) {
+        if due {
             self.retitle(session);
         }
-        let run = if ended {
-            self.end_run(session, failed.is_some())
-        } else {
-            None
-        };
-        if let Some(error) = failed {
-            self.report_failed_turn(session, &error);
-        }
-        if ended {
-            self.write_handoff(session, run);
-        }
+        self.observe_run(session, event, over, failed.as_deref());
         if let Some(hub) = self.me.upgrade() {
-            crate::dispatch::observe(&hub, session, event);
             crate::requirements::observe(&hub, session, event, ended);
         }
-    }
-
-    /// An agent session's turn ended on an error. Nobody may be watching
-    /// (a scheduled run), so it becomes a report and a notification instead
-    /// of only a line in the live view.
-    fn report_failed_turn(&self, session: &str, error: &str) {
-        let Some(record) = self
-            .store
-            .sessions()
-            .into_iter()
-            .find(|record| record.id == session)
-        else {
-            return;
-        };
-        let Some(agent) = record.agent else {
-            return;
-        };
-        let title = format!("运行中断：{}", record.title.as_deref().unwrap_or(session));
-        let report = Report {
-            id: self.new_id("r"),
-            agent,
-            session: session.to_string(),
-            body: format!("这一轮因错误中断，没有完成：\n{error}"),
-            title,
-            at: now(),
-            read: false,
-        };
-        match self.post_report(&report) {
-            Ok(()) => self.notify(&report.title, error, session),
-            Err(error) => {
-                jucode_agent_core::log_warn!("daemon", "failure report not saved", error = error)
-            }
-        }
-    }
-
-    /// A run of an agent session ended without the agent concluding it
-    /// (`finish`): the title model writes its handoff note into the run's
-    /// outcome in the background (see `titles`). One at a time per session;
-    /// a turn that ends meanwhile is covered by the next.
-    fn write_handoff(&self, session: &str, run: Option<(String, bool)>) {
-        let Some((run, false)) = run else {
-            return;
-        };
-        let Some(record) = self
-            .store
-            .sessions()
-            .into_iter()
-            .find(|record| record.id == session && record.agent.is_some())
-        else {
-            return;
-        };
-        let Some(hub) = self.me.upgrade() else {
-            return;
-        };
-        if !lock(&self.handing_off).insert(session.to_string()) {
-            return;
-        }
-        let title = record.title.clone().unwrap_or_default();
-        // What this session's earlier runs left, for the model to update.
-        let previous = self
-            .store
-            .runs()
-            .into_iter()
-            .rev()
-            .filter(|r| r.session.as_deref() == Some(session) && r.id != run)
-            .find_map(|r| r.outcome.map(|o| o.next).filter(|next| !next.is_empty()));
-        let Some(prompt) = lock(&self.turns)
-            .get(session)
-            .map(|turns| turns.handoff_prompt(&title, previous.as_deref()))
-        else {
-            lock(&self.handing_off).remove(session);
-            return;
-        };
-        let id = session.to_string();
-        thread::spawn(move || {
-            let reply = jucode_agent_core::title_completion(titles::HANDOFF_SYSTEM, &prompt);
-            lock(&hub.handing_off).remove(&id);
-            let note = match reply {
-                Ok(reply) => titles::clean_handoff(&reply),
-                Err(error) => {
-                    jucode_agent_core::log_warn!("daemon", "handoff note failed", error = error);
-                    None
-                }
-            };
-            if let Some(note) = note {
-                hub.note_run_handoff(&run, &note);
-            }
-        });
     }
 
     /// Asks the title model for a title in the background, unless a client
@@ -1775,26 +1124,10 @@ impl Hub {
     pub fn sessions_json(&self) -> Value {
         let records = self.store.sessions();
         let saved = saved_by_id(records.iter().map(|record| record.cwd.as_path()));
-        // The task each agent session carries (none for one from before
-        // tasks that was left out of the migration).
-        let mut task_of: HashMap<String, String> = self
-            .store
-            .tasks()
-            .into_iter()
-            .filter_map(|task| Some((task.session?, task.id)))
-            .collect();
-        for run in self.store.runs() {
-            if let Some(session) = run.session {
-                task_of.insert(session, run.task);
-            }
-        }
         let sessions = lock(&self.sessions);
         let list: Vec<Value> = records
             .into_iter()
-            // An agent's session stays on its agent's page even when a
-            // client hid it from a session list (desktops listed them there
-            // before they moved to the workbench).
-            .filter(|record| !record.hidden || record.agent.is_some())
+            .filter(|record| !record.hidden)
             .map(|record| {
                 let hosted = sessions.get(&record.id);
                 let cwd = hosted.map_or_else(|| record.cwd.clone(), |h| h.cwd.clone());
@@ -1810,8 +1143,7 @@ impl Hub {
                     "group": record.group,
                     "gateway": record.gateway,
                     "engine": record.engine.as_deref().unwrap_or("jucode"),
-                    "agent": record.agent,
-                    "task": task_of.get(&record.id),
+                    "schedule": record.schedule,
                     "open": hosted.is_some(),
                     "watchers": hosted.map(|h| h.watchers.len()).unwrap_or(0),
                 })
@@ -1842,7 +1174,7 @@ impl Hub {
                 "updated_at": updated_at,
                 "entries": entries,
                 "archived": record.is_some_and(|r| r.archived),
-                "agent": record.and_then(|r| r.agent.clone()),
+                "schedule": record.and_then(|r| r.schedule.clone()),
                 "open": sessions.contains_key(&id),
                 "engine": engine,
                 "session": id,
@@ -1895,35 +1227,6 @@ fn saved_by_id<'a>(
         .collect()
 }
 
-/// How a message reads in the receiving session: the user's own words
-/// as-is, anything else with a line saying where it came from.
-fn report_json(report: &Report) -> Value {
-    json!({
-        "id": report.id,
-        "agent": report.agent,
-        "session": report.session,
-        "title": report.title,
-        "body": report.body,
-        "at": report.at,
-        "read": report.read,
-    })
-}
-
-fn question_json(question: &Question) -> Value {
-    json!({
-        "id": question.id,
-        "agent": question.agent,
-        "session": question.session,
-        "title": question.title,
-        "body": question.body,
-        "assumption": question.assumption,
-        "default": question.default_action,
-        "importance": question.importance,
-        "due_at": question.due_at,
-        "asked_at": question.asked_at,
-    })
-}
-
 /// A closed item's JSON with who closed it, why and when.
 fn with_closure(mut item: Value, closure: &Closure) -> Value {
     item["closed_by"] = json!(closure.by);
@@ -1947,9 +1250,9 @@ fn shown_title(record: &SessionRecord, label: Option<&str>) -> Option<String> {
         .or_else(|| label.and_then(title_from))
 }
 
-/// How `delivery_text` starts the line naming where a message came from.
-/// Clients show a message with one of these headers as a notice, not as
-/// something the user wrote (JuCode-Desktop `src/lib/delivery.ts`).
+/// How messages the long-lived agents (gone since 2026-10) received started:
+/// a line naming where they came from. Their archived sessions still have
+/// them, and older daemons wrote them as titles.
 const DELIVERY_HEADERS: [&str; 5] = [
     "[message from ",
     "[timer ",
@@ -1958,8 +1261,7 @@ const DELIVERY_HEADERS: [&str; 5] = [
     "[task ",
 ];
 
-/// `text` without the delivery header line `delivery_text` put first: what
-/// was actually asked, for titles and handoff notes.
+/// `text` without a delivery header line: what was actually asked.
 pub(crate) fn without_delivery_header(text: &str) -> &str {
     let text = text.trim_start();
     if DELIVERY_HEADERS
@@ -1989,45 +1291,21 @@ pub(crate) fn title_from(text: &str) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
-fn delivery_text(message: &Message) -> String {
-    if message.from == "user" {
-        return message.body.clone();
-    }
-    let origin = match message.from.split_once(':') {
-        Some(("agent", id)) => format!("message from agent {id}"),
-        Some(("timer", id)) => format!("timer {id} fired"),
-        Some(("schedule", id)) => format!("scheduled task {id}"),
-        Some(("question", id)) => format!("answer to your question {id}"),
-        Some(("task", id)) => format!("task {id} update"),
-        _ => format!("message from {}", message.from),
-    };
-    format!("[{origin} · {}]\n{}", message.id, message.body)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{store::now, Agents};
+    use crate::store::now;
     use std::{fs, sync::mpsc};
 
     #[test]
     fn titles_come_from_what_was_asked_never_a_delivery_header() {
-        let scheduled = delivery_text(&Message {
-            id: "m-1".into(),
-            to: "ops".into(),
-            from: "schedule:sch-1".into(),
-            body: "定时任务「每日巡检」：\n检查部署".into(),
-            session: None,
-            reply_to: None,
-            dedupe_key: None,
-            at: 0,
-        });
+        let scheduled = "[scheduled task sch-1 · m-1]\n定时任务「每日巡检」：\n检查部署";
         assert_eq!(
-            title_from(&scheduled).as_deref(),
+            title_from(scheduled).as_deref(),
             Some("定时任务「每日巡检」")
         );
         assert_eq!(
-            without_delivery_header(&scheduled),
+            without_delivery_header(scheduled),
             "定时任务「每日巡检」：\n检查部署"
         );
         assert_eq!(
@@ -2040,7 +1318,7 @@ mod tests {
         let record = SessionRecord {
             id: "s1".into(),
             cwd: "/tmp".into(),
-            agent: Some("ops".into()),
+            schedule: None,
             created_at: 0,
             closed: false,
             title: Some("[scheduled task sch-1 · m-".into()),
@@ -2052,7 +1330,7 @@ mod tests {
             group: None,
         };
         assert_eq!(
-            shown_title(&record, Some(&scheduled)).as_deref(),
+            shown_title(&record, Some(scheduled)).as_deref(),
             Some("定时任务「每日巡检」")
         );
         assert_eq!(shown_title(&record, Some("")), None);
@@ -2065,203 +1343,13 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_timers_stay_cancelled_and_cannot_race_firing() {
-        let dir =
-            std::env::temp_dir().join(format!("jucode-cancel-{}-{}", std::process::id(), now()));
-        let open = || {
-            Hub::new(
-                Store::open(dir.join("daemon")).unwrap(),
-                Agents::open(dir.join("agents")).unwrap(),
-                "test",
-                None,
-            )
-        };
-        let timer = |id: &str| Timer {
-            id: id.into(),
-            agent: "ops".into(),
-            session: None,
-            fire_at: 0,
-            body: "remind".into(),
-        };
-        let hub = open();
-        hub.set_timer(&timer("t1")).unwrap();
-        assert!(hub.cancel_timer("t1", Some("other")).is_err());
-        hub.cancel_timer("t1", Some("ops")).unwrap();
-        drop(hub);
-        let hub = open();
-        hub.fire_due_timers();
-        assert!(hub.store.message_log(None, 100).is_empty());
-        assert!(hub.cancel_timer("t1", None).is_err());
-
-        // Exactly one wins, including cancellation during a scheduler tick.
-        for n in 0..20 {
-            let id = format!("race-{n}");
-            hub.set_timer(&timer(&id)).unwrap();
-            let gate = Arc::new(std::sync::Barrier::new(2));
-            let firing = hub.clone();
-            let start = gate.clone();
-            let worker = thread::spawn(move || {
-                start.wait();
-                firing.fire_due_timers();
-            });
-            gate.wait();
-            let cancelled = hub.cancel_timer(&id, None).is_ok();
-            worker.join().unwrap();
-            let fired = hub
-                .store
-                .message_log(None, 100)
-                .iter()
-                .any(|m| m["from"] == format!("timer:{id}"));
-            assert_ne!(cancelled, fired);
-        }
-        drop(hub);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn an_agent_turn_that_fails_becomes_a_report() {
-        let dir = std::env::temp_dir().join(format!(
-            "jucode-hub-failed-{}-{}",
-            std::process::id(),
-            now()
-        ));
-        let hub = Hub::new(
-            Store::open(dir.join("daemon")).unwrap(),
-            Agents::open(dir.join("agents")).unwrap(),
-            "test",
-            None,
-        );
-        hub.store
-            .record_engine_session("a1", &dir, Some("ops"), None, false)
-            .unwrap();
-        hub.store
-            .record_engine_session("u1", &dir, None, None, false)
-            .unwrap();
-        for session in ["a1", "u1"] {
-            hub.observe(
-                session,
-                &json!({ "type": "user_message", "content": "巡检" }),
-            );
-            hub.observe(session, &json!({ "type": "error", "message": "HTTP 502" }));
-            hub.observe(session, &json!({ "type": "status", "message": "ready" }));
-        }
-        let reports = hub.store.reports(10);
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].session, "a1");
-        assert_eq!(reports[0].agent, "ops");
-        assert!(reports[0].body.contains("HTTP 502"));
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn a_new_scheduled_run_retires_the_earlier_ones() {
-        let dir = std::env::temp_dir().join(format!(
-            "jucode-hub-retire-{}-{}",
-            std::process::id(),
-            now()
-        ));
-        let hub = Hub::new(
-            Store::open(dir.join("daemon")).unwrap(),
-            Agents::open(dir.join("agents")).unwrap(),
-            "test",
-            None,
-        );
-        for (message, session) in [("m1", "run1"), ("m2", "run2"), ("m3", "run3")] {
-            hub.store
-                .record_engine_session(session, &dir, Some("ops"), None, false)
-                .unwrap();
-            hub.store
-                .record_message(&Message {
-                    id: message.into(),
-                    to: "ops".into(),
-                    from: "schedule:sch-1".into(),
-                    body: "巡检".into(),
-                    session: None,
-                    reply_to: None,
-                    dedupe_key: None,
-                    at: 1,
-                })
-                .unwrap();
-            hub.store.record_delivered(message, session).unwrap();
-        }
-        let ask = |id: &str, session: &str| Question {
-            id: id.into(),
-            agent: "ops".into(),
-            session: session.into(),
-            title: id.into(),
-            body: String::new(),
-            assumption: String::new(),
-            default_action: String::new(),
-            importance: "normal".into(),
-            due_at: None,
-            asked_at: 1,
-            task: None,
-            key: None,
-        };
-        hub.ask(&ask("q1", "run1")).unwrap();
-        hub.ask(&ask("q3", "run3")).unwrap();
-        let act = |id: &str, session: &str| jucode_agent_core::actions::DeferredAction {
-            id: id.into(),
-            session_id: session.into(),
-            cwd: dir.clone(),
-            call_id: id.into(),
-            name: "shell".into(),
-            arguments: "{}".into(),
-            summary: id.into(),
-            subagent_id: None,
-            digest: id.into(),
-            created_at: 1,
-        };
-        hub.store.record_deferred(&act("a1", "run1")).unwrap();
-        hub.store.record_deferred(&act("a2", "run2")).unwrap();
-        // run2 is still working: left alone.
-        lock(&hub.busy).insert("run2".into());
-
-        hub.retire_schedule_runs("sch-1", "巡检", "run3");
-        let open: Vec<String> = hub
-            .store
-            .open_questions()
-            .into_iter()
-            .map(|q| q.id)
-            .collect();
-        assert_eq!(open, ["q1", "q3"], "questions stay for the user");
-        let actions: Vec<String> = hub.store.open_actions().into_iter().map(|a| a.id).collect();
-        assert_eq!(actions, ["a2"], "a finished run's approval closes");
-        let archived = |id: &str| {
-            hub.store
-                .sessions()
-                .iter()
-                .any(|r| r.id == id && r.archived)
-        };
-        // run1 still asks a question, run2 is working: neither is archived.
-        assert!(!archived("run1") && !archived("run2") && !archived("run3"));
-
-        // Once its question is closed, the next run archives it.
-        hub.close_item(ItemKind::Question, "q1", "user", "")
-            .unwrap();
-        hub.retire_schedule_runs("sch-1", "巡检", "run3");
-        assert!(archived("run1"));
-
-        // Reopening brings its run back out of the archive.
-        hub.reopen_item(ItemKind::Question, "q1").unwrap();
-        assert!(!archived("run1"));
-        assert!(hub.reopen_item(ItemKind::Question, "q1").is_err());
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn a_finishing_engine_leaves_its_successor_hosted() {
         let dir = std::env::temp_dir().join(format!(
             "jucode-hub-generation-{}-{}",
             std::process::id(),
             now()
         ));
-        let hub = Hub::new(
-            Store::open(dir.join("daemon")).unwrap(),
-            Agents::open(dir.join("agents")).unwrap(),
-            "test",
-            None,
-        );
+        let hub = Hub::new(Store::open(dir.join("daemon")).unwrap(), "test", None);
         let (old_ops, _old_rx) = mpsc::channel();
         let old = hub.next_generation();
         hub.host("s1".to_string(), old_ops, dir.clone(), old);
@@ -2284,12 +1372,7 @@ mod tests {
             std::process::id(),
             now()
         ));
-        let hub = Hub::new(
-            Store::open(dir.join("daemon")).unwrap(),
-            Agents::open(dir.join("agents")).unwrap(),
-            "test",
-            None,
-        );
+        let hub = Hub::new(Store::open(dir.join("daemon")).unwrap(), "test", None);
         (hub, dir)
     }
 
@@ -2310,7 +1393,7 @@ mod tests {
         let (outbox, frames) = Hub::outbox();
         hub.add_client(outbox, None);
 
-        assert_eq!(hub.close_idle(at, &HashSet::new()), ["old"]);
+        assert_eq!(hub.close_idle(at), ["old"]);
         assert_eq!(old.try_recv().unwrap()["op"], "shutdown");
         assert!(lock(&hub.sessions).contains_key("recent"));
 
@@ -2342,7 +1425,7 @@ mod tests {
         let at = now();
         let _old = host_idle(&hub, "s", at, IDLE_CLOSE_MS);
         let old_generation = lock(&hub.sessions)["s"].generation;
-        hub.close_idle(at, &HashSet::new());
+        hub.close_idle(at);
         // Opened again before the old engine thread finished.
         let _new = host_idle(&hub, "s", at, 0);
         hub.session_ended("s", old_generation);
@@ -2359,14 +1442,12 @@ mod tests {
         let _busy = host_idle(&hub, "busy", at, long);
         let _claimed = host_idle(&hub, "claimed", at, long);
         let _held = host_idle(&hub, "held", at, long);
-        let _run = host_idle(&hub, "run", at, long);
         lock(&hub.busy).insert("busy".into());
         lock(&hub.claims).insert("claimed".into(), 1);
         lock(&hub.sessions).get_mut("held").unwrap().held = true;
-        let open_runs: HashSet<String> = ["run".to_string()].into();
 
-        assert!(hub.close_idle(at, &open_runs).is_empty());
-        assert_eq!(lock(&hub.sessions).len(), 4);
+        assert!(hub.close_idle(at).is_empty());
+        assert_eq!(lock(&hub.sessions).len(), 3);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2384,7 +1465,7 @@ mod tests {
             };
             rx.push(host_idle(&hub, &format!("s{i}"), at, idle));
         }
-        let mut closed = hub.close_idle(at, &HashSet::new());
+        let mut closed = hub.close_idle(at);
         closed.sort();
         assert_eq!(
             closed,
@@ -2409,7 +1490,7 @@ mod tests {
         lock(&hub.sessions).get_mut("released").unwrap().held = true;
         hub.set_held("released", false);
 
-        assert!(hub.close_idle(now(), &HashSet::new()).is_empty());
+        assert!(hub.close_idle(now()).is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 

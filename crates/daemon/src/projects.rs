@@ -244,20 +244,6 @@ pub fn project_of_cwd(hub: &Hub, cwd: &Path) -> Option<Value> {
         .find(|project| project["path"].as_str().map(Path::new) == Some(cwd))
 }
 
-/// An `agent_create` / `agent_update` op with a `project` (an id; null
-/// clears it): the agent works in that project's main directory (`cwd`).
-pub fn with_project_cwd(hub: &Hub, mut op: Value) -> Result<Value, String> {
-    match op.get("project") {
-        Some(Value::String(id)) => {
-            let project = project(hub, id).ok_or_else(|| format!("unknown project {id}"))?;
-            op["cwd"] = project["path"].clone();
-        }
-        None | Some(Value::Null) => {}
-        Some(_) => return Err("project must be a project id or null".to_string()),
-    }
-    Ok(op)
-}
-
 /// The extra directories of the project at `cwd` that still exist: an
 /// engine started there may work in them too.
 pub fn extra_dirs(hub: &Hub, cwd: &Path) -> Vec<PathBuf> {

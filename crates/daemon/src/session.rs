@@ -17,21 +17,19 @@ use std::{
     time::Duration,
 };
 
-/// Opens an engine in `cwd` (resuming `resume` when given) on a new thread,
-/// set up for `agent` when the session belongs to one. Returns the session
-/// id once the engine is ready, with the thread's generation (see
-/// `Hub::session_ended`), or the open error.
+/// Opens an engine in `cwd` (resuming `resume` when given) on a new thread.
+/// Returns the session id once the engine is ready, with the thread's
+/// generation (see `Hub::session_ended`), or the open error.
 pub fn spawn(
     hub: Arc<Hub>,
     cwd: PathBuf,
     resume: Option<String>,
-    agent: Option<String>,
 ) -> Result<(String, Sender<Value>, u64), String> {
     let (ops_tx, ops_rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     let generation = hub.next_generation();
     thread::spawn(move || {
-        let core = match open(&hub, cwd, resume.as_deref(), agent.as_deref()) {
+        let core = match open(&hub, cwd, resume.as_deref()) {
             Ok(core) => core,
             Err(error) => {
                 let _ = ready_tx.send(Err(error));
@@ -49,12 +47,7 @@ pub fn spawn(
     Ok((id, ops_tx, generation))
 }
 
-fn open(
-    hub: &Arc<Hub>,
-    cwd: PathBuf,
-    resume: Option<&str>,
-    agent: Option<&str>,
-) -> Result<AgentCore, String> {
+fn open(hub: &Arc<Hub>, cwd: PathBuf, resume: Option<&str>) -> Result<AgentCore, String> {
     let dirs = crate::projects::extra_dirs(hub, &cwd);
     let mut core = AgentCore::open(cwd)
         .map_err(|error| error.to_string())?
@@ -69,22 +62,6 @@ fn open(
         Some(id) => resume_session(hub, &mut core, id),
     };
     result?;
-    if let Some(agent) = agent.and_then(|id| hub.agents.get(id)) {
-        if let Ok(mode) = ApprovalMode::parse(&agent.approval_mode) {
-            core.set_approval_mode(mode);
-        }
-        // Refuse to start rather than run an agent's commands unsandboxed.
-        let policy = agent.policy()?;
-        policy.check_available()?;
-        core.set_sandbox(Some(policy));
-        let session = core.session_id().to_string();
-        core.set_host_extensions(crate::agent_tools::extensions(
-            Arc::clone(hub),
-            agent.id,
-            session,
-        ));
-    }
-    // After an agent's sandbox, which replaces the default one.
     core.add_writable_dirs(&dirs);
     if resume.is_some_and(|id| crate::requirements::gated(hub, id)) {
         core.set_approval_mode(ApprovalMode::Manual);
@@ -184,17 +161,11 @@ fn terminal(
             publish(hub, id, event);
         }
     }
-    // An agent's session runs as the agent set it up (tools, sandbox).
-    let agent = hub
-        .store
-        .sessions()
-        .into_iter()
-        .any(|r| r.id == id && r.agent.is_some());
     // The jucode TUI is this binary, or the one JUCODE_BIN names.
     let exe = std::env::var_os("JUCODE_BIN")
         .map(std::path::PathBuf::from)
         .map_or_else(std::env::current_exe, Ok);
-    let (Some(arc), Ok(exe), false) = (hub.handle(), exe, agent) else {
+    let (Some(arc), Ok(exe)) = (hub.handle(), exe) else {
         refuse("this session cannot open in the terminal".to_string());
         return Some(core);
     };
@@ -237,7 +208,7 @@ fn terminal(
         }
         Err(error) => refuse(error),
     }
-    match open(&arc, cwd, Some(id), None) {
+    match open(&arc, cwd, Some(id)) {
         Ok(core) => {
             hub.broadcast(&json!({ "type": "surface", "surface": "gui", "session": id }));
             for event in core.state_events() {

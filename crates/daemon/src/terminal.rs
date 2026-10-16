@@ -343,10 +343,7 @@ fn flush(hub: &Hub, client: u64, id: &str, buffer: &mut Vec<u8>) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::{
-        store::{now, Store},
-        Agents,
-    };
+    use crate::store::{now, Store};
     use std::{fs, path::PathBuf};
 
     fn hub(label: &str) -> (Arc<Hub>, PathBuf, PathBuf) {
@@ -355,12 +352,7 @@ mod tests {
             std::process::id(),
             now()
         ));
-        let hub = Hub::new(
-            Store::open(dir.join("daemon")).unwrap(),
-            Agents::open(dir.join("agents")).unwrap(),
-            "test",
-            None,
-        );
+        let hub = Hub::new(Store::open(dir.join("daemon")).unwrap(), "test", None);
         let project = dir.join("app");
         fs::create_dir_all(&project).unwrap();
         hub.store

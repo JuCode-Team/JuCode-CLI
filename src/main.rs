@@ -534,7 +534,6 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
         listener.local_addr()?,
         jucode_daemon::state_dir()?.join("token").display()
     );
-    let agents = jucode_daemon::Agents::open(jucode_daemon::agents_dir()?)?;
     if let Some(dir) = &web {
         eprintln!(
             "remote page: http://{}/remote (from {})",
@@ -542,14 +541,7 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
             dir.display()
         );
     }
-    jucode_daemon::serve(
-        listener,
-        store,
-        agents,
-        web,
-        env!("CARGO_PKG_VERSION"),
-        relay,
-    )?;
+    jucode_daemon::serve(listener, store, web, env!("CARGO_PKG_VERSION"), relay)?;
     Ok(0)
 }
 

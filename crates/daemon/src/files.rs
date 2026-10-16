@@ -108,7 +108,6 @@ pub fn known_dir(hub: &Hub, path: &str) -> Result<PathBuf, String> {
 fn known_dirs(hub: &Hub) -> Vec<PathBuf> {
     let mut dirs = projects::project_paths(hub);
     dirs.extend(hub.store.sessions().into_iter().map(|record| record.cwd));
-    dirs.extend(hub.agents.list().into_iter().map(|agent| agent.cwd));
     dirs
 }
 

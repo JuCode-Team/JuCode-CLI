@@ -7,14 +7,13 @@
 //! Screenshots are uploads (see `uploads`) moved into
 //! `~/.jucode/uploads/requirements/<id>/` when the requirement is noted.
 //!
-//! Its state is the user's: idea, open, done or parked, or proposed while an
-//! agent's proposal to note it waits for the user. While it is open, what it
-//! shows follows its sessions: one waits for an approval, the session at the
-//! start gate (`gate`) waits for the user to confirm its understanding or
-//! plan, the latest one failed, one is running, or else it is the user's
-//! turn ("review": the work is done, or the agent asks something in its
-//! reply). An agent's proposal to close it shows as "proposal". Turning to
-//! the user's turn notifies the paired phones.
+//! Its state is the user's: idea, open, done or parked. While it is open,
+//! what it shows follows its sessions: one waits for an approval, the
+//! session at the start gate (`gate`) waits for the user to confirm its
+//! understanding or plan, the latest one failed, one is running, or else it
+//! is the user's turn ("review": the work is done, or the agent asks
+//! something in its reply). Turning to the user's turn notifies the paired
+//! phones.
 //!
 //! Work starts behind the gate: the session first only reads and explains
 //! what it understood (read-only), then, if the user asked for one, writes a
@@ -48,7 +47,7 @@ const REPLY_LIMIT: usize = 600;
 /// Bounds on the progress record the model writes.
 const ITEMS: usize = 8;
 const ITEM_CHARS: usize = 300;
-const STATES: [&str; 5] = ["idea", "open", "done", "parked", "proposed"];
+const STATES: [&str; 4] = ["idea", "open", "done", "parked"];
 const SECTIONS: [&str; 6] = ["decided", "done", "doing", "blocked", "next", "files"];
 
 pub const PROGRESS_SYSTEM: &str = "You keep the progress record of one requirement that a user \
@@ -346,10 +345,6 @@ pub fn link(hub: &Arc<Hub>, id: &str, session: &str) -> Result<(), String> {
             if r["id"] == id {
                 list.push(json!(session));
                 r["state"] = json!("open");
-                // Starting on it accepts an agent's proposal to note it.
-                if r["proposal"]["kind"] == "create" {
-                    remove(r, "proposal");
-                }
                 r["updated_at"] = json!(now());
             } else if r["gate"]["session"] == session {
                 remove(r, "gate");
@@ -562,49 +557,6 @@ pub fn confirm(hub: &Arc<Hub>, op: &Value) -> Result<Value, String> {
     Ok(json!({ "type": "requirement_confirmed", "requirement": id, "stage": stage }))
 }
 
-/// `requirement_proposal`: the user accepts or turns down an agent's
-/// proposal to note the requirement or to close it.
-pub fn decide_proposal(hub: &Arc<Hub>, op: &Value) -> Result<Value, String> {
-    let id = text(&op["requirement"]);
-    let accept = op["accept"]
-        .as_bool()
-        .ok_or("requirement_proposal requires accept")?;
-    let r = hub
-        .requirements
-        .get(id)
-        .ok_or_else(|| format!("unknown requirement {id}"))?;
-    let proposal = &r["proposal"];
-    match (text(&proposal["kind"]), accept) {
-        ("create", false) => {
-            delete(hub, id)?;
-        }
-        ("create", true) | ("close", false) => {
-            hub.requirements.update(id, |r| {
-                if r["state"] == "proposed" {
-                    r["state"] = json!("idea");
-                }
-                remove(r, "proposal");
-                Ok(())
-            })?;
-        }
-        ("close", true) => {
-            let outcome = match text(&proposal["outcome"]) {
-                "parked" => "parked",
-                _ => "done",
-            };
-            hub.requirements.update(id, |r| {
-                r["state"] = json!(outcome);
-                remove(r, "proposal");
-                remove(r, "gate");
-                Ok(())
-            })?;
-        }
-        _ => return Err(format!("{id} has no proposal")),
-    }
-    hub.broadcast(&hub.requirements.json(hub));
-    Ok(json!({ "type": "requirement_proposal_decided", "requirement": id, "accept": accept }))
-}
-
 /// Hosts `session` if it is not (after a restart); returns its engine
 /// (None: jucode).
 fn open(hub: &Arc<Hub>, session: &str) -> Result<Option<engines::Kind>, String> {
@@ -637,7 +589,10 @@ pub fn read_only(hub: &Hub, session: &str) -> &'static str {
     }
 }
 
-fn engine_mode(engine: Option<engines::Kind>, mode: &str) -> Result<&'static str, String> {
+pub(crate) fn engine_mode(
+    engine: Option<engines::Kind>,
+    mode: &str,
+) -> Result<&'static str, String> {
     let jucode = engine.is_none();
     Ok(match mode {
         "ask" | "manual" | "read-only" => {
@@ -1037,9 +992,6 @@ fn brief(r: &Value, extra: &str, lang: &str) -> String {
 /// The status a client shows (see the module doc).
 fn status(r: &Value, live: &HashMap<String, Live>) -> &'static str {
     let state = text(&r["state"]);
-    if matches!(state, "open" | "idea") && r["proposal"]["kind"] == "close" {
-        return "proposal";
-    }
     match state {
         "open" => {
             let list: Vec<&str> = sessions(r).collect();
@@ -1067,169 +1019,27 @@ fn status(r: &Value, live: &HashMap<String, Live>) -> &'static str {
         }
         "done" => "done",
         "parked" => "parked",
-        "proposed" => "proposed",
         _ => "idea",
     }
 }
 
-/// The `requirements` tool of `agent` (of `project`, if any) in `session`.
-/// Noting and closing a requirement only proposes it to the user.
-pub fn tool(
-    hub: &Arc<Hub>,
-    agent: &str,
-    project: Option<&str>,
-    session: &str,
-    args: &Value,
-) -> Result<Value, String> {
-    let reqs = &hub.requirements;
-    let arg = |key: &str| args[key].as_str().map(str::trim).unwrap_or_default();
-    match arg("action") {
-        "list" => {
-            let project = args["project"].as_str().or(project);
-            let live = lock(&reqs.live).clone();
-            let list: Vec<Value> = lock(&reqs.data)
-                .list
-                .iter()
-                .filter(|r| match project {
-                    Some("none") => r["project"].is_null(),
-                    Some(id) => r["project"] == id,
-                    None => true,
-                })
-                .filter(|r| args["state"].is_null() || r["state"] == args["state"])
-                .map(|r| {
-                    json!({
-                        "id": r["id"],
-                        "title": r["title"],
-                        "state": r["state"],
-                        "status": status(r, &live),
-                        "project": r["project"],
-                        "goal": r["progress"]["goal"],
-                        "proposal": r["proposal"].is_object(),
-                    })
-                })
-                .collect();
-            Ok(json!(list))
-        }
-        "get" => {
-            let id = arg("requirement");
-            let mut r = reqs
-                .get(id)
-                .ok_or_else(|| format!("unknown requirement {id}"))?;
-            r["status"] = json!(status(&r, &lock(&reqs.live)));
-            Ok(r)
-        }
-        "propose_create" => {
-            let words = arg("text");
-            let reason = arg("reason");
-            if words.is_empty() || reason.is_empty() {
-                return Err("propose_create requires text and reason".to_string());
-            }
-            let r = add(
-                hub,
-                words,
-                &[],
-                json!({
-                    "project": project,
-                    "state": "proposed",
-                    "source": "agent",
-                    "source_session": session,
-                    "proposal": proposal("create", agent, session, reason),
-                }),
-            )?;
-            notify_proposal(hub, &r, reason);
-            Ok(
-                json!({ "proposed": r["id"], "note": "The user is asked; it is noted only once they accept." }),
-            )
-        }
-        "propose_close" => {
-            let id = arg("requirement");
-            let reason = arg("reason");
-            let outcome = arg("outcome");
-            if reason.is_empty() || !matches!(outcome, "done" | "parked") {
-                return Err(
-                    "propose_close requires reason and outcome (done or parked)".to_string()
-                );
-            }
-            let r = reqs.update(id, |r| {
-                if !matches!(text(&r["state"]), "open" | "idea") {
-                    return Err(format!("{id} is not open"));
-                }
-                let mut close = proposal("close", agent, session, reason);
-                close["outcome"] = json!(outcome);
-                r["proposal"] = close;
-                Ok(r.clone())
-            })?;
-            hub.broadcast(&reqs.json(hub));
-            notify_proposal(hub, &r, reason);
-            Ok(
-                json!({ "proposed": id, "note": "The user is asked; it closes only once they accept." }),
-            )
-        }
-        "progress" => {
-            let id = arg("requirement");
-            reqs.update(id, |r| {
-                r["progress"] = merge_progress(&r["progress"], args);
-                r["progress_at"] = json!(now());
-                Ok(())
-            })?;
-            hub.broadcast(&reqs.json(hub));
-            Ok(json!({ "updated": id }))
-        }
-        _ => Err(
-            "requirements action must be list, get, propose_create, propose_close or progress"
-                .to_string(),
-        ),
-    }
-}
-
-fn proposal(kind: &str, agent: &str, session: &str, reason: &str) -> Value {
-    json!({ "kind": kind, "agent": agent, "session": session, "reason": reason, "at": now() })
-}
-
-fn notify_proposal(hub: &Hub, r: &Value, reason: &str) {
-    let id = text(&r["id"]);
-    hub.notify_at(
-        &format!("{id} {} · Agent 提议", text(&r["title"])),
-        reason,
-        id,
-        &format!("/remote?requirement={id}"),
-    );
-}
-
-/// `progress` with an agent's additions: each list item appended once, the
-/// newest kept within bounds; `note` replaces the note.
-fn merge_progress(progress: &Value, args: &Value) -> Value {
-    let mut merged = if progress.is_object() {
-        progress.clone()
-    } else {
-        json!({ "goal": "" })
-    };
-    for key in ["decided", "done", "doing", "blocked", "next"] {
-        let mut items = paths(&merged[key]);
-        let added = match &args[key] {
-            Value::String(item) => vec![item.clone()],
-            list => paths(list),
-        };
-        for item in added {
-            let item = head(item.trim(), ITEM_CHARS);
-            if !item.is_empty() && !items.contains(&item) {
-                items.push(item);
-            }
-        }
-        let skip = items.len().saturating_sub(ITEMS);
-        merged[key] = json!(items[skip..]);
-    }
-    if let Some(note) = args["note"].as_str() {
-        merged["note"] = json!(head(note.trim(), ITEM_CHARS));
-    }
-    merged
-}
-
 /// Requirements from before projects had ids name theirs by path
 /// (`projects`); each gets the id of the project at its first path, or
-/// none. Waits for the workspaces to have projects. Returns whether any
-/// changed.
+/// none. Waits for the workspaces to have projects. Agents' proposals are
+/// dropped (agents are gone): a proposed requirement is an idea. Returns
+/// whether any changed.
 fn migrate(list: &mut [Value], workspaces: &Value) -> bool {
+    let mut changed = false;
+    for r in list.iter_mut() {
+        if r["state"] == "proposed" {
+            r["state"] = json!("idea");
+            changed = true;
+        }
+        if r.get("proposal").is_some() {
+            remove(r, "proposal");
+            changed = true;
+        }
+    }
     let projects: Vec<&Value> = workspaces["workspaces"]
         .as_array()
         .into_iter()
@@ -1237,9 +1047,8 @@ fn migrate(list: &mut [Value], workspaces: &Value) -> bool {
         .flat_map(|ws| ws["projects"].as_array().into_iter().flatten())
         .collect();
     if projects.is_empty() {
-        return false;
+        return changed;
     }
-    let mut changed = false;
     for r in list.iter_mut() {
         let Some(map) = r.as_object_mut() else {
             continue;
@@ -1439,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn status_shows_the_gate_and_proposals() {
+    fn status_shows_the_gate() {
         let mut live = HashMap::new();
         let mut r = open(&["a"]);
         r["gate"] = json!({ "session": "a", "stage": "understand", "plan": false, "mode": "auto" });
@@ -1463,12 +1272,6 @@ mod tests {
             },
         );
         assert_eq!(status(&r, &live), "approval");
-        r["proposal"] = json!({ "kind": "close", "outcome": "done" });
-        assert_eq!(status(&r, &live), "proposal");
-        let idea = json!({ "state": "idea", "proposal": { "kind": "close" } });
-        assert_eq!(status(&idea, &live), "proposal");
-        let proposed = json!({ "state": "proposed", "proposal": { "kind": "create" } });
-        assert_eq!(status(&proposed, &live), "proposed");
     }
 
     #[test]
@@ -1490,6 +1293,12 @@ mod tests {
         assert!(list[2]["project"].is_null());
         assert!(list.iter().all(|r| r.get("projects").is_none()));
         assert!(!migrate(&mut list, &workspaces));
+        // An agent's proposal is gone with the agents.
+        let mut list =
+            vec![json!({ "id": "R-8", "state": "proposed", "proposal": { "kind": "create" } })];
+        assert!(migrate(&mut list, &json!({ "workspaces": [] })));
+        assert_eq!(list[0]["state"], "idea");
+        assert!(list[0].get("proposal").is_none());
         // A project set meanwhile (no projects at the first load) is kept.
         let mut list = vec![json!({ "id": "R-9", "projects": ["/a"], "project": "p-2" })];
         assert!(migrate(&mut list, &workspaces));
@@ -1498,28 +1307,11 @@ mod tests {
     }
 
     #[test]
-    fn an_agents_progress_is_merged_once_and_bounded() {
-        let before = json!({ "goal": "导出", "done": ["读取会话"], "files": ["a.rs"] });
-        let args = json!({ "done": ["读取会话", " 写文件 ", ""], "next": "你查看效果", "note": "先做 md" });
-        let merged = merge_progress(&before, &args);
-        assert_eq!(merged["goal"], "导出");
-        assert_eq!(merged["done"], json!(["读取会话", "写文件"]));
-        assert_eq!(merged["next"], json!(["你查看效果"]));
-        assert_eq!(merged["files"], json!(["a.rs"]));
-        assert_eq!(merged["note"], "先做 md");
-        let many: Vec<String> = (0..12).map(|n| n.to_string()).collect();
-        let bounded = merge_progress(&Value::Null, &json!({ "doing": many }));
-        assert_eq!(bounded["doing"].as_array().unwrap().len(), ITEMS);
-        assert_eq!(bounded["doing"][ITEMS - 1], "11");
-    }
-
-    #[test]
     fn the_gate_reads_first_then_plans_then_switches_to_the_mode() {
         let dir =
             std::env::temp_dir().join(format!("jucode-req-gate-{}-{}", std::process::id(), now()));
         let hub = Hub::new(
             crate::store::Store::open(dir.join("daemon")).unwrap(),
-            crate::Agents::open(dir.join("agents")).unwrap(),
             "test",
             None,
         );
