@@ -471,15 +471,23 @@ fn channel(engine: &str, gateway: bool, provider: &str) -> (&'static str, String
 }
 
 // A reference estimate is captured when the tokens arrive. Unknown models
-// and cache-write prices stay unknown, rather than borrowing another model's price.
+// stay unknown, rather than borrowing another model's price.
 fn estimate(provider: &str, model: &str, usage: &Value) -> Option<f64> {
-    if usage["cache_write_tokens"].as_u64().unwrap_or(0) > 0
+    let writes = usage["cache_write_tokens"].as_u64().unwrap_or(0);
+    let writes_1h = usage["cache_write_1h_tokens"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(writes);
+    // Only Anthropic's cache-write prices are known (below).
+    if (writes > 0 && provider != "anthropic")
         || !jucode_agent_core::builtin_providers()
             .iter()
             .any(|(id, _, _)| id == provider)
     {
         return None;
     }
+    // Claude Code names a long-context model "claude-opus-4-8[1m]".
+    let model = model.split('[').next().unwrap_or(model);
     let prices = jucode_agent_core::models_for_provider(provider)
         .into_iter()
         .find(|m| m.name == model)?;
@@ -492,7 +500,11 @@ fn estimate(provider: &str, model: &str, usage: &Value) -> Option<f64> {
     {
         return None;
     }
-    Some(prices.cost_for(input, cached, output))
+    // Cache writes are input, already priced once; Anthropic bills them at
+    // 1.25× the input price for the 5-minute cache and 2× for the 1-hour one.
+    let write_surcharge =
+        ((writes - writes_1h) as f64 * 0.25 + writes_1h as f64) * prices.input_cost / 1_000_000.0;
+    Some(prices.cost_for(input, cached, output) + write_surcharge)
 }
 
 fn fetch_charges(turns: &[String]) -> Result<HashMap<String, Value>, String> {
@@ -935,9 +947,14 @@ mod tests {
         assert_eq!(saved["totals"]["running"], false);
         assert!(estimate("my-provider", "unknown-model", &event).is_none());
         assert!(estimate("anthropic", "unknown-model", &event).is_none());
+        // Writes (part of input): 5-minute ones at 1.25× the input price, 1-hour ones at 2×.
         let mut writes = event.clone();
-        writes["cache_write_tokens"] = json!(5);
-        assert!(estimate("anthropic", &model.name, &writes).is_none());
+        writes["cache_write_tokens"] = json!(300);
+        writes["cache_write_1h_tokens"] = json!(100);
+        let priced = estimate("anthropic", &format!("{}[1m]", model.name), &writes).unwrap();
+        let surcharge = (200.0 * 0.25 + 100.0) * model.input_cost / 1_000_000.0;
+        assert!((priced - (expected + surcharge)).abs() < 1e-12);
+        assert!(estimate("openai", &model.name, &writes).is_none());
         drop(store);
         let _ = fs::remove_dir_all(dir);
     }

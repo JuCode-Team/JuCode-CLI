@@ -1343,6 +1343,7 @@ impl Claude {
                         "input_tokens": context_tokens(input),
                         "cached_input_tokens": count("cache_read_input_tokens"),
                         "cache_write_tokens": count("cache_creation_input_tokens"),
+                        "cache_write_1h_tokens": input["cache_creation"]["ephemeral_1h_input_tokens"].as_u64().unwrap_or(0),
                         "output_tokens": output,
                     }),
                     json!({ "type": "context_usage", "tokens": self.last_context }),
@@ -2895,11 +2896,11 @@ mod tests {
         );
         let usage = frame(
             &mut c,
-            json!({ "type": "stream_event", "event": { "type": "message_delta", "usage": { "input_tokens": 10, "cache_read_input_tokens": 3000, "cache_creation_input_tokens": 40, "output_tokens": 5 } } }),
+            json!({ "type": "stream_event", "event": { "type": "message_delta", "usage": { "input_tokens": 10, "cache_read_input_tokens": 3000, "cache_creation_input_tokens": 40, "cache_creation": { "ephemeral_5m_input_tokens": 30, "ephemeral_1h_input_tokens": 10 }, "output_tokens": 5 } } }),
         );
         assert_eq!(
             usage[0],
-            json!({ "type": "usage", "input_tokens": 3050, "cached_input_tokens": 3000, "cache_write_tokens": 40, "output_tokens": 5 })
+            json!({ "type": "usage", "input_tokens": 3050, "cached_input_tokens": 3000, "cache_write_tokens": 40, "cache_write_1h_tokens": 10, "output_tokens": 5 })
         );
         frame(
             &mut c,
