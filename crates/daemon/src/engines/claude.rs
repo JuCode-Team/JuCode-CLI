@@ -141,14 +141,19 @@ pub fn command(id: &str, options: &Options) -> Command {
     command.args(["--permission-prompt-tool", "stdio"]);
     // The daemon's own tools, served in-process over the control channel
     // (`mcp_message`); they only show the user something, so they never ask.
-    command.arg("--mcp-config").arg(
-        json!({ "mcpServers": { MCP_SERVER: { "type": "sdk", "name": MCP_SERVER } } }).to_string(),
-    );
+    // With all of them off there is no server.
     let allowed: Vec<String> = user_tools::NAMES
         .iter()
+        .filter(|name| !options.app_tools_off.contains(name))
         .map(|name| format!("mcp__{MCP_SERVER}__{name}"))
         .collect();
-    command.args(["--allowedTools", &allowed.join(",")]);
+    if !allowed.is_empty() {
+        command.arg("--mcp-config").arg(
+            json!({ "mcpServers": { MCP_SERVER: { "type": "sdk", "name": MCP_SERVER } } })
+                .to_string(),
+        );
+        command.args(["--allowedTools", &allowed.join(",")]);
+    }
     let mode = to_claude_mode(options.approval_mode.as_deref().unwrap_or_default());
     if mode == "bypassPermissions" {
         command.arg("--dangerously-skip-permissions");
@@ -719,6 +724,8 @@ pub struct Claude {
     commands: Vec<Value>,
     /// `user_tools` calls waiting for the daemon.
     calls: Vec<HostCall>,
+    /// The `user_tools` the user turned off.
+    app_tools_off: Vec<&'static str>,
 }
 
 impl Claude {
@@ -764,6 +771,7 @@ impl Claude {
             queued: Vec::new(),
             commands: Vec::new(),
             calls: Vec::new(),
+            app_tools_off: options.app_tools_off.clone(),
         }
     }
 
@@ -1610,9 +1618,8 @@ impl Claude {
             "tools/list" => {
                 // Always in the prompt, not behind tool search: the model
                 // should think of them without looking.
-                let tools: Vec<Value> = user_tools::specs()
+                let tools: Vec<Value> = user_tools::offered(&self.app_tools_off)
                     .into_iter()
-                    .chain(user_tools::session_specs())
                     .map(|(name, description, schema)| {
                         json!({
                             "name": name, "description": description, "inputSchema": schema,
@@ -2197,8 +2204,14 @@ impl Adapter for Claude {
         // The command list with descriptions, before the first turn. The
         // desktop has a stop button per background task, so an interrupt
         // spares them.
+        // The in-process server, unless `command` left it out.
+        let servers: &[&str] = if user_tools::offered(&self.app_tools_off).is_empty() {
+            &[]
+        } else {
+            &[MCP_SERVER]
+        };
         frames.push(self.control_request(
-            json!({ "subtype": "initialize", "promptSuggestions": true, "agentProgressSummaries": true, "perTaskStopAffordance": true, "sdkMcpServers": [MCP_SERVER] }),
+            json!({ "subtype": "initialize", "promptSuggestions": true, "agentProgressSummaries": true, "perTaskStopAffordance": true, "sdkMcpServers": servers }),
             "",
         ));
         if self.ultracode {
@@ -4135,6 +4148,43 @@ mod tests {
             allowed.contains("mcp__jucode__present_files,")
                 && allowed.ends_with("mcp__jucode__send_session"),
             "{allowed}"
+        );
+    }
+
+    #[test]
+    fn app_tools_turned_off_are_not_served() {
+        let some = Options {
+            app_tools_off: vec!["present_files"],
+            ..Options::default()
+        };
+        let args = |options: &Options| -> Vec<String> {
+            command("s", options)
+                .get_args()
+                .map(|arg| arg.to_string_lossy().to_string())
+                .collect()
+        };
+        assert!(!args(&some).iter().any(|arg| arg.contains("present_files")));
+        let mut c = Claude::new(&some);
+        let listed = c.translate(Line::Frame(
+            json!({ "type": "control_request", "request_id": "m1", "request": { "subtype": "mcp_message", "server_name": "jucode", "message": { "jsonrpc": "2.0", "id": 1, "method": "tools/list" } } }),
+        ));
+        let reply: Value = serde_json::from_str(&listed.frames[0]).unwrap();
+        assert_eq!(
+            reply["response"]["response"]["mcp_response"]["result"]["tools"][0]["name"],
+            "propose_schedule"
+        );
+        let none = Options {
+            app_tools_off: user_tools::NAMES.to_vec(),
+            ..Options::default()
+        };
+        assert!(!args(&none)
+            .iter()
+            .any(|arg| arg == "--mcp-config" || arg == "--allowedTools"));
+        let init = Claude::new(&none).start();
+        assert!(
+            init.iter()
+                .any(|frame| frame.contains("\"sdkMcpServers\":[]")),
+            "{init:?}"
         );
     }
 

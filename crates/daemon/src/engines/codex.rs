@@ -472,6 +472,8 @@ pub struct Codex {
     mcp_relist: bool,
     /// `user_tools` calls waiting for the daemon.
     calls: Vec<HostCall>,
+    /// The `user_tools` the user turned off.
+    app_tools_off: Vec<&'static str>,
 }
 
 impl Codex {
@@ -516,6 +518,7 @@ impl Codex {
             mcp_watched: false,
             mcp_relist: false,
             calls: Vec::new(),
+            app_tools_off: options.app_tools_off.clone(),
         }
     }
 
@@ -887,9 +890,8 @@ impl Codex {
                 let (approval, sandbox) = policy(self.mode, &self.dirs);
                 // The daemon's own tools (`user_tools`): a thread keeps them,
                 // so a resumed one is not told again.
-                let tools: Vec<Value> = user_tools::specs()
+                let tools: Vec<Value> = user_tools::offered(&self.app_tools_off)
                     .into_iter()
-                    .chain(user_tools::session_specs())
                     .map(|(name, description, schema)| json!({ "type": "function", "name": name, "description": description, "inputSchema": schema }))
                     .collect();
                 let open = json!({ "cwd": self.cwd, "approvalPolicy": approval, "sandbox": sandbox_mode(&sandbox) });
@@ -2267,6 +2269,26 @@ mod tests {
             transcript(&json!([{ "items": [done] }]))[0]["name"],
             "present_files"
         );
+    }
+
+    #[test]
+    fn app_tools_turned_off_are_not_offered() {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                app_tools_off: vec!["start_session", "wait_session", "send_session"],
+                ..Options::default()
+            },
+        );
+        c.start();
+        let next = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        let names: Vec<&str> = next[1]["params"]["dynamicTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, ["present_files", "propose_schedule"]);
     }
 
     #[test]

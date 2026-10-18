@@ -88,6 +88,9 @@ pub struct Options {
     /// Claude / Codex: directories besides `cwd` the engine may work in (the
     /// project's extra directories; set by `spawn`, never by a client).
     pub dirs: Vec<PathBuf>,
+    /// The app tools (`user_tools::NAMES`) the user turned off (set by
+    /// `spawn` from the daemon's settings, never by a client).
+    pub app_tools_off: Vec<&'static str>,
 }
 
 impl Options {
@@ -124,6 +127,7 @@ impl Options {
             fast: value["fast"] == true,
             thinking: value["thinking"].as_bool(),
             dirs: Vec::new(),
+            app_tools_off: Vec::new(),
         }
     }
 
@@ -187,6 +191,47 @@ pub struct HostCall {
 fn host_call(cwd: &Path, call: &HostCall) -> Result<Value, String> {
     jucode_agent_core::user_tools::run(&call.name, &call.args, cwd)
         .unwrap_or_else(|| Err(format!("unknown tool: {}", call.name)))
+}
+
+/// The daemon setting holding the app tools' switches (`user_tools::GROUPS`
+/// keys; a switch not there is on).
+pub const APP_TOOLS_SETTING: &str = "app_tools";
+
+/// The app tools the user turned off, for engines starting now.
+pub fn app_tools_off(store: &crate::store::Store) -> Vec<&'static str> {
+    let setting = store.setting(APP_TOOLS_SETTING);
+    jucode_agent_core::user_tools::GROUPS
+        .iter()
+        .filter(|(key, _)| setting[*key] == false)
+        .flat_map(|(_, tools)| tools.iter().copied())
+        .collect()
+}
+
+/// The switches, as `app_tools` and `app_tools_set` answer.
+pub fn app_tools_json(store: &crate::store::Store) -> Value {
+    let setting = store.setting(APP_TOOLS_SETTING);
+    let mut out = json!({ "type": "app_tools" });
+    for (key, _) in jucode_agent_core::user_tools::GROUPS {
+        out[key] = json!(setting[key] != false);
+    }
+    out
+}
+
+/// Sets the switches `op` names; the others stay.
+pub fn set_app_tools(store: &crate::store::Store, op: &Value) -> Result<Value, String> {
+    let mut setting = store.setting(APP_TOOLS_SETTING);
+    if !setting.is_object() {
+        setting = json!({});
+    }
+    for (key, _) in jucode_agent_core::user_tools::GROUPS {
+        if let Some(on) = op[key].as_bool() {
+            setting[key] = json!(on);
+        }
+    }
+    store
+        .set_setting(APP_TOOLS_SETTING, setting)
+        .map_err(|error| error.to_string())?;
+    Ok(app_tools_json(store))
 }
 
 /// A session tool's result, for the adapter to answer with.
@@ -639,6 +684,7 @@ pub fn spawn(
         .is_some_and(|session| crate::requirements::gated(&hub, session));
     let options = Options {
         dirs: crate::projects::extra_dirs(&hub, &cwd),
+        app_tools_off: app_tools_off(&hub.store),
         approval_mode: if gated {
             Some("read-only".to_string())
         } else {
@@ -771,6 +817,12 @@ impl Session<'_> {
         answers: &Sender<Answer>,
     ) {
         for call in adapter.take_calls() {
+            // A resumed Codex thread keeps the tools it started with.
+            if current.app_tools_off.contains(&call.name.as_str()) {
+                let off = jucode_agent_core::user_tools::turned_off(&call.name);
+                process.write(adapter.answer(&call.token, Err(off)));
+                continue;
+            }
             if !jucode_agent_core::user_tools::SESSION_TOOLS.contains(&call.name.as_str()) {
                 let result = host_call(&self.cwd, &call);
                 process.write(adapter.answer(&call.token, result));
@@ -905,6 +957,7 @@ impl Session<'_> {
                     next.gateway = next.gateway.or(options.gateway);
                     next.approval_mode = next.approval_mode.or(options.approval_mode.clone());
                     next.dirs = crate::projects::extra_dirs(self.hub, &self.cwd);
+                    next.app_tools_off = app_tools_off(&self.hub.store);
                     current = next.clone();
                     process.stop();
                     let id = self.id.clone().unwrap_or_default();
@@ -1420,6 +1473,34 @@ fn full_access(mode: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_tools_are_switched_in_groups() {
+        let dir = std::env::temp_dir().join(format!(
+            "jucode-app-tools-{}-{}",
+            std::process::id(),
+            crate::store::now()
+        ));
+        let store = crate::store::Store::open(dir.clone()).unwrap();
+        assert!(app_tools_off(&store).is_empty());
+        assert_eq!(app_tools_json(&store)["sessions"], true);
+        let set = set_app_tools(&store, &json!({ "sessions": false })).unwrap();
+        assert_eq!(
+            (set["sessions"].as_bool(), set["present_files"].as_bool()),
+            (Some(false), Some(true))
+        );
+        set_app_tools(&store, &json!({ "present_files": false })).unwrap();
+        assert_eq!(
+            app_tools_off(&store),
+            [
+                "present_files",
+                "start_session",
+                "wait_session",
+                "send_session"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn an_idle_closed_engine_reopens_on_its_whole_conversation() {

@@ -29,6 +29,18 @@ pub const NAMES: [&str; 5] = [
     WAIT_SESSION,
     SEND_SESSION,
 ];
+/// What the app's settings switch on and off: each switch's key (in the
+/// daemon's settings) and the tools it covers.
+pub const GROUPS: [(&str, &[&str]); 3] = [
+    ("present_files", &[PRESENT_FILES]),
+    ("propose_schedule", &[PROPOSE_SCHEDULE]),
+    ("sessions", &SESSION_TOOLS),
+];
+
+/// Said to a model calling one of these tools while the user has it off.
+pub fn turned_off(name: &str) -> String {
+    format!("{name} is turned off in the JuCode app's settings")
+}
 
 /// Files one call may present.
 const MAX_FILES: usize = 12;
@@ -125,6 +137,15 @@ pub fn session_specs() -> Vec<(&'static str, &'static str, Value)> {
             }),
         ),
     ]
+}
+
+/// All the tools (`specs` and `session_specs`) but those in `off`.
+pub fn offered(off: &[&str]) -> Vec<(&'static str, &'static str, Value)> {
+    specs()
+        .into_iter()
+        .chain(session_specs())
+        .filter(|(name, ..)| !off.contains(name))
+        .collect()
 }
 
 /// Runs one of the `LOCAL` tools: Ok with the JSON output, Err with what the

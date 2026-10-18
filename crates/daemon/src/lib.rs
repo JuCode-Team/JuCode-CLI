@@ -310,6 +310,11 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         reply(json!({ "type": "error", "message": "only the desktop can manage devices" }));
         return;
     }
+    // What every agent is given is the desktop's settings.
+    if name == "app_tools_set" && !hub.is_local(client) {
+        reply(json!({ "type": "error", "message": "only the desktop can change the app tools" }));
+        return;
+    }
     // An MCP server is a command to run or a place to send credentials.
     if matches!(name, "mcp_set" | "mcp_remove" | "mcp_toggle") && !hub.is_local(client) {
         reply(json!({ "type": "error", "message": "only the desktop can change MCP servers" }));
@@ -469,6 +474,8 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         },
         ("pair_link", _) => hub.relay.pair_link(hub),
         ("relay_status", _) => Ok(hub.relay.status_json()),
+        ("app_tools", _) => Ok(engines::app_tools_json(&hub.store)),
+        ("app_tools_set", _) => engines::set_app_tools(&hub.store, &op),
         ("relay_set", _) => match op["enabled"].as_bool() {
             Some(enabled) => hub
                 .relay

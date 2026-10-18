@@ -63,6 +63,7 @@ fn open(hub: &Arc<Hub>, cwd: PathBuf, resume: Option<&str>) -> Result<AgentCore,
     };
     result?;
     core.add_writable_dirs(&dirs);
+    core.set_app_tools_off(crate::engines::app_tools_off(&hub.store));
     if resume.is_some_and(|id| crate::requirements::gated(hub, id)) {
         core.set_approval_mode(ApprovalMode::Manual);
     }

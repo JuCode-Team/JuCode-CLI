@@ -2064,12 +2064,13 @@ impl AgentCore {
         );
         let images_enabled = images.is_ok();
         self.tool_state.set_images(images);
-        let prompt_tools = crate::tools::prompt_tool_names(
+        let mut prompt_tools = crate::tools::prompt_tool_names(
             &self.config.edit_tools,
             true,
             signed_in,
             images_enabled,
         );
+        prompt_tools.retain(|name| !self.tool_state.app_tool_off(name));
         let context = PromptContext {
             date: current_utc_date(),
             cwd: self.cwd.clone(),
@@ -2685,6 +2686,11 @@ impl AgentCore {
     /// Gives the session the daemon's session tools (`start_session` …).
     pub fn set_host_tools(&self, host: crate::tools::HostTools) {
         self.tool_state.set_host(host);
+    }
+
+    /// The app tools (`user_tools::NAMES`) the user turned off.
+    pub fn set_app_tools_off(&self, off: Vec<&'static str>) {
+        self.tool_state.set_app_tools_off(off);
     }
 
     /// Reads the session's approval mode as it is when called (it changes

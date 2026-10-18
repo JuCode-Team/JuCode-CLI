@@ -440,7 +440,7 @@ pub(crate) fn request_tool_definitions(offer: &ToolOffer<'_>) -> Vec<Value> {
         definitions.extend(subagent_definitions(model, efforts, models));
     }
     if offer.tool_state.host().is_some() {
-        definitions.extend(crate::user_tools::session_specs().into_iter().map(
+        definitions.extend(crate::user_tools::session_specs().into_iter().filter(|(name, ..)| !offer.tool_state.app_tool_off(name)).map(
             |(name, description, parameters)| json!({ "type": "function", "name": name, "description": description, "parameters": parameters, "strict": false }),
         ));
     }
@@ -486,6 +486,9 @@ fn disabled_tool_error(
     tool_state: &tools::ToolState,
     enabled_edit_tools: &[String],
 ) -> Option<String> {
+    if tool_state.app_tool_off(name) {
+        return Some(crate::user_tools::turned_off(name));
+    }
     if name == crate::images::TOOL_NAME {
         if let Err(reason) = tool_state.images() {
             return Some(reason);
@@ -3165,6 +3168,24 @@ mod tests {
         assert!(client.disabled_tool_error("hashline_edit").is_none());
         assert!(client.disabled_tool_error("read").is_none());
         assert!(client.disabled_tool_error("bash").is_none());
+    }
+
+    #[test]
+    fn app_tools_turned_off_are_neither_offered_nor_run() {
+        let client = test_client();
+        client.tool_state.set_app_tools_off(vec!["present_files"]);
+        let request = ToolCallRequest {
+            call_id: "call_present".to_string(),
+            name: "present_files".to_string(),
+            arguments: json!({ "files": [] }).to_string(),
+        };
+        let result =
+            client.run_tool_call(&request, Path::new("."), &[], &HashSet::new(), &mut |_| {
+                Ok(())
+            });
+        assert!(result.is_error);
+        assert!(result.output.contains("turned off"), "{}", result.output);
+        assert!(client.disabled_tool_error("propose_schedule").is_none());
     }
 
     #[test]

@@ -2568,6 +2568,8 @@ struct ToolStateInner {
     /// Runs the session tools (`user_tools::SESSION_TOOLS`); only the daemon
     /// sets it, and they are offered only then.
     host: Option<HostTools>,
+    /// The app tools (`user_tools::NAMES`) the user turned off.
+    app_tools_off: Vec<&'static str>,
 }
 
 /// The daemon's handler for the session tools: (tool name, arguments) →
@@ -2646,6 +2648,19 @@ impl ToolState {
 
     pub(crate) fn host(&self) -> Option<HostTools> {
         self.inner.lock().ok().and_then(|inner| inner.host.clone())
+    }
+
+    pub fn set_app_tools_off(&self, off: Vec<&'static str>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.app_tools_off = off;
+        }
+    }
+
+    /// Whether the user turned app tool `name` off.
+    pub(crate) fn app_tool_off(&self, name: &str) -> bool {
+        self.inner
+            .lock()
+            .is_ok_and(|inner| inner.app_tools_off.contains(&name))
     }
 
     pub(crate) fn push_notice(&self, notice: String) {
