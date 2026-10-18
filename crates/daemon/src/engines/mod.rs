@@ -171,6 +171,27 @@ impl Output {
     }
 }
 
+/// The engine called one of the tools the daemon gives it
+/// (`jucode_agent_core::user_tools`); `token` is how the adapter finds the
+/// request to answer.
+#[derive(Debug)]
+pub struct HostCall {
+    pub token: Value,
+    pub name: String,
+    pub args: Value,
+}
+
+/// Runs a daemon tool for a session in `cwd`: its JSON output, or what the
+/// model should fix. The session tools are not among them (see
+/// `Session::host_calls`).
+fn host_call(cwd: &Path, call: &HostCall) -> Result<Value, String> {
+    jucode_agent_core::user_tools::run(&call.name, &call.args, cwd)
+        .unwrap_or_else(|| Err(format!("unknown tool: {}", call.name)))
+}
+
+/// A session tool's result, for the adapter to answer with.
+type Answer = (Value, Result<Value, String>);
+
 pub trait Adapter: Send {
     /// Frames to send once the engine started.
     fn start(&mut self) -> Vec<String>;
@@ -200,6 +221,14 @@ pub trait Adapter: Send {
     /// A mode switch reaches the running turn (else it applies to the next).
     fn mode_applies_live(&self) -> bool {
         true
+    }
+    /// The daemon-tool calls the engine made since last asked.
+    fn take_calls(&mut self) -> Vec<HostCall> {
+        Vec::new()
+    }
+    /// Frames answering a `HostCall` with the tool's result.
+    fn answer(&mut self, _token: &Value, _result: Result<Value, String>) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -732,12 +761,55 @@ impl Session<'_> {
         format!("{head}\n{}", tail.join("\n"))
     }
 
+    /// Runs the daemon tools the engine called: the session tools on their
+    /// own threads (answered through `answers`), the others here.
+    fn host_calls(
+        &self,
+        process: &Process,
+        adapter: &mut dyn Adapter,
+        current: &Options,
+        answers: &Sender<Answer>,
+    ) {
+        for call in adapter.take_calls() {
+            if !jucode_agent_core::user_tools::SESSION_TOOLS.contains(&call.name.as_str()) {
+                let result = host_call(&self.cwd, &call);
+                process.write(adapter.answer(&call.token, result));
+                continue;
+            }
+            let (Some(hub), Some(session)) = (self.hub.handle(), self.id.clone()) else {
+                process.write(
+                    adapter.answer(&call.token, Err("the session is not open yet".to_string())),
+                );
+                continue;
+            };
+            let parent = crate::subsessions::Parent {
+                session,
+                cwd: self.cwd.clone(),
+                mode: adapter
+                    .approval_mode()
+                    .or_else(|| current.approval_mode.clone())
+                    .unwrap_or_default(),
+                gateway: current.gateway == Some(true),
+            };
+            let answers = answers.clone();
+            thread::spawn(move || {
+                let result = crate::subsessions::call(&hub, &parent, &call.name, &call.args);
+                let _ = answers.send((call.token, result));
+            });
+        }
+    }
+
     fn run(&mut self, mut process: Process, options: Options, ops: Receiver<Value>) {
         let mut adapter = adapter(self.kind, &self.cwd, &options);
         process.write(adapter.start());
         // What the process runs as now (a restart changes it).
         let mut current = options.clone();
+        // Session tools answer from their own threads (`wait_session` blocks).
+        let (answers_tx, answers) = mpsc::channel::<Answer>();
         loop {
+            while let Ok((token, result)) = answers.try_recv() {
+                process.write(adapter.answer(&token, result));
+            }
             loop {
                 match ops.try_recv() {
                     Ok(op) => {
@@ -787,6 +859,7 @@ impl Session<'_> {
                         }
                         let output = adapter.translate(line);
                         process.write(output.frames);
+                        self.host_calls(&process, adapter.as_mut(), &current, &answers_tx);
                         if self.id.is_none() {
                             if let Some(id) = adapter.conversation() {
                                 self.named(id);

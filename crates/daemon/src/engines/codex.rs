@@ -21,7 +21,8 @@
 //!   the conversation. `thread/turns/list` reads one back.
 //! - A rewind is `thread/revert` to before a user message's turn.
 
-use super::{home, resolve, Adapter, Line, Options, Output};
+use super::{home, resolve, Adapter, HostCall, Line, Options, Output};
+use jucode_agent_core::user_tools;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -223,8 +224,24 @@ fn file_change_output(changes: &[Value], error: Option<&str>) -> String {
         .map(|c| text(&c["diff"]))
         .collect::<Vec<_>>()
         .join("\n");
-    let mut out =
-        json!({ "path": paths.first().copied().unwrap_or_default(), "paths": paths, "diff": diff });
+    // Lines each file gains and loses, for the turn's list of edited files.
+    let files: Vec<Value> = changes
+        .iter()
+        .filter(|c| !text(&c["path"]).is_empty())
+        .map(|c| {
+            let (add, del) = text(&c["diff"]).lines().fold((0, 0), |(add, del), line| {
+                if line.starts_with('+') && !line.starts_with("+++") {
+                    (add + 1, del)
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    (add, del + 1)
+                } else {
+                    (add, del)
+                }
+            });
+            json!({ "path": c["path"], "add": add, "del": del })
+        })
+        .collect();
+    let mut out = json!({ "path": paths.first().copied().unwrap_or_default(), "paths": paths, "diff": diff, "files": files });
     if let Some(error) = error {
         out["error"] = json!(error);
     }
@@ -245,6 +262,18 @@ fn mcp_body(item: &Value) -> String {
         Value::String(text) => text,
         other => other.to_string(),
     }
+}
+
+/// A dynamic tool call's result: the text it returned.
+fn dynamic_body(item: &Value) -> String {
+    item["contentItems"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["type"] == "inputText")
+        .map(|c| text(&c["text"]))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn command_output(item: &Value, command: &str, streamed: &str) -> Value {
@@ -296,6 +325,7 @@ fn transcript(turns: &Value) -> Vec<Value> {
                 "role": "tool", "name": format!("{}.{}", text(&item["server"]), text(&item["tool"])), "output": mcp_body(item),
             })),
             "webSearch" => rows.push(json!({ "role": "tool", "name": "web_search", "output": json!({ "query": item["query"] }).to_string() })),
+            "dynamicToolCall" => rows.push(json!({ "role": "tool", "name": item["tool"], "output": dynamic_body(item) })),
             _ => {}
         }
     }
@@ -440,6 +470,8 @@ pub struct Codex {
     /// A client looked at the MCP servers: their changes are sent on.
     mcp_watched: bool,
     mcp_relist: bool,
+    /// `user_tools` calls waiting for the daemon.
+    calls: Vec<HostCall>,
 }
 
 impl Codex {
@@ -483,6 +515,7 @@ impl Codex {
             warned: Default::default(),
             mcp_watched: false,
             mcp_relist: false,
+            calls: Vec::new(),
         }
     }
 
@@ -852,8 +885,16 @@ impl Codex {
         match method.as_str() {
             "initialize" => {
                 let (approval, sandbox) = policy(self.mode, &self.dirs);
+                // The daemon's own tools (`user_tools`): a thread keeps them,
+                // so a resumed one is not told again.
+                let tools: Vec<Value> = user_tools::specs()
+                    .into_iter()
+                    .chain(user_tools::session_specs())
+                    .map(|(name, description, schema)| json!({ "type": "function", "name": name, "description": description, "inputSchema": schema }))
+                    .collect();
                 let open = json!({ "cwd": self.cwd, "approvalPolicy": approval, "sandbox": sandbox_mode(&sandbox) });
                 self.open_params = open.clone();
+                self.open_params["dynamicTools"] = json!(tools);
                 let mut frames =
                     vec![json!({ "jsonrpc": "2.0", "method": "initialized" }).to_string()];
                 frames.push(match self.resume.clone() {
@@ -865,7 +906,10 @@ impl Codex {
                         }
                         self.request("thread/resume", params, "")
                     }
-                    None => self.request("thread/start", open, ""),
+                    None => {
+                        let params = self.open_params.clone();
+                        self.request("thread/start", params, "")
+                    }
                 });
                 frames.push(self.request("model/list", json!({}), ""));
                 let cwd = self.cwd.clone();
@@ -975,6 +1019,23 @@ impl Codex {
         let answer =
             |result: Value| json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
         let full = self.mode == "full-auto";
+        if method == "item/tool/call" {
+            let tool = text(&params["tool"]);
+            if user_tools::NAMES.contains(&tool) {
+                self.calls.push(HostCall {
+                    token: id.clone(),
+                    name: tool.to_string(),
+                    args: params["arguments"].clone(),
+                });
+                return Output::default();
+            }
+            return Output {
+                events: vec![],
+                frames: vec![answer(
+                    json!({ "contentItems": [{ "type": "inputText", "text": format!("unknown tool: {tool}") }], "success": false }),
+                )],
+            };
+        }
         // Full access never prompts; a turn started before the switch still may.
         match method {
             "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" if full => {
@@ -1392,7 +1453,7 @@ impl Codex {
                         t => t.into(),
                     });
                 vec![
-                    json!({ "type": "tool_output", "call_id": id, "name": name, "output": item["contentItems"].to_string(), "is_error": failed }),
+                    json!({ "type": "tool_output", "call_id": id, "name": name, "output": dynamic_body(item), "is_error": failed }),
                 ]
             }
             "webSearch" => vec![
@@ -1678,6 +1739,21 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    fn take_calls(&mut self) -> Vec<HostCall> {
+        std::mem::take(&mut self.calls)
+    }
+
+    fn answer(&mut self, token: &Value, result: Result<Value, String>) -> Vec<String> {
+        let (body, success) = match result {
+            Ok(output) => (output.to_string(), true),
+            Err(error) => (error, false),
+        };
+        vec![json!({ "jsonrpc": "2.0", "id": token, "result": {
+            "contentItems": [{ "type": "inputText", "text": body }], "success": success,
+        } })
+        .to_string()]
+    }
+
     fn start(&mut self) -> Vec<String> {
         vec![self.request(
             "initialize",
@@ -2159,6 +2235,53 @@ mod tests {
             .iter()
             .map(|f| serde_json::from_str(f).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn user_tools_are_dynamic_tools() {
+        let mut c = Codex::new(Path::new("/p"), &Options::default());
+        c.start();
+        let next = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        assert_eq!(
+            next[1]["params"]["dynamicTools"][1]["name"],
+            "propose_schedule"
+        );
+        let call = frame(
+            &mut c,
+            json!({ "id": 40, "method": "item/tool/call", "params": { "threadId": "th", "turnId": "tu", "callId": "c", "tool": "present_files", "arguments": { "files": ["a"] } } }),
+        );
+        assert!(call.frames.is_empty());
+        let calls = c.take_calls();
+        let answer = sent(&c.answer(&calls[0].token, Ok(json!({ "files": [] }))));
+        assert_eq!(answer[0]["id"], 40);
+        assert_eq!(answer[0]["result"]["success"], true);
+        assert_eq!(
+            answer[0]["result"]["contentItems"][0]["text"],
+            "{\"files\":[]}"
+        );
+        let unknown = sent(&frame(&mut c, json!({ "id": 41, "method": "item/tool/call", "params": { "tool": "other", "arguments": {} } })).frames);
+        assert_eq!(unknown[0]["result"]["success"], false);
+        let done = json!({ "type": "dynamicToolCall", "id": "d", "tool": "present_files", "contentItems": [{ "type": "inputText", "text": "{}" }] });
+        assert_eq!(dynamic_body(&done), "{}");
+        assert_eq!(
+            transcript(&json!([{ "items": [done] }]))[0]["name"],
+            "present_files"
+        );
+    }
+
+    #[test]
+    fn resumed_threads_keep_their_tools() {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                resume: Some("th-9".into()),
+                ..Options::default()
+            },
+        );
+        c.start();
+        let next = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        assert_eq!(next[1]["method"], "thread/resume");
+        assert!(next[1]["params"]["dynamicTools"].is_null());
     }
 
     fn opened() -> Codex {

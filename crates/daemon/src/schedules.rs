@@ -65,6 +65,9 @@ pub struct Schedule {
     pub last_run: Option<LastRun>,
     /// Times skipped in a row since the last run started.
     pub skipped: u32,
+    /// The agent proposal it was created from (`propose_schedule`), which
+    /// the proposal's card looks for.
+    pub origin: Option<String>,
 }
 
 /// The latest run: when it started, its session and how it is going.
@@ -97,6 +100,7 @@ impl Schedule {
             next_run_at: None,
             last_run: None,
             skipped: 0,
+            origin: None,
         }
     }
 
@@ -120,6 +124,7 @@ impl Schedule {
                 "at": run.at, "session": run.session, "status": run.status, "error": run.error,
             })),
             "skipped": self.skipped,
+            "origin": self.origin,
         })
     }
 
@@ -190,6 +195,9 @@ impl Schedule {
         }
         if let Some(date) = text("date") {
             self.date = Some(date);
+        }
+        if let Some(origin) = text("origin").filter(|origin| !origin.is_empty()) {
+            self.origin = Some(origin);
         }
         if let Some(days) = changes["days"].as_array() {
             let mut parsed = days

@@ -42,7 +42,7 @@ pub enum ToolExecutionEvent {
 }
 
 pub fn definitions() -> Vec<Value> {
-    with_function_tool_defaults(vec![
+    with_function_tool_defaults([
         json!({
             "type": "function",
             "name": "read",
@@ -261,7 +261,16 @@ pub fn definitions() -> Vec<Value> {
         crate::web_fetch::definition(),
         crate::web::search_definition(),
         crate::images::definition(),
-    ])
+    ]
+    .into_iter()
+    .chain(
+        crate::user_tools::specs()
+            .into_iter()
+            .map(|(name, description, parameters)| {
+                json!({ "type": "function", "name": name, "description": description, "parameters": parameters })
+            }),
+    )
+    .collect())
 }
 
 /// Static tool names for the system prompt's "Available tools" line. Mirrors
@@ -298,6 +307,7 @@ pub fn prompt_tool_names(
     if images {
         names.push(crate::images::TOOL_NAME);
     }
+    names.extend(crate::user_tools::LOCAL);
     if subagents {
         names.extend([
             "spawn_agent",
@@ -396,7 +406,16 @@ pub fn run_tool_with_events(
         crate::images::TOOL_NAME => {
             crate::images::run(&args, cwd, extra_read_roots, state, &mut emit)
         }
-        _ => json!({ "error": format!("unknown tool: {name}") }),
+        _ => match crate::user_tools::run(name, &args, cwd).or_else(|| {
+            let host = state
+                .host()
+                .filter(|_| crate::user_tools::SESSION_TOOLS.contains(&name))?;
+            Some(host(name, &args))
+        }) {
+            Some(Ok(output)) => output,
+            Some(Err(error)) => json!({ "error": error }),
+            None => json!({ "error": format!("unknown tool: {name}") }),
+        },
     };
     tool_result(name, result, cwd)
 }
@@ -2546,7 +2565,14 @@ struct ToolStateInner {
     /// Messages for the session from work that outlived its tool call (an
     /// interrupted generate_image saving its result), drained into Info events.
     notices: Vec<String>,
+    /// Runs the session tools (`user_tools::SESSION_TOOLS`); only the daemon
+    /// sets it, and they are offered only then.
+    host: Option<HostTools>,
 }
+
+/// The daemon's handler for the session tools: (tool name, arguments) →
+/// output or error. It may block until the answer is in (`wait_session`).
+pub type HostTools = Arc<dyn Fn(&str, &Value) -> Result<Value, String> + Send + Sync>;
 
 impl Drop for ToolStateInner {
     /// The engine owning these background shells is gone (a daemon session
@@ -2610,6 +2636,16 @@ impl ToolState {
             .ok()
             .and_then(|inner| inner.images.clone())
             .unwrap_or_else(|| Err(crate::images::UNAVAILABLE.to_string()))
+    }
+
+    pub fn set_host(&self, host: HostTools) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.host = Some(host);
+        }
+    }
+
+    pub(crate) fn host(&self) -> Option<HostTools> {
+        self.inner.lock().ok().and_then(|inner| inner.host.clone())
     }
 
     pub(crate) fn push_notice(&self, notice: String) {
@@ -4458,7 +4494,9 @@ mod tests {
                 "checkpoint",
                 "web_fetch",
                 "web_search",
-                "generate_image"
+                "generate_image",
+                "present_files",
+                "propose_schedule"
             ]
         );
         assert!(tools
@@ -4510,6 +4548,8 @@ mod tests {
                 "checkpoint",
                 "web_fetch",
                 "generate_image",
+                "present_files",
+                "propose_schedule",
                 "spawn_agent",
                 "wait_agent",
                 "list_agents",

@@ -66,6 +66,23 @@ fn open(hub: &Arc<Hub>, cwd: PathBuf, resume: Option<&str>) -> Result<AgentCore,
     if resume.is_some_and(|id| crate::requirements::gated(hub, id)) {
         core.set_approval_mode(ApprovalMode::Manual);
     }
+    // The session tools (`start_session` …), run by the daemon.
+    let (me, session, mode) = (
+        Arc::downgrade(hub),
+        core.session_id().to_string(),
+        core.live_approval_mode(),
+    );
+    let cwd = core.cwd().to_path_buf();
+    core.set_host_tools(Arc::new(move |name, args| {
+        let hub = me.upgrade().ok_or("the app is shutting down")?;
+        let parent = crate::subsessions::Parent {
+            session: session.clone(),
+            cwd: cwd.clone(),
+            mode: mode().to_string(),
+            gateway: true,
+        };
+        crate::subsessions::call(&hub, &parent, name, args)
+    }));
     Ok(core)
 }
 

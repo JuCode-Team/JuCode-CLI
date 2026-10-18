@@ -121,6 +121,9 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "send_message",
     "close_agent",
     TOOL_NAME,
+    // They only show the user something.
+    crate::user_tools::PRESENT_FILES,
+    crate::user_tools::PROPOSE_SCHEDULE,
 ];
 
 /// Why plan mode refuses this call, or None when it may run. `mcp_read_only`

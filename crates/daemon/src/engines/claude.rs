@@ -35,8 +35,9 @@
 
 mod runs;
 
-use super::{home, resolve, Adapter, Line, Options, Output};
+use super::{home, resolve, Adapter, HostCall, Line, Options, Output};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use jucode_agent_core::user_tools;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -55,6 +56,9 @@ const EDIT_PREVIEW_EVERY: Duration = Duration::from_millis(200);
 /// The API takes an image of at most 5 MB base64 (3.75 MB raw); larger ones
 /// stay files the model opens with Read, which downsizes them.
 const IMAGE_CAP: u64 = 3_750_000;
+
+/// The in-process MCP server carrying `user_tools` (see `command`).
+const MCP_SERVER: &str = "jucode";
 
 /// Settings files written for gateway keys (see `use_gateway`).
 static GATEWAY_FILES: std::sync::Mutex<Vec<(String, std::path::PathBuf)>> =
@@ -135,6 +139,16 @@ pub fn command(id: &str, options: &Options) -> Command {
     ]);
     // Without a prompt tool the CLI drops AskUserQuestion, even in full access.
     command.args(["--permission-prompt-tool", "stdio"]);
+    // The daemon's own tools, served in-process over the control channel
+    // (`mcp_message`); they only show the user something, so they never ask.
+    command.arg("--mcp-config").arg(
+        json!({ "mcpServers": { MCP_SERVER: { "type": "sdk", "name": MCP_SERVER } } }).to_string(),
+    );
+    let allowed: Vec<String> = user_tools::NAMES
+        .iter()
+        .map(|name| format!("mcp__{MCP_SERVER}__{name}"))
+        .collect();
+    command.args(["--allowedTools", &allowed.join(",")]);
     let mode = to_claude_mode(options.approval_mode.as_deref().unwrap_or_default());
     if mode == "bypassPermissions" {
         command.arg("--dangerously-skip-permissions");
@@ -249,7 +263,10 @@ fn tool_name(name: &str) -> &str {
         "Grep" | "Glob" => "ripgrep",
         "WebSearch" => "web_search",
         "WebFetch" => "web_fetch",
-        other => other,
+        other => other
+            .strip_prefix("mcp__jucode__")
+            .filter(|name| user_tools::NAMES.contains(name))
+            .unwrap_or(other),
     }
 }
 
@@ -695,6 +712,8 @@ pub struct Claude {
     /// The composer's slash commands: the CLI's `initialize` reply (with
     /// descriptions and argument hints), plus names only `system/init` lists.
     commands: Vec<Value>,
+    /// `user_tools` calls waiting for the daemon.
+    calls: Vec<HostCall>,
 }
 
 impl Claude {
@@ -737,6 +756,7 @@ impl Claude {
             interrupting: false,
             queued: Vec::new(),
             commands: Vec::new(),
+            calls: Vec::new(),
         }
     }
 
@@ -1509,6 +1529,55 @@ impl Claude {
         events
     }
 
+    /// A JSON-RPC message for the in-process MCP server: initialize and the
+    /// tool list are answered here, a tool call waits for the daemon
+    /// (`answer`); notifications get the empty reply the CLI expects.
+    fn on_mcp_message(&mut self, request_id: &str, message: &Value) -> Output {
+        let reply = |response: Value| {
+            json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request_id, "response": { "mcp_response": response } } })
+                .to_string()
+        };
+        let id = &message["id"];
+        let response = match text(&message["method"]) {
+            _ if id.is_null() => json!({ "jsonrpc": "2.0", "result": {}, "id": 0 }),
+            "initialize" => json!({ "jsonrpc": "2.0", "id": id, "result": {
+                "protocolVersion": message["params"]["protocolVersion"],
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": MCP_SERVER, "version": env!("CARGO_PKG_VERSION") },
+            } }),
+            "tools/list" => {
+                // Always in the prompt, not behind tool search: the model
+                // should think of them without looking.
+                let tools: Vec<Value> = user_tools::specs()
+                    .into_iter()
+                    .chain(user_tools::session_specs())
+                    .map(|(name, description, schema)| {
+                        json!({
+                            "name": name, "description": description, "inputSchema": schema,
+                            "_meta": { "anthropic/alwaysLoad": true },
+                        })
+                    })
+                    .collect();
+                json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tools } })
+            }
+            "tools/call" => {
+                self.calls.push(HostCall {
+                    token: json!({ "request_id": request_id, "id": id }),
+                    name: text(&message["params"]["name"]).to_string(),
+                    args: object(&message["params"]["arguments"]),
+                });
+                return Output::default();
+            }
+            method => {
+                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": format!("unknown method {method}") } })
+            }
+        };
+        Output {
+            events: Vec::new(),
+            frames: vec![reply(response)],
+        }
+    }
+
     fn on_control_request(&mut self, frame: &Value) -> Output {
         let request = &frame["request"];
         let request_id = text(&frame["request_id"]).to_string();
@@ -1528,6 +1597,9 @@ impl Claude {
             });
             self.approvals.insert(call, (request_id, request.clone()));
             return Output::events(vec![event]);
+        }
+        if request["subtype"] == "mcp_message" && request["server_name"] == MCP_SERVER {
+            return self.on_mcp_message(&request_id, &request["message"]);
         }
         if request["subtype"] != "can_use_tool" {
             let subtype = text(&request["subtype"]);
@@ -2033,7 +2105,7 @@ impl Adapter for Claude {
         // desktop has a stop button per background task, so an interrupt
         // spares them.
         frames.push(self.control_request(
-            json!({ "subtype": "initialize", "promptSuggestions": true, "agentProgressSummaries": true, "perTaskStopAffordance": true }),
+            json!({ "subtype": "initialize", "promptSuggestions": true, "agentProgressSummaries": true, "perTaskStopAffordance": true, "sdkMcpServers": [MCP_SERVER] }),
             "",
         ));
         if self.ultracode {
@@ -2448,6 +2520,21 @@ impl Adapter for Claude {
         })
     }
 
+    fn take_calls(&mut self) -> Vec<HostCall> {
+        std::mem::take(&mut self.calls)
+    }
+
+    fn answer(&mut self, token: &Value, result: Result<Value, String>) -> Vec<String> {
+        let (body, is_error) = match result {
+            Ok(output) => (output.to_string(), false),
+            Err(error) => (error, true),
+        };
+        let response = json!({ "jsonrpc": "2.0", "id": token["id"], "result": {
+            "content": [{ "type": "text", "text": body }], "isError": is_error,
+        } });
+        vec![json!({ "type": "control_response", "response": { "subtype": "success", "request_id": token["request_id"], "response": { "mcp_response": response } } }).to_string()]
+    }
+
     fn keep(&self, options: Options) -> Options {
         Options {
             ultracode: self.ultracode,
@@ -2588,6 +2675,35 @@ fn is_conversation_id(id: &str) -> bool {
 
 /// Rows Claude adds that are not conversation: subagent streams, meta notes,
 /// the post-compaction summary.
+/// The `user_tools` calls in a saved row, which the replay keeps (their
+/// cards are what the user was shown): an assistant row's calls are noted
+/// in `calls` (tool_use id → name), a user row's results to them become
+/// tool items.
+fn user_tool_rows(row: &Value, calls: &mut HashMap<String, String>) -> Vec<Value> {
+    let blocks = row["message"]["content"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut items = Vec::new();
+    for block in blocks {
+        match text(&block["type"]) {
+            "tool_use" => {
+                let name = tool_name(text(&block["name"]));
+                if user_tools::NAMES.contains(&name) {
+                    calls.insert(text(&block["id"]).to_string(), name.to_string());
+                }
+            }
+            "tool_result" => {
+                if let Some(name) = calls.remove(text(&block["tool_use_id"])) {
+                    items.push(json!({ "role": "tool", "name": name, "output": result_text(&block["content"]) }));
+                }
+            }
+            _ => {}
+        }
+    }
+    items
+}
+
 fn is_synthetic(row: &Value) -> bool {
     [
         "isSidechain",
@@ -2687,19 +2803,24 @@ fn transcript_in(home: &Path, cwd: &Path, id: &str) -> Vec<Value> {
     if !is_conversation_id(id) {
         return vec![];
     }
+    let mut user_calls = HashMap::new();
     let mut items: Vec<Value> = rows(
         &project_dir(home, cwd).join(format!("{id}.jsonl")),
         64 * 1024 * 1024,
     )
     .filter(|row| !is_synthetic(row))
-    .filter_map(|row| match text(&row["type"]) {
-        "user" | "assistant" => {
-            row_text(&row).map(|content| json!({ "role": row["type"], "content": content }))
-        }
-        "attachment" => {
-            queued_prompt(&row).map(|content| json!({ "role": "user", "content": content }))
-        }
-        _ => None,
+    .flat_map(|row| {
+        let mut items = user_tool_rows(&row, &mut user_calls);
+        items.extend(match text(&row["type"]) {
+            "user" | "assistant" => {
+                row_text(&row).map(|content| json!({ "role": row["type"], "content": content }))
+            }
+            "attachment" => {
+                queued_prompt(&row).map(|content| json!({ "role": "user", "content": content }))
+            }
+            _ => None,
+        });
+        items
     })
     .collect();
     let excess = items.len().saturating_sub(500);
@@ -3777,6 +3898,67 @@ mod tests {
             "Haiku 4.5"
         );
         assert_eq!(compact_model("", "sonnet"), "Sonnet");
+    }
+
+    #[test]
+    fn user_tools_are_served_in_process() {
+        let mut c = claude();
+        let mcp = |id: u64, message: Value| {
+            Line::Frame(
+                json!({ "type": "control_request", "request_id": format!("m{id}"), "request": { "subtype": "mcp_message", "server_name": "jucode", "message": message } }),
+            )
+        };
+        let listed = c.translate(mcp(
+            1,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        ));
+        let reply: Value = serde_json::from_str(&listed.frames[0]).unwrap();
+        let tools = &reply["response"]["response"]["mcp_response"]["result"]["tools"];
+        assert_eq!(tools[0]["name"], "present_files");
+        assert_eq!(tools[0]["_meta"]["anthropic/alwaysLoad"], true);
+        let called = c.translate(mcp(2, json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": "present_files", "arguments": { "files": ["a.mp4"] } } })));
+        assert!(called.frames.is_empty());
+        let calls = c.take_calls();
+        assert_eq!((calls.len(), calls[0].name.as_str()), (1, "present_files"));
+        let answer: Value =
+            serde_json::from_str(&c.answer(&calls[0].token, Err("no such file: a.mp4".into()))[0])
+                .unwrap();
+        assert_eq!(answer["response"]["request_id"], "m2");
+        let response = &answer["response"]["response"]["mcp_response"];
+        assert_eq!(
+            (
+                response["id"].as_u64(),
+                response["result"]["isError"].as_bool()
+            ),
+            (Some(7), Some(true))
+        );
+        assert_eq!(tool_name("mcp__jucode__present_files"), "present_files");
+        assert_eq!(tool_name("mcp__jucode__other"), "mcp__jucode__other");
+        let allowed = command("s", &Options::default())
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .find(|arg| arg.starts_with("mcp__jucode__"))
+            .unwrap();
+        assert!(
+            allowed.contains("mcp__jucode__present_files,")
+                && allowed.ends_with("mcp__jucode__send_session"),
+            "{allowed}"
+        );
+    }
+
+    #[test]
+    fn replay_keeps_user_tool_cards() {
+        let mut calls = HashMap::new();
+        let call = json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "id": "t1", "name": "mcp__jucode__present_files" }, { "type": "tool_use", "id": "t2", "name": "Bash" }] } });
+        assert!(user_tool_rows(&call, &mut calls).is_empty());
+        let result = json!({ "type": "user", "message": { "content": [
+            { "type": "tool_result", "tool_use_id": "t2", "content": "ls" },
+            { "type": "tool_result", "tool_use_id": "t1", "content": [{ "type": "text", "text": "{\"files\":[]}" }] },
+        ] } });
+        assert_eq!(
+            user_tool_rows(&result, &mut calls),
+            vec![json!({ "role": "tool", "name": "present_files", "output": "{\"files\":[]}" })]
+        );
     }
 
     #[test]

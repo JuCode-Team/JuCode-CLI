@@ -439,6 +439,11 @@ pub(crate) fn request_tool_definitions(offer: &ToolOffer<'_>) -> Vec<Value> {
     if let Some((model, efforts, models)) = offer.subagents {
         definitions.extend(subagent_definitions(model, efforts, models));
     }
+    if offer.tool_state.host().is_some() {
+        definitions.extend(crate::user_tools::session_specs().into_iter().map(
+            |(name, description, parameters)| json!({ "type": "function", "name": name, "description": description, "parameters": parameters, "strict": false }),
+        ));
+    }
     definitions.extend(offer.mcp.definitions());
     if offer
         .tool_state

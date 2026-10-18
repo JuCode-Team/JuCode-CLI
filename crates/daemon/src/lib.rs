@@ -21,6 +21,7 @@ mod schedules;
 mod session;
 mod skills;
 mod store;
+mod subsessions;
 mod terminal;
 mod titles;
 mod uploads;

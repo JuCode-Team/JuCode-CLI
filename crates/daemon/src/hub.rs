@@ -93,6 +93,8 @@ pub struct Hub {
     turns: Mutex<HashMap<String, Turns>>,
     /// Sessions whose title is being written now.
     titling: Mutex<HashSet<String>>,
+    /// Sessions other sessions started, by id (see `subsessions`).
+    pub(crate) children: Mutex<HashMap<String, crate::subsessions::Child>>,
     /// This hub, for the threads it starts.
     me: Weak<Hub>,
     /// Each turn's token usage (see `usage`).
@@ -143,6 +145,7 @@ impl Hub {
             last_sweep: AtomicU64::new(0),
             turns: Mutex::new(HashMap::new()),
             titling: Mutex::new(HashSet::new()),
+            children: Mutex::new(HashMap::new()),
             relay: Relay::new(relay, &store),
             usage: Usage::new(&store),
             requirements,
@@ -645,6 +648,7 @@ impl Hub {
         self.usage.close(id);
         self.usage.forget(id);
         self.run_session_ended(id);
+        crate::subsessions::ended(self, id);
         let mut closed = json!({ "type": "session_closed", "session": id });
         if let Some(reason) = lock(&self.close_reasons).remove(id) {
             closed["reason"] = json!(reason);
@@ -981,6 +985,7 @@ impl Hub {
             self.retitle(session);
         }
         self.observe_run(session, event, over, failed.as_deref());
+        crate::subsessions::observe(self, session, event, over, failed.as_deref());
         if let Some(hub) = self.me.upgrade() {
             crate::requirements::observe(&hub, session, event, ended);
         }

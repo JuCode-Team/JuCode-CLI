@@ -2682,6 +2682,18 @@ impl AgentCore {
     /// Marks whether a client is watching. Going unattended also converts
     /// calls already waiting on a prompt into deferred actions, so a client
     /// that disconnects mid-prompt never leaves the turn blocked.
+    /// Gives the session the daemon's session tools (`start_session` …).
+    pub fn set_host_tools(&self, host: crate::tools::HostTools) {
+        self.tool_state.set_host(host);
+    }
+
+    /// Reads the session's approval mode as it is when called (it changes
+    /// mid-session).
+    pub fn live_approval_mode(&self) -> impl Fn() -> &'static str + Send + Sync + 'static {
+        let live = self.approval_mode.clone();
+        move || live.get().as_str()
+    }
+
     pub fn set_attended(&mut self, attended: bool) -> Vec<AgentEvent> {
         self.attended = attended;
         let mut events = Vec::new();

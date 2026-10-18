@@ -28,6 +28,7 @@ mod tokens;
 mod tools;
 mod trust;
 pub mod update;
+pub mod user_tools;
 mod web;
 mod web_fetch;
 
@@ -42,7 +43,9 @@ pub use event::{
 };
 pub use hunks::HunkView;
 pub use session::SessionSummary;
-pub use tools::{git_diff, signal_process_group, terminate_tool_processes, track_process_group};
+pub use tools::{
+    git_diff, signal_process_group, terminate_tool_processes, track_process_group, HostTools,
+};
 
 /// The JuCode gateway URL and an access token good for at least two more
 /// minutes (refreshed first when needed), for tools spawned to call the
