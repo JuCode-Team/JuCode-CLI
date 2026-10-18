@@ -1184,7 +1184,7 @@ impl Session<'_> {
     /// TUI resume it).
     fn saved(&self, id: &str) -> bool {
         match self.kind {
-            Kind::Claude => !claude::transcript(&self.cwd, id).is_empty(),
+            Kind::Claude => !claude::transcript(&self.cwd, id, self.hub.uploads.dir()).is_empty(),
             Kind::Codex => codex::saved(&self.cwd)
                 .iter()
                 .any(|(saved, ..)| saved == id),
@@ -1356,7 +1356,7 @@ impl Session<'_> {
                 // Codex replays its thread when it resumes; Claude Code's
                 // conversation is read from its file.
                 if self.kind == Kind::Claude {
-                    events.push(json!({ "type": "transcript", "items": claude::transcript(&self.cwd, &id) }));
+                    events.push(json!({ "type": "transcript", "items": claude::transcript(&self.cwd, &id, self.hub.uploads.dir()) }));
                 }
                 self.publish(events);
                 Some((started, engine, next))
