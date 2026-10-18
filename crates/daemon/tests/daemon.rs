@@ -1233,6 +1233,226 @@ fn a_running_turn_moves_to_the_tui_only_when_forced() {
     });
 }
 
+/// A phone on a relay stream: sends ops and reads frames, Noise-sealed.
+struct RelayPhone {
+    stream: u32,
+    transport: jucode_daemon::noise::Transport,
+}
+
+impl RelayPhone {
+    fn send(&mut self, relay: &mut FakeRelay, frame: Value) {
+        for message in self.transport.seal(frame.to_string().as_bytes()).unwrap() {
+            relay.send(2, self.stream, &message);
+        }
+    }
+
+    /// Reads frames until `done` matches one; returns all frames read.
+    fn until(&mut self, relay: &mut FakeRelay, mut done: impl FnMut(&Value) -> bool) -> Vec<Value> {
+        let mut seen = Vec::new();
+        loop {
+            let (kind, message) = relay.next_on(self.stream);
+            assert_eq!(kind, 2, "{seen:#?}");
+            let Some(plain) = self.transport.open(&message).unwrap() else {
+                continue;
+            };
+            let frame: Value = serde_json::from_slice(&plain).unwrap();
+            let finished = done(&frame);
+            seen.push(frame);
+            if finished {
+                return seen;
+            }
+        }
+    }
+}
+
+/// A daemon whose relay is a fake one, with a desktop client and a phone
+/// paired through the relay that got its `hello`.
+fn relay_phone(label: &str) -> (Daemon, Client, FakeRelay, RelayPhone) {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+    let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+    let root = temp_dir(label);
+    let daemon = start_daemon_with(
+        root.join("daemon"),
+        Some(format!("ws://{}/relay/v1", relay.local_addr().unwrap())),
+    );
+    let mut desktop = Client::connect(&daemon);
+    request(&mut desktop, json!({ "op": "relay_set", "enabled": true }));
+    let reply = request(&mut desktop, json!({ "op": "pair_link" }));
+    let pair = reply["link"]
+        .as_str()
+        .unwrap()
+        .split_once("/remote#pair=")
+        .unwrap()
+        .1;
+    let parts: Vec<&str> = pair.split('.').collect();
+    let (host_key, code) = (URL_SAFE_NO_PAD.decode(parts[1]).unwrap(), parts[2]);
+    // Other tests' daemons in this process may reach a reused port.
+    let mut host = loop {
+        let (tcp, _) = relay.accept().unwrap();
+        if let Ok(host) = tungstenite::accept(tcp) {
+            break host;
+        }
+    };
+    host.send(Message::text(
+        json!({ "t": "challenge", "nonce": URL_SAFE_NO_PAD.encode([7u8; 32]) }).to_string(),
+    ))
+    .unwrap();
+    host.read().unwrap();
+    host.send(Message::text(
+        json!({ "t": "ready", "host": parts[0] }).to_string(),
+    ))
+    .unwrap();
+    host.get_ref()
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let mut relay = FakeRelay { host };
+    let (phone_key, _) = jucode_daemon::noise::generate_keypair().unwrap();
+    let (reply, transport) = relay.connect(
+        1,
+        &phone_key,
+        &host_key,
+        json!({ "name": "phone", "pair": code }),
+    );
+    assert_eq!(reply["ok"], true, "{reply}");
+    let mut phone = RelayPhone {
+        stream: 1,
+        transport,
+    };
+    phone.until(&mut relay, |f| f["type"] == "hello");
+    (daemon, desktop, relay, phone)
+}
+
+#[test]
+fn a_paired_phone_views_and_drives_a_session_tui_through_the_relay() {
+    let _guard = setup();
+    let _log = fake_claude();
+    let (_daemon, mut desktop, mut relay, mut phone) = relay_phone("relay-tui-state");
+
+    // The desktop moves a conversation to its TUI.
+    let dir = temp_dir("daemon-relay-tui");
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": { "approval_mode": "auto-edit" } }),
+    );
+    let session = created["session"].as_str().unwrap().to_string();
+    desktop.send(json!({ "op": "watch", "session": session }));
+    desktop.until(is_ready(&session));
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "hello" }));
+    desktop.until(turn_done(&session));
+    let opened = request(
+        &mut desktop,
+        json!({ "op": "session_tui", "session": session, "cols": 100, "rows": 30 }),
+    );
+    let term = opened["term"].as_str().unwrap().to_string();
+    let banner = format!("TUI {session}");
+    desktop.until(|f| term_text(std::slice::from_ref(f), &term).contains(&banner));
+
+    // The phone learns the terminal from its snapshot and attaches.
+    phone.send(&mut relay, json!({ "op": "watch", "session": session }));
+    let frames = phone.until(&mut relay, |f| {
+        f["session"] == session.as_str() && f["type"] == "surface"
+    });
+    let surface = frames.last().unwrap();
+    assert_eq!(
+        (surface["surface"].as_str(), surface["term"].as_str()),
+        (Some("tui"), Some(term.as_str()))
+    );
+    phone.send(
+        &mut relay,
+        json!({ "op": "term_attach", "term": term, "cols": 60, "rows": 20, "id": 5 }),
+    );
+    let attached = phone.until(&mut relay, |f| f["id"] == 5).pop().unwrap();
+    assert_eq!(attached["type"], "term_attached", "{attached}");
+    let replay = phone.until(&mut relay, |f| {
+        term_text(std::slice::from_ref(f), &term).contains(&banner)
+    });
+    assert!(replay.iter().all(|f| f["replay"] == true), "{replay:#?}");
+
+    // What the phone types reaches the TUI; both see its answer.
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    phone.send(
+        &mut relay,
+        json!({ "op": "term_input", "term": term, "data": STANDARD.encode("from the phone\n") }),
+    );
+    let mut written = 0;
+    phone.until(&mut relay, |f| {
+        if f["type"] == "term_output" {
+            written += STANDARD.decode(f["data"].as_str().unwrap()).unwrap().len();
+        }
+        term_text(std::slice::from_ref(f), &term).contains("tui: from the phone")
+    });
+    desktop.until(|f| term_text(std::slice::from_ref(f), &term).contains("tui: from the phone"));
+    phone.send(
+        &mut relay,
+        json!({ "op": "term_ack", "term": term, "bytes": written }),
+    );
+
+    // The phone leaving only detaches it.
+    relay.send(3, 1, &[]);
+    type_in(&mut desktop, &term, "still here\n");
+    desktop.until(|f| term_text(std::slice::from_ref(f), &term).contains("tui: still here"));
+    desktop.send(json!({ "op": "term_close", "term": term }));
+    desktop.until(|f| {
+        f["session"] == session.as_str() && f["type"] == "surface" && f["surface"] == "gui"
+    });
+}
+
+#[test]
+fn a_paired_phone_opens_a_shell_that_dies_with_it() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let _guard = setup();
+    let (_daemon, mut desktop, mut relay, mut phone) = relay_phone("relay-shell-state");
+    // Only known directories: a session's makes this one known.
+    let dir = temp_dir("daemon-relay-shell");
+    fs::create_dir_all(&dir).unwrap();
+    let refused = request(&mut desktop, json!({ "op": "term_open", "cwd": dir }));
+    assert_eq!(refused["type"], "error", "{refused}");
+    desktop.create_session(&dir);
+
+    phone.send(
+        &mut relay,
+        json!({ "op": "term_open", "cwd": dir, "cols": 80, "rows": 24, "id": 5 }),
+    );
+    let opened = phone.until(&mut relay, |f| f["id"] == 5).pop().unwrap();
+    assert_eq!(opened["type"], "term_opened", "{opened}");
+    let term = opened["term"].as_str().unwrap().to_string();
+    // It is the phone's alone.
+    let refused = request(&mut desktop, json!({ "op": "term_attach", "term": term }));
+    assert_eq!(refused["message"], format!("unknown terminal {term}"));
+
+    phone.send(
+        &mut relay,
+        json!({ "op": "term_input", "term": term, "data": STANDARD.encode("echo $$ > shell.pid; echo hi-$((40+2))\n") }),
+    );
+    let mut written = 0;
+    phone.until(&mut relay, |f| {
+        if f["type"] == "term_output" {
+            written += STANDARD.decode(f["data"].as_str().unwrap()).unwrap().len();
+        }
+        term_text(std::slice::from_ref(f), &term).contains("hi-42")
+    });
+    phone.send(
+        &mut relay,
+        json!({ "op": "term_ack", "term": term, "bytes": written }),
+    );
+    let pid = fs::read_to_string(dir.join("shell.pid")).unwrap();
+
+    // The phone leaving kills its shell.
+    relay.send(3, 1, &[]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::process::Command::new("kill")
+        .args(["-0", pid.trim()])
+        .status()
+        .unwrap()
+        .success()
+    {
+        assert!(Instant::now() < deadline, "shell {pid} still running");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn a_jucode_conversation_moves_to_its_tui_and_back() {
     let _guard = setup();

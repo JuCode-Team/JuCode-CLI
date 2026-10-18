@@ -108,6 +108,9 @@ plus jitter.
 | handshake (challenge answered) timeout | 10 s |
 | idle client stream (no traffic either way) | 10 min |
 
+Terminal output is flow-controlled end to end by the daemon
+(daemon-protocol.md, Terminals).
+
 `GET /relay/v1/healthz` → `200 ok`.
 Logs: connects/disconnects with host id and stream counts; never payloads.
 

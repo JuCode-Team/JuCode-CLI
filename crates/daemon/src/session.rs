@@ -151,8 +151,8 @@ fn run(hub: &Hub, mut core: AgentCore, id: &str, ops: Receiver<Value>) {
     }
 }
 
-/// The conversation in the jucode TUI, on a terminal for the client that
-/// asked: the engine here lets go of the session while the TUI has it, and
+/// The conversation in the jucode TUI, on a session terminal the client
+/// that asked views first: the engine here lets go of the session while the TUI has it, and
 /// opens it again once the TUI exits. None when the session should stop.
 fn terminal(
     hub: &Hub,

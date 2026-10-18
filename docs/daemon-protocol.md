@@ -557,46 +557,73 @@ in its text. The session's `user_message` event, and the user items of its
 
 ## Terminals
 
-A client (local or a paired device) may run the user's login shell on a pty
-on this computer. `term` is the terminal's id; `data` is base64 (standard
-alphabet) of raw bytes.
+A terminal runs on a pty of this computer and is one of two kinds:
+
+- a session's own TUI (see "A conversation in its TUI"). It belongs to its
+  session: clients (local ones and paired devices, over the LAN or the
+  relay) are its viewers.
+- the user's login shell, opened with `term_open` by any client, local or
+  paired. It belongs to that client: the client is its only viewer, no
+  other client can attach to it, and it is killed (SIGHUP, then SIGKILL)
+  when the client disconnects, detaches, is detached or sends `term_close`.
+
+No client names a program to run. `term` is the terminal's id; `data` is
+base64 (standard alphabet) of raw bytes.
 
 | Op | Reply | |
 | --- | --- | --- |
-| `{"op":"term_open","cwd":"/path","cols":80,"rows":24}` | `term_opened` with `term` | `cwd` must lie in a known directory, as for `fs_*` (`~` is the home directory). `cols` and `rows` default to 80 × 24 and are kept within 2–1000. |
-| `{"op":"term_input","term":"t-…","data":"<base64>"}` | none | Written to the shell in order. |
-| `{"op":"term_resize","term":"t-…","cols":120,"rows":40}` | none | |
-| `{"op":"term_close","term":"t-…"}` | none | Kills the shell; `term_exit` follows. |
+| `{"op":"term_open","cwd":"/path","cols":80,"rows":24}` | `term_opened` with `term` | Opens a shell; the client is its viewer (nothing to replay). `cwd` must lie in a known directory, as for `fs_*` (`~` is the home directory). A client may have 4 shells open; a fifth `term_open` is an error. |
+| `{"op":"term_attach","term":"t-…","cols":80,"rows":24}` | `term_attached` with `term`, `cols`, `rows` | Makes the client a viewer (again, when it already is). The reply comes first, then the latest output (at most 256 KiB) as `term_output` with `"replay":true`. The pty then takes the client's size; when that is its size already, it is changed and set back so the TUI repaints. `cols` and `rows` default to 80 × 24 and are kept within 2–1000. An unknown or ended terminal, or a shell: `"unknown terminal t-…"`. |
+| `{"op":"term_detach","term":"t-…"}` | none | Stops this client's output; a TUI goes on, a shell is killed. |
+| `{"op":"term_input","term":"t-…","data":"<base64>"}` | none | Written to the program in order. |
+| `{"op":"term_resize","term":"t-…","cols":120,"rows":40}` | none | The last resize wins. |
+| `{"op":"term_ack","term":"t-…","bytes":524288}` | none | `bytes`: the decoded bytes this client has written to its emulator for the terminal since it opened the terminal or last attached, replay included. Paired devices only (ignored from local clients); a value not above the last one is ignored. |
+| `{"op":"term_close","term":"t-…"}` | none | Kills the TUI or shell (SIGHUP, then SIGKILL); every viewer gets `term_exit`, and a TUI's session engine resumes. |
 
-Only the client that opened a terminal receives its events:
+Ops other than `term_attach` from a client that is not a viewer are errors
+(`"not attached to terminal t-…"`). Viewers get:
 
-- `{"type":"term_output","term":"t-…","data":"<base64>"}`: the shell's
+- `{"type":"term_output","term":"t-…","data":"<base64>"}`: the program's
   output, sent after 10 ms without more output, at most 64 KiB before
   encoding per frame. A frame may end inside a UTF-8 character or an
-  escape sequence.
-- `{"type":"term_exit","term":"t-…","code":3}`: the shell has exited and
+  escape sequence. Replay frames carry `"replay":true`: a client resets its
+  emulator before the first one and writes them like live output.
+- `{"type":"term_exit","term":"t-…","code":3}`: the program has exited and
   been reaped; `code` is null when it was killed by a signal.
+- `{"type":"term_detached","term":"t-…","reason":"slow"}`: the daemon
+  detached the client (see below); it may attach to a TUI again, and a
+  shell is killed.
 
-A client may have 4 terminals open; a fifth `term_open` is an error. Ops on
-another client's terminal or an unknown one are errors. A terminal belongs to
-its connection: when the client disconnects its shells are killed (SIGHUP,
-then SIGKILL), and there is no reattaching. The shell is `$SHELL -l` (else
-`/bin/zsh` on macOS, `/bin/bash`, then `/bin/sh`), `%COMSPEC%` or
-PowerShell on Windows, with the daemon's environment plus
-`TERM=xterm-256color`, `COLORTERM=truecolor` and `LANG=en_US.UTF-8` when
-`LANG` is unset.
+A client that disconnects is detached; a TUI keeps running until it exits,
+a viewer sends `term_close`, its session closes or the daemon stops. Its
+shells are killed. The shell is `$SHELL -l` (else `/bin/zsh` on macOS,
+`/bin/bash`, then `/bin/sh`), `%COMSPEC%` or PowerShell on Windows, in
+`cwd`, with the daemon's environment plus `TERM=xterm-256color`,
+`COLORTERM=truecolor` and `LANG=en_US.UTF-8` when `LANG` is unset.
+
+Output to a paired device is flow-controlled end to end, so a fast program
+cannot overflow the relay's queue for a slow phone: at most 512 KiB may be
+sent to a device and not acknowledged. While a device's window is full the
+daemon stops reading the pty (the program waits on its writes, as on a slow
+terminal) and every viewer waits; a device whose window stays full for 15 s
+gets `term_detached` with `reason: "slow"`, and output goes on for the
+others. A device acknowledges once it has written 64 KiB more than it last
+acknowledged, else 100 ms after its last unacknowledged write. Local clients
+send no acknowledgements.
 
 ### A conversation in its TUI
 
 `{"op":"session_tui","session":"<id>","cols":120,"rows":40}` moves a
-claude, codex or jucode conversation from the client's chat view into the
-engine's own terminal interface, on a pty of the daemon. The reply is
-`term_opened`; the terminal then works like one from `term_open` (only the
-requesting client gets its output and may type into it, `term_close` ends
-it). It is refused while a turn runs unless the op has `"force":true`
-(the user agreed to stop it: a jucode turn is interrupted, a claude or codex
-engine is killed and every client gets `{"type":"status","message":"interrupted"}`),
-and for an ACP engine.
+claude, codex, jucode or built-in ACP agent conversation from the chat view
+into the engine's own terminal interface, on a pty of the daemon. Any
+client may send it; the daemon decides what runs. The reply is
+`term_opened` with `term`, and the requesting client is the terminal's
+first viewer (nothing to replay yet). It is refused while a turn runs unless
+the op has `"force":true` (the user agreed to stop it: a jucode turn is
+interrupted, another engine is killed and every client gets
+`{"type":"status","message":"interrupted"}`), for an ACP agent the desktop
+registered (`"a registered ACP agent has no TUI here"`), and for an ACP
+conversation that has not opened yet.
 
 The engine process stops first, background tasks with it (clients get an
 empty `background_tasks`), and the TUI resumes the same conversation
@@ -605,14 +632,28 @@ conversation the engine has not saved yet starts there instead (`claude
 --session-id <id>`, plain `codex`, whose new thread the daemon finds in the
 directory when the TUI exits) with
 the session's approval mode and model; under the gateway it gets its own
-key. Every client of the session gets
-`{"type":"surface","session":"<id>","surface":"tui","term":"t-…","client":1}`.
+key. A built-in ACP agent's TUI resumes the agent's conversation (its ACP
+session id is the TUI's too), in the session's approval mode, found and
+started as its ACP agent is (same `PATH`; on the gateway the same agent
+directory and session store):
+
+| `agent` | TUI |
+| --- | --- |
+| `opencode` | `opencode --standalone --session <id>`, with `OPENCODE_CONFIG_CONTENT` as for ACP (`--standalone`: its own server, which sees that environment) |
+| `omp` | `omp --approval-mode <always-ask\|write\|yolo> --resume <id>` |
+| `pi` | `pi --session <id>` (Pi itself, not pi-acp) |
+
+Every client of the session gets
+`{"type":"surface","session":"<id>","surface":"tui","term":"t-…","client":1}`
+(`client`: the one that opened it), also in a watcher's snapshot: that is
+how other clients learn the terminal to attach to.
 While the TUI runs, ops on the session other than `snapshot` are errors.
 
 When the TUI exits (the user quits it, or `term_close`) the engine starts
 again on the conversation, now including the turns typed in the TUI, and
 the session publishes `{"type":"surface","session":"<id>","surface":"gui"}`
-and a fresh `transcript`. Variables that would mark the TUI as a nested
+and a fresh `transcript` (an ACP agent's from its `session/load` replay).
+Variables that would mark the TUI as a nested
 Claude Code session (`CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`, …) are
 removed so it saves its transcript.
 
