@@ -21,7 +21,10 @@
 //!   subagents report through `system/task_*` and
 //!   `background_tasks_changed`; a finished background task also comes back
 //!   as a `<task-notification>` user message that starts a turn.
-//! - Mid-turn user messages queue in the CLI and run as the next turn.
+//! - A user message sent mid-turn is taken into the running turn at the
+//!   next tool boundary (or starts the next turn), and replayed then; until
+//!   that replay it shows as queued (`pending_messages`). Claude saves it
+//!   only as a `queued_command` attachment row.
 //! - Full access (`bypassPermissions`) is only honored when the CLI starts
 //!   with `--dangerously-skip-permissions`, so switching into or out of it
 //!   restarts the engine on the same conversation.
@@ -687,6 +690,8 @@ pub struct Claude {
     start_usage: Value,
     active_turn: bool,
     interrupting: bool,
+    /// Messages sent mid-turn that Claude has not taken in (replayed) yet.
+    queued: Vec<String>,
     /// The composer's slash commands: the CLI's `initialize` reply (with
     /// descriptions and argument hints), plus names only `system/init` lists.
     commands: Vec<Value>,
@@ -730,6 +735,7 @@ impl Claude {
             start_usage: Value::Null,
             active_turn: false,
             interrupting: false,
+            queued: Vec::new(),
             commands: Vec::new(),
         }
     }
@@ -814,6 +820,10 @@ impl Claude {
             });
         }
         content
+    }
+
+    fn queued_event(&self) -> Value {
+        json!({ "type": "pending_messages", "messages": self.queued })
     }
 
     fn user_text(text: &str) -> String {
@@ -1409,6 +1419,15 @@ impl Claude {
                     .unwrap_or_default(),
             };
             let trimmed = message.trim();
+            let mut events = Vec::new();
+            if let Some(i) = self.queued.iter().position(|q| q == trimmed) {
+                self.queued.remove(i);
+                events.push(self.queued_event());
+            }
+            if let Some(command) = shown_command(trimmed) {
+                events.push(json!({ "type": "user_message", "content": command }));
+                return events;
+            }
             // A finished background task comes back as `task_done`.
             if trimmed.starts_with("<command-")
                 || trimmed.starts_with("<local-command-")
@@ -1416,9 +1435,10 @@ impl Claude {
                 || is_effort_echo(&message)
                 || message.is_empty()
             {
-                return vec![];
+                return events;
             }
-            return vec![json!({ "type": "user_message", "content": message })];
+            events.push(json!({ "type": "user_message", "content": message }));
+            return events;
         }
         let mut events: Vec<Value> = content
             .as_array()
@@ -1438,6 +1458,12 @@ impl Claude {
         self.active_turn = false;
         let was_interrupting = std::mem::take(&mut self.interrupting);
         let mut events = Vec::new();
+        // Stopped: what was waiting is not known to run; if it does, its
+        // replay still shows it.
+        if was_interrupting && !self.queued.is_empty() {
+            self.queued.clear();
+            events.push(self.queued_event());
+        }
         if let Some(usage) = frame["modelUsage"].as_object() {
             for (name, usage) in usage {
                 if let Some(window) = usage["contextWindow"].as_u64().filter(|w| *w > 0) {
@@ -2178,7 +2204,20 @@ impl Adapter for Claude {
 
     fn encode(&mut self, op: &Value) -> Result<Output, String> {
         let frames = match text(&op["op"]) {
-            "user_message" => vec![json!({ "type": "user", "message": { "role": "user", "content": Self::user_content(op) } }).to_string()],
+            "user_message" => {
+                let frames = vec![json!({ "type": "user", "message": { "role": "user", "content": Self::user_content(op) } }).to_string()];
+                if !self.active_turn {
+                    return Ok(Output {
+                        events: Vec::new(),
+                        frames,
+                    });
+                }
+                self.queued.push(text(&op["content"]).trim().to_string());
+                return Ok(Output {
+                    events: vec![self.queued_event()],
+                    frames,
+                });
+            }
             "approve" => {
                 let call = text(&op["call_id"]);
                 let Some((request_id, request)) = self.approvals.remove(call) else {
@@ -2336,7 +2375,9 @@ impl Adapter for Claude {
             )],
             "mcp_list" => vec![self.control_request(json!({ "subtype": "mcp_status" }), "")],
             // What the context holds, by kind (Claude Code's /context).
-            "context_usage" => vec![self.control_request(json!({ "subtype": "get_context_usage" }), "")],
+            "context_usage" => {
+                vec![self.control_request(json!({ "subtype": "get_context_usage" }), "")]
+            }
             "mcp_toggle" | "mcp_reconnect" => {
                 let request = if op["op"] == "mcp_toggle" {
                     json!({ "subtype": "mcp_toggle", "serverName": op["name"], "enabled": op["enabled"] == true })
@@ -2360,15 +2401,18 @@ impl Adapter for Claude {
             "subagent_transcript" => {
                 let id = text(&op["agent_id"]);
                 let event = match runs::transcript(&self.session_dir(), id) {
-                    Ok(items) => json!({ "type": "subagent_transcript", "agent_id": id, "items": items }),
-                    Err(error) => json!({ "type": "subagent_transcript", "agent_id": id, "error": error }),
+                    Ok(items) => {
+                        json!({ "type": "subagent_transcript", "agent_id": id, "items": items })
+                    }
+                    Err(error) => {
+                        json!({ "type": "subagent_transcript", "agent_id": id, "error": error })
+                    }
                 };
                 return Ok(Output::events(vec![event]));
             }
-            "permission_rules" => vec![self.control_request(
-                json!({ "subtype": "list_permission_rules" }),
-                "",
-            )],
+            "permission_rules" => {
+                vec![self.control_request(json!({ "subtype": "list_permission_rules" }), "")]
+            }
             // The user's name for the session, so `claude --resume` shows it too.
             "rename" => vec![self.control_request(
                 json!({ "subtype": "rename_session", "title": op["title"], "source": "host" }),
@@ -2555,21 +2599,72 @@ fn is_synthetic(row: &Value) -> bool {
     .any(|key| row[*key] == true)
 }
 
-fn row_text(row: &Value) -> Option<String> {
-    let content = &row["message"]["content"];
-    if let Some(text) = content.as_str() {
+/// Slash commands that show in the conversation as what the user wrote.
+/// Claude echoes a command as `<command-name>/goal</command-name>
+/// <command-message>…</command-message><command-args>…</command-args>`;
+/// other commands (settings, /compact) stay out of the conversation.
+const SHOWN_COMMANDS: &[&str] = &["/goal"];
+
+/// `/goal <its condition>` for an echoed command that shows.
+fn shown_command(text: &str) -> Option<String> {
+    let between = |open: &str, close: &str| {
+        let start = text.find(open)? + open.len();
+        let end = start + text[start..].find(close)?;
+        Some(text[start..end].trim())
+    };
+    let name = between("<command-name>", "</command-name>")?;
+    if !SHOWN_COMMANDS.contains(&name) {
+        return None;
+    }
+    let args = between("<command-args>", "</command-args>").unwrap_or("");
+    Some(if args.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} {args}")
+    })
+}
+
+/// The user's or the model's text in a saved message: text blocks, without
+/// the markup Claude adds (`<system-reminder>`, command echoes), except a
+/// command that shows.
+fn content_text(content: &Value) -> Option<String> {
+    let keep = |text: &str| {
         let text = text.trim();
-        return (!text.is_empty() && !text.starts_with('<')).then(|| text.to_string());
+        if text.starts_with('<') {
+            shown_command(text)
+        } else {
+            (!text.is_empty()).then(|| text.to_string())
+        }
+    };
+    if let Some(text) = content.as_str() {
+        return keep(text);
     }
     let text = content
         .as_array()?
         .iter()
         .filter(|block| block["type"] == "text")
         .filter_map(|block| block["text"].as_str())
-        .filter(|text| !text.trim().is_empty() && !text.trim_start().starts_with('<'))
+        .filter_map(keep)
         .collect::<Vec<_>>()
         .join("\n");
     (!text.is_empty()).then_some(text)
+}
+
+fn row_text(row: &Value) -> Option<String> {
+    content_text(&row["message"]["content"])
+}
+
+/// A message the user sent while a turn ran: Claude takes it in at the next
+/// tool boundary and saves it only as a `queued_command` attachment row.
+fn queued_prompt(row: &Value) -> Option<String> {
+    let attachment = &row["attachment"];
+    if row["type"] != "attachment"
+        || attachment["type"] != "queued_command"
+        || attachment["commandMode"] != "prompt"
+    {
+        return None;
+    }
+    content_text(&attachment["prompt"])
 }
 
 fn rows(path: &Path, limit: u64) -> impl Iterator<Item = Value> {
@@ -2596,9 +2691,15 @@ fn transcript_in(home: &Path, cwd: &Path, id: &str) -> Vec<Value> {
         &project_dir(home, cwd).join(format!("{id}.jsonl")),
         64 * 1024 * 1024,
     )
-    .filter(|row| matches!(text(&row["type"]), "user" | "assistant") && !is_synthetic(row))
-    .filter_map(|row| {
-        row_text(&row).map(|content| json!({ "role": row["type"], "content": content }))
+    .filter(|row| !is_synthetic(row))
+    .filter_map(|row| match text(&row["type"]) {
+        "user" | "assistant" => {
+            row_text(&row).map(|content| json!({ "role": row["type"], "content": content }))
+        }
+        "attachment" => {
+            queued_prompt(&row).map(|content| json!({ "role": "user", "content": content }))
+        }
+        _ => None,
     })
     .collect();
     let excess = items.len().saturating_sub(500);
@@ -3622,6 +3723,47 @@ mod tests {
             json!({ "type": "user", "isReplay": true, "message": { "content": "/effort high" } })
         )
         .is_empty());
+        // A goal is what the user asked for: it shows.
+        let goal = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": "<command-name>/goal</command-name>\n<command-message>goal</command-message>\n<command-args>tests pass</command-args>" } }),
+        );
+        assert_eq!(
+            goal,
+            vec![json!({ "type": "user_message", "content": "/goal tests pass" })]
+        );
+    }
+
+    #[test]
+    fn a_message_sent_mid_turn_shows_as_queued_until_claude_takes_it_in() {
+        let mut c = claude();
+        let idle = c
+            .encode(&json!({ "op": "user_message", "content": "first" }))
+            .unwrap();
+        assert!(idle.events.is_empty());
+        frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "status", "status": "requesting" }),
+        );
+        let queued = c
+            .encode(&json!({ "op": "user_message", "content": "also this " }))
+            .unwrap();
+        assert_eq!(queued.frames.len(), 1);
+        assert_eq!(
+            queued.events,
+            vec![json!({ "type": "pending_messages", "messages": ["also this"] })]
+        );
+        let taken = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "also this " }] } }),
+        );
+        assert_eq!(
+            taken,
+            vec![
+                json!({ "type": "pending_messages", "messages": [] }),
+                json!({ "type": "user_message", "content": "also this " })
+            ]
+        );
     }
 
     #[test]
@@ -3650,6 +3792,9 @@ mod tests {
                 json!({ "type": "user", "isMeta": true, "message": { "content": "caveat" } }),
                 json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "hi" }, { "type": "tool_use" }] } }),
                 json!({ "type": "user", "message": { "content": "<command-name>/x</command-name>" } }),
+                json!({ "type": "attachment", "attachment": { "type": "queued_command", "commandMode": "prompt", "prompt": [{ "type": "text", "text": "and the docs" }] } }),
+                json!({ "type": "attachment", "attachment": { "type": "queued_command", "commandMode": "task-notification", "prompt": "<task-notification>" } }),
+                json!({ "type": "user", "message": { "content": "<command-name>/goal</command-name><command-args>done</command-args>" } }),
             ]
             .iter()
             .map(|row| row.to_string() + "\n")
@@ -3662,7 +3807,9 @@ mod tests {
             items,
             vec![
                 json!({ "role": "user", "content": "hello there" }),
-                json!({ "role": "assistant", "content": "hi" })
+                json!({ "role": "assistant", "content": "hi" }),
+                json!({ "role": "user", "content": "and the docs" }),
+                json!({ "role": "user", "content": "/goal done" })
             ]
         );
         assert_eq!(listed[0].0, "11-22");
