@@ -417,6 +417,71 @@ fn gateway(id: &str) {
     client.send(json!({ "op": "session_close", "session": session }));
 }
 
+/// The effort control without a prompt: the levels the agent offers (its
+/// unset value apart), a level picked and the unset value picked back, each
+/// confirmed by the agent's options.
+fn efforts(id: &str) {
+    let mut client = start(id);
+    if !ready(&mut client, id) {
+        return;
+    }
+    let (session, _) = create(&mut client, id, false);
+    let opened = client.until(|f| of(&session, "status")(f) && f["message"] == "ready");
+    let status = opened
+        .iter()
+        .rfind(|f| of(&session, "model_status")(f))
+        .unwrap_or_else(|| panic!("no model_status: {opened:#?}"))
+        .clone();
+    println!("model_status: {status}");
+    let model = status["model"].as_str().unwrap().to_string();
+    let levels = status["reasoning_efforts"].as_array().unwrap().clone();
+    let unset = status["default_effort"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(!levels.is_empty(), "{status}");
+    assert!(
+        levels.iter().all(|l| l != "default" && l != "auto"),
+        "{status}"
+    );
+    let mut pick = |effort: &str| {
+        client.send(json!({ "op": "command", "session": session, "input": format!("/model {model} {effort}") }));
+        let seen =
+            client.until(|f| of(&session, "model_status")(f) && f["reasoning_effort"] == effort);
+        println!("set {effort}: {}", seen.last().unwrap());
+    };
+    let level = levels
+        .iter()
+        .find(|l| **l != status["reasoning_effort"])
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+    pick(&level);
+    if !unset.is_empty() {
+        pick(&unset);
+    }
+    client.send(json!({ "op": "session_close", "session": session }));
+}
+
+#[test]
+#[ignore]
+fn opencode_efforts() {
+    efforts("opencode");
+}
+
+#[test]
+#[ignore]
+fn omp_efforts() {
+    efforts("omp");
+}
+
+#[test]
+#[ignore]
+fn pi_efforts() {
+    efforts("pi");
+}
+
 fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap())
 }

@@ -413,9 +413,11 @@ or an `error`.
 The rest uses the usual events:
 
 - `model_status` with `provider: "acp"`, `model` and `model_label` (the
-  agent's model option value and its name), `reasoning_effort` and
-  `reasoning_efforts` (its thought-level option), `context_window` (the
-  size it last reported). `/model` answers with `model_view` (a current
+  agent's model option value and its name, less a `provider/` prefix the
+  value has too), `reasoning_effort` and `reasoning_efforts` (its
+  thought-level option; the levels leave out a value that leaves the level
+  to the agent, `default` or `auto`, which is `default_effort`, "" when
+  none), `context_window` (the size it last reported). `/model` answers with `model_view` (a current
   value the agent does not list comes first with `listed: false`);
   `/model <value> [effort]` sets the options. Agents without a model option
   have neither.

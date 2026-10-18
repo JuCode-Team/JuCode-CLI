@@ -141,6 +141,35 @@ fn choice_values(option: Option<&Value>) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// Effort values that leave the level to the agent (OpenCode's "default",
+/// oh-my-pi's "auto"): the unset state, not a level of their own.
+const UNSET_EFFORTS: &[&str] = &["default", "auto"];
+
+/// An effort option's levels, weakest first as agents list them, and its
+/// unset value if it has one.
+fn effort_levels(option: Option<&Value>) -> (Vec<Value>, &'static str) {
+    let mut unset = "";
+    let mut levels = Vec::new();
+    for value in choice_values(option) {
+        match UNSET_EFFORTS.iter().find(|u| value == **u) {
+            Some(u) => unset = u,
+            None => levels.push(value),
+        }
+    }
+    (levels, unset)
+}
+
+/// A model's name without the provider prefix of its value, as the other
+/// engines name models ("deepseek/DeepSeek V4 Pro" for
+/// "deepseek/deepseek-v4-pro" is "DeepSeek V4 Pro").
+fn model_name<'a>(value: &str, name: &'a str) -> &'a str {
+    value
+        .split_once('/')
+        .and_then(|(provider, _)| name.strip_prefix(provider)?.strip_prefix('/'))
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(name)
+}
+
 #[derive(Default)]
 struct Tool {
     name: String,
@@ -403,12 +432,15 @@ impl Acp {
         let label = choices(model)
             .into_iter()
             .find(|choice| &choice["value"] == current)
-            .map_or("", |choice| text(&choice["name"]));
+            .map_or("", |choice| {
+                model_name(text(current), text(&choice["name"]))
+            });
         let effort = self.select("thought_level");
+        let (efforts, unset) = effort_levels(effort);
         Some(json!({
             "type": "model_status", "provider": "acp", "model": text(current), "model_label": label,
             "reasoning_effort": effort.map_or("", |e| text(&e["currentValue"])),
-            "reasoning_efforts": choice_values(effort),
+            "reasoning_efforts": efforts, "default_effort": unset,
             "context_window": self.usage_size, "context_limit": 0,
             "state": if self.prompt_in_flight { "streaming" } else { "ready" },
         }))
@@ -418,11 +450,17 @@ impl Acp {
         let model = self.select("model")?;
         let current = &model["currentValue"];
         let effort = self.select("thought_level");
-        let efforts = choice_values(effort);
+        let (efforts, _) = effort_levels(effort);
         let row = |value: &Value, label: &Value| json!({ "model": value, "label": label, "active": value == current, "context_window": 0, "max_output_tokens": 0, "reasoning_efforts": efforts });
         let mut rows: Vec<Value> = choices(model)
             .into_iter()
-            .map(|choice| row(&choice["value"], &choice["name"]))
+            .map(|choice| {
+                let value = &choice["value"];
+                row(
+                    value,
+                    &json!(model_name(text(value), text(&choice["name"]))),
+                )
+            })
             .collect();
         if !rows.iter().any(|row| row["active"] == true) {
             let mut unlisted = row(current, current);
@@ -1436,6 +1474,58 @@ mod tests {
             .encode(&json!({ "op": "command", "input": "/model jucode/claude-5 low" }))
             .unwrap();
         assert!(same.frames.is_empty());
+    }
+
+    #[test]
+    fn an_agent_default_effort_is_the_unset_state_and_names_drop_the_provider() {
+        // OpenCode 2.0: "default" is listed after the strongest level, and
+        // names repeat the provider the value starts with.
+        let mut a = opened();
+        let options = json!([
+            { "id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "deepseek/deepseek-flash",
+              "options": [{ "value": "deepseek/deepseek-flash", "name": "deepseek/DeepSeek V4.1 Flash" },
+                          { "value": "openai/gpt-5", "name": "GPT-5" }] },
+            { "id": "effort", "name": "Effort", "category": "thought_level", "type": "select", "currentValue": "default",
+              "options": [{ "value": "none", "name": "None" }, { "value": "low", "name": "Low" },
+                          { "value": "high", "name": "High" }, { "value": "max", "name": "Max" },
+                          { "value": "default", "name": "Default" }] },
+        ]);
+        let out = update(
+            &mut a,
+            json!({ "sessionUpdate": "config_option_update", "configOptions": options }),
+        );
+        let status = event(&out.events, "model_status");
+        assert_eq!(status["model_label"], "DeepSeek V4.1 Flash");
+        assert_eq!(status["reasoning_effort"], "default");
+        assert_eq!(
+            status["reasoning_efforts"],
+            json!(["none", "low", "high", "max"])
+        );
+        assert_eq!(status["default_effort"], "default");
+        let view = a
+            .encode(&json!({ "op": "command", "input": "/model" }))
+            .unwrap();
+        let rows = &view.events[0]["models"];
+        assert_eq!(rows[0]["label"], "DeepSeek V4.1 Flash");
+        assert_eq!(rows[1]["label"], "GPT-5");
+        assert_eq!(
+            rows[0]["reasoning_efforts"],
+            json!(["none", "low", "high", "max"])
+        );
+        // Back to the agent's default is a pick like any level.
+        let frames = sent(
+            &a.encode(&json!({ "op": "command", "input": "/model deepseek/deepseek-flash high" }))
+                .unwrap()
+                .frames,
+        );
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["params"]["value"], "high");
+        // An effort option without one has no unset value.
+        let out = update(
+            &mut a,
+            json!({ "sessionUpdate": "config_option_update", "configOptions": config() }),
+        );
+        assert_eq!(event(&out.events, "model_status")["default_effort"], "");
     }
 
     #[test]
