@@ -470,7 +470,7 @@ directory, on an engine and in a permission mode. The tasks are saved in
 | Field | Meaning |
 | --- | --- |
 | `cwd` | Where each run starts (null until set: an enabled task needs one). The project's extra directories come along as for any session. |
-| `engine` | `jucode`, `claude` or `codex`. |
+| `engine` | `jucode`, `claude`, `codex` or `acp`. An `acp` task runs a built-in agent: `options.agent` names it (`"a scheduled ACP task needs a built-in agent"`, `"unknown ACP agent <id>"`), and its options name no `command`, `args`, `bin` or `env` (`"scheduled ACP tasks run built-in agents only"`). Its runs start in the task's mode (Pi never asks). |
 | `mode` | The permission mode of its runs: `ask`, `edits`, `auto` or `all`, translated for the engine (`ask` is `manual` on jucode, `read-only` on Claude Code and Codex). |
 | `options` | Start options as `session_create` takes them (`gateway`, `model`, …), saved by the desktop. |
 | `repeat` | `once`, `hourly`, `daily`, `weekdays` (Monday to Friday) or `weekly`. A `once` task switches itself off when it fires. |
@@ -638,7 +638,7 @@ where the last one stopped. The requirement's id comes as `requirement`
 | `{"op":"requirement_image","requirement":"R-1","index":0}` | `requirement_image` with `data` (a data URL) | |
 | `{"op":"requirement_begin","requirement":"R-1","session":"s…","plan":false,"mode":"edits","text":"…","lang":"zh"}` | `requirement_begun` with `requirement`, `session` | Starts work behind the gate (below): links the session, switches it to read-only and sends the requirement with the ask to only explain its understanding. `text`: the user's added words (optional). `lang`: `zh` (default) or `en`. |
 | `{"op":"requirement_confirm","requirement":"R-1","text":"…","lang":"zh"}` | `requirement_confirmed` with `requirement`, `stage` (`plan` or `go`) | The user confirms the gate's current step; an error without a gate or while its session runs a turn. `text` (optional) goes with the next message. |
-| `{"op":"requirement_reply","requirement":"R-1","text":"…","new_session":false,"cwd":"/path","engine":"claude","plan":false,"mode":"auto","lang":"zh"}` | `requirement_replied` with `session` | Sends `text` to its latest session (reopened if closed). With `new_session`, or no session yet, starts one in `cwd` (default: the latest session's, else the project's main directory; neither is an error) on `engine` (default: the latest session's, else jucode) and runs `requirement_begin` on it with `plan` (default `false`), `mode` (default `auto`) and `text`. |
+| `{"op":"requirement_reply","requirement":"R-1","text":"…","new_session":false,"cwd":"/path","engine":"claude","plan":false,"mode":"auto","lang":"zh"}` | `requirement_replied` with `session` | Sends `text` to its latest session (reopened if closed). With `new_session`, or no session yet, starts one in `cwd` (default: the latest session's, else the project's main directory; neither is an error) on `engine` (default: the latest session's, else jucode; `acp` needs `agent`, a built-in agent's id, which defaults to the latest session's when `engine` is left out: `"an ACP session needs options.agent"`) and runs `requirement_begin` on it with `plan` (default `false`), `mode` (default `auto`) and `text`. |
 
 ### The start gate
 

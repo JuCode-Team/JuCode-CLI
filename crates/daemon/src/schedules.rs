@@ -43,7 +43,8 @@ pub struct Schedule {
     /// Where its runs start; None until the user picks one (a task migrated
     /// from an agent whose own folder is gone).
     pub cwd: Option<PathBuf>,
-    /// `claude` or `codex`; None: jucode.
+    /// `claude`, `codex` or `acp` (a built-in agent, `options.agent`);
+    /// None: jucode.
     pub engine: Option<String>,
     /// `ask`, `edits`, `auto` or `all`.
     pub mode: String,
@@ -173,9 +174,6 @@ impl Schedule {
         }
         if let Some(engine) = text("engine") {
             engines::Kind::parse(&engine)?;
-            if engine == "acp" {
-                return Err("scheduled tasks run on jucode, claude or codex".to_string());
-            }
             self.engine = Some(engine).filter(|engine| engine != "jucode" && !engine.is_empty());
         }
         if let Some(mode) = text("mode") {
@@ -208,6 +206,18 @@ impl Schedule {
             parsed.sort_unstable();
             parsed.dedup();
             self.days = parsed;
+        }
+        if self.engine.as_deref() == Some("acp") {
+            let options = engines::Options::from_json(&self.options);
+            if options.runs_programs() {
+                return Err("scheduled ACP tasks run built-in agents only".to_string());
+            }
+            let agent = options
+                .agent
+                .ok_or("a scheduled ACP task needs a built-in agent")?;
+            if engines::acp_presets::find(&agent).is_none() {
+                return Err(format!("unknown ACP agent {agent}"));
+            }
         }
         if self.name.is_empty() {
             return Err("schedule name must not be empty".to_string());
@@ -515,8 +525,11 @@ impl Hub {
                 run.session = Some(session.clone());
             }
         });
-        // The jucode engine takes no start options.
-        self.forward(&session, json!({ "op": "set_approval_mode", "mode": mode }))?;
+        // The jucode engine takes no start options. An ACP agent starts in
+        // its mode (Pi, which never asks, would refuse the switch).
+        if engine != Some(engines::Kind::Acp) {
+            self.forward(&session, json!({ "op": "set_approval_mode", "mode": mode }))?;
+        }
         self.send_to_session(&session, &schedule.prompt)?;
         self.retire_runs(&schedule.id, &session);
         self.broadcast(&self.sessions_json());
@@ -861,11 +874,46 @@ mod tests {
             json!({ "name": "n", "prompt": "p", "repeat": "once", "time": "11:00", "date": "2026-02-30" }),
             json!({ "name": "n", "prompt": "p", "repeat": "daily", "time": "11:00", "mode": "yolo" }),
             json!({ "name": "n", "prompt": "p", "repeat": "daily", "time": "11:00", "engine": "acp" }),
+            json!({ "name": "n", "prompt": "p", "repeat": "daily", "time": "11:00", "engine": "acp",
+                    "options": { "agent": "gemini" } }),
+            json!({ "name": "n", "prompt": "p", "repeat": "daily", "time": "11:00", "engine": "acp",
+                    "options": { "agent": "omp", "command": "/bin/sh" } }),
+            json!({ "name": "n", "prompt": "p", "repeat": "daily", "time": "11:00", "engine": "acp",
+                    "options": { "command": "/bin/sh", "args": ["-c", "x"] } }),
             json!({ "name": "n", "prompt": "p", "repeat": "daily", "time": "11:00", "engine": "gemini" }),
         ] {
             let mut schedule = Schedule::new("sch-1".to_string(), 0);
             assert!(schedule.apply(&bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_scheduled_acp_task_runs_a_built_in_agent() {
+        let mut schedule = Schedule::new("sch-1".to_string(), 0);
+        let fields = json!({ "name": "n", "prompt": "p", "repeat": "daily", "time": "09:00",
+            "engine": "acp", "mode": "edits", "options": { "agent": "omp", "jucode_gateway": false } });
+        schedule.apply(&fields).unwrap();
+        assert_eq!(schedule.engine.as_deref(), Some("acp"));
+        assert_eq!(schedule.to_json()["options"]["agent"], "omp");
+        let message = |changes: Value| {
+            let mut schedule = schedule.clone();
+            schedule.apply(&changes).unwrap_err()
+        };
+        assert_eq!(
+            message(json!({ "options": {} })),
+            "a scheduled ACP task needs a built-in agent"
+        );
+        assert_eq!(
+            message(json!({ "options": { "agent": "x" } })),
+            "unknown ACP agent x"
+        );
+        assert_eq!(
+            message(json!({ "options": { "agent": "omp", "bin": "/bin/sh" } })),
+            "scheduled ACP tasks run built-in agents only"
+        );
+        // Back on jucode, the agent no longer matters.
+        schedule.apply(&json!({ "engine": "jucode" })).unwrap();
+        assert_eq!(schedule.engine, None);
     }
 
     fn hub_with_run(label: &str) -> (Arc<Hub>, std::path::PathBuf, String) {

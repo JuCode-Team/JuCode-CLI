@@ -446,8 +446,13 @@ pub fn reply(hub: &Arc<Hub>, op: &Value) -> Result<Value, String> {
                     .unwrap_or_default(),
             )?,
         };
-        let session =
-            hub.create_engine_session(Some(cwd), None, false, engine, engines::Options::default())?;
+        // No engine named: the latest session's, its agent too.
+        let agent = match op["engine"].is_null() {
+            true => latest.as_ref().and_then(|l| l.agent.as_deref()),
+            false => None,
+        };
+        let options = reply_options(engine, op["agent"].as_str().or(agent))?;
+        let session = hub.create_engine_session(Some(cwd), None, false, engine, options)?;
         let gate = Gate {
             plan: op["plan"] == true,
             mode,
@@ -458,6 +463,24 @@ pub fn reply(hub: &Arc<Hub>, op: &Value) -> Result<Value, String> {
         session
     };
     Ok(json!({ "type": "requirement_replied", "requirement": id, "session": target }))
+}
+
+/// The start options of a new session for `requirement_reply`: an ACP
+/// session runs the built-in agent `agent`.
+fn reply_options(
+    engine: Option<engines::Kind>,
+    agent: Option<&str>,
+) -> Result<engines::Options, String> {
+    if engine != Some(engines::Kind::Acp) {
+        return Ok(engines::Options::default());
+    }
+    let agent = agent
+        .filter(|agent| !agent.is_empty())
+        .ok_or("an ACP session needs options.agent")?;
+    Ok(engines::Options {
+        agent: Some(agent.to_string()),
+        ..engines::Options::default()
+    })
 }
 
 /// How work on a requirement starts: with a plan step or not, the
@@ -1163,6 +1186,22 @@ mod tests {
 
     fn open(sessions: &[&str]) -> Value {
         json!({ "id": "R-1", "state": "open", "sessions": sessions })
+    }
+
+    #[test]
+    fn a_new_acp_session_for_a_requirement_runs_the_named_agent() {
+        let acp = Some(engines::Kind::Acp);
+        let options = reply_options(acp, Some("omp")).unwrap();
+        assert_eq!(options.agent.as_deref(), Some("omp"));
+        assert!(!options.runs_programs());
+        assert_eq!(
+            reply_options(acp, None).unwrap_err(),
+            "an ACP session needs options.agent"
+        );
+        assert_eq!(
+            reply_options(None, Some("omp")).unwrap(),
+            engines::Options::default()
+        );
     }
 
     #[test]
