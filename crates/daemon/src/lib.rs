@@ -75,7 +75,6 @@ pub fn serve(
         gateway::set_group(&record.id, record.group.as_deref());
     }
     let hub = Hub::new(store, version, relay);
-    tool_providers::init(&hub);
     // Runs left going by the last daemon ended with it.
     hub.interrupt_schedule_runs();
     if hub.relay.url().is_some() {

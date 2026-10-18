@@ -73,17 +73,33 @@ pub fn tui(id: Option<&str>, options: &Options) -> Command {
 /// The provider a gateway session configures (see `use_gateway`).
 const GATEWAY_PROVIDER: &str = "jucode_gateway";
 
+/// The provider a session on a custom provider (`tool_providers`)
+/// configures: also through the local gateway, but not the JuCode gateway
+/// (usage and the UI tell them apart by it).
+const CUSTOM_PROVIDER: &str = "jucode_custom";
+
 /// The env var a gateway session reads its key from.
 const GATEWAY_KEY_ENV: &str = "JUCODE_GATEWAY_TOKEN";
 
-/// This session talks to the JuCode gateway through the daemon's local
-/// gateway (`base`, see crate::gateway): config overrides for this process
-/// alone, with the local `key` (never the JuCode token) in its environment.
-pub fn use_gateway(command: &mut Command, base: &str, key: &str) -> Result<(), String> {
+/// This session talks to the JuCode gateway, or to the custom provider
+/// named `custom`, through the daemon's local gateway (`base`, see
+/// crate::gateway): config overrides for this process alone, with the local
+/// `key` (never the real credential) in its environment.
+pub fn use_gateway(
+    command: &mut Command,
+    base: &str,
+    key: &str,
+    custom: Option<&str>,
+) -> Result<(), String> {
+    let (provider, name) = match custom {
+        // A JSON string is a TOML basic string.
+        Some(name) => (CUSTOM_PROVIDER, json!(name).to_string()),
+        None => (GATEWAY_PROVIDER, json!("JuCode").to_string()),
+    };
     command
-        .args(["-c", &format!("model_provider=\"{GATEWAY_PROVIDER}\""), "-c"])
+        .args(["-c", &format!("model_provider=\"{provider}\""), "-c"])
         .arg(format!(
-            "model_providers.{GATEWAY_PROVIDER}={{name=\"JuCode\",base_url=\"{base}/v1\",env_key=\"{GATEWAY_KEY_ENV}\",wire_api=\"responses\"}}"
+            "model_providers.{provider}={{name={name},base_url=\"{base}/v1\",env_key=\"{GATEWAY_KEY_ENV}\",wire_api=\"responses\"}}"
         ))
         .env(GATEWAY_KEY_ENV, key);
     Ok(())
@@ -415,9 +431,11 @@ pub struct Codex {
     pending: HashMap<u64, (String, String)>,
     thread: Option<String>,
     resume: Option<String>,
-    /// Talks to the JuCode gateway: a resumed thread must too, whichever
-    /// provider it was written with (`thread/resume` would use that one).
-    gateway: bool,
+    /// The provider `use_gateway` configured (the JuCode gateway or a custom
+    /// one): a resumed thread must use it too, whichever provider it was
+    /// written with (`thread/resume` would use that one). None: Codex's own
+    /// configuration, the only one with a ChatGPT plan's limits.
+    gateway: Option<&'static str>,
     active_turn: Option<String>,
     /// A turn is starting or running.
     busy: bool,
@@ -486,8 +504,17 @@ impl Codex {
             pending: HashMap::new(),
             thread: None,
             resume: options.resume.clone(),
-            gateway: options.gateway == Some(true)
-                || crate::tool_providers::selected("codex").is_some(),
+            gateway: if options.gateway == Some(true) {
+                Some(GATEWAY_PROVIDER)
+            } else if options
+                .tool_provider
+                .as_deref()
+                .is_some_and(|p| !p.is_empty())
+            {
+                Some(CUSTOM_PROVIDER)
+            } else {
+                None
+            },
             active_turn: None,
             busy: false,
             queued: Vec::new(),
@@ -904,8 +931,8 @@ impl Codex {
                     Some(thread) => {
                         let mut params = open;
                         params["threadId"] = json!(thread);
-                        if self.gateway {
-                            params["modelProvider"] = json!(GATEWAY_PROVIDER);
+                        if let Some(provider) = self.gateway {
+                            params["modelProvider"] = json!(provider);
                         }
                         self.request("thread/resume", params, "")
                     }
@@ -918,7 +945,7 @@ impl Codex {
                 let cwd = self.cwd.clone();
                 frames.push(self.request("skills/list", json!({ "cwds": [cwd] }), ""));
                 // The ChatGPT plan's limits (a gateway session has none).
-                if !self.gateway {
+                if self.gateway.is_none() {
                     frames.push(self.request("account/rateLimits/read", json!({}), ""));
                 }
                 Output {
@@ -2664,7 +2691,7 @@ mod tests {
     #[test]
     fn the_gateway_goes_to_this_process_only() {
         let mut command = std::process::Command::new("codex");
-        use_gateway(&mut command, "http://127.0.0.1:7788/gw", "tok").unwrap();
+        use_gateway(&mut command, "http://127.0.0.1:7788/gw", "tok", None).unwrap();
         let args: Vec<String> = command
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
@@ -2930,6 +2957,43 @@ mod tests {
         let next = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
         assert_eq!(next[1]["method"], "thread/resume");
         assert_eq!(next[1]["params"]["modelProvider"], GATEWAY_PROVIDER);
+    }
+
+    #[test]
+    fn a_custom_provider_session_is_not_the_jucode_gateway_and_has_no_plan() {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                resume: Some("th-9".into()),
+                gateway: Some(false),
+                tool_provider: Some("mine".into()),
+                ..Options::default()
+            },
+        );
+        c.start();
+        let next = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        assert_eq!(next[1]["params"]["modelProvider"], CUSTOM_PROVIDER);
+        assert!(next
+            .iter()
+            .all(|f| f["method"] != "account/rateLimits/read"));
+        let mut command = std::process::Command::new("codex");
+        use_gateway(
+            &mut command,
+            "http://127.0.0.1:7788/gw",
+            "tok",
+            Some("My \"API\""),
+        )
+        .unwrap();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args[1], "model_provider=\"jucode_custom\"");
+        assert!(
+            args[3].starts_with("model_providers.jucode_custom={name=\"My \\\"API\\\"\","),
+            "{}",
+            args[3]
+        );
     }
 
     #[test]

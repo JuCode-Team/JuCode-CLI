@@ -80,6 +80,11 @@ pub struct Options {
     /// the user's JuCode login instead of the provider in their own config
     /// (which stays untouched). None: as the session last ran.
     pub gateway: Option<bool>,
+    /// Claude / Codex off the JuCode gateway: the custom provider
+    /// (`tool_providers`) the session runs on, by id; "" the tool's own
+    /// configuration; None the tool's current default (a new session). A
+    /// session keeps the one it started on (see `pin_tool_provider`).
+    pub tool_provider: Option<String>,
     /// Claude: start with ultracode on (standing Workflow orchestration).
     pub ultracode: bool,
     /// Claude: the thinking effort to start with.
@@ -126,6 +131,9 @@ impl Options {
                 .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
                 .collect(),
             gateway: value["jucode_gateway"].as_bool(),
+            tool_provider: value["tool_provider"]
+                .as_str()
+                .map(|id| id.trim().to_string()),
             ultracode: value["ultracode"] == true,
             effort: text("effort"),
             fast: value["fast"] == true,
@@ -299,6 +307,7 @@ fn adapter(kind: Kind, cwd: &Path, options: &Options) -> Box<dyn Adapter> {
 /// The engine's command, and the local gateway key it holds when it runs
 /// on the JuCode gateway (see crate::gateway).
 fn command(
+    hub: &Hub,
     kind: Kind,
     id: &str,
     cwd: &Path,
@@ -309,13 +318,14 @@ fn command(
         Kind::Codex => codex::command(options),
         Kind::Acp => acp::command(options)?,
     };
-    with_gateway(kind, id, cwd, options, command)
+    with_gateway(hub, kind, id, cwd, options, command)
 }
 
 /// The engine's own TUI resuming conversation `id` (Claude Code, Codex, a
 /// built-in ACP agent), configured as its GUI process is: environment and
 /// gateway, with a gateway key for `session`.
 fn tui_command(
+    hub: &Hub,
     kind: Kind,
     id: &str,
     session: &str,
@@ -331,12 +341,13 @@ fn tui_command(
             None => return Err("a registered ACP agent has no TUI here".to_string()),
         },
     };
-    with_gateway(kind, session, cwd, options, command)
+    with_gateway(hub, kind, session, cwd, options, command)
 }
 
 /// `command` with the session's environment, and on the JuCode gateway when
 /// it runs there: with the local gateway key it holds.
 fn with_gateway(
+    hub: &Hub,
     kind: Kind,
     id: &str,
     cwd: &Path,
@@ -344,11 +355,7 @@ fn with_gateway(
     mut command: Command,
 ) -> Result<(Command, Option<String>), String> {
     command.envs(options.env.iter().map(|(name, value)| (name, value)));
-    let custom = if options.gateway != Some(true) {
-        crate::tool_providers::selected(kind.name())
-    } else {
-        None
-    };
+    let custom = custom_provider(&hub.store, kind, options)?;
     if options.gateway != Some(true) && custom.is_none() {
         return Ok((command, None));
     }
@@ -365,11 +372,22 @@ fn with_gateway(
     }
     let base = crate::gateway::base_url()?;
     let key = crate::gateway::issue(id)?;
+    let model = custom
+        .as_ref()
+        .and_then(|p| p["model"].as_str().map(str::to_string));
+    let name = custom
+        .as_ref()
+        .and_then(|p| p["name"].as_str().map(str::to_string));
     if let Some(provider) = custom {
-        crate::gateway::set_custom(&key, kind.name(), provider);
+        let owner = hub
+            .handle()
+            .as_ref()
+            .map(Arc::downgrade)
+            .unwrap_or_default();
+        crate::gateway::set_custom(&key, kind.name(), provider, owner);
     }
     let configured = match (kind, preset) {
-        (Kind::Claude, _) => claude::use_gateway(&mut command, id, &base, &key),
+        (Kind::Claude, _) => claude::use_gateway(&mut command, id, &base, &key, model.as_deref()),
         (_, Some(preset)) => acp_presets::use_gateway(
             &mut command,
             preset,
@@ -378,13 +396,69 @@ fn with_gateway(
             &key,
             options.model.as_deref(),
         ),
-        _ => codex::use_gateway(&mut command, &base, &key),
+        _ => codex::use_gateway(&mut command, &base, &key, name.as_deref()),
     };
     if let Err(error) = configured {
         crate::gateway::revoke(&key);
         return Err(error);
     }
     Ok((command, Some(key)))
+}
+
+/// Settles which custom provider a Claude / Codex session off the gateway
+/// runs on, so it keeps that one when it reopens or restarts: one upstream
+/// rejects another's conversation state (Claude's thinking signatures).
+/// None (a new session, or one leaving the gateway) takes the tool's
+/// current default.
+pub fn pin_tool_provider(store: &crate::store::Store, kind: Kind, options: &mut Options) {
+    if matches!(kind, Kind::Claude | Kind::Codex)
+        && options.gateway != Some(true)
+        && options.tool_provider.is_none()
+    {
+        let selected = crate::tool_providers::selected(store, kind.name());
+        options.tool_provider = Some(
+            selected
+                .and_then(|p| p["id"].as_str().map(str::to_string))
+                .unwrap_or_default(),
+        );
+    }
+}
+
+/// The custom provider a session runs on (None: the gateway or the tool's
+/// own configuration). One that was removed fails the start, rather than
+/// moving the conversation somewhere else.
+fn custom_provider(
+    store: &crate::store::Store,
+    kind: Kind,
+    options: &Options,
+) -> Result<Option<Value>, String> {
+    if !matches!(kind, Kind::Claude | Kind::Codex) || options.gateway == Some(true) {
+        return Ok(None);
+    }
+    match options.tool_provider.as_deref() {
+        None | Some("") => Ok(None),
+        Some(id) => crate::tool_providers::find(store, kind.name(), id)
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "这个会话使用的自定义服务商「{id}」已被删除，无法继续。请把会话切换到 JuCode 网关或 {} 自身的配置后再打开。",
+                    match kind {
+                        Kind::Claude => "Claude Code",
+                        _ => "Codex",
+                    }
+                )
+            }),
+    }
+}
+
+/// The `tool_provider` state event: the custom provider the session runs
+/// on (id, name, model), or null.
+fn tool_provider_event(store: &crate::store::Store, kind: Kind, options: &Options) -> Value {
+    let provider = custom_provider(store, kind, options)
+        .ok()
+        .flatten()
+        .map(|p| crate::tool_providers::view(&p));
+    json!({ "type": "tool_provider", "provider": provider })
 }
 
 /// One window of an official plan's usage for the `plan_usage` event: its
@@ -575,6 +649,7 @@ const STATE_EVENTS: &[&str] = &[
     "plan_usage",
     "engine_caps",
     "session_options",
+    "tool_provider",
 ];
 
 impl Snapshot {
@@ -729,15 +804,12 @@ pub fn spawn(
         .as_deref()
         .or(options.resume.as_deref())
         .is_some_and(|session| crate::requirements::gated(&hub, session));
+    let custom = custom_provider(&hub.store, kind, &options)?;
     let options = Options {
-        model: options.model.clone().or_else(|| {
-            if options.gateway == Some(true) {
-                None
-            } else {
-                crate::tool_providers::selected(kind.name())
-                    .and_then(|p| p["model"].as_str().map(str::to_string))
-            }
-        }),
+        model: options
+            .model
+            .clone()
+            .or_else(|| custom.and_then(|p| p["model"].as_str().map(str::to_string))),
         dirs: crate::projects::extra_dirs(&hub, &cwd),
         app_tools_off: app_tools_off(&hub.store),
         approval_mode: if gated {
@@ -747,7 +819,13 @@ pub fn spawn(
         },
         ..options
     };
-    let (command, gateway_key) = command(kind, id.as_deref().unwrap_or_default(), &cwd, &options)?;
+    let (command, gateway_key) = command(
+        &hub,
+        kind,
+        id.as_deref().unwrap_or_default(),
+        &cwd,
+        &options,
+    )?;
     let process = match Process::spawn(command, &cwd) {
         Ok(process) => process,
         Err(error) => {
@@ -909,6 +987,11 @@ impl Session<'_> {
     fn run(&mut self, mut process: Process, options: Options, ops: Receiver<Value>) {
         let mut adapter = adapter(self.kind, &self.cwd, &options);
         process.write(adapter.start());
+        self.publish(vec![tool_provider_event(
+            &self.hub.store,
+            self.kind,
+            &options,
+        )]);
         // What the process runs as now (a restart changes it).
         let mut current = options.clone();
         // Session tools answer from their own threads (`wait_session` blocks).
@@ -1026,6 +1109,15 @@ impl Session<'_> {
                     next.command = options.command.clone();
                     next.args = options.args.clone();
                     next.gateway = next.gateway.or(options.gateway);
+                    next.tool_provider = next.tool_provider.or(options.tool_provider.clone());
+                    // Off the gateway for the first time: the tool's default.
+                    pin_tool_provider(&self.hub.store, self.kind, &mut next);
+                    if let (Some(id), Some(provider)) = (&self.id, &next.tool_provider) {
+                        let _ = self
+                            .hub
+                            .store
+                            .record_session_meta(id, &json!({ "tool_provider": provider }));
+                    }
                     next.approval_mode = next.approval_mode.or(options.approval_mode.clone());
                     next.dirs = crate::projects::extra_dirs(self.hub, &self.cwd);
                     next.app_tools_off = app_tools_off(&self.hub.store);
@@ -1035,14 +1127,21 @@ impl Session<'_> {
                     if let Some(key) = self.gateway_key.take() {
                         release_key(self.kind, &key);
                     }
-                    match command(self.kind, &id, &self.cwd, &next).and_then(|(command, key)| {
-                        self.gateway_key = key;
-                        Process::spawn(command, &self.cwd)
-                    }) {
+                    match command(self.hub, self.kind, &id, &self.cwd, &next).and_then(
+                        |(command, key)| {
+                            self.gateway_key = key;
+                            Process::spawn(command, &self.cwd)
+                        },
+                    ) {
                         Ok(started) => {
                             process = started;
                             adapter = self::adapter(self.kind, &self.cwd, &next);
                             process.write(adapter.start());
+                            self.publish(vec![tool_provider_event(
+                                &self.hub.store,
+                                self.kind,
+                                &next,
+                            )]);
                         }
                         Err(error) => {
                             self.publish(vec![json!({ "type": "error", "message": error })]);
@@ -1132,6 +1231,7 @@ impl Session<'_> {
         };
         let session = self.key_owner(&id);
         match tui_command(
+            self.hub,
             self.kind,
             &id,
             &session,
@@ -1242,11 +1342,12 @@ impl Session<'_> {
             ..options
         };
         let owner = self.key_owner(&id);
-        let started =
-            self::command(self.kind, &owner, &self.cwd, &next).and_then(|(command, key)| {
+        let started = self::command(self.hub, self.kind, &owner, &self.cwd, &next).and_then(
+            |(command, key)| {
                 self.gateway_key = key;
                 Process::spawn(command, &self.cwd)
-            });
+            },
+        );
         match started {
             Ok(started) => {
                 let mut engine = self::adapter(self.kind, &self.cwd, &next);

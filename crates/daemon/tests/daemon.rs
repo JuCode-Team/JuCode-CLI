@@ -1146,6 +1146,130 @@ fn a_claude_conversation_moves_to_its_tui_and_back() {
 }
 
 #[test]
+fn a_claude_session_keeps_the_custom_provider_it_started_on() {
+    let _guard = setup();
+    let log = fake_claude();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-claude-provider");
+    fs::create_dir_all(&dir).unwrap();
+    let mut desktop = Client::connect(&daemon);
+    for id in ["p1", "p2"] {
+        let saved = request(
+            &mut desktop,
+            json!({ "op": "tool_provider_save", "tool": "claude", "provider": { "id": id,
+                "name": format!("Name {id}"), "base_url": "https://example.com/anthropic",
+                "format": "anthropic", "model": format!("model-{id}"), "key": "secret-key" } }),
+        );
+        assert_eq!(saved["type"], "tool_providers", "{saved}");
+    }
+    let select = |desktop: &mut Client, id: &str| {
+        let selected = request(
+            desktop,
+            json!({ "op": "tool_provider_select", "tool": "claude", "provider_id": id }),
+        );
+        assert_eq!(selected["config"]["selected"], id, "{selected}");
+    };
+    select(&mut desktop, "p1");
+    let provider_of = |desktop: &mut Client, session: &str| -> Value {
+        desktop.send(json!({ "op": "watch", "session": session }));
+        let frames = desktop.until(|f| f["session"] == session && f["type"] == "tool_provider");
+        frames.last().unwrap()["provider"].clone()
+    };
+    let created = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude" }),
+    );
+    let session = created["session"].as_str().unwrap().to_string();
+    let p1 = json!({ "id": "p1", "name": "Name p1", "model": "model-p1" });
+    assert_eq!(provider_of(&mut desktop, &session), p1);
+    // The engine's own start, once it has logged it.
+    let start = |n: usize| -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(args) = starts(&log).get(n) {
+                return args.clone();
+            }
+            assert!(Instant::now() < deadline, "no start {n}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let close = |desktop: &mut Client| {
+        desktop.send(json!({ "op": "session_close", "session": session }));
+        desktop.until(|f| f["type"] == "session_closed");
+    };
+
+    // Another default: the conversation stays where it started.
+    select(&mut desktop, "p2");
+    close(&mut desktop);
+    let opened = request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": session }),
+    );
+    assert_eq!(opened["type"], "session_opened", "{opened}");
+    assert_eq!(provider_of(&mut desktop, &session), p1);
+    for n in [0, 1] {
+        let args = start(n);
+        assert!(
+            args.windows(2).any(|w| w == ["--model", "model-p1"]),
+            "{args:?}"
+        );
+        assert!(!args.concat().contains("secret-key"), "{args:?}");
+    }
+
+    // Its provider is gone: it does not move to another one.
+    close(&mut desktop);
+    request(
+        &mut desktop,
+        json!({ "op": "tool_provider_remove", "tool": "claude", "provider_id": "p1" }),
+    );
+    let refused = request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": session }),
+    );
+    assert_eq!(refused["type"], "error", "{refused}");
+    assert!(
+        refused["message"].as_str().unwrap().contains("「p1」"),
+        "{refused}"
+    );
+    // The user moves it to Claude Code's own configuration.
+    let opened = request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": session, "options": { "tool_provider": "" } }),
+    );
+    assert_eq!(opened["type"], "session_opened", "{opened}");
+    assert_eq!(provider_of(&mut desktop, &session), Value::Null);
+    close(&mut desktop);
+    let opened = request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": session }),
+    );
+    assert_eq!(opened["type"], "session_opened", "{opened}");
+    assert_eq!(provider_of(&mut desktop, &session), Value::Null);
+
+    // A paired device may not see or change the providers.
+    desktop.send(json!({ "op": "pair_start", "id": 1 }));
+    let code = desktop.until(|f| f["id"] == 1).pop().unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (_, response) = http(&daemon, &pair_request(&code));
+    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let mut phone = Client::connect_with(&daemon, body["token"].as_str().unwrap());
+    for op in [
+        json!({ "op": "tool_providers", "tool": "claude" }),
+        json!({ "op": "tool_provider_select", "tool": "claude", "provider_id": "" }),
+        json!({ "op": "tool_provider_save", "tool": "claude", "provider": {} }),
+        json!({ "op": "tool_provider_remove", "tool": "claude", "provider_id": "p2" }),
+    ] {
+        let refused = request(&mut phone, op);
+        assert_eq!(
+            refused["message"], "only the desktop can manage tool providers",
+            "{refused}"
+        );
+    }
+}
+
+#[test]
 fn a_new_claude_conversation_starts_in_its_tui() {
     let _guard = setup();
     let log = fake_claude();

@@ -94,10 +94,13 @@ pub fn revoke(key: &str) {
     state.owners.remove(key);
 }
 
-/// Installs a route cache scoped to this core's lifetime. Each provider/key
-/// pair gets a different local key, including compaction and subagent clients.
+/// Routes a JuCode session's API-key inference through here, so it is
+/// metered (see `Meter`). The core asks per client for a local base and key;
+/// each provider/key pair gets its own local key, revoked with the core.
+/// Requests go on to exactly the URL the core would have called (`exact_url`).
 pub fn proxy_core(core: &mut jucode_agent_core::AgentCore, hub: &std::sync::Arc<crate::hub::Hub>) {
-    struct Routes(std::sync::Mutex<HashMap<(String, String, String, String), String>>);
+    type Route = (String, String, String);
+    struct Routes(std::sync::Mutex<HashMap<Route, String>>);
     impl Drop for Routes {
         fn drop(&mut self) {
             for key in self.0.get_mut().unwrap_or_else(|p| p.into_inner()).values() {
@@ -112,17 +115,18 @@ pub fn proxy_core(core: &mut jucode_agent_core::AgentCore, hub: &std::sync::Arc<
         if provider == "jucode" || !matches!(protocol, "anthropic" | "responses" | "chat") {
             return Ok((api.to_string(), token.to_string()));
         }
-        let route = (provider.to_string(), protocol.to_string(), api.to_string(), token.to_string());
+        let route = (provider.to_string(), api.to_string(), token.to_string());
         let mut keys = routes.0.lock().unwrap_or_else(|p| p.into_inner());
         let key = match keys.get(&route) {
             Some(key) => key.clone(),
             None => {
                 let key = issue(&session)?;
-                let upstream = if protocol == "anthropic" && !api.trim_end_matches('/').ends_with("/v1") && !api.trim_end_matches('/').ends_with("/anthropic") && !api.starts_with("https://api.anthropic.com") {
-                    format!("{}/anthropic", api.trim_end_matches('/'))
-                } else { api.to_string() };
-                set_custom(&key, "jucode", json!({"id":provider,"base_url":upstream,"format":protocol,"key":token,"strip_v1":protocol != "anthropic"}));
-                state().owners.insert(key.clone(), owner.clone());
+                set_custom(
+                    &key,
+                    "jucode",
+                    json!({ "id": provider, "base_url": api, "key": token, "exact": true }),
+                    owner.clone(),
+                );
                 keys.insert(route, key.clone());
                 key
             }
@@ -131,15 +135,34 @@ pub fn proxy_core(core: &mut jucode_agent_core::AgentCore, hub: &std::sync::Arc<
     });
 }
 
-pub fn set_custom(key: &str, tool: &str, mut provider: Value) {
+/// Requests with `key` go to `provider` (`base_url`, `key`, `format`) instead
+/// of the JuCode gateway, metered for `owner`'s usage ledger.
+pub fn set_custom(
+    key: &str,
+    tool: &str,
+    mut provider: Value,
+    owner: std::sync::Weak<crate::hub::Hub>,
+) {
     provider["tool"] = json!(tool);
     let mut state = state();
     state.custom.insert(key.to_string(), provider);
-    if let Some(hub) = crate::tool_providers::hub() {
-        state
-            .owners
-            .insert(key.to_string(), std::sync::Arc::downgrade(&hub));
+    state.owners.insert(key.to_string(), owner);
+}
+
+/// The upstream URL for a JuCode session's request: the core was given
+/// `<local>/v1` as its base, so `target` is `/v1` + what its client appended
+/// to that base, and the same suffix goes on the real base. Anthropic
+/// Messages is the one protocol whose path depends on the base itself
+/// (`messages_url`), so it is rebuilt from the real base.
+fn exact_url(api: &str, target: &str) -> String {
+    let rest = target.strip_prefix("/v1").unwrap_or(target);
+    let path = rest.split('?').next().unwrap_or_default();
+    if path == "/messages" || path.starts_with("/messages/") {
+        let messages = llm_provider_kit::anthropic::messages_url(api);
+        let base = messages.strip_suffix("/messages").unwrap_or(&messages);
+        return format!("{base}{rest}");
     }
+    format!("{}{rest}", api.trim_end_matches('/'))
 }
 
 pub fn custom_for_session(session: &str) -> Option<Value> {
@@ -485,22 +508,32 @@ fn serve_with(
         )
     };
 
-    let target = if custom
-        .as_ref()
-        .is_some_and(|p| p["strip_v1"] == true || upstream.api.ends_with("/v1"))
-    {
-        request
-            .target
-            .strip_prefix("/v1")
-            .unwrap_or(&request.target)
-    } else {
-        &request.target
+    let url = match &custom {
+        Some(provider) if provider["exact"] == true => exact_url(&upstream.api, &request.target),
+        // A tool provider's URL may name the version (`…/v1`) or not.
+        Some(_) if upstream.api.ends_with("/v1") => format!(
+            "{}{}",
+            upstream.api,
+            request
+                .target
+                .strip_prefix("/v1")
+                .unwrap_or(&request.target)
+        ),
+        _ => format!("{}{}", upstream.api.trim_end_matches('/'), request.target),
     };
-    let url = format!("{}{}", upstream.api.trim_end_matches('/'), target);
     let mut call = agent()
         .request(&request.method, &url)
         .set("Accept-Encoding", "identity");
-    if custom.as_ref().is_some_and(|p| p["format"] == "anthropic") {
+    // As the core's own client authenticates (see llm_provider_kit's
+    // transport): x-api-key only on Anthropic's own host.
+    let api_key_header = match &custom {
+        Some(provider) if provider["exact"] == true => {
+            llm_provider_kit::anthropic::is_official_url(&url)
+        }
+        Some(provider) => provider["format"] == "anthropic",
+        None => false,
+    };
+    if api_key_header {
         call = call.set("x-api-key", &upstream.token);
     } else {
         call = call.set("Authorization", &format!("Bearer {}", upstream.token));
@@ -661,8 +694,16 @@ impl Meter {
         if !self.usage.is_object() {
             self.usage = json!({});
         }
+        // Counts are cumulative (Anthropic's message_delta repeats or
+        // updates message_start's): the largest is the total, and a later
+        // event that zeroes or drops a count does not lose it.
         for (key, value) in usage.as_object().unwrap() {
-            self.usage[key] = value.clone();
+            let seen = self.usage[key].as_u64();
+            match value.as_u64() {
+                Some(count) if seen.is_some_and(|seen| seen >= count) => {}
+                _ if value.is_null() => {}
+                _ => self.usage[key] = value.clone(),
+            }
         }
     }
 }
@@ -892,6 +933,7 @@ mod tests {
             &key,
             "claude",
             json!({"id":"private","base_url":format!("{api}/v1"),"key":"own-secret","format":"anthropic"}),
+            std::sync::Weak::new(),
         );
         set_turn("s-custom-proxy", Some("private-turn"));
         set_group("s-custom-proxy", Some("g1"));
@@ -911,6 +953,94 @@ mod tests {
         assert!(!received.contains("x-jucode-"));
         revoke(&key);
         assert!(custom_for_session("s-custom-proxy").is_none());
+    }
+
+    #[test]
+    fn a_jucode_session_s_request_goes_to_exactly_the_url_its_client_would_call() {
+        use llm_provider_kit::{transport::endpoint, Protocol};
+        let local = "http://127.0.0.1:7788/gw/v1";
+        let bases = [
+            "https://api.anthropic.com",
+            "https://api.anthropic.com/",
+            "https://api.anthropic.com.example.net",
+            "https://api.deepseek.com/anthropic",
+            "https://api.deepseek.com/anthropic/",
+            "https://openrouter.ai/api/v1",
+            "https://openrouter.ai/api/v1/",
+            "https://api.moonshot.cn/v1",
+            "https://host/proxy",
+            "https://host/proxy/",
+            "http://127.0.0.1:11434",
+        ];
+        let protocols = [
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiResponses,
+            Protocol::OpenAiChatCompletions,
+            Protocol::OpenAiCodexResponses,
+        ];
+        for base in bases {
+            for protocol in protocols {
+                let direct = endpoint(protocol, base);
+                let proxied = endpoint(protocol, local);
+                let target = proxied.strip_prefix("http://127.0.0.1:7788/gw").unwrap();
+                assert_eq!(exact_url(base, target), direct, "{base} {protocol:?}");
+            }
+        }
+        // Query strings (Claude Code's `?beta=true`) stay as they were.
+        assert_eq!(
+            exact_url(
+                "https://api.deepseek.com/anthropic",
+                "/v1/messages?beta=true"
+            ),
+            "https://api.deepseek.com/anthropic/v1/messages?beta=true"
+        );
+    }
+
+    #[test]
+    fn a_jucode_session_s_request_authenticates_as_its_client_would() {
+        for (base, path, header) in [
+            (
+                "/anthropic",
+                "/anthropic/v1/messages",
+                "authorization: bearer own-secret",
+            ),
+            (
+                "/v1",
+                "/v1/chat/completions",
+                "authorization: bearer own-secret",
+            ),
+        ] {
+            let key = issue("s-exact").unwrap();
+            let (api, upstream) = fake_upstream();
+            set_custom(
+                &key,
+                "jucode",
+                json!({"id":"p","base_url":format!("{api}{base}"),"key":"own-secret","exact":true}),
+                std::sync::Weak::new(),
+            );
+            let target = if path.ends_with("/messages") {
+                "/v1/messages"
+            } else {
+                "/v1/chat/completions"
+            };
+            let request = format!("POST /gw{target} HTTP/1.1\r\nHost: 127.0.0.1:7788\r\nAuthorization: Bearer {key}\r\nContent-Length: 2\r\n\r\n{{}}");
+            through_gateway(&request, "http://127.0.0.1:9".into(), None);
+            let received = upstream.join().unwrap().to_ascii_lowercase();
+            assert!(received.starts_with(&format!("post {path} ")), "{received}");
+            assert!(received.contains(header), "{received}");
+            assert!(!received.contains("x-api-key"), "{received}");
+            revoke(&key);
+        }
+    }
+
+    #[test]
+    fn a_later_event_that_zeroes_a_count_does_not_lose_it() {
+        let mut meter = Meter::default();
+        meter.feed(b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":40,\"cache_read_input_tokens\":7,\"output_tokens\":1}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":0,\"cache_read_input_tokens\":null,\"output_tokens\":25}}\n\n", true);
+        meter.finish(true);
+        assert_eq!(meter.usage["input_tokens"], 40);
+        assert_eq!(meter.usage["cache_read_input_tokens"], 7);
+        assert_eq!(meter.usage["output_tokens"], 25);
     }
 
     /// A fake JuCode gateway: answers one request with a streamed body and

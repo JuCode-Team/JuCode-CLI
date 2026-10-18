@@ -75,6 +75,9 @@ pub struct SessionRecord {
     pub agent: Option<String>,
     /// ACP: the agent's own id for the conversation.
     pub agent_session: Option<String>,
+    /// Claude / Codex: the custom provider it last ran on off the gateway
+    /// ("": the tool's own configuration; None: not recorded).
+    pub tool_provider: Option<String>,
 }
 
 /// A paired remote device (a phone's browser). Only a hash of its token is
@@ -175,6 +178,9 @@ impl Store {
             }
             if let Some(conversation) = &record.agent_session {
                 meta["agent_session"] = json!(conversation);
+            }
+            if let Some(provider) = &record.tool_provider {
+                meta["tool_provider"] = json!(provider);
             }
             if meta.as_object().is_some_and(|fields| fields.len() > 2) {
                 sessions.push(meta);
@@ -332,8 +338,8 @@ impl Store {
     }
 
     /// Renames, (un)archives, hides or regroups a session from `changes`
-    /// (`title`, `archived`, `hidden`, `group`; the daemon's own `gateway`
-    /// and `agent_session`); fields left out are
+    /// (`title`, `archived`, `hidden`, `group`; the daemon's own `gateway`,
+    /// `agent_session` and `tool_provider`); fields left out are
     /// unchanged, an empty title goes back to the engine's label and an
     /// empty group to automatic routing. False when `changes` names none.
     pub fn record_session_meta(&self, id: &str, changes: &Value) -> io::Result<bool> {
@@ -362,6 +368,10 @@ impl Store {
         }
         if let Some(conversation) = changes["agent_session"].as_str() {
             entry["agent_session"] = json!(conversation);
+            changed = true;
+        }
+        if let Some(provider) = changes["tool_provider"].as_str() {
+            entry["tool_provider"] = json!(provider);
             changed = true;
         }
         if changed {
@@ -430,6 +440,7 @@ impl Store {
                             group: None,
                             agent: None,
                             agent_session: None,
+                            tool_provider: None,
                         }
                     });
                     record.closed = false;
@@ -461,6 +472,9 @@ impl Store {
                         }
                         if let Some(conversation) = entry["agent_session"].as_str() {
                             record.agent_session = Some(conversation.to_string());
+                        }
+                        if let Some(provider) = entry["tool_provider"].as_str() {
+                            record.tool_provider = Some(provider.to_string());
                         }
                     }
                 }
@@ -943,6 +957,9 @@ mod tests {
         assert!(store
             .record_session_meta("s", &json!({ "agent_session": "a-1" }))
             .unwrap());
+        assert!(store
+            .record_session_meta("s", &json!({ "tool_provider": "p1" }))
+            .unwrap());
         store.record_session_closed("s").unwrap();
         store
             .record_engine_session("s", cwd, None, Some("acp"), true, Some("omp"))
@@ -950,7 +967,8 @@ mod tests {
         let record = store.sessions()[0].clone();
         assert_eq!(record.agent.as_deref(), Some("omp"));
         assert_eq!(record.agent_session.as_deref(), Some("a-1"));
-        // Compacted on the next open, both stay.
+        assert_eq!(record.tool_provider.as_deref(), Some("p1"));
+        // Compacted on the next open, all stay.
         drop(store);
         let store = Store::open(dir).unwrap();
         assert_eq!(store.sessions()[0], record);

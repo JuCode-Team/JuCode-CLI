@@ -336,6 +336,11 @@ impl Hub {
         }
         let gateway = options.gateway == Some(true);
         let agent = options.agent.clone();
+        let mut options = options;
+        if let Some(kind) = engine {
+            engines::pin_tool_provider(&self.store, kind, &mut options);
+        }
+        let tool_provider = options.tool_provider.clone();
         let (id, ops, generation) = match engine {
             None => session::spawn(Arc::clone(self), cwd.clone(), None)?,
             Some(kind) => {
@@ -357,6 +362,11 @@ impl Hub {
                 agent.as_deref(),
             )
             .map_err(|error| error.to_string())?;
+        if let Some(provider) = tool_provider {
+            self.store
+                .record_session_meta(&id, &json!({ "tool_provider": provider }))
+                .map_err(|error| error.to_string())?;
+        }
         lock(&self.untitled).insert(id.clone());
         self.host(id.clone(), ops, cwd, generation);
         Ok(id)
@@ -432,12 +442,14 @@ impl Hub {
                     group: None,
                     agent: None,
                     agent_session: None,
+                    tool_provider: None,
                 }
             }
             (None, None) => return Err(format!("unknown session {id}")),
         };
         let kind = engines::Kind::parse(record.engine.as_deref().unwrap_or_default())?;
         let mut gateway = false;
+        let mut tool_provider = None;
         let agent = record.agent.clone();
         let (ops, generation) = match kind {
             None => {
@@ -459,12 +471,22 @@ impl Hub {
                     engines::Kind::Claude => engines::claude::transcript(&record.cwd, id),
                     engines::Kind::Codex | engines::Kind::Acp => Vec::new(),
                 };
-                // A client that does not say (a phone) keeps how it last ran.
-                let options = engines::Options {
+                // A client that does not say (a phone) keeps how it last ran,
+                // on the provider it last ran on off the gateway (recorded
+                // from the first; one recorded before is the tool's own).
+                let mut options = engines::Options {
                     resume: saved.then(|| id.to_string()),
                     gateway: Some(options.gateway.unwrap_or(record.gateway)),
+                    tool_provider: options.tool_provider.or_else(|| {
+                        record
+                            .tool_provider
+                            .clone()
+                            .or_else(|| (!record.gateway).then(String::new))
+                    }),
                     ..options
                 };
+                engines::pin_tool_provider(&self.store, kind, &mut options);
+                tool_provider = options.tool_provider.clone();
                 // An ACP agent names its conversation itself: the session
                 // keeps its id and reopens the agent's (a built-in agent
                 // from its record, whatever the client names; a registered
@@ -508,6 +530,11 @@ impl Hub {
                     gateway,
                     agent.as_deref(),
                 )
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(provider) = tool_provider.filter(|p| record.tool_provider.as_ref() != Some(p)) {
+            self.store
+                .record_session_meta(id, &json!({ "tool_provider": provider }))
                 .map_err(|error| error.to_string())?;
         }
         self.host(id.to_string(), ops, record.cwd, generation);
@@ -1363,6 +1390,7 @@ mod tests {
             group: None,
             agent: None,
             agent_session: None,
+            tool_provider: None,
         };
         assert_eq!(
             shown_title(&record, Some(scheduled)).as_deref(),

@@ -1,20 +1,6 @@
 //! Tool-owned API-key providers. Credentials never leave the local daemon.
-use crate::{hub::Hub, store::Store};
+use crate::store::Store;
 use serde_json::{json, Value};
-use std::sync::{Mutex, OnceLock, Weak};
-
-static HUB: OnceLock<Mutex<Weak<Hub>>> = OnceLock::new();
-pub fn init(hub: &std::sync::Arc<Hub>) {
-    *HUB.get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(|p| p.into_inner()) = std::sync::Arc::downgrade(hub);
-}
-pub fn hub() -> Option<std::sync::Arc<Hub>> {
-    HUB.get()?
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .upgrade()
-}
 
 pub fn format(tool: &str) -> Result<&'static str, String> {
     match tool {
@@ -141,15 +127,27 @@ pub fn handle(store: &Store, op: &Value) -> Result<Value, String> {
     list(store, tool)
 }
 
-pub fn selected(tool: &str) -> Option<Value> {
-    let hub = hub()?;
-    let config = hub.store.setting(&format!("tool_providers_{tool}"));
+/// The provider `tool`'s new sessions start on (None: the tool's own
+/// configuration).
+pub fn selected(store: &Store, tool: &str) -> Option<Value> {
+    let config = store.setting(&format!("tool_providers_{tool}"));
     let id = config["selected"].as_str().filter(|id| !id.is_empty())?;
-    config["providers"]
+    find(store, tool, id)
+}
+
+/// `tool`'s provider `id`, key included (for the local gateway only).
+pub fn find(store: &Store, tool: &str, id: &str) -> Option<Value> {
+    store.setting(&format!("tool_providers_{tool}"))["providers"]
         .as_array()?
         .iter()
         .find(|p| p["id"] == id)
         .cloned()
+}
+
+/// What clients are told about the provider a session runs on: never its
+/// key or URL.
+pub fn view(provider: &Value) -> Value {
+    json!({ "id": provider["id"], "name": provider["name"], "model": provider["model"] })
 }
 
 #[cfg(test)]

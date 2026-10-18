@@ -70,13 +70,32 @@ static GATEWAY_FILES: std::sync::Mutex<Vec<(String, std::path::PathBuf)>> =
 /// credential is the local `key`, never the JuCode token; the file is named
 /// by the session (`id`), not the key, since its path is in the engine's argv
 /// for anyone on the machine to read. An empty ANTHROPIC_API_KEY masks one
-/// the user's own settings set.
-pub fn use_gateway(command: &mut Command, id: &str, base: &str, key: &str) -> Result<(), String> {
-    let settings = json!({ "env": {
+/// the user's own settings set. A custom provider (`tool_providers`) serves
+/// its one `model`: Claude Code's background and subagent requests, which
+/// name Claude models, go to it too.
+pub fn use_gateway(
+    command: &mut Command,
+    id: &str,
+    base: &str,
+    key: &str,
+    model: Option<&str>,
+) -> Result<(), String> {
+    let mut settings = json!({ "env": {
         "ANTHROPIC_BASE_URL": base,
         "ANTHROPIC_AUTH_TOKEN": key,
         "ANTHROPIC_API_KEY": "",
     } });
+    if let Some(model) = model {
+        for name in [
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+        ] {
+            settings["env"][name] = json!(model);
+        }
+    }
     let dir = home().join(".jucode").join("daemon");
     // Older daemons wrote the JuCode token itself here.
     let _ = std::fs::remove_file(dir.join("claude-gateway.json"));
@@ -3124,6 +3143,7 @@ mod tests {
             "sess-1",
             "http://127.0.0.1:7788/gw",
             "jgw-secretkey",
+            None,
         )
         .unwrap();
         let args: Vec<String> = command
@@ -3138,6 +3158,33 @@ mod tests {
             .contains("jgw-secretkey"));
         forget_gateway("jgw-secretkey");
         assert!(!std::path::Path::new(&path).exists());
+        // A custom provider's one model serves the background requests too.
+        let mut command = Command::new("claude");
+        use_gateway(
+            &mut command,
+            "sess-2",
+            "http://x/gw",
+            "jgw-k2",
+            Some("deepseek-chat"),
+        )
+        .unwrap();
+        let path = command
+            .get_args()
+            .last()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+            "deepseek-chat"
+        );
+        assert_eq!(
+            settings["env"]["ANTHROPIC_SMALL_FAST_MODEL"],
+            "deepseek-chat"
+        );
+        forget_gateway("jgw-k2");
     }
 
     #[test]
@@ -4045,9 +4092,21 @@ mod tests {
             "env": { "CLAUDE_CONFIG_DIR": "/tmp/c" },
         }));
         assert!(options.runs_programs());
-        let (command, _) =
-            super::super::command(super::super::Kind::Claude, "x", Path::new("/p"), &options)
-                .unwrap();
+        let dir = std::env::temp_dir().join(format!("jucode-bin-test-{}", std::process::id()));
+        let hub = crate::hub::Hub::new(
+            crate::store::Store::open(dir.clone()).unwrap(),
+            "test",
+            None,
+        );
+        let (command, _) = super::super::command(
+            &hub,
+            super::super::Kind::Claude,
+            "x",
+            Path::new("/p"),
+            &options,
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(dir);
         assert_eq!(command.get_program(), "/opt/claude/bin/claude");
         assert!(command
             .get_envs()

@@ -281,6 +281,7 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `error` | `message` | Error line. Also used for malformed commands and unknown ops. |
 | `surface` / `term_*` | see `docs/daemon-protocol.md` → Terminals | Daemon sessions only: the conversation moved to its engine's TUI on a terminal clients attach to, and back. |
 | `engine_caps` / `session_options` | see `docs/daemon-protocol.md` → ACP agents | Daemon ACP sessions only: what the agent can do, and its settings besides model and effort (set with the `set_session_option` op). |
+| `tool_provider` | `provider: {id, name, model} \| null` | Daemon Claude Code / Codex / ACP sessions only: the custom provider the session runs on, sent when its engine starts; null on the JuCode gateway or the tool's own configuration. See `docs/daemon-protocol.md` → Custom provider traffic and usage. |
 | `status` | `message` | Turn status string: `ready`, `streaming`, `queued: N`, `steering`, `interrupted`, `compacting`, `approval mode: ...`, `trusted ...`, etc. `ready` marks the end of a turn. |
 
 ## Turn sequence

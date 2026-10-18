@@ -346,8 +346,13 @@ impl AgentCore {
     }
 
     /// Whether API-key inference is metered by the host's local gateway.
+    /// A provider with no key (a local server) is called directly, so its
+    /// usage events are the only record of it.
     pub fn uses_request_proxy(&self) -> bool {
         if self.request_proxy.is_none() || self.config.provider == "jucode" {
+            return false;
+        }
+        if self.client_key().is_none() {
             return false;
         }
         let catalog = llm_provider_kit::omp::catalog();
@@ -367,10 +372,13 @@ impl AgentCore {
             )
     }
 
+    fn client_key(&self) -> Option<String> {
+        self.provider_api_key()
+            .or_else(|| env::var(&self.config.api_key_env).ok())
+    }
+
     fn client_route(&self) -> Result<(String, Option<String>), String> {
-        let key = self
-            .provider_api_key()
-            .or_else(|| env::var(&self.config.api_key_env).ok());
+        let key = self.client_key();
         if !self.uses_request_proxy() {
             return Ok((self.config.base_url.clone(), key));
         }
