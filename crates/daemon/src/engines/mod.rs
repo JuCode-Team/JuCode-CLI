@@ -6,6 +6,7 @@
 //! clients that start watching mid-session.
 
 pub mod acp;
+pub mod acp_presets;
 pub mod claude;
 pub mod codex;
 
@@ -66,6 +67,8 @@ pub struct Options {
     pub resume: Option<String>,
     /// Claude: resume the conversation as it was at this message.
     pub resume_at: Option<String>,
+    /// ACP: a built-in agent (`acp_presets`), by id.
+    pub agent: Option<String>,
     /// ACP: the agent's command line.
     pub command: Option<String>,
     pub args: Vec<String>,
@@ -73,9 +76,9 @@ pub struct Options {
     pub bin: Option<String>,
     /// Extra environment for the engine process.
     pub env: Vec<(String, String)>,
-    /// Claude / Codex: talk to the JuCode gateway on the user's JuCode login
-    /// instead of the provider in their own config (which stays untouched).
-    /// None: as the session last ran.
+    /// Claude / Codex / gateway ACP presets: talk to the JuCode gateway on
+    /// the user's JuCode login instead of the provider in their own config
+    /// (which stays untouched). None: as the session last ran.
     pub gateway: Option<bool>,
     /// Claude: start with ultracode on (standing Workflow orchestration).
     pub ultracode: bool,
@@ -107,6 +110,7 @@ impl Options {
             model: text("model"),
             resume: None,
             resume_at: text("resume_at"),
+            agent: text("agent"),
             command: text("command"),
             bin: text("bin"),
             args: value["args"]
@@ -134,7 +138,10 @@ impl Options {
     /// Whether these options name a program or environment to run, which
     /// only the desktop may do.
     pub fn runs_programs(&self) -> bool {
-        self.command.is_some() || self.bin.is_some() || !self.env.is_empty()
+        self.command.is_some()
+            || self.bin.is_some()
+            || !self.args.is_empty()
+            || !self.env.is_empty()
     }
 
     /// Environment names an agent may be given: plain names, never ones that
@@ -275,41 +282,56 @@ pub trait Adapter: Send {
     fn answer(&mut self, _token: &Value, _result: Result<Value, String>) -> Vec<String> {
         Vec::new()
     }
+    /// It can move to the JuCode gateway (`set_gateway`).
+    fn has_gateway(&self) -> bool {
+        true
+    }
 }
 
 fn adapter(kind: Kind, cwd: &Path, options: &Options) -> Box<dyn Adapter> {
     match kind {
         Kind::Claude => Box::new(claude::Claude::new(options).at(cwd)),
         Kind::Codex => Box::new(codex::Codex::new(cwd, options)),
-        Kind::Acp => Box::new(acp::Acp::new(cwd)),
+        Kind::Acp => Box::new(acp::Acp::new(cwd, options)),
     }
 }
 
 /// The engine's command, and the local gateway key it holds when it runs
 /// on the JuCode gateway (see crate::gateway).
-fn command(kind: Kind, id: &str, options: &Options) -> Result<(Command, Option<String>), String> {
+fn command(
+    kind: Kind,
+    id: &str,
+    cwd: &Path,
+    options: &Options,
+) -> Result<(Command, Option<String>), String> {
     let command = match kind {
         Kind::Claude => claude::command(id, options),
         Kind::Codex => codex::command(options),
-        Kind::Acp => acp::command(options),
+        Kind::Acp => acp::command(options)?,
     };
-    with_gateway(kind, id, options, command)
+    with_gateway(kind, id, cwd, options, command)
 }
 
-/// The engine's own TUI resuming conversation `id` (Claude Code, Codex),
-/// configured as its GUI process is: environment and gateway.
+/// The engine's own TUI resuming conversation `id` (Claude Code, Codex, a
+/// built-in ACP agent), configured as its GUI process is: environment and
+/// gateway, with a gateway key for `session`.
 fn tui_command(
     kind: Kind,
     id: &str,
+    session: &str,
+    cwd: &Path,
     options: &Options,
     saved: bool,
 ) -> Result<(Command, Option<String>), String> {
     let command = match kind {
         Kind::Claude => claude::tui(id, options, saved),
         Kind::Codex => codex::tui(saved.then_some(id), options),
-        Kind::Acp => return Err("an ACP agent has no TUI here".to_string()),
+        Kind::Acp => match acp::preset(options)? {
+            Some(preset) => acp_presets::tui(preset, options, id)?,
+            None => return Err("a registered ACP agent has no TUI here".to_string()),
+        },
     };
-    with_gateway(kind, id, options, command)
+    with_gateway(kind, session, cwd, options, command)
 }
 
 /// `command` with the session's environment, and on the JuCode gateway when
@@ -317,6 +339,7 @@ fn tui_command(
 fn with_gateway(
     kind: Kind,
     id: &str,
+    cwd: &Path,
     options: &Options,
     mut command: Command,
 ) -> Result<(Command, Option<String>), String> {
@@ -329,9 +352,13 @@ fn with_gateway(
     if options.gateway != Some(true) && custom.is_none() {
         return Ok((command, None));
     }
-    if kind == Kind::Acp {
-        return Err("an ACP agent has no JuCode gateway mode".to_string());
-    }
+    let preset = match kind {
+        Kind::Acp => match acp::preset(options)? {
+            Some(preset) if preset.gateway => Some(preset),
+            _ => return Err("this agent has no JuCode gateway mode".to_string()),
+        },
+        _ => None,
+    };
     // Not signed in fails the start, not the first request.
     if custom.is_none() {
         jucode_agent_core::jucode_gateway_credentials()?;
@@ -341,8 +368,16 @@ fn with_gateway(
     if let Some(provider) = custom {
         crate::gateway::set_custom(&key, kind.name(), provider);
     }
-    let configured = match kind {
-        Kind::Claude => claude::use_gateway(&mut command, id, &base, &key),
+    let configured = match (kind, preset) {
+        (Kind::Claude, _) => claude::use_gateway(&mut command, id, &base, &key),
+        (_, Some(preset)) => acp_presets::use_gateway(
+            &mut command,
+            preset,
+            cwd,
+            &base,
+            &key,
+            options.model.as_deref(),
+        ),
         _ => codex::use_gateway(&mut command, &base, &key),
     };
     if let Err(error) = configured {
@@ -538,6 +573,8 @@ const STATE_EVENTS: &[&str] = &[
     "plan",
     "rate_limit",
     "plan_usage",
+    "engine_caps",
+    "session_options",
 ];
 
 impl Snapshot {
@@ -710,7 +747,7 @@ pub fn spawn(
         },
         ..options
     };
-    let (command, gateway_key) = command(kind, id.as_deref().unwrap_or_default(), &options)?;
+    let (command, gateway_key) = command(kind, id.as_deref().unwrap_or_default(), &cwd, &options)?;
     let process = match Process::spawn(command, &cwd) {
         Ok(process) => process,
         Err(error) => {
@@ -876,6 +913,8 @@ impl Session<'_> {
         let mut current = options.clone();
         // Session tools answer from their own threads (`wait_session` blocks).
         let (answers_tx, answers) = mpsc::channel::<Answer>();
+        // ACP: the agent's conversation id as last recorded.
+        let mut agent_session: Option<String> = None;
         loop {
             while let Ok((token, result)) = answers.try_recv() {
                 process.write(adapter.answer(&token, result));
@@ -935,6 +974,17 @@ impl Session<'_> {
                                 self.named(id);
                             }
                         }
+                        // An ACP session reopens the agent's conversation,
+                        // which the agent names.
+                        if self.kind == Kind::Acp && adapter.conversation() != agent_session {
+                            agent_session = adapter.conversation();
+                            if let (Some(id), Some(conversation)) = (&self.id, &agent_session) {
+                                let _ = self.hub.store.record_session_meta(
+                                    id,
+                                    &json!({ "agent_session": conversation }),
+                                );
+                            }
+                        }
                         let events =
                             self.allow_while_opening(&mut process, adapter.as_mut(), output.events);
                         self.publish(events);
@@ -972,6 +1022,9 @@ impl Session<'_> {
                     // and gateway.
                     next.bin = options.bin.clone();
                     next.env = options.env.clone();
+                    next.agent = options.agent.clone();
+                    next.command = options.command.clone();
+                    next.args = options.args.clone();
                     next.gateway = next.gateway.or(options.gateway);
                     next.approval_mode = next.approval_mode.or(options.approval_mode.clone());
                     next.dirs = crate::projects::extra_dirs(self.hub, &self.cwd);
@@ -982,7 +1035,7 @@ impl Session<'_> {
                     if let Some(key) = self.gateway_key.take() {
                         release_key(self.kind, &key);
                     }
-                    match command(self.kind, &id, &next).and_then(|(command, key)| {
+                    match command(self.kind, &id, &self.cwd, &next).and_then(|(command, key)| {
                         self.gateway_key = key;
                         Process::spawn(command, &self.cwd)
                     }) {
@@ -1040,6 +1093,15 @@ impl Session<'_> {
         }
     }
 
+    /// The id a gateway key is issued for: the conversation's, except that
+    /// an ACP agent's is not the session's.
+    fn key_owner(&self, conversation: &str) -> String {
+        match (self.kind, &self.id) {
+            (Kind::Acp, Some(session)) => session.clone(),
+            _ => conversation.to_string(),
+        }
+    }
+
     /// Answers a TUI request with an error, to the client that made it.
     fn refuse(&self, request: &Value, message: String) {
         let mut error = json!({ "type": "error", "message": message });
@@ -1059,11 +1121,24 @@ impl Session<'_> {
         options: &Options,
         request: &Value,
     ) -> Option<(String, Command, Option<String>)> {
-        let Some(id) = adapter.conversation().or(self.id.clone()) else {
+        // An ACP agent's conversation is its own, never the session id.
+        let conversation = match self.kind {
+            Kind::Acp => adapter.conversation(),
+            _ => adapter.conversation().or(self.id.clone()),
+        };
+        let Some(id) = conversation else {
             self.refuse(request, "the conversation has not started yet".to_string());
             return None;
         };
-        match tui_command(self.kind, &id, options, self.saved(&id)) {
+        let session = self.key_owner(&id);
+        match tui_command(
+            self.kind,
+            &id,
+            &session,
+            &self.cwd,
+            options,
+            self.saved(&id),
+        ) {
             Ok((tui, key)) => Some((id, tui, key)),
             Err(error) => {
                 self.refuse(request, error);
@@ -1072,11 +1147,11 @@ impl Session<'_> {
         }
     }
 
-    /// The conversation in its engine's own TUI, on a terminal for the
-    /// client that asked, its engine stopped (one process per conversation);
-    /// the engine starts again, resuming, once the TUI exits, and clients see
-    /// `surface` change and the conversation as the TUI left it. None when
-    /// the session should stop.
+    /// The conversation in its engine's own TUI, on a session terminal the
+    /// client that asked views first, its engine stopped (one process per
+    /// conversation); the engine starts again, resuming, once the TUI exits,
+    /// and clients see `surface` change and the conversation as the TUI left
+    /// it. None when the session should stop.
     fn terminal(
         &mut self,
         (id, tui, tui_key): (String, Command, Option<String>),
@@ -1166,10 +1241,12 @@ impl Session<'_> {
             resume_at: None,
             ..options
         };
-        let started = self::command(self.kind, &id, &next).and_then(|(command, key)| {
-            self.gateway_key = key;
-            Process::spawn(command, &self.cwd)
-        });
+        let owner = self.key_owner(&id);
+        let started =
+            self::command(self.kind, &owner, &self.cwd, &next).and_then(|(command, key)| {
+                self.gateway_key = key;
+                Process::spawn(command, &self.cwd)
+            });
         match started {
             Ok(started) => {
                 let mut engine = self::adapter(self.kind, &self.cwd, &next);
@@ -1215,9 +1292,9 @@ impl Session<'_> {
             // A client watching or not changes nothing: approvals wait for
             // whoever answers them next.
             "set_attended" => false,
-            // Claude Code / Codex move between this machine's own login and
-            // the JuCode gateway (a new process; the conversation resumes),
-            // once the running turn ends.
+            // Claude Code, Codex and the gateway ACP presets move between
+            // this machine's own login and the JuCode gateway (a new
+            // process; the conversation resumes), once the running turn ends.
             "set_gateway" => {
                 let Some(gateway) = op["gateway"].as_bool() else {
                     self.publish(vec![
@@ -1225,8 +1302,8 @@ impl Session<'_> {
                     ]);
                     return false;
                 };
-                if self.kind == Kind::Acp {
-                    self.publish(vec![json!({ "type": "error", "message": "an ACP agent has no JuCode gateway mode" })]);
+                if !adapter.has_gateway() {
+                    self.publish(vec![json!({ "type": "error", "message": "this agent has no JuCode gateway mode" })]);
                     return false;
                 }
                 self.restart = Some(

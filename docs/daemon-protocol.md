@@ -126,19 +126,20 @@ every connected client.
 
 | Op | Fields | Reply |
 | --- | --- | --- |
-| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `schedule` (the scheduled task it is a run of, or null), `open`, `watchers`, `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at` |
+| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `schedule` (the scheduled task it is a run of, or null), `open`, `watchers`, `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at`, `engine`, `agent` (an ACP session's built-in agent, else null) |
 | `gateway_catalog` | — | `gateway_catalog`: `models` (the JuCode models the user chose to show, `jucode_models` in config.json) and `groups` (the gateway's groups with their models and multipliers); empty when not signed in or offline. For clients that cannot read this machine's login (the remote page) |
 | `tool_providers` | `tool`: `claude` or `codex` | `tool_providers` with `tool`, `config: {selected, providers}`. Provider rows expose `has_key`, never the key. Local desktop only |
 | `tool_provider_save` | `tool`, `provider: {id, name, base_url, format, model, key}` | Updated `tool_providers`. An empty key preserves the saved key on edit. Claude requires `anthropic`; Codex requires `responses`. Local desktop only |
 | `tool_provider_select` | `tool`, `provider_id` (empty restores the tool’s own configuration) | Updated `tool_providers`. Applies to new or reopened local-mode sessions. Local desktop only |
 | `tool_provider_remove` | `tool`, `provider_id` | Updated `tool_providers`; removing the selected provider clears the selection. Local desktop only |
+| `acp_presets` | — | `acp_presets` with `presets: [{id, name, status, path, version, min_version, approvals, gateway, install, tui}]`: the built-in ACP agents and whether each can start here (`status`: `ready`, `missing` or `unsupported`, older than `min_version`). Each program is asked its `--version` (10 s at most). See "ACP agents" |
 | `restart_when_idle` | — | none. Desktop only: this daemon exits once no session is running (after a `daemon_restarting` broadcast), so the desktop can start a newer one without cutting off a task |
 | `session_meta` | `session`, and any of `title`, `archived`, `hidden`, `group` | none; every client receives the new `sessions` list. An empty title goes back to the engine's label; a hidden session leaves `session_list` and `session_history` (its conversation stays on disk). A session created here is titled after its first user message (first line, 40 characters) unless a client titled it first. After its 1st and 3rd turns, then every 5th, the title model (`title_model` in config.json, else the main `model`) renames it from the project name, the current title, the first and latest requests and the start of the latest reply. A title a client set with `session_meta` is never replaced |
 | `session_history` | `cwd` | `session_history`: every session saved in `cwd`, newest first, whoever ran it (daemon, TUI, `jucode serve`), with `title`, `updated_at`, `entries`, `archived`, `schedule`, `open` |
 | `session_create` | `cwd`, optional `engine` (`jucode`, default, `claude`, `codex` or `acp`) and `options` | `session_created` with `session`; the session's startup events follow. See "Other engines" |
 | `session_open` | `session`, optional `cwd`, `engine`, `options` | `session_opened`; with `cwd`, also opens a session saved there that the daemon never hosted. Reopens a closed session (or one from before a restart), resuming its transcript and its undecided deferred actions |
 | `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped |
-| `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `approval_mode_pending`, `mcp_servers`), a `transcript` of the conversation so far and `attended` |
+| `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `approval_mode_pending`, `mcp_servers`, `engine_caps`, `session_options`), a `transcript` of the conversation so far and `attended` |
 | `actions_list` | — | `actions`: undecided deferred actions across all sessions, and in `closed` the ones closed in the last 7 days (each with `closed_by`, `closed_reason`, `closed_at`) |
 | `pair_start` | — | `pairing` with `code` and `expires_at` (local clients only) |
 | `device_list` | — | `devices`: paired, unrevoked devices (local clients only) |
@@ -247,18 +248,19 @@ clients need nothing engine-specific. `options`:
 | `model` | Model to start with |
 | `resume_at` | Claude Code: resume the conversation as it was at this assistant message uuid |
 | `effort`, `ultracode`, `fast`, `thinking` | Claude Code: start with this thinking effort, ultracode on, fast mode on, thinking summaries shown (`false` hides them). A restart (full access, gateway switch) keeps the session's own |
-| `jucode_gateway` | Claude Code / Codex: `true` runs this session through the JuCode gateway on the user's JuCode login; `false` uses this tool’s selected custom provider, or the user’s own Claude Code / Codex config when none is selected. The endpoint and key go to this process only (Claude: `--settings` file; Codex: `-c` overrides and an env var), never to the user's config files. Omitted on `session_open`: as the session last ran |
-| `command`, `args` | ACP: the agent's command line |
+| `jucode_gateway` | Claude Code / Codex / ACP agents with `gateway`: `true` runs this session through the JuCode gateway on the user's JuCode login; `false` uses the tool's selected custom provider (Claude Code / Codex), or the provider in the user's own config when none is selected. The endpoint and key go to this process only (Claude: `--settings` file; Codex: `-c` overrides and an env var; ACP: see "ACP agents"), never to the user's config files. Omitted on `session_open`: as the session last ran |
+| `agent` | ACP: a built-in agent by id (`acp_presets`); the daemon finds and starts it. Excludes `command`, `args`, `bin` and `env` |
+| `command`, `args` | ACP: the agent's command line (an agent the desktop registered) |
 | `bin` | Claude Code / Codex: the engine binary to run instead of the one found on `PATH` |
 | `env` | Extra environment variables for the engine process (plain names; no `DYLD_*`/`LD_*`) |
 
-`engine: "acp"` runs an Agent Client Protocol agent (`jucode acp`,
-`gemini --experimental-acp`, ...) from `options.command`. Only local
-clients may start or reopen one, or pass `bin` or `env` for any engine,
-since that names a program to run; paired devices watch and drive such
-sessions like any other. ACP agents keep no
-conversation the daemon can resume, so reopening an ACP session starts a
-new conversation under the same session id.
+`engine: "acp"` runs an Agent Client Protocol agent: a built-in one named
+by `options.agent`, or one the desktop registered, from `options.command`
+(`jucode acp`, `gemini --experimental-acp`, ...). Any client may start a
+built-in agent by id; only local clients may name `command`, `args`, `bin`
+or `env` for any engine, since that names a program to run (`"only the
+desktop can choose what an engine runs"`). Paired devices watch and drive
+every session like any other. See "ACP agents".
 
 The session id is the engine's conversation id (Claude Code's session id,
 Codex's thread id), so reopening a closed session resumes the same
@@ -334,6 +336,109 @@ attached to a `user_message` go as image blocks (files over 3.75 MB as a path
 to Read). A session's name is shared both ways: a `session_meta` title is
 sent to Claude Code (`claude --resume` lists it), and a name Claude Code
 has for the session becomes its title.
+
+### ACP agents
+
+Only the stable ACP schema is used (protocol v1); what it cannot express is
+not offered. The built-in agents:
+
+| `agent` | Runs | Approvals | Gateway |
+| --- | --- | --- | --- |
+| `opencode` | `opencode acp` (2.0.0 or later) | asks for edits and shell commands in `read-only` (and `plan`, `auto`, `manual`), for shell commands in `auto-edit`, through `OPENCODE_CONFIG_CONTENT`; `full-access` leaves the user's own OpenCode rules | no: it runs on the providers the user set up in OpenCode |
+| `omp` | `omp acp --approval-mode always-ask` (`write` in `auto-edit`, `yolo` in `full-access`) | yes, as permission prompts and form elicitations | yes |
+| `pi` | `npx -y pi-acp@0.0.34`, which runs `pi --mode rpc` (Pi 0.81.0 or later) | none: Pi never asks (`engine_caps.approvals` is `false`) | yes |
+
+A program is found on `PATH`, the usual install directories, then
+`~/.opencode/bin` (OpenCode) or `~/.bun/bin` (oh-my-pi), and runs with its
+own directory first on `PATH`. A missing or too old one fails the start
+(`"<name> is not installed: <install>"`, `"<name> <version> is too old
+(needs <min>)"`); an unknown id is `"unknown ACP agent <id>"`.
+
+On the gateway, oh-my-pi and Pi run on JuCode's own agent directory,
+`~/.jucode/daemon/acp/<agent>` (`PI_CODING_AGENT_DIR`), written at each
+start: the JuCode models (Claude models over Anthropic Messages, others over
+Responses) with the session's local gateway key read from
+`JUCODE_GATEWAY_TOKEN`. Their sessions stay in the user's own session
+store: Pi's per-directory folder (`PI_CODING_AGENT_SESSION_DIR`), and for
+oh-my-pi a `sessions` link to `~/.omp/agent/sessions` (it looks sessions up
+only under its agent directory). User-level skills,
+extensions and instructions in `~/.pi/agent` / `~/.omp/agent` are not
+loaded there; project-level ones are.
+
+The session id is the daemon's; the agent's own conversation id is kept
+with the session. Reopening it uses `session/load` when the agent can (its
+replay becomes one `transcript`), else `session/resume` (no replay), else
+starts a new conversation and says so in an `info`. A session of a built-in
+agent starts and reopens from any client that may open sessions; one the
+desktop registered only from the desktop (`"this agent's session can only be
+reopened on the desktop"`). Built-in agents also have their own TUI (`tui`
+in `acp_presets`; see "A conversation in its TUI"), run scheduled tasks
+(see "Scheduled tasks") and take requirements (`requirement_reply` with
+`agent`); registered ones do none of these.
+
+What the agent offers arrives as these state events (part of a watcher's
+snapshot), sent at open and whenever they change:
+
+```json
+{"type":"engine_caps",
+ "agent":{"id":"omp","name":"Oh My Pi","version":"18.1.21"},
+ "approvals":true,
+ "gateway":true,
+ "caps":{"interrupt":true,"approvalModes":true,"modelPicker":true,"contextUsage":false,
+         "slashCommands":true,"transcriptReplay":true}}
+```
+
+`agent.id` is the built-in agent's id (null for a registered one); `name`
+and `version` come from the agent. `approvals`: whether the built-in agent
+asks before running tools (null for a registered one). `gateway`: it can run
+on the JuCode gateway. `caps`: `approvalModes` when its approval mode can be
+switched, `modelPicker` when it has a model option, `contextUsage` once it
+reported usage, `slashCommands` when it lists commands, `transcriptReplay`
+when it can reopen a conversation with its history.
+
+```json
+{"type":"session_options","options":[
+  {"id":"mode","name":"Session Mode","description":null,"category":"mode","type":"select","value":"build",
+   "choices":[{"value":"build","name":"build","description":null},{"value":"plan","name":"plan","description":null}]},
+  {"id":"x","name":"…","description":null,"category":null,"type":"boolean","value":true}]}
+```
+
+The agent's config options besides model and effort (those are in
+`model_status`), or its legacy modes as one `mode` select when it has no
+config options. `{"op":"set_session_option","session":"<id>","id":"mode","value":"plan"}`
+(`value` a string or a boolean) changes one; answered by `session_options`
+or an `error`.
+
+The rest uses the usual events:
+
+- `model_status` with `provider: "acp"`, `model` and `model_label` (the
+  agent's model option value and its name), `reasoning_effort` and
+  `reasoning_efforts` (its thought-level option), `context_window` (the
+  size it last reported). `/model` answers with `model_view` (a current
+  value the agent does not list comes first with `listed: false`);
+  `/model <value> [effort]` sets the options. Agents without a model option
+  have neither.
+- `context_usage` with `tokens` (and `cost` when the agent reports USD).
+- `command_list` with the agent's commands; `/<name> args` sends that text
+  as a prompt. Other commands are an `error`.
+- `approval_mode` (the launched mode as `read-only`, `auto-edit` or
+  `full-auto`) for built-in agents that ask. `set_approval_mode` to
+  another mode restarts the agent after the running turn
+  (`approval_mode_pending` meanwhile) on the same conversation; other ACP
+  agents refuse it.
+- `approval_request` for `session/request_permission` (summary: title and
+  diffs), and named `mcp_elicitation` with `questions` for a form
+  elicitation (a lone field without a title is asked by the message);
+  answer with `approve` (`answers` for a form; `decision: "deny"` declines).
+- Messages sent before the session opens or during a turn wait
+  (`pending_messages`, `status: "queued: N"`) and are echoed as
+  `user_message` once sent. Images go as base64 blocks when the agent takes
+  them (files over 20 MB are not sent); otherwise an `info` says they were
+  not sent.
+- `interrupt` cancels open questions, drops waiting messages and sends
+  `session/cancel`; the turn ends with `status: "interrupted"`.
+- Agent notices are `info` (or `error`), a turn that ends with no reply
+  an `info`. Replies outside a turn (startup banners) are dropped.
 
 ## Scheduled tasks
 
@@ -625,15 +730,18 @@ events carry the same `session` field.
 session's running turn (and its subagents) gates its next tool call by the
 new mode, and calls waiting for a decision the new mode no longer needs run.
 Codex takes the mode with each turn, and Claude Code goes in or out of full
-access only by restarting; switched while a turn runs, they send
+access (a built-in ACP agent into another mode) only by restarting; switched while a turn runs, they send
 `{"type":"approval_mode_pending","mode":"…"}` and apply it when the turn
 ends (`mode: null` then; a client can `interrupt` to apply it sooner). A
 switch to full access answers the turn's open and later approvals at once.
 
-`set_gateway` (`gateway`: bool, optional `model`) moves a Claude Code or Codex
-session between this machine's own login and the JuCode gateway: the engine
+`set_gateway` (`gateway`: bool, optional `model`) moves a Claude Code, Codex
+or gateway-capable ACP agent session between this machine's own login and the JuCode gateway: the engine
 restarts once the running turn ends and resumes the conversation, and the
 session's `gateway` flag in `session_list` follows.
+
+`set_session_option` (`id`, `value`) changes an ACP agent's setting from
+`session_options` (see "ACP agents").
 
 Differences from `jucode serve`:
 

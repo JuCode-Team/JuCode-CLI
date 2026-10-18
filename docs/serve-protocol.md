@@ -240,7 +240,7 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `type` | Fields | Meaning |
 | --- | --- | --- |
 | `startup` | `version`, `session_id`, `profile_dir`, `config_path`, `cwd`, `model`, `context_window` | First event; identifies the session. |
-| `model_status` | `provider`, `model`, `reasoning_effort`, `context_window`, `context_limit`, `max_output_tokens`, `reasoning_efforts`, `state` | Current model selection; deduplicated, re-emitted on change. Claude Code sessions add their own fields (`docs/daemon-protocol.md` → Other engines). |
+| `model_status` | `provider`, `model`, `reasoning_effort`, `context_window`, `context_limit`, `max_output_tokens`, `reasoning_efforts`, `state` | Current model selection; deduplicated, re-emitted on change. Claude Code and ACP sessions add their own fields (`docs/daemon-protocol.md` → Other engines). |
 | `command_list` | `commands: [{command, marker, args, description}]` | Available slash commands incl. custom and MCP prompt commands. |
 | `approval_mode` | `mode` | Current approval mode; emitted at startup and on change. |
 | `agent_runs` | `workflows: []`, `agents: [{id, label, model, effort, state, started_at, duration_ms, tokens, tool_calls, prompt, result, error, type: "subagent", tool_use_id, activity}]` | Every subagent of the session, oldest first. `id` is its path (`/root/<task_name>`), `state` ∈ `pending`/`running`/`completed`/`errored`/`interrupted`/`closed`, `started_at` epoch ms, `tool_use_id` the parent's `spawn_agent` call, `activity` its latest action in a few words ("Running cargo test"). |
@@ -279,6 +279,8 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `transcript` | `items: [{role, ...}]` | Rendered conversation (`/transcript`); roles: `user`, `assistant`, `tool` (`name`, `output`), `branch` (`label`). |
 | `info` | `message` | Informational line (hook output, notices, update available). |
 | `error` | `message` | Error line. Also used for malformed commands and unknown ops. |
+| `surface` / `term_*` | see `docs/daemon-protocol.md` → Terminals | Daemon sessions only: the conversation moved to its engine's TUI on a terminal clients attach to, and back. |
+| `engine_caps` / `session_options` | see `docs/daemon-protocol.md` → ACP agents | Daemon ACP sessions only: what the agent can do, and its settings besides model and effort (set with the `set_session_option` op). |
 | `status` | `message` | Turn status string: `ready`, `streaming`, `queued: N`, `steering`, `interrupted`, `compacting`, `approval mode: ...`, `trusted ...`, etc. `ready` marks the end of a turn. |
 
 ## Turn sequence

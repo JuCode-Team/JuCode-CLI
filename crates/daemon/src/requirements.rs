@@ -1318,7 +1318,7 @@ mod tests {
         let cwd = dir.join("app");
         fs::create_dir_all(&cwd).unwrap();
         hub.store
-            .record_engine_session("s", &cwd, None, None, false)
+            .record_engine_session("s", &cwd, None, None, false, None)
             .unwrap();
         let (ops, rx) = std::sync::mpsc::channel();
         hub.host("s".to_string(), ops, cwd, hub.next_generation());

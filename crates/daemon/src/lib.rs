@@ -371,6 +371,19 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         thread::spawn(move || respond(&hub, client, &request, Ok(gateway::catalog_json())));
         return;
     }
+    // Each built-in ACP agent's version is asked of the agent.
+    if name == "acp_presets" {
+        let hub = Arc::clone(hub);
+        thread::spawn(move || {
+            respond(
+                &hub,
+                client,
+                &request,
+                Ok(engines::acp_presets::presets_json()),
+            )
+        });
+        return;
+    }
     // Ledger reads wait on the network; input and interrupts must keep flowing.
     if matches!(name, "session_usage" | "schedule_usage") {
         let hub = Arc::clone(hub);
@@ -428,22 +441,23 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         return;
     }
     // A program to run (an ACP agent, an engine binary, its environment):
-    // only the desktop names one.
+    // only the desktop names one. A built-in ACP agent is the daemon's.
     if matches!(name, "session_create" | "session_open") {
         let options = engines::Options::from_json(&op["options"]);
         let acp = op["engine"] == "acp";
-        if (acp || options.runs_programs()) && !hub.is_local(client) {
+        if options.runs_programs() && !hub.is_local(client) {
             reply(
                 json!({ "type": "error", "message": "only the desktop can choose what an engine runs" }),
             );
             return;
         }
-        let checked = options
-            .check_env()
-            .and_then(|()| match acp && options.command.is_none() {
-                true => Err("an ACP session needs options.command".to_string()),
-                false => Ok(()),
-            });
+        let checked = options.check_env().and_then(|()| match acp {
+            true if options.command.is_none() && options.agent.is_none() => {
+                Err("an ACP session needs options.agent or options.command".to_string())
+            }
+            true => engines::acp::preset(&options).map(|_| ()),
+            false => Ok(()),
+        });
         if let Err(message) = checked {
             reply(json!({ "type": "error", "message": message }));
             return;

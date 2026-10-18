@@ -551,7 +551,7 @@ fn channel(engine: &str, gateway: bool, provider: &str) -> (&'static str, String
             jucode_agent_core::provider_channel_kind(provider),
             provider.to_string(),
         ),
-        "claude" if gateway => ("jucode", "jucode".to_string()),
+        "claude" | "acp" if gateway => ("jucode", "jucode".to_string()),
         "claude" => ("local", "anthropic".to_string()),
         "codex" if provider == "jucode_gateway" || (gateway && provider.is_empty()) => {
             ("jucode", "jucode".to_string())
@@ -1184,6 +1184,7 @@ mod tests {
         assert_eq!(channel("jucode", false, "kimi-code").0, "third_party");
         assert_eq!(channel("jucode", false, "my-relay").0, "local");
         assert_eq!(channel("acp", false, "").0, "local");
+        assert_eq!(channel("acp", true, "").0, "jucode");
     }
 
     #[test]

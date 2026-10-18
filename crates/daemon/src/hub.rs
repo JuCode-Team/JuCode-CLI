@@ -334,6 +334,7 @@ impl Hub {
             return Err(format!("not a directory: {}", cwd.display()));
         }
         let gateway = options.gateway == Some(true);
+        let agent = options.agent.clone();
         let (id, ops, generation) = match engine {
             None => session::spawn(Arc::clone(self), cwd.clone(), None)?,
             Some(kind) => {
@@ -352,6 +353,7 @@ impl Hub {
                 schedule,
                 engine.map(engines::Kind::name),
                 gateway,
+                agent.as_deref(),
             )
             .map_err(|error| error.to_string())?;
         lock(&self.untitled).insert(id.clone());
@@ -407,7 +409,8 @@ impl Hub {
                     Some(engines::Kind::Codex) => engines::codex::saved(&cwd)
                         .iter()
                         .any(|(saved, _, _)| saved == id),
-                    // ACP agents keep no conversations to reopen.
+                    // An ACP agent's conversations are known only from the
+                    // sessions the daemon hosted.
                     Some(engines::Kind::Acp) => false,
                 };
                 if !saved {
@@ -426,12 +429,15 @@ impl Hub {
                     engine: engine.map(|kind| kind.name().to_string()),
                     gateway: false,
                     group: None,
+                    agent: None,
+                    agent_session: None,
                 }
             }
             (None, None) => return Err(format!("unknown session {id}")),
         };
         let kind = engines::Kind::parse(record.engine.as_deref().unwrap_or_default())?;
         let mut gateway = false;
+        let agent = record.agent.clone();
         let (ops, generation) = match kind {
             None => {
                 let (_, ops, generation) =
@@ -458,9 +464,28 @@ impl Hub {
                     gateway: Some(options.gateway.unwrap_or(record.gateway)),
                     ..options
                 };
+                // An ACP agent names its conversation itself: the session
+                // keeps its id and reopens the agent's (a built-in agent
+                // from its record, whatever the client names; a registered
+                // one only from the desktop, which knows its command).
+                let options = match kind {
+                    engines::Kind::Acp => {
+                        if agent.is_none() && options.command.is_none() {
+                            return Err("this agent's session can only be reopened on the desktop"
+                                .to_string());
+                        }
+                        engines::Options {
+                            resume: record.agent_session.clone(),
+                            agent: agent.clone(),
+                            ..options
+                        }
+                    }
+                    _ => options,
+                };
                 gateway = options.gateway == Some(true);
                 // A new start keeps the recorded id; a resume opens it.
-                let fresh = options.resume.is_none().then(|| id.to_string());
+                let fresh = (kind == engines::Kind::Acp || options.resume.is_none())
+                    .then(|| id.to_string());
                 let (_, ops, generation) = engines::spawn(
                     Arc::clone(self),
                     kind,
@@ -480,6 +505,7 @@ impl Hub {
                     record.schedule.as_deref(),
                     record.engine.as_deref(),
                     gateway,
+                    agent.as_deref(),
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -1148,6 +1174,7 @@ impl Hub {
                     "group": record.group,
                     "gateway": record.gateway,
                     "engine": record.engine.as_deref().unwrap_or("jucode"),
+                    "agent": record.agent,
                     "schedule": record.schedule,
                     "open": hosted.is_some(),
                     "watchers": hosted.map(|h| h.watchers.len()).unwrap_or(0),
@@ -1333,6 +1360,8 @@ mod tests {
             engine: None,
             gateway: false,
             group: None,
+            agent: None,
+            agent_session: None,
         };
         assert_eq!(
             shown_title(&record, Some(scheduled)).as_deref(),

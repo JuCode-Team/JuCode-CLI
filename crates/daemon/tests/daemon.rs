@@ -1585,14 +1585,15 @@ fn the_desktop_saves_mcp_servers_for_every_session_without_one() {
 }
 
 #[test]
-fn only_the_desktop_starts_acp_agents_which_run_like_any_session() {
+fn only_the_desktop_names_an_acp_command_and_the_agents_run_like_any_session() {
     let _guard = setup();
     let daemon = start_daemon();
     let dir = temp_dir("daemon-acp");
     fs::create_dir_all(&dir).unwrap();
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_acp.py");
-    let options =
-        json!({ "command": script, "args": ["--flag"], "env": { "FAKE_ACP_GREETING": "hey" } });
+    let state = dir.join("agent-state.json");
+    let options = json!({ "command": script, "args": ["--flag"],
+        "env": { "FAKE_ACP_GREETING": "hey", "FAKE_ACP_STATE": state } });
 
     // A paired device may not name a command to run.
     let mut desktop = Client::connect(&daemon);
@@ -1608,12 +1609,57 @@ fn only_the_desktop_starts_acp_agents_which_run_like_any_session() {
         &mut phone,
         json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": options }),
     );
-    assert_eq!(refused["type"], "error", "{refused}");
+    assert_eq!(
+        refused["message"], "only the desktop can choose what an engine runs",
+        "{refused}"
+    );
+    let refused = request(
+        &mut phone,
+        json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": { "agent": "omp", "args": ["x"] } }),
+    );
+    assert_eq!(
+        refused["message"], "only the desktop can choose what an engine runs",
+        "{refused}"
+    );
+    // A built-in agent, by id, is the daemon's to resolve: past the gate.
+    let resolved = request(
+        &mut phone,
+        json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": { "agent": "deepseek" } }),
+    );
+    assert_eq!(
+        resolved["message"], "unknown ACP agent deepseek",
+        "{resolved}"
+    );
+    let named = request(
+        &mut phone,
+        json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": {} }),
+    );
+    assert_eq!(
+        named["message"], "an ACP session needs options.agent or options.command",
+        "{named}"
+    );
     let refused = request(
         &mut phone,
         json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": { "bin": script } }),
     );
     assert_eq!(refused["type"], "error", "{refused}");
+    // A built-in agent is named, never given a command.
+    let both = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": { "agent": "omp", "command": script } }),
+    );
+    assert_eq!(
+        both["message"], "options.agent and options.command are exclusive",
+        "{both}"
+    );
+    let unknown = request(
+        &mut desktop,
+        json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": { "agent": "deepseek" } }),
+    );
+    assert_eq!(
+        unknown["message"], "unknown ACP agent deepseek",
+        "{unknown}"
+    );
     let bad_env = request(
         &mut desktop,
         json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": { "command": script, "env": { "DYLD_INSERT_LIBRARIES": "x" } } }),
@@ -1629,10 +1675,20 @@ fn only_the_desktop_starts_acp_agents_which_run_like_any_session() {
         .unwrap_or_else(|| panic!("{created}"))
         .to_string();
     phone.send(json!({ "op": "watch", "session": session }));
-    phone.until(|f| f["session"] == session.as_str() && f["type"] == "attended");
+    let watched = phone.until(|f| f["session"] == session.as_str() && f["type"] == "engine_caps");
+    let caps = watched.last().unwrap();
+    assert_eq!(caps["agent"]["name"], "fake");
+    assert_eq!(caps["caps"]["transcriptReplay"], true);
+    assert_eq!(caps["caps"]["modelPicker"], true);
     phone.send(json!({ "op": "user_message", "session": session, "content": "hi" }));
     let frames = phone.until(turn_done(&session));
     assert_eq!(claude_reply(&frames, &session), "ok: hi --flag hey");
+    assert!(
+        frames
+            .iter()
+            .any(|f| f["type"] == "context_usage" && f["tokens"] == 100),
+        "{frames:#?}"
+    );
 
     // The phone answers the agent's permission prompt.
     phone.send(json!({ "op": "user_message", "session": session, "content": "use a tool" }));
@@ -1648,6 +1704,52 @@ fn only_the_desktop_starts_acp_agents_which_run_like_any_session() {
             .any(|f| f["type"] == "tool_output" && f["is_error"] == false),
         "{frames:#?}"
     );
+
+    // Closed and reopened, the agent replays the conversation. A desktop
+    // registered agent reopens only where its command is known.
+    desktop.send(json!({ "op": "session_close", "session": session }));
+    desktop.until(|f| f["type"] == "session_closed" && f["session"] == session.as_str());
+    let refused = request(
+        &mut phone,
+        json!({ "op": "session_open", "session": session }),
+    );
+    assert_eq!(
+        refused["message"], "this agent's session can only be reopened on the desktop",
+        "{refused}"
+    );
+    // Naming a built-in agent does not turn it into one.
+    let refused = request(
+        &mut phone,
+        json!({ "op": "session_open", "session": session, "engine": "acp", "options": { "agent": "omp" } }),
+    );
+    assert_eq!(
+        refused["message"], "this agent's session can only be reopened on the desktop",
+        "{refused}"
+    );
+    let opened = request(
+        &mut desktop,
+        json!({ "op": "session_open", "session": session, "engine": "acp", "options": options }),
+    );
+    assert_eq!(opened["type"], "session_opened", "{opened}");
+    desktop.send(json!({ "op": "watch", "session": session }));
+    let replayed = desktop.until(|f| {
+        f["session"] == session.as_str()
+            && f["type"] == "transcript"
+            && f["items"].as_array().is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|i| i["role"] == "user" && i["content"] == "hi")
+            })
+    });
+    let items = replayed.last().unwrap()["items"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(items[1]["content"], "ok: hi --flag hey");
+    assert_eq!(items[2]["content"], "use a tool");
+    desktop.send(json!({ "op": "user_message", "session": session, "content": "again" }));
+    let frames = desktop.until(turn_done(&session));
+    assert_eq!(claude_reply(&frames, &session), "ok: again --flag hey");
 }
 
 /// A one-route HTTP server standing in for the JuCode API: every request

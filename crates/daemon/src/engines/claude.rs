@@ -2111,7 +2111,9 @@ pub(super) fn elicitation_questions(schema: &Value) -> Value {
             let options: Vec<Value> = match (field["enum"].as_array(), text(&field["type"])) {
                 (Some(values), _) => values.iter().map(|v| json!({ "label": text(v) })).collect(),
                 (None, "boolean") => vec![json!({ "label": "true" }), json!({ "label": "false" })],
-                _ => vec![],
+                _ => titled_choices(field)
+                    .map(|(_, label)| json!({ "label": label }))
+                    .collect(),
             };
             json!({
                 "question": match text(&field["title"]) { "" => key.as_str(), title => title },
@@ -2122,6 +2124,21 @@ pub(super) fn elicitation_questions(schema: &Value) -> Value {
         })
         .collect();
     json!(questions)
+}
+
+/// A titled enum's choices (`oneOf: [{const, title}]`): value and label.
+fn titled_choices(field: &Value) -> impl Iterator<Item = (&Value, &str)> {
+    field["oneOf"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|choice| {
+            let label = match text(&choice["title"]) {
+                "" => text(&choice["const"]),
+                title => title,
+            };
+            (&choice["const"], label)
+        })
 }
 
 /// The accepted form's content: each answer under its field, typed as the
@@ -2137,6 +2154,11 @@ pub(super) fn elicitation_content(schema: &Value, answers: &Value) -> Value {
         let Some(answer) = answers[question].as_str() else {
             continue;
         };
+        // A titled choice is answered by its title.
+        if let Some((value, _)) = titled_choices(field).find(|(_, label)| *label == answer) {
+            content.insert(key.clone(), value.clone());
+            continue;
+        }
         let value = match text(&field["type"]) {
             "boolean" => json!(answer == "true"),
             "integer" => answer
@@ -3947,6 +3969,27 @@ mod tests {
     }
 
     #[test]
+    fn a_titled_enum_is_offered_by_title_and_answered_by_value() {
+        let schema = json!({ "type": "object", "properties": { "env": {
+            "type": "string", "title": "Where",
+            "oneOf": [{ "const": "prod", "title": "Production" }, { "const": "dev" }]
+        } } });
+        let questions = elicitation_questions(&schema);
+        assert_eq!(
+            questions[0]["options"],
+            json!([{ "label": "Production" }, { "label": "dev" }])
+        );
+        assert_eq!(
+            elicitation_content(&schema, &json!({ "Where": "Production" })),
+            json!({ "env": "prod" })
+        );
+        assert_eq!(
+            elicitation_content(&schema, &json!({ "Where": "dev" })),
+            json!({ "env": "dev" })
+        );
+    }
+
+    #[test]
     fn always_allow_can_be_saved_for_the_project() {
         let mut c = claude();
         let out = c.translate(Line::Frame(json!({ "type": "control_request", "request_id": "r1", "request": {
@@ -4003,7 +4046,8 @@ mod tests {
         }));
         assert!(options.runs_programs());
         let (command, _) =
-            super::super::command(super::super::Kind::Claude, "x", &options).unwrap();
+            super::super::command(super::super::Kind::Claude, "x", Path::new("/p"), &options)
+                .unwrap();
         assert_eq!(command.get_program(), "/opt/claude/bin/claude");
         assert!(command
             .get_envs()
