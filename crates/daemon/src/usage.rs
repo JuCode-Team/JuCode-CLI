@@ -172,21 +172,27 @@ impl Usage {
         });
         record["channel_kind"] = json!(kind);
         record["channel"] = json!(channel);
-        record["model"] = json!(event["model"]
+        let model = event["model"]
             .as_str()
             .filter(|m| !m.is_empty())
-            .unwrap_or(&model));
-        record["requests"] = json!(record["requests"].as_u64().unwrap_or(0) + 1);
+            .unwrap_or(&model)
+            .to_string();
+        // An aggregate (Claude's subagents and the like, summed over several
+        // requests, maybe on another model) leaves the turn's model and
+        // request count as they are.
+        let aggregate = event["aggregate"] == true;
+        if !aggregate || record["model"].is_null() {
+            record["model"] = json!(model);
+        }
+        if !aggregate {
+            record["requests"] = json!(record["requests"].as_u64().unwrap_or(0) + 1);
+        }
         for field in TOKEN_FIELDS {
             let sum = record[field].as_u64().unwrap_or(0) + event[field].as_u64().unwrap_or(0);
             record[field] = json!(sum);
         }
         if kind != "jucode" {
-            match estimate(
-                &channel,
-                record["model"].as_str().unwrap_or_default(),
-                event,
-            ) {
+            match estimate(&channel, &model, event) {
                 Some(cost) => {
                     record["estimated_cost_usd"] =
                         json!(record["estimated_cost_usd"].as_f64().unwrap_or(0.0) + cost);
@@ -203,15 +209,17 @@ impl Usage {
     /// engine announces it again).
     pub fn forget(&self, session: &str) {
         self.lock().routes.remove(session);
+        crate::gateway::set_turn(session, None);
     }
 
     /// The session is ready again: its turns are written.
     pub fn close(&self, session: &str) {
         // Keep the move from open turns to the file atomic for ledger snapshots.
         let mut state = self.lock();
-        if state.current.remove(session).is_some() {
-            crate::gateway::set_turn(session, None);
-        }
+        // The gateway keeps tagging requests with this turn until the next
+        // one opens: Claude's background agents and Workflows run on after
+        // the turn ends, and are this turn's cost.
+        state.current.remove(session);
         let turns: Vec<String> = state
             .open
             .iter()
@@ -915,6 +923,25 @@ mod tests {
             }
             assert_ne!(ids[0], ids[1]);
         }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_aggregate_adds_tokens_but_not_the_model_or_a_request() {
+        let (usage, dir) = usage_in("aggregate");
+        usage.observe(
+            "s1",
+            &json!({ "type": "model_status", "model": "claude-opus-5-5" }),
+            || None,
+        );
+        usage.observe("s1", &spend(100, 10), || info("claude", true));
+        let aggregate = json!({ "type": "usage", "aggregate": true, "model": "claude-haiku-5-5", "input_tokens": 50, "cached_input_tokens": 0, "output_tokens": 5 });
+        usage.observe("s1", &aggregate, || info("claude", true));
+        let record = usage.lock().open.values().next().unwrap().clone();
+        assert_eq!(record["model"], "claude-opus-5-5");
+        assert_eq!(record["requests"], 1);
+        assert_eq!(record["input_tokens"], 150);
+        assert_eq!(record["output_tokens"], 15);
         let _ = fs::remove_dir_all(dir);
     }
 

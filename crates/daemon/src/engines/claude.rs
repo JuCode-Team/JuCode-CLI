@@ -705,6 +705,11 @@ pub struct Claude {
     /// The input counts of the message streaming now, from its start: a
     /// `message_delta` may leave them out.
     start_usage: Value,
+    /// The CLI's running per-model totals (`modelUsage`) as of the last
+    /// result; unknown for a resumed conversation until `get_usage` says.
+    model_totals: Option<HashMap<String, Tokens>>,
+    /// Main-loop usage already reported since then, by model.
+    streamed: HashMap<String, Tokens>,
     active_turn: bool,
     interrupting: bool,
     /// Messages sent mid-turn that Claude has not taken in (replayed) yet.
@@ -752,6 +757,8 @@ impl Claude {
             completed_blocks: 0,
             last_context: 0,
             start_usage: Value::Null,
+            model_totals: options.resume.is_none().then(HashMap::new),
+            streamed: HashMap::new(),
             active_turn: false,
             interrupting: false,
             queued: Vec::new(),
@@ -1367,6 +1374,15 @@ impl Claude {
                 };
                 let count = |key: &str| input[key].as_u64().unwrap_or(0);
                 self.last_context = context_tokens(input) + output;
+                let streamed = self.streamed.entry(self.model.clone()).or_default();
+                for (sum, n) in streamed.iter_mut().zip([
+                    count("input_tokens"),
+                    count("cache_read_input_tokens"),
+                    count("cache_creation_input_tokens"),
+                    output,
+                ]) {
+                    *sum += n;
+                }
                 vec![
                     json!({
                         "type": "usage",
@@ -1474,6 +1490,51 @@ impl Claude {
         events
     }
 
+    /// What the main loop's stream did not show: Task subagents, Workflow
+    /// agents, compaction. A result's `modelUsage` covers them all, as
+    /// running totals; what grew since the last result, less the main
+    /// loop's own usage, is reported per model, one `aggregate` usage each
+    /// (summed over several requests). Background work that ends after a
+    /// result lands in the next one.
+    fn other_usage(&mut self, usage: &Value) -> Vec<Value> {
+        let streamed = std::mem::take(&mut self.streamed);
+        let current = model_totals(usage);
+        // Crash and startup-error results carry zeroed totals.
+        if current.values().all(|t| t.iter().all(|n| *n == 0)) {
+            return vec![];
+        }
+        let Some(mut before) = self.model_totals.replace(current.clone()) else {
+            return vec![];
+        };
+        // /clear starts the totals over.
+        if before.iter().any(|(model, b)| {
+            current
+                .get(model)
+                .is_none_or(|c| c.iter().zip(b).any(|(c, b)| c < b))
+        }) {
+            before.clear();
+        }
+        let mut events = Vec::new();
+        for (model, now) in &current {
+            let was = before.get(model).copied().unwrap_or_default();
+            let main = streamed.get(model).copied().unwrap_or_default();
+            let [input, read, write, output] =
+                std::array::from_fn(|i| now[i].saturating_sub(was[i]).saturating_sub(main[i]));
+            if input + read + write + output > 0 {
+                events.push(json!({
+                    "type": "usage",
+                    "aggregate": true,
+                    "model": model,
+                    "input_tokens": input + read + write,
+                    "cached_input_tokens": read,
+                    "cache_write_tokens": write,
+                    "output_tokens": output,
+                }));
+            }
+        }
+        events
+    }
+
     fn on_result(&mut self, frame: &Value) -> Vec<Value> {
         self.active_turn = false;
         let was_interrupting = std::mem::take(&mut self.interrupting);
@@ -1491,6 +1552,7 @@ impl Claude {
                 }
             }
         }
+        events.extend(self.other_usage(&frame["modelUsage"]));
         if let Some(window) = self.model_windows.get(&self.model).copied() {
             if window != self.context_window {
                 self.context_window = window;
@@ -1674,7 +1736,7 @@ impl Claude {
             };
             return match subtype.as_str() {
                 // A CLI without get_settings has no ultracode: nothing to offer.
-                "get_settings" => vec![],
+                "get_settings" | "get_usage" => vec![],
                 "side_question" => {
                     vec![json!({ "type": "side_answer", "question": tag, "error": message })]
                 }
@@ -1698,6 +1760,14 @@ impl Claude {
             };
         }
         match subtype.as_str() {
+            "get_usage" => {
+                if self.model_totals.is_none() {
+                    self.model_totals = Some(model_totals(
+                        &response["response"]["session"]["model_usage"],
+                    ));
+                }
+                vec![]
+            }
             "set_permission_mode" => {
                 if self.started {
                     return vec![];
@@ -2077,6 +2147,29 @@ pub(super) fn elicitation_content(schema: &Value, answers: &Value) -> Value {
     Value::Object(content)
 }
 
+/// Uncached input, cache reads, cache writes, output.
+type Tokens = [u64; 4];
+
+/// `modelUsage` by model, in `Tokens` order.
+fn model_totals(usage: &Value) -> HashMap<String, Tokens> {
+    let Some(models) = usage.as_object() else {
+        return HashMap::new();
+    };
+    models
+        .iter()
+        .map(|(model, u)| {
+            let n = |key: &str| u[key].as_u64().unwrap_or(0);
+            let tokens = [
+                n("inputTokens"),
+                n("cacheReadInputTokens"),
+                n("cacheCreationInputTokens"),
+                n("outputTokens"),
+            ];
+            (model.clone(), tokens)
+        })
+        .collect()
+}
+
 fn command_entry(name: &str, args: &str, description: &str) -> Value {
     json!({ "command": format!("/{name}"), "marker": null, "args": args, "description": description })
 }
@@ -2120,6 +2213,13 @@ impl Adapter for Claude {
         }
         frames.push(self.control_request(json!({ "subtype": "get_settings" }), ""));
         frames.push(self.control_request(json!({ "subtype": "mcp_status" }), ""));
+        // A resumed conversation's totals start from what it spent before.
+        if self.model_totals.is_none() {
+            frames.push(self.control_request(
+                json!({ "subtype": "get_usage", "skip_behaviors": true }),
+                "",
+            ));
+        }
         frames
     }
 
@@ -3181,6 +3281,98 @@ mod tests {
         );
         assert_eq!(types(&end), ["model_status", "context_usage", "status"]);
         assert!(!c.busy());
+    }
+
+    #[test]
+    fn usage_beyond_the_main_loop_is_reported_from_the_running_totals() {
+        let totals = |opus: [u64; 4], haiku: [u64; 4]| {
+            let model = |[i, r, w, o]: [u64; 4]| json!({ "inputTokens": i, "cacheReadInputTokens": r, "cacheCreationInputTokens": w, "outputTokens": o, "costUSD": 0.1 });
+            json!({ "claude-opus-5-5": model(opus), "claude-haiku-5-5": model(haiku) })
+        };
+        let result =
+            |usage: Value| json!({ "type": "result", "subtype": "success", "modelUsage": usage });
+        let usage_of = |events: &[Value]| -> Vec<Value> {
+            events
+                .iter()
+                .filter(|e| e["type"] == "usage")
+                .cloned()
+                .collect()
+        };
+        let main_request = |c: &mut Claude| {
+            frame(
+                c,
+                json!({ "type": "stream_event", "event": { "type": "message_start", "message": { "usage": { "input_tokens": 10, "cache_read_input_tokens": 1000 } } } }),
+            );
+            frame(
+                c,
+                json!({ "type": "stream_event", "event": { "type": "message_delta", "usage": { "output_tokens": 5 } } }),
+            );
+        };
+
+        let mut c = claude();
+        frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "init", "session_id": "s", "model": "claude-opus-5-5" }),
+        );
+        main_request(&mut c);
+        // A subagent on haiku ran beside the main loop's one request.
+        let end = frame(&mut c, result(totals([10, 1000, 0, 5], [3, 0, 200, 50])));
+        assert_eq!(
+            usage_of(&end),
+            [
+                json!({ "type": "usage", "aggregate": true, "model": "claude-haiku-5-5", "input_tokens": 203, "cached_input_tokens": 0, "cache_write_tokens": 200, "output_tokens": 50 })
+            ]
+        );
+        assert_eq!(end.last().unwrap()["message"], "ready");
+        // A background agent finished after that result; the next turn's
+        // result carries it, and a compaction on opus besides.
+        main_request(&mut c);
+        let end = frame(
+            &mut c,
+            result(totals([30, 2000, 100, 10], [4, 200, 200, 60])),
+        );
+        let usage = usage_of(&end);
+        assert_eq!(usage.len(), 2);
+        let of = |model: &str| usage.iter().find(|e| e["model"] == model).unwrap().clone();
+        assert_eq!(
+            (
+                of("claude-opus-5-5")["input_tokens"].as_u64(),
+                of("claude-opus-5-5")["output_tokens"].as_u64()
+            ),
+            (Some(110), Some(0))
+        );
+        assert_eq!(
+            (
+                of("claude-haiku-5-5")["input_tokens"].as_u64(),
+                of("claude-haiku-5-5")["output_tokens"].as_u64()
+            ),
+            (Some(201), Some(10))
+        );
+        // A zeroed result changes nothing; /clear starts the totals over.
+        assert!(usage_of(&frame(&mut c, result(totals([0; 4], [0; 4])))).is_empty());
+        main_request(&mut c);
+        assert!(usage_of(&frame(&mut c, result(totals([10, 1000, 0, 5], [0; 4])))).is_empty());
+
+        // Resumed: the totals already hold earlier turns.
+        let mut c = Claude::new(&Options {
+            resume: Some("s".into()),
+            ..Options::default()
+        });
+        let boot = c.start();
+        frame(
+            &mut c,
+            json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request_id(&boot, "get_usage"), "response": { "session": { "model_usage": totals([100, 9000, 50, 70], [5, 0, 0, 5]) } } } }),
+        );
+        frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "init", "session_id": "s", "model": "claude-opus-5-5" }),
+        );
+        main_request(&mut c);
+        assert!(usage_of(&frame(
+            &mut c,
+            result(totals([110, 10000, 50, 75], [5, 0, 0, 5]))
+        ))
+        .is_empty());
     }
 
     #[test]

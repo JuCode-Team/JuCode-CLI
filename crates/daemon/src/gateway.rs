@@ -39,7 +39,8 @@ struct State {
     keys: HashMap<String, String>,
     /// Session → the group it routes to.
     groups: HashMap<String, String>,
-    /// Session → its running turn (`X-JuCode-Turn`, see crate::usage).
+    /// Session → the turn its requests are charged to (`X-JuCode-Turn`, see
+    /// crate::usage): the running one, else the last until the next opens.
     turns: HashMap<String, String>,
     /// The gateway's groups (`/v1/open/groups`), and when they were read.
     catalog: Option<(Instant, Vec<Value>)>,
@@ -97,7 +98,7 @@ pub fn set_group(session: &str, group: Option<&str>) {
     };
 }
 
-/// `session`'s requests belong to `turn` (None: between turns).
+/// `session`'s requests belong to `turn` (None: its engine stopped).
 pub fn set_turn(session: &str, turn: Option<&str>) {
     let mut state = state();
     match turn {
