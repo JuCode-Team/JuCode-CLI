@@ -128,6 +128,10 @@ every connected client.
 | --- | --- | --- |
 | `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `schedule` (the scheduled task it is a run of, or null), `open`, `watchers`, `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at` |
 | `gateway_catalog` | — | `gateway_catalog`: `models` (the JuCode models the user chose to show, `jucode_models` in config.json) and `groups` (the gateway's groups with their models and multipliers); empty when not signed in or offline. For clients that cannot read this machine's login (the remote page) |
+| `tool_providers` | `tool`: `claude` or `codex` | `tool_providers` with `tool`, `config: {selected, providers}`. Provider rows expose `has_key`, never the key. Local desktop only |
+| `tool_provider_save` | `tool`, `provider: {id, name, base_url, format, model, key}` | Updated `tool_providers`. An empty key preserves the saved key on edit. Claude requires `anthropic`; Codex requires `responses`. Local desktop only |
+| `tool_provider_select` | `tool`, `provider_id` (empty restores the tool’s own configuration) | Updated `tool_providers`. Applies to new or reopened local-mode sessions. Local desktop only |
+| `tool_provider_remove` | `tool`, `provider_id` | Updated `tool_providers`; removing the selected provider clears the selection. Local desktop only |
 | `restart_when_idle` | — | none. Desktop only: this daemon exits once no session is running (after a `daemon_restarting` broadcast), so the desktop can start a newer one without cutting off a task |
 | `session_meta` | `session`, and any of `title`, `archived`, `hidden`, `group` | none; every client receives the new `sessions` list. An empty title goes back to the engine's label; a hidden session leaves `session_list` and `session_history` (its conversation stays on disk). A session created here is titled after its first user message (first line, 40 characters) unless a client titled it first. After its 1st and 3rd turns, then every 5th, the title model (`title_model` in config.json, else the main `model`) renames it from the project name, the current title, the first and latest requests and the start of the latest reply. A title a client set with `session_meta` is never replaced |
 | `session_history` | `cwd` | `session_history`: every session saved in `cwd`, newest first, whoever ran it (daemon, TUI, `jucode serve`), with `title`, `updated_at`, `entries`, `archived`, `schedule`, `open` |
@@ -243,7 +247,7 @@ clients need nothing engine-specific. `options`:
 | `model` | Model to start with |
 | `resume_at` | Claude Code: resume the conversation as it was at this assistant message uuid |
 | `effort`, `ultracode`, `fast`, `thinking` | Claude Code: start with this thinking effort, ultracode on, fast mode on, thinking summaries shown (`false` hides them). A restart (full access, gateway switch) keeps the session's own |
-| `jucode_gateway` | Claude Code / Codex: `true` runs this session through the JuCode gateway on the user's JuCode login; `false` on the provider in the user's own Claude Code / Codex config. The endpoint and key go to this process only (Claude: `--settings` file; Codex: `-c` overrides and an env var), never to the user's config files. Omitted on `session_open`: as the session last ran |
+| `jucode_gateway` | Claude Code / Codex: `true` runs this session through the JuCode gateway on the user's JuCode login; `false` uses this tool’s selected custom provider, or the user’s own Claude Code / Codex config when none is selected. The endpoint and key go to this process only (Claude: `--settings` file; Codex: `-c` overrides and an env var), never to the user's config files. Omitted on `session_open`: as the session last ran |
 | `command`, `args` | ACP: the agent's command line |
 | `bin` | Claude Code / Codex: the engine binary to run instead of the one found on `PATH` |
 | `env` | Extra environment variables for the engine process (plain names; no `DYLD_*`/`LD_*`) |
@@ -642,3 +646,25 @@ Differences from `jucode serve`:
   `approval_request` into a deferred action.
 - `decide_action` is recorded in `actions.jsonl` before the engine acts on
   it, so an approved action is never offered again after a restart.
+
+
+## Custom provider traffic and usage
+
+Claude Code and Codex own separate provider lists and defaults, stored in the
+daemon’s owner-only settings file. Their API keys stay in the daemon. Only a
+per-process local key reaches the tool; the tool’s original configuration stays
+intact. A JuCode gateway session (`jucode_gateway: true`) continues to use the
+JuCode account instead of the custom default.
+
+JuCode CLI keeps its own existing provider configuration. Hosted API-key
+sessions using `anthropic`, `responses` or `chat` also route through the local
+gateway. OAuth sessions retain their existing transport. No cross-protocol
+conversion is performed.
+
+For custom traffic the local gateway reads JSON or SSE usage while forwarding
+the original bytes. It records input, cache-read, cache-write, output and
+reasoning tokens under `channel_kind: local`, namespaced as `tool:provider`.
+Requests in one turn are aggregated, including those still in flight when the
+tool reports ready. The tool’s duplicate usage is excluded. Custom rates remain
+unknown and do not count as JuCode gateway charges. As with existing local usage,
+records sync to the signed-in JuCode account without keys or project paths.

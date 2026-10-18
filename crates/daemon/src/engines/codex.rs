@@ -486,7 +486,8 @@ impl Codex {
             pending: HashMap::new(),
             thread: None,
             resume: options.resume.clone(),
-            gateway: options.gateway == Some(true),
+            gateway: options.gateway == Some(true)
+                || crate::tool_providers::selected("codex").is_some(),
             active_turn: None,
             busy: false,
             queued: Vec::new(),

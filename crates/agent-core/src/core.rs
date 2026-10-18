@@ -132,7 +132,11 @@ enum WorkerEvent {
     Error(String),
 }
 
+type RequestProxy =
+    dyn Fn(&str, &str, &str, &str) -> Result<(String, String), String> + Send + Sync;
+
 pub struct AgentCore {
+    request_proxy: Option<Arc<RequestProxy>>,
     config: Config,
     auth: AuthStore,
     /// Tag each turn's JuCode gateway requests (`X-JuCode-Turn`) so the
@@ -271,6 +275,7 @@ impl AgentCore {
         let session_lock = SessionLock::acquire(&profile_dir()?, &cwd, session.session_id()).ok();
         let (action_tx, action_rx) = mpsc::channel();
         Ok(Self {
+            request_proxy: None,
             config,
             auth,
             session,
@@ -328,8 +333,67 @@ impl AgentCore {
         })
     }
 
-    /// Sets the version reported by `startup_events` and the update check.
-    /// Front-end binaries should pass their own package version.
+    /// Routes inference clients through the host's local gateway. The host
+    /// receives the original route; persistent provider settings stay intact.
+    pub fn set_request_proxy(
+        &mut self,
+        proxy: impl Fn(&str, &str, &str, &str) -> Result<(String, String), String>
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        self.request_proxy = Some(Arc::new(proxy));
+    }
+
+    /// Whether API-key inference is metered by the host's local gateway.
+    pub fn uses_request_proxy(&self) -> bool {
+        if self.request_proxy.is_none() || self.config.provider == "jucode" {
+            return false;
+        }
+        let catalog = llm_provider_kit::omp::catalog();
+        let store_id = catalog
+            .auth_provider(&self.config.provider)
+            .and_then(|p| p.store_as.as_deref())
+            .unwrap_or(&self.config.provider);
+        self.auth.oauth_credential(store_id).is_none()
+            && matches!(
+                crate::llm::protocol_for(
+                    &self.config.provider,
+                    &self.config.protocol,
+                    &self.config.model
+                )
+                .as_str(),
+                "anthropic" | "responses" | "chat"
+            )
+    }
+
+    fn client_route(&self) -> Result<(String, Option<String>), String> {
+        let key = self
+            .provider_api_key()
+            .or_else(|| env::var(&self.config.api_key_env).ok());
+        if !self.uses_request_proxy() {
+            return Ok((self.config.base_url.clone(), key));
+        }
+        match (&self.request_proxy, key) {
+            (Some(proxy), Some(key)) => {
+                let protocol = crate::llm::protocol_for(
+                    &self.config.provider,
+                    &self.config.protocol,
+                    &self.config.model,
+                );
+                let (base, key) = proxy(
+                    &self.config.provider,
+                    protocol.as_str(),
+                    &self.config.base_url,
+                    &key,
+                )?;
+                Ok((base, Some(key)))
+            }
+            (_, key) => Ok((self.config.base_url.clone(), key)),
+        }
+    }
+
+    /// Sets the version reported by startup events and the update check.
     pub fn with_version(mut self, version: &'static str) -> Self {
         self.version = version;
         self
@@ -2162,6 +2226,10 @@ impl AgentCore {
         let (approval_tx, approval_rx) = mpsc::channel();
         self.approval_receiver = Some(approval_rx);
         self.pending_approvals.clear();
+        let (base_url, api_key) = match self.client_route() {
+            Ok(route) => route,
+            Err(error) => return vec![AgentEvent::Error(error)],
+        };
         let Ok(mut client) = OpenAiClient::from_config(OpenAiClientConfig {
             model: self.config.model.clone(),
             provider: self.config.provider.clone(),
@@ -2172,9 +2240,9 @@ impl AgentCore {
             system_prompt,
             prompt_cache_key: self.session.session_id().to_string(),
             mcp: self.mcp.clone(),
-            base_url: self.config.base_url.clone(),
+            base_url,
             max_output_tokens: self.config.current_model_config().max_output_tokens,
-            api_key: self.provider_api_key().as_deref(),
+            api_key: api_key.as_deref(),
             api_key_env: &self.config.api_key_env,
             retry_attempts: self.config.retry_attempts,
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
@@ -2430,6 +2498,7 @@ impl AgentCore {
     }
 
     fn compaction_client(&self) -> Result<OpenAiClient, String> {
+        let (base_url, api_key) = self.client_route()?;
         let (model, reasoning_effort) = self.config.compact();
         OpenAiClient::from_config(OpenAiClientConfig {
             model,
@@ -2441,9 +2510,9 @@ impl AgentCore {
             system_prompt: String::new(),
             prompt_cache_key: self.session.session_id().to_string(),
             mcp: McpManager::default(),
-            base_url: self.config.base_url.clone(),
+            base_url,
             max_output_tokens: self.config.compact_model_config().max_output_tokens,
-            api_key: self.provider_api_key().as_deref(),
+            api_key: api_key.as_deref(),
             api_key_env: &self.config.api_key_env,
             retry_attempts: self.config.retry_attempts,
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),
@@ -2464,6 +2533,7 @@ impl AgentCore {
     }
 
     fn resume_summary_client(&self) -> Result<OpenAiClient, String> {
+        let (base_url, api_key) = self.client_route()?;
         let model = self
             .config
             .models
@@ -2493,9 +2563,9 @@ impl AgentCore {
             system_prompt: String::new(),
             prompt_cache_key: self.session.session_id().to_string(),
             mcp: McpManager::default(),
-            base_url: self.config.base_url.clone(),
+            base_url,
             max_output_tokens,
-            api_key: self.provider_api_key().as_deref(),
+            api_key: api_key.as_deref(),
             api_key_env: &self.config.api_key_env,
             retry_attempts: self.config.retry_attempts,
             connect_timeout: Duration::from_secs(self.config.connect_timeout_seconds),

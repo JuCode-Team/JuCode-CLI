@@ -39,6 +39,8 @@ struct State {
     keys: HashMap<String, String>,
     /// Session → the group it routes to.
     groups: HashMap<String, String>,
+    custom: HashMap<String, Value>,
+    owners: HashMap<String, std::sync::Weak<crate::hub::Hub>>,
     /// Session → the turn its requests are charged to (`X-JuCode-Turn`, see
     /// crate::usage): the running one, else the last until the next opens.
     turns: HashMap<String, String>,
@@ -86,7 +88,67 @@ pub fn bind(key: &str, session: &str) {
 
 /// The engine holding `key` is gone.
 pub fn revoke(key: &str) {
-    state().keys.remove(key);
+    let mut state = state();
+    state.keys.remove(key);
+    state.custom.remove(key);
+    state.owners.remove(key);
+}
+
+/// Installs a route cache scoped to this core's lifetime. Each provider/key
+/// pair gets a different local key, including compaction and subagent clients.
+pub fn proxy_core(core: &mut jucode_agent_core::AgentCore, hub: &std::sync::Arc<crate::hub::Hub>) {
+    struct Routes(std::sync::Mutex<HashMap<(String, String, String, String), String>>);
+    impl Drop for Routes {
+        fn drop(&mut self) {
+            for key in self.0.get_mut().unwrap_or_else(|p| p.into_inner()).values() {
+                revoke(key);
+            }
+        }
+    }
+    let routes = Routes(std::sync::Mutex::new(HashMap::new()));
+    let session = core.session_id().to_string();
+    let owner = std::sync::Arc::downgrade(hub);
+    core.set_request_proxy(move |provider, protocol, api, token| {
+        if provider == "jucode" || !matches!(protocol, "anthropic" | "responses" | "chat") {
+            return Ok((api.to_string(), token.to_string()));
+        }
+        let route = (provider.to_string(), protocol.to_string(), api.to_string(), token.to_string());
+        let mut keys = routes.0.lock().unwrap_or_else(|p| p.into_inner());
+        let key = match keys.get(&route) {
+            Some(key) => key.clone(),
+            None => {
+                let key = issue(&session)?;
+                let upstream = if protocol == "anthropic" && !api.trim_end_matches('/').ends_with("/v1") && !api.trim_end_matches('/').ends_with("/anthropic") && !api.starts_with("https://api.anthropic.com") {
+                    format!("{}/anthropic", api.trim_end_matches('/'))
+                } else { api.to_string() };
+                set_custom(&key, "jucode", json!({"id":provider,"base_url":upstream,"format":protocol,"key":token,"strip_v1":protocol != "anthropic"}));
+                state().owners.insert(key.clone(), owner.clone());
+                keys.insert(route, key.clone());
+                key
+            }
+        };
+        Ok((format!("{}/v1", base_url()?), key))
+    });
+}
+
+pub fn set_custom(key: &str, tool: &str, mut provider: Value) {
+    provider["tool"] = json!(tool);
+    let mut state = state();
+    state.custom.insert(key.to_string(), provider);
+    if let Some(hub) = crate::tool_providers::hub() {
+        state
+            .owners
+            .insert(key.to_string(), std::sync::Arc::downgrade(&hub));
+    }
+}
+
+pub fn custom_for_session(session: &str) -> Option<Value> {
+    let state = state();
+    state.keys.iter().find_map(|(key, owner)| {
+        (owner == session)
+            .then(|| state.custom.get(key).cloned())
+            .flatten()
+    })
 }
 
 /// `session` routes to `group` (None or empty: no choice).
@@ -297,6 +359,17 @@ fn dropped_reply_header(name: &str) -> bool {
     )
 }
 
+struct MeteredRequest {
+    hub: std::sync::Arc<crate::hub::Hub>,
+    session: String,
+    turn: String,
+}
+impl Drop for MeteredRequest {
+    fn drop(&mut self) {
+        self.hub.usage.gateway_finished(&self.session);
+    }
+}
+
 fn serve_with(
     stream: TcpStream,
     head: &str,
@@ -346,7 +419,42 @@ fn serve_with(
         },
         Err((status, message)) => return reply_error(&mut out, status, &message),
     };
-    let upstream = match upstream() {
+    let custom = state().custom.get(&presented).cloned();
+    let inference = request.method.eq_ignore_ascii_case("POST")
+        && matches!(
+            request.target.split('?').next(),
+            Some(
+                "/v1/messages" | "/v1/responses" | "/v1/responses/compact" | "/v1/chat/completions"
+            )
+        );
+    let metered = custom
+        .as_ref()
+        .filter(|_| inference)
+        .and_then(|_| {
+            state()
+                .owners
+                .get(&presented)
+                .and_then(std::sync::Weak::upgrade)
+        })
+        .map(|hub| {
+            let turn = hub.usage.gateway_started(&session);
+            MeteredRequest {
+                hub,
+                session: session.clone(),
+                turn,
+            }
+        });
+    let upstream = match custom.as_ref() {
+        Some(provider) => Ok(Upstream {
+            api: provider["base_url"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            token: provider["key"].as_str().unwrap_or_default().to_string(),
+        }),
+        None => upstream(),
+    };
+    let upstream = match upstream {
         Ok(upstream) => upstream,
         // "not logged in to JuCode …": the desktop reads it as a sign-in error.
         Err(message) => return reply_error(&mut out, 401, &message),
@@ -355,8 +463,12 @@ fn serve_with(
         .ok()
         .and_then(|body| body["model"].as_str().map(str::to_string))
         .unwrap_or_default();
-    let chosen = state().groups.get(&session).cloned();
-    let default = if model.is_empty() {
+    let chosen = if custom.is_none() {
+        state().groups.get(&session).cloned()
+    } else {
+        None
+    };
+    let default = if model.is_empty() || custom.is_some() {
         None
     } else {
         defaults().get(&model).cloned()
@@ -373,11 +485,26 @@ fn serve_with(
         )
     };
 
-    let url = format!("{}{}", upstream.api.trim_end_matches('/'), request.target);
+    let target = if custom
+        .as_ref()
+        .is_some_and(|p| p["strip_v1"] == true || upstream.api.ends_with("/v1"))
+    {
+        request
+            .target
+            .strip_prefix("/v1")
+            .unwrap_or(&request.target)
+    } else {
+        &request.target
+    };
+    let url = format!("{}{}", upstream.api.trim_end_matches('/'), target);
     let mut call = agent()
         .request(&request.method, &url)
-        .set("Authorization", &format!("Bearer {}", upstream.token))
         .set("Accept-Encoding", "identity");
+    if custom.as_ref().is_some_and(|p| p["format"] == "anthropic") {
+        call = call.set("x-api-key", &upstream.token);
+    } else {
+        call = call.set("Authorization", &format!("Bearer {}", upstream.token));
+    }
     for (name, value) in &request.headers {
         if !dropped_request_header(name) {
             call = call.set(name, value);
@@ -386,7 +513,12 @@ fn serve_with(
     if let Some(group) = &group {
         call = call.set("X-JuCode-Group", group);
     }
-    if let Some(turn) = state().turns.get(&session).cloned() {
+    if let Some(turn) = state()
+        .turns
+        .get(&session)
+        .cloned()
+        .filter(|_| custom.is_none())
+    {
         call = call.set("X-JuCode-Turn", &turn);
     }
     let result = if request.body.is_empty() && request.method.eq_ignore_ascii_case("GET") {
@@ -400,7 +532,14 @@ fn serve_with(
             return reply_error(
                 &mut out,
                 502,
-                &format!("cannot reach the JuCode gateway: {error}"),
+                &format!(
+                    "cannot reach {}: {error}",
+                    if custom.is_some() {
+                        "the custom provider"
+                    } else {
+                        "the JuCode gateway"
+                    }
+                ),
             );
         }
     };
@@ -422,14 +561,27 @@ fn serve_with(
         .map_err(|error| error.to_string())?;
     // Relayed as it arrives (server-sent events); a client that hangs up
     // ends the copy, and dropping the reader closes the upstream request.
+    let success = (200..300).contains(&response.status());
+    let streaming = response
+        .header("content-type")
+        .unwrap_or("")
+        .contains("text/event-stream");
+    let mut meter = Meter::default();
     let mut body = response.into_reader();
     let mut buffer = [0u8; 16 * 1024];
+    let mut read_error = None;
     loop {
         let read = match body.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => read,
-            Err(error) => return Err(format!("upstream read failed: {error}")),
+            Err(error) => {
+                read_error = Some(format!("upstream read failed: {error}"));
+                break;
+            }
         };
+        if metered.is_some() && success {
+            meter.feed(&buffer[..read], streaming);
+        }
         if out
             .write_all(&buffer[..read])
             .and_then(|()| out.flush())
@@ -438,7 +590,81 @@ fn serve_with(
             break;
         }
     }
-    Ok(())
+    if let Some(provider) = custom.filter(|_| success) {
+        meter.finish(streaming);
+        if let Some(metered) = &metered {
+            metered.hub.usage.record_gateway(
+                &session,
+                &metered.turn,
+                &provider,
+                &model,
+                meter.usage,
+                &metered
+                    .hub
+                    .store
+                    .sessions()
+                    .into_iter()
+                    .find(|r| r.id == session)
+                    .map(|r| r.cwd.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    match read_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Bounded incremental SSE/JSON usage reader; bytes forwarded remain untouched.
+#[derive(Default)]
+struct Meter {
+    pending: Vec<u8>,
+    usage: Value,
+}
+impl Meter {
+    fn feed(&mut self, bytes: &[u8], streaming: bool) {
+        for byte in bytes {
+            if self.pending.len() < MAX_BODY {
+                self.pending.push(*byte);
+            }
+            if streaming && *byte == b'\n' {
+                let line = std::mem::take(&mut self.pending);
+                if let Some(data) = line.strip_prefix(b"data:") {
+                    self.parse(data);
+                }
+            }
+        }
+    }
+    fn finish(&mut self, streaming: bool) {
+        let pending = std::mem::take(&mut self.pending);
+        if streaming {
+            if let Some(data) = pending.strip_prefix(b"data:") {
+                self.parse(data);
+            }
+        } else {
+            self.parse(&pending);
+        }
+    }
+    fn parse(&mut self, bytes: &[u8]) {
+        let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+            return;
+        };
+        let usage = value
+            .get("usage")
+            .or_else(|| value.get("message")?.get("usage"))
+            .or_else(|| value.get("response")?.get("usage"));
+        let Some(usage) = usage else { return };
+        if !usage.is_object() {
+            return;
+        }
+        if !self.usage.is_object() {
+            self.usage = json!({});
+        }
+        for (key, value) in usage.as_object().unwrap() {
+            self.usage[key] = value.clone();
+        }
+    }
 }
 
 fn loopback_host(host: &str) -> bool {
@@ -633,12 +859,66 @@ mod tests {
         assert!(!state().keys.contains_key(&key));
     }
 
+    #[test]
+    fn usage_is_read_across_chunks_without_summing_cumulative_deltas() {
+        let mut meter = Meter::default();
+        let stream = b"event: message_start\r\ndata: {\"message\":{\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":20,\"output_tokens\":1}}}\r\n\r\ndata: {\"usage\":{\"output_tokens\":8}}\n\ndata: {\"usage\":{\"output_tokens\":13}}\n\n";
+        for part in stream.chunks(3) {
+            meter.feed(part, true);
+        }
+        meter.finish(true);
+        assert_eq!(meter.usage["input_tokens"], 12);
+        assert_eq!(meter.usage["cache_read_input_tokens"], 20);
+        assert_eq!(meter.usage["output_tokens"], 13);
+        let mut meter = Meter::default();
+        meter.feed(br#"data: {"type":"response.completed","response":{"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":60},"output_tokens":15}}}"#, true);
+        meter.finish(true);
+        assert_eq!(meter.usage["input_tokens"], 100);
+        assert_eq!(meter.usage["input_tokens_details"]["cached_tokens"], 60);
+        let mut meter = Meter::default();
+        meter.feed(
+            br#"{"usage":{"prompt_tokens":30,"completion_tokens":5}}"#,
+            false,
+        );
+        meter.finish(false);
+        assert_eq!(meter.usage["prompt_tokens"], 30);
+    }
+
+    #[test]
+    fn custom_routes_inject_only_the_upstream_key_and_do_not_send_jucode_tags() {
+        let key = issue("s-custom-proxy").unwrap();
+        let (api, upstream) = fake_upstream();
+        set_custom(
+            &key,
+            "claude",
+            json!({"id":"private","base_url":format!("{api}/v1"),"key":"own-secret","format":"anthropic"}),
+        );
+        set_turn("s-custom-proxy", Some("private-turn"));
+        set_group("s-custom-proxy", Some("g1"));
+        let body = r#"{"model":"claude-custom","stream":true}"#;
+        let request = format!("POST /gw/v1/messages HTTP/1.1\r\nHost: localhost:7788\r\nAuthorization: Bearer {key}\r\nX-JuCode-Group: bad\r\nX-JuCode-Turn: bad\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        let reply = through_gateway(&request, "http://127.0.0.1:9".into(), Some("g1"));
+        let received = upstream.join().unwrap().to_ascii_lowercase();
+        assert!(
+            reply.contains("data: one\n\ndata: two\n\n"),
+            "{reply}\nupstream received: {received}"
+        );
+        assert!(received.starts_with("post /v1/messages "), "{received}");
+        assert!(received.contains("x-api-key: own-secret"));
+        assert!(!received.contains("authorization:"));
+        assert!(!received.contains(&key));
+        assert!(!received.contains("real-token"));
+        assert!(!received.contains("x-jucode-"));
+        revoke(&key);
+        assert!(custom_for_session("s-custom-proxy").is_none());
+    }
+
     /// A fake JuCode gateway: answers one request with a streamed body and
     /// reports what it received.
     fn fake_upstream() -> (String, thread::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let handle = thread::spawn(move || {
+        let handle = thread::spawn(move || loop {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut received = String::new();
@@ -654,6 +934,13 @@ mod tests {
                     break;
                 }
             }
+            // A local dev-server scanner can probe temporary test ports.
+            if !received.starts_with("POST ") {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
             let mut body = vec![0u8; length];
             reader.read_exact(&mut body).unwrap();
             received.push_str(&String::from_utf8_lossy(&body));
@@ -667,7 +954,7 @@ mod tests {
                 stream.flush().unwrap();
             }
             stream.write_all(b"0\r\n\r\n").unwrap();
-            received
+            break received;
         });
         (format!("http://{addr}"), handle)
     }

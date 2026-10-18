@@ -62,6 +62,7 @@ fn open(hub: &Arc<Hub>, cwd: PathBuf, resume: Option<&str>) -> Result<AgentCore,
         Some(id) => resume_session(hub, &mut core, id),
     };
     result?;
+    crate::gateway::proxy_core(&mut core, hub);
     core.add_writable_dirs(&dirs);
     core.set_app_tools_off(crate::engines::app_tools_off(&hub.store));
     if resume.is_some_and(|id| crate::requirements::gated(hub, id)) {
@@ -135,7 +136,7 @@ fn run(hub: &Hub, mut core: AgentCore, id: &str, ops: Receiver<Value>) {
             let turn = matches!(event, AgentEvent::Usage { .. })
                 .then(|| core.turn_tag().map(str::to_string))
                 .flatten();
-            publish_on(hub, id, event, turn);
+            publish_on(hub, id, event, turn, core.uses_request_proxy());
         }
         let status = session_event_json(id, core.model_status_event());
         // Reconciled every tick, so a message that never started a run (an
@@ -307,11 +308,11 @@ fn rejected(op: &Value) -> Option<String> {
 /// Records deferred-action events before sending any event to clients, so
 /// an action a client sees is always one the daemon can restore.
 fn publish(hub: &Hub, id: &str, event: AgentEvent) {
-    publish_on(hub, id, event, None);
+    publish_on(hub, id, event, None, false);
 }
 
 /// `publish`, naming the turn a usage event belongs to.
-fn publish_on(hub: &Hub, id: &str, event: AgentEvent, turn: Option<String>) {
+fn publish_on(hub: &Hub, id: &str, event: AgentEvent, turn: Option<String>, metered: bool) {
     if let AgentEvent::ActionDeferred(action) = &event {
         if let Err(error) = hub.store.record_deferred(action) {
             hub.broadcast(&json!({
@@ -329,6 +330,9 @@ fn publish_on(hub: &Hub, id: &str, event: AgentEvent, turn: Option<String>) {
     hub.attach_sent_images(id, &mut json);
     if let Some(turn) = turn {
         json["turn"] = json!(turn);
+    }
+    if metered && json["type"] == "usage" {
+        json["gateway_metered"] = json!(true);
     }
     hub.observe(id, &json);
     hub.usage.tag_event(id, &mut json);

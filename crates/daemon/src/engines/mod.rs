@@ -321,16 +321,26 @@ fn with_gateway(
     mut command: Command,
 ) -> Result<(Command, Option<String>), String> {
     command.envs(options.env.iter().map(|(name, value)| (name, value)));
-    if options.gateway != Some(true) {
+    let custom = if options.gateway != Some(true) {
+        crate::tool_providers::selected(kind.name())
+    } else {
+        None
+    };
+    if options.gateway != Some(true) && custom.is_none() {
         return Ok((command, None));
     }
     if kind == Kind::Acp {
         return Err("an ACP agent has no JuCode gateway mode".to_string());
     }
     // Not signed in fails the start, not the first request.
-    jucode_agent_core::jucode_gateway_credentials()?;
+    if custom.is_none() {
+        jucode_agent_core::jucode_gateway_credentials()?;
+    }
     let base = crate::gateway::base_url()?;
     let key = crate::gateway::issue(id)?;
+    if let Some(provider) = custom {
+        crate::gateway::set_custom(&key, kind.name(), provider);
+    }
     let configured = match kind {
         Kind::Claude => claude::use_gateway(&mut command, id, &base, &key),
         _ => codex::use_gateway(&mut command, &base, &key),
@@ -683,6 +693,14 @@ pub fn spawn(
         .or(options.resume.as_deref())
         .is_some_and(|session| crate::requirements::gated(&hub, session));
     let options = Options {
+        model: options.model.clone().or_else(|| {
+            if options.gateway == Some(true) {
+                None
+            } else {
+                crate::tool_providers::selected(kind.name())
+                    .and_then(|p| p["model"].as_str().map(str::to_string))
+            }
+        }),
         dirs: crate::projects::extra_dirs(&hub, &cwd),
         app_tools_off: app_tools_off(&hub.store),
         approval_mode: if gated {

@@ -24,6 +24,7 @@ mod store;
 mod subsessions;
 mod terminal;
 mod titles;
+mod tool_providers;
 mod uploads;
 mod usage;
 
@@ -74,6 +75,7 @@ pub fn serve(
         gateway::set_group(&record.id, record.group.as_deref());
     }
     let hub = Hub::new(store, version, relay);
+    tool_providers::init(&hub);
     // Runs left going by the last daemon ended with it.
     hub.interrupt_schedule_runs();
     if hub.relay.url().is_some() {
@@ -333,6 +335,22 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             let result = skills::handle(&name, &op);
             respond(&hub, client, &request, result);
         });
+        return;
+    }
+    if matches!(
+        name,
+        "tool_providers" | "tool_provider_save" | "tool_provider_remove" | "tool_provider_select"
+    ) {
+        if !hub.is_local(client) {
+            reply(json!({"type":"error","message":"only the desktop can manage tool providers"}));
+            return;
+        }
+        respond(
+            hub,
+            client,
+            &request,
+            tool_providers::handle(&hub.store, &op),
+        );
         return;
     }
     // The gateway's groups come from the network.

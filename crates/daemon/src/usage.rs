@@ -58,6 +58,8 @@ struct State {
     open: HashMap<String, Value>,
     /// A turn was written since the last upload.
     dirty: bool,
+    gateway_active: HashMap<String, usize>,
+    gateway_closing: HashSet<String>,
 }
 
 pub struct Usage {
@@ -103,9 +105,11 @@ impl Usage {
             Some("user_message") => {
                 let Some(info) = info() else { return };
                 // The JuCode engine tags its own turns.
-                if info.engine != "jucode" {
+                if info.engine != "jucode" || crate::gateway::custom_for_session(session).is_some()
+                {
                     let mut state = self.lock();
-                    if !state.current.contains_key(session) {
+                    let previous_closing = state.gateway_closing.remove(session);
+                    if previous_closing || !state.current.contains_key(session) {
                         let turn = new_turn_id();
                         crate::gateway::set_turn(session, Some(&turn));
                         state.current.insert(session.to_string(), turn);
@@ -114,6 +118,12 @@ impl Usage {
             }
             Some("usage") => {
                 let Some(info) = info() else { return };
+                if event["gateway_metered"] == true
+                    || (info.engine != "jucode"
+                        && crate::gateway::custom_for_session(session).is_some())
+                {
+                    return;
+                }
                 self.add(session, event, &info);
             }
             Some("status") if event["message"] == "ready" => self.close(session),
@@ -154,7 +164,11 @@ impl Usage {
             },
         };
         let (provider, model) = state.routes.get(session).cloned().unwrap_or_default();
-        let (kind, channel) = channel(&info.engine, info.gateway, &provider);
+        let (kind, channel) = if let Some(provider) = event["gateway_provider"].as_str() {
+            ("local", provider.to_string())
+        } else {
+            channel(&info.engine, info.gateway, &provider)
+        };
         let record = state.open.entry(turn.clone()).or_insert_with(|| {
             json!({
                 "turn_id": turn,
@@ -205,6 +219,77 @@ impl Usage {
         }
     }
 
+    pub fn gateway_started(&self, session: &str) -> String {
+        let mut state = self.lock();
+        *state.gateway_active.entry(session.to_string()).or_default() += 1;
+        state
+            .current
+            .entry(session.to_string())
+            .or_insert_with(new_turn_id)
+            .clone()
+    }
+
+    pub fn gateway_finished(&self, session: &str) {
+        let close = {
+            let mut state = self.lock();
+            let count = state.gateway_active.entry(session.to_string()).or_default();
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.gateway_active.remove(session);
+                state.gateway_closing.remove(session)
+            } else {
+                false
+            }
+        };
+        if close {
+            self.close(session);
+        }
+    }
+
+    /// Custom upstreams are metered once at the local gateway, independently
+    /// of the tool's aggregate usage events.
+    pub fn record_gateway(
+        &self,
+        session: &str,
+        turn: &str,
+        provider: &Value,
+        model: &str,
+        usage: Value,
+        cwd: &str,
+    ) {
+        let cached = usage["cache_read_input_tokens"]
+            .as_u64()
+            .or(usage["input_tokens_details"]["cached_tokens"].as_u64())
+            .or(usage["prompt_tokens_details"]["cached_tokens"].as_u64())
+            .unwrap_or(0);
+        let raw_input = usage["input_tokens"]
+            .as_u64()
+            .or(usage["prompt_tokens"].as_u64())
+            .unwrap_or(0);
+        let input = if provider["format"] != "anthropic" {
+            raw_input
+        } else {
+            raw_input
+                .saturating_add(cached)
+                .saturating_add(usage["cache_creation_input_tokens"].as_u64().unwrap_or(0))
+        };
+        let event = json!({"type":"usage", "turn":turn, "model":model,
+            "gateway_provider": format!("{}:{}", provider["tool"].as_str().unwrap_or(""), provider["id"].as_str().unwrap_or("")),
+            "input_tokens":input, "cached_input_tokens":cached,
+            "cache_write_tokens":usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+            "output_tokens":usage["output_tokens"].as_u64().or(usage["completion_tokens"].as_u64()).unwrap_or(0),
+            "reasoning_tokens":usage["output_tokens_details"]["reasoning_tokens"].as_u64().or(usage["completion_tokens_details"]["reasoning_tokens"].as_u64()).unwrap_or(0)});
+        self.add(
+            session,
+            &event,
+            &SessionInfo {
+                engine: provider["tool"].as_str().unwrap_or("").to_string(),
+                gateway: false,
+                cwd: cwd.to_string(),
+            },
+        );
+    }
+
     /// The session's engine stopped: its model route goes (a reopened
     /// engine announces it again).
     pub fn forget(&self, session: &str) {
@@ -214,8 +299,13 @@ impl Usage {
 
     /// The session is ready again: its turns are written.
     pub fn close(&self, session: &str) {
-        // Keep the move from open turns to the file atomic for ledger snapshots.
+        // The engine can report ready before the final response bytes arrive.
+        // Keep its turn open until every in-flight gateway request is recorded.
         let mut state = self.lock();
+        if state.gateway_active.get(session).copied().unwrap_or(0) > 0 {
+            state.gateway_closing.insert(session.to_string());
+            return;
+        }
         // The gateway keeps tagging requests with this turn until the next
         // one opens: Claude's background agents and Workflows run on after
         // the turn ends, and are this turn's cost.
@@ -239,9 +329,10 @@ impl Usage {
         let lines: String = records
             .into_iter()
             .filter(|record| {
-                TOKEN_FIELDS
-                    .iter()
-                    .any(|f| record[*f].as_u64().unwrap_or(0) > 0)
+                record["requests"].as_u64().unwrap_or(0) > 0
+                    || TOKEN_FIELDS
+                        .iter()
+                        .any(|f| record[*f].as_u64().unwrap_or(0) > 0)
             })
             .map(|mut record| {
                 record["ended_at"] = json!(ended);
@@ -924,6 +1015,103 @@ mod tests {
             assert_ne!(ids[0], ids[1]);
         }
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn gateway_counts_cached_input_once_and_keeps_custom_cost_unknown() {
+        let (usage, dir) = usage_in("custom-gateway");
+        usage.record_gateway("s-custom", "t-claude", &json!({"id":"private","tool":"claude","format":"anthropic"}), "model", json!({"input_tokens":12,"cache_read_input_tokens":20,"cache_creation_input_tokens":5,"output_tokens":8}), "");
+        usage.record_gateway("s-custom", "t-codex", &json!({"id":"private","tool":"codex","format":"responses"}), "model", json!({"input_tokens":100,"input_tokens_details":{"cached_tokens":60},"output_tokens":15,"output_tokens_details":{"reasoning_tokens":4}}), "");
+        usage.close("s-custom");
+        let records = usage.records();
+        assert_eq!(records.len(), 2);
+        let claude = records.iter().find(|r| r["engine"] == "claude").unwrap();
+        let codex = records.iter().find(|r| r["engine"] == "codex").unwrap();
+        assert_eq!(claude["input_tokens"], 37);
+        assert_eq!(claude["cached_input_tokens"], 20);
+        assert_eq!(claude["cache_write_tokens"], 5);
+        assert_eq!(codex["input_tokens"], 100);
+        assert_eq!(codex["cached_input_tokens"], 60);
+        assert_eq!(codex["reasoning_tokens"], 4);
+        assert!(records.iter().all(|r| r["channel_kind"] == "local"
+            && r["requests"] == 1
+            && r["estimated_cost_usd"].is_null()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ready_waits_for_gateway_requests_and_records_one_turn_without_tool_duplicates() {
+        let (usage, dir) = usage_in("gateway-race");
+        let turn = usage.gateway_started("s-race");
+        assert_eq!(usage.gateway_started("s-race"), turn);
+        let provider = json!({"id":"custom","tool":"jucode","format":"chat"});
+        usage.close("s-race");
+        usage.record_gateway(
+            "s-race",
+            &turn,
+            &provider,
+            "m",
+            json!({"prompt_tokens":30,"completion_tokens":5}),
+            "",
+        );
+        usage.gateway_finished("s-race");
+        assert!(usage.records().is_empty());
+        usage.observe(
+            "s-race",
+            &json!({"type":"usage","gateway_metered":true,"input_tokens":9999}),
+            || info("jucode", false),
+        );
+        usage.record_gateway(
+            "s-race",
+            &turn,
+            &provider,
+            "m",
+            json!({"prompt_tokens":20,"completion_tokens":3}),
+            "",
+        );
+        usage.gateway_finished("s-race");
+        let records = usage.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["requests"], 2);
+        assert_eq!(records[0]["input_tokens"], 50);
+        assert_eq!(records[0]["output_tokens"], 8);
+        assert!(usage.lock().gateway_active.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_turn_does_not_merge_with_a_previous_stream_that_is_still_closing() {
+        let (usage, dir) = usage_in("gateway-next-turn");
+        let first = usage.gateway_started("s-next");
+        usage.close("s-next");
+        usage.observe("s-next", &json!({"type":"user_message"}), || {
+            info("claude", false)
+        });
+        let second = usage.gateway_started("s-next");
+        assert_ne!(first, second);
+        let provider = json!({"id":"custom","tool":"claude","format":"anthropic"});
+        usage.record_gateway(
+            "s-next",
+            &first,
+            &provider,
+            "m",
+            json!({"input_tokens":10}),
+            "",
+        );
+        usage.gateway_finished("s-next");
+        usage.record_gateway(
+            "s-next",
+            &second,
+            &provider,
+            "m",
+            json!({"input_tokens":20}),
+            "",
+        );
+        usage.gateway_finished("s-next");
+        assert!(usage.records().is_empty());
+        usage.close("s-next");
+        assert_eq!(usage.records().len(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
