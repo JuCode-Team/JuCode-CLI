@@ -36,7 +36,7 @@ pub use config::{
     builtin_providers, jucode_visible_models, models_for_provider, ApprovalMode, ModelConfig,
     SubagentModel,
 };
-pub use core::{title_completion, AgentCore};
+pub use core::{queue_index, title_completion, AgentCore};
 pub use event::{
     AgentEvent, CommandView, GoalView, LoginProviderView, McpServerView, McpToolView,
     ModelOptionView, PlanItem, SessionListItemView, TranscriptItem, TreeNodeView,

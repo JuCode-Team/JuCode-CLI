@@ -95,10 +95,12 @@ Structured views come back as events (`model_view`, `resume_view`,
 ### `steer`
 
 ```json
-{"op":"steer"}
+{"op":"steer","index":-1}
 ```
 
-Sends the next queued message into the in-flight turn: the model reads it
+Sends a queued message into the in-flight turn: `index` picks it (the next
+one when absent; negative counts from the last, so `-1` is the message just
+sent; out of range is a no-op). The model reads it
 before its next request (once the current tool calls finish), and running
 tools and subagents keep going. Emits `status:"steering"` and the updated
 `pending_messages`; when the model reads it, a `user_message` event (it is

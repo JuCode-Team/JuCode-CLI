@@ -17,13 +17,15 @@
 //!   (legacy `modes` when it has none); the client sees them as
 //!   `model_status` and `session_options`, and what the session can do as
 //!   `engine_caps`.
-//! - One prompt at a time: messages sent during a turn run as the next turns.
+//! - One prompt at a time: messages sent during a turn run as the next turns;
+//!   `steer` cancels the turn so a queued one runs now.
 
 use super::{
     acp_presets::{self, Mode, Preset},
     claude, find_program, Adapter, Line, Options, Output,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
+use jucode_agent_core::queue_index;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
@@ -1178,10 +1180,26 @@ impl Adapter for Acp {
                 };
                 vec![json!({ "jsonrpc": "2.0", "id": request, "result": result }).to_string()]
             }
-            "interrupt" => {
+            // A queued message (`index`, the next by default, negative from
+            // the last) goes now: the
+            // turn is cancelled and, once it settles, that message starts
+            // the next one, ahead of the others waiting.
+            "steer" | "interrupt" => {
                 let Some(session) = self.session.clone() else {
                     return Ok(Output::default());
                 };
+                let steer = op["op"] == "steer";
+                if steer {
+                    let Some(index) = queue_index(op["index"].as_i64(), self.queued.len()) else {
+                        return Ok(Output::default());
+                    };
+                    if !self.prompt_in_flight {
+                        return Ok(Output::default());
+                    }
+                    if let Some(chosen) = self.queued.remove(index) {
+                        self.queued.push_front(chosen);
+                    }
+                }
                 let mut frames: Vec<String> = self
                     .approvals
                     .drain()
@@ -1193,7 +1211,9 @@ impl Adapter for Acp {
                         json!({ "jsonrpc": "2.0", "id": request, "result": result }).to_string()
                     })
                     .collect();
-                self.queued.clear();
+                if !steer {
+                    self.queued.clear();
+                }
                 frames.push(json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": session } }).to_string());
                 return Ok(Output {
                     frames,
@@ -1891,6 +1911,39 @@ mod tests {
             ]
         );
         assert!(!a.busy());
+    }
+
+    #[test]
+    fn steering_cancels_the_turn_and_the_chosen_message_runs_next() {
+        let mut a = opened();
+        a.encode(&json!({ "op": "user_message", "content": "one" }))
+            .unwrap();
+        for text in ["two", "three"] {
+            a.encode(&json!({ "op": "user_message", "content": text }))
+                .unwrap();
+        }
+        let out = a.encode(&json!({ "op": "steer", "index": -1 })).unwrap();
+        assert_eq!(
+            sent(&out.frames).last().unwrap()["method"],
+            "session/cancel"
+        );
+        assert_eq!(
+            out.events,
+            [json!({ "type": "pending_messages", "messages": ["three", "two"] })]
+        );
+        let prompt = a
+            .pending
+            .iter()
+            .find(|(_, (m, _))| m == "session/prompt")
+            .map(|(id, _)| *id)
+            .unwrap();
+        let done = frame(
+            &mut a,
+            json!({ "id": prompt, "result": { "stopReason": "cancelled" } }),
+        );
+        let next = sent(&done.frames);
+        assert_eq!(next[0]["method"], "session/prompt");
+        assert_eq!(next[0]["params"]["prompt"][0]["text"], "three");
     }
 
     #[test]

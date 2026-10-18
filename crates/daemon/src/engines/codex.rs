@@ -22,7 +22,7 @@
 //! - A rewind is `thread/revert` to before a user message's turn.
 
 use super::{home, resolve, Adapter, HostCall, Line, Options, Output};
-use jucode_agent_core::user_tools;
+use jucode_agent_core::{queue_index, user_tools};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -1853,10 +1853,16 @@ impl Adapter for Codex {
                 else {
                     return Ok(Output::default());
                 };
-                if self.waiting.is_empty() {
+                // One message (`index`, negative from the last) or all that wait.
+                self.steering = match op["index"].as_i64() {
+                    None => std::mem::take(&mut self.waiting),
+                    index => queue_index(index, self.waiting.len())
+                        .map(|i| vec![self.waiting.remove(i)])
+                        .unwrap_or_default(),
+                };
+                if self.steering.is_empty() {
                     return Ok(Output::default());
                 }
-                self.steering = std::mem::take(&mut self.waiting);
                 let input: Vec<Value> = self
                     .steering
                     .iter()
@@ -2446,6 +2452,30 @@ mod tests {
         let next = sent(&ended.frames);
         assert_eq!(next[0]["method"], "turn/start");
         assert_eq!(next[0]["params"]["input"][0]["text"], "also this");
+    }
+
+    #[test]
+    fn one_waiting_message_steers_in_by_its_index() {
+        let mut c = opened();
+        busy(&mut c);
+        for text in ["one", "two"] {
+            c.encode(&json!({ "op": "user_message", "content": text }))
+                .unwrap();
+        }
+        let steer = c.encode(&json!({ "op": "steer", "index": 1 })).unwrap();
+        let frames = sent(&steer.frames);
+        assert_eq!(frames[0]["method"], "turn/steer");
+        assert_eq!(frames[0]["params"]["input"][0]["text"], "two");
+        assert_eq!(frames[0]["params"]["input"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            steer.events,
+            vec![json!({ "type": "pending_messages", "messages": ["one"] })]
+        );
+        assert!(c
+            .encode(&json!({ "op": "steer", "index": -3 }))
+            .unwrap()
+            .frames
+            .is_empty());
     }
 
     #[test]

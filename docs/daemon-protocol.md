@@ -284,7 +284,10 @@ Differences from a jucode session:
   conversation (it only honors that mode as a start flag), after the running
   turn. Codex applies a new mode, and a model picked with `/model`, from the
   next turn.
-- `steer`, `decide_action`, `mcp_set`/`mcp_remove` and the jucode-only
+- `steer` stops the running turn so the queued messages run now: they are in
+  Claude Code's input already, and it takes them in order once the turn
+  stops (`index` is ignored).
+- `decide_action`, `mcp_set`/`mcp_remove` and the jucode-only
   commands (`/resume`, `/rewind`, `/tree`, ...) are refused with an `error`
   event. Other slash commands go to Claude Code as a user message, as Claude
   Code expects.
@@ -309,7 +312,8 @@ Codex sessions take the same `steer`, `/fast`, `/thinking`, `rename`,
 `mcp_login` `name` (answered by `mcp_login` with the server's sign-in `url`)
 and `/login` (a device code to sign Codex in to ChatGPT, as an `info`). A
 message sent mid-turn waits in the daemon (`pending_messages`) and starts the
-next turn; `steer` sends it into the running one (`turn/steer`). Approval
+next turn; `steer` sends it into the running one (`turn/steer`): the
+message at `index` (negative from the last), or all that wait without one. Approval
 mode `plan` is Codex's plan collaboration mode and `auto` its `auto_review`
 reviewer. Codex's own requests for permissions, for the user's answers
 (`ask_question` with `questions`) and MCP elicitations come as approval
@@ -439,6 +443,9 @@ The rest uses the usual events:
   `user_message` once sent. Images go as base64 blocks when the agent takes
   them (files over 20 MB are not sent); otherwise an `info` says they were
   not sent.
+- `steer` (`index`, negative from the last) cancels the turn the same way
+  but keeps the waiting messages, the chosen one first: it runs as soon as
+  the turn settles.
 - `interrupt` cancels open questions, drops waiting messages and sends
   `session/cancel`; the turn ends with `status: "interrupted"`.
 - Agent notices are `info` (or `error`), a turn that ends with no reply

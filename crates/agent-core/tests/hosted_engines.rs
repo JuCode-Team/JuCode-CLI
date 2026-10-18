@@ -550,7 +550,7 @@ fn a_steered_message_joins_the_running_turn_without_stopping_its_tool() {
         thread::sleep(Duration::from_millis(5));
     }
     core.submit_user_message("also check the weather".to_string());
-    events.extend(core.steer());
+    events.extend(core.steer(None));
     events.extend(pump(&mut core, is_ready));
 
     // The tool was not killed: its file exists.
@@ -569,6 +569,31 @@ fn a_steered_message_joins_the_running_turn_without_stopping_its_tool() {
 }
 
 #[test]
+fn a_steer_by_index_takes_that_message_and_leaves_the_others_waiting() {
+    let _guard = setup();
+    let dir = temp_dir("steer-index");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+
+    let slow = if cfg!(windows) {
+        "RUN: Start-Sleep -Seconds 3".to_string()
+    } else {
+        "RUN: sleep 3".to_string()
+    };
+    core.submit_user_message(slow);
+    pump(&mut core, |e| matches!(e, AgentEvent::ToolStart { .. }));
+    core.submit_user_message("first".to_string());
+    core.submit_user_message("second".to_string());
+    let events = core.steer(Some(-1));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::PendingMessages(texts) if *texts == ["first"]
+    )));
+    // Out of range: nothing happens.
+    assert!(core.steer(Some(4)).is_empty());
+    core.interrupt();
+}
+
+#[test]
 fn an_interrupt_requeues_unread_steers_ahead_of_later_messages() {
     let _guard = setup();
     let dir = temp_dir("steer-interrupt");
@@ -583,7 +608,7 @@ fn an_interrupt_requeues_unread_steers_ahead_of_later_messages() {
     pump(&mut core, |e| matches!(e, AgentEvent::ToolStart { .. }));
     // Steered while the tool runs, so the model has not read it yet.
     core.submit_user_message("first".to_string());
-    core.steer();
+    core.steer(None);
     core.submit_user_message("second".to_string());
     let events = core.interrupt();
     // Shown again, ahead of the message sent after it.

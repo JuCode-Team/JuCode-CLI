@@ -24,7 +24,8 @@
 //! - A user message sent mid-turn is taken into the running turn at the
 //!   next tool boundary (or starts the next turn), and replayed then; until
 //!   that replay it shows as queued (`pending_messages`). Claude saves it
-//!   only as a `queued_command` attachment row.
+//!   only as a `queued_command` attachment row. `steer` stops the turn so
+//!   the queued messages run now.
 //! - Full access (`bypassPermissions`) is only honored when the CLI starts
 //!   with `--dangerously-skip-permissions`, so switching into or out of it
 //!   restarts the engine on the same conversation.
@@ -736,6 +737,8 @@ pub struct Claude {
     streamed: HashMap<String, Tokens>,
     active_turn: bool,
     interrupting: bool,
+    /// The turn is being stopped for the queued messages, which then run.
+    steering: bool,
     /// Messages sent mid-turn that Claude has not taken in (replayed) yet.
     queued: Vec<String>,
     /// The composer's slash commands: the CLI's `initialize` reply (with
@@ -787,6 +790,7 @@ impl Claude {
             streamed: HashMap::new(),
             active_turn: false,
             interrupting: false,
+            steering: false,
             queued: Vec::new(),
             commands: Vec::new(),
             calls: Vec::new(),
@@ -1566,10 +1570,11 @@ impl Claude {
     fn on_result(&mut self, frame: &Value) -> Vec<Value> {
         self.active_turn = false;
         let was_interrupting = std::mem::take(&mut self.interrupting);
+        let was_steering = std::mem::take(&mut self.steering);
         let mut events = Vec::new();
         // Stopped: what was waiting is not known to run; if it does, its
         // replay still shows it.
-        if was_interrupting && !self.queued.is_empty() {
+        if was_interrupting && !was_steering && !self.queued.is_empty() {
             self.queued.clear();
             events.push(self.queued_event());
         }
@@ -2502,6 +2507,16 @@ impl Adapter for Claude {
                     return Ok(Output::default());
                 }
                 self.interrupting = true;
+                vec![self.control_request(json!({ "subtype": "interrupt" }), "")]
+            }
+            // Queued messages go now: they are in the CLI's input already and
+            // run once the turn stops (claude 2.1.296), in the order sent.
+            "steer" => {
+                if !self.active_turn || self.queued.is_empty() {
+                    return Ok(Output::default());
+                }
+                self.interrupting = true;
+                self.steering = true;
                 vec![self.control_request(json!({ "subtype": "interrupt" }), "")]
             }
             "set_approval_mode" => {
@@ -4185,7 +4200,12 @@ mod tests {
         assert!(c
             .encode(&json!({ "op": "command", "input": "/resume x" }))
             .is_err());
-        assert!(c.encode(&json!({ "op": "steer" })).is_err());
+        // Nothing queued, nothing running: nothing to steer.
+        assert!(c
+            .encode(&json!({ "op": "steer" }))
+            .unwrap()
+            .frames
+            .is_empty());
     }
 
     #[test]
@@ -4295,6 +4315,28 @@ mod tests {
         // Read again, the same file.
         assert_eq!(transcript_in(&home, cwd, "33-44", &images), items);
         assert_eq!(fs::read_dir(&images).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn steering_stops_the_turn_and_the_queued_messages_stay_to_run() {
+        let mut c = claude();
+        c.encode(&json!({ "op": "user_message", "content": "first" }))
+            .unwrap();
+        frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "status", "status": "requesting" }),
+        );
+        c.encode(&json!({ "op": "user_message", "content": "now this" }))
+            .unwrap();
+        let steer = c.encode(&json!({ "op": "steer", "index": 0 })).unwrap();
+        assert!(steer.frames[0].contains("\"interrupt\""));
+        let ended = frame(
+            &mut c,
+            json!({ "type": "result", "subtype": "error_during_execution", "is_error": true }),
+        );
+        assert!(!ended.iter().any(|e| e["type"] == "error"));
+        assert!(!ended.iter().any(|e| e["type"] == "pending_messages"));
+        assert_eq!(c.queued, ["now this"]);
     }
 
     #[test]

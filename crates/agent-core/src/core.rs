@@ -723,13 +723,22 @@ impl AgentCore {
         self.queued.iter().map(|(text, _)| text.clone()).collect()
     }
 
-    /// Sends the next queued message into the running turn: the model reads
-    /// it before its next request (after the current tool calls finish), and
-    /// running tools and subagents keep going. A message with images, or one
-    /// sent while nothing runs, starts a turn of its own as before.
-    pub fn steer(&mut self) -> Vec<AgentEvent> {
-        if !self.running || self.queued.is_empty() {
+    /// Sends a queued message (`index`, the next one by default; negative
+    /// counts from the last) into the running turn: the model reads it before
+    /// its next request (after the current tool calls finish), and running
+    /// tools and subagents keep going. A message with images, or one sent
+    /// while nothing runs, starts a turn of its own as before.
+    pub fn steer(&mut self, index: Option<i64>) -> Vec<AgentEvent> {
+        let Some(index) = queue_index(index, self.queued.len()) else {
             return Vec::new();
+        };
+        if !self.running {
+            return Vec::new();
+        }
+        if index > 0 {
+            if let Some(chosen) = self.queued.remove(index) {
+                self.queued.push_front(chosen);
+            }
         }
         if self
             .queued
@@ -5687,4 +5696,16 @@ mod login_kind_tests {
             None
         );
     }
+}
+
+/// A queued message's position from a client's `index` (the first when
+/// absent; negative counts from the last), if there is one there.
+pub fn queue_index(index: Option<i64>, len: usize) -> Option<usize> {
+    let index = index.unwrap_or(0);
+    let at = if index < 0 {
+        len.checked_sub(index.unsigned_abs() as usize)?
+    } else {
+        index as usize
+    };
+    (at < len).then_some(at)
 }

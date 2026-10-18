@@ -54,7 +54,8 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
         }
         // A failed turn again, without a new user message (see continue_turn).
         "continue" => core.continue_turn(),
-        "steer" => core.steer(),
+        // A queued message into the running turn: `index`, negative from the last.
+        "steer" => core.steer(value.get("index").and_then(Value::as_i64)),
         "interrupt" => core.interrupt(),
         // Structured twin of the `/approve` text command (GUI convenience):
         // {"op":"approve","call_id":"...","decision":"allow|deny",
