@@ -239,6 +239,9 @@ pub struct Acp {
     resume: Option<String>,
     /// The model to switch to once open.
     model: Option<String>,
+    /// The thinking effort to switch to once open (after the model: its
+    /// levels can depend on it).
+    effort: Option<String>,
     preset: Option<&'static Preset>,
     /// The approval mode the agent was launched in (presets).
     mode: Mode,
@@ -280,6 +283,7 @@ impl Acp {
             session: None,
             resume: options.resume.clone(),
             model: options.model.clone(),
+            effort: options.effort.clone().filter(|e| !e.is_empty()),
             preset: options.agent.as_deref().and_then(acp_presets::find),
             mode: Mode::of(options.approval_mode.as_deref()),
             agent: Value::Null,
@@ -622,6 +626,15 @@ impl Acp {
         });
         if let Some((id, value)) = wanted {
             frames.push(self.set_option(&id, &value));
+        }
+        let effort = self.effort.clone().and_then(|effort| {
+            let option = self.select("thought_level")?;
+            (option["currentValue"] != effort.as_str())
+                .then(|| option["id"].clone())
+                .map(|id| (id, effort))
+        });
+        if let Some((id, effort)) = effort {
+            frames.push(self.set_option(&id, &json!(effort)));
         }
         let mut output = Output { events, frames };
         if let Some(next) = self.next_queued() {
@@ -1327,6 +1340,48 @@ mod tests {
         assert_eq!(caps["session"]["notices"], json!({}));
         assert_eq!(caps["terminal"], false);
         assert_eq!(init["params"]["clientInfo"]["name"], "jucode");
+    }
+
+    #[test]
+    fn the_model_and_effort_to_start_with_are_set_once_open() {
+        // A new session's picks made before it started (the desktop's draft).
+        let (mut a, _) = started(
+            Options {
+                model: Some("jucode/claude-5".into()),
+                effort: Some("high".into()),
+                ..omp()
+            },
+            json!({}),
+        );
+        let open = frame(
+            &mut a,
+            json!({ "id": 2, "result": { "sessionId": "s1", "configOptions": config() } }),
+        );
+        let frames = sent(&open.frames);
+        let set: Vec<(&Value, &Value)> = frames
+            .iter()
+            .map(|f| (&f["params"]["configId"], &f["params"]["value"]))
+            .collect();
+        assert_eq!(
+            set,
+            [
+                (&json!("model"), &json!("jucode/claude-5")),
+                (&json!("effort"), &json!("high"))
+            ]
+        );
+        // What it already runs asks for nothing.
+        let (mut a, _) = started(
+            Options {
+                effort: Some("low".into()),
+                ..omp()
+            },
+            json!({}),
+        );
+        let open = frame(
+            &mut a,
+            json!({ "id": 2, "result": { "sessionId": "s1", "configOptions": config() } }),
+        );
+        assert!(open.frames.is_empty());
     }
 
     #[test]

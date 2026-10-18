@@ -87,7 +87,7 @@ pub struct Options {
     pub tool_provider: Option<String>,
     /// Claude: start with ultracode on (standing Workflow orchestration).
     pub ultracode: bool,
-    /// Claude: the thinking effort to start with.
+    /// Claude and ACP agents: the thinking effort to start with.
     pub effort: Option<String>,
     /// Claude: start in fast mode.
     pub fast: bool,

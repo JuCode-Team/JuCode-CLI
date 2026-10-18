@@ -248,6 +248,7 @@ clients need nothing engine-specific. `options`:
 | `model` | Model to start with |
 | `resume_at` | Claude Code: resume the conversation as it was at this assistant message uuid |
 | `effort`, `ultracode`, `fast`, `thinking` | Claude Code: start with this thinking effort, ultracode on, fast mode on, thinking summaries shown (`false` hides them). A restart (full access, gateway switch) keeps the session's own |
+| `effort` | ACP: the thought-level value to switch to once the conversation opens (after `model`) |
 | `jucode_gateway` | Claude Code / Codex / ACP agents with `gateway`: `true` runs this session through the JuCode gateway on the user's JuCode login; `false` on the session's custom provider (Claude Code / Codex, see `tool_provider`), or the provider in the user's own config. The endpoint and key go to this process only (Claude: `--settings` file; Codex: `-c` overrides and an env var; ACP: see "ACP agents"), never to the user's config files. Omitted on `session_open`: as the session last ran |
 | `tool_provider` | Claude Code / Codex off the gateway: the custom provider (`tool_providers`) to run on, by id; `""` the tool's own configuration. Omitted: a new session takes the tool's selected provider, a reopened one the provider it last ran on. See "Custom provider traffic and usage" |
 | `agent` | ACP: a built-in agent by id (`acp_presets`); the daemon finds and starts it. Excludes `command`, `args`, `bin` and `env` |
