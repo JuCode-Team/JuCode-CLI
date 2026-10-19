@@ -1475,6 +1475,26 @@ impl Claude {
     fn on_user(&mut self, frame: &Value) -> Vec<Value> {
         let content = &frame["message"]["content"];
         if frame["isReplay"] == true {
+            // Messages queued during a turn are taken in together, one text
+            // block each (claude 2.1.296): each is the user's own message.
+            let texts: Vec<&str> = content
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|block| block["type"] == "text")
+                .map(|block| text(&block["text"]).trim())
+                .collect();
+            if texts.len() > 1 && texts.iter().all(|t| self.queued.iter().any(|q| q == t)) {
+                let mut events = Vec::new();
+                for t in &texts {
+                    if let Some(i) = self.queued.iter().position(|q| q == t) {
+                        self.queued.remove(i);
+                    }
+                    events.push(json!({ "type": "user_message", "content": t }));
+                }
+                events.insert(0, self.queued_event());
+                return events;
+            }
             let message = match content.as_str() {
                 Some(message) => message.to_string(),
                 None => content
@@ -4315,6 +4335,33 @@ mod tests {
         // Read again, the same file.
         assert_eq!(transcript_in(&home, cwd, "33-44", &images), items);
         assert_eq!(fs::read_dir(&images).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn queued_messages_taken_in_together_each_show_as_sent() {
+        let mut c = claude();
+        c.encode(&json!({ "op": "user_message", "content": "first" }))
+            .unwrap();
+        frame(
+            &mut c,
+            json!({ "type": "system", "subtype": "status", "status": "requesting" }),
+        );
+        for text in ["apple", "banana"] {
+            c.encode(&json!({ "op": "user_message", "content": text }))
+                .unwrap();
+        }
+        let taken = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "apple" }, { "type": "text", "text": "banana" }] } }),
+        );
+        assert_eq!(
+            taken,
+            vec![
+                json!({ "type": "pending_messages", "messages": [] }),
+                json!({ "type": "user_message", "content": "apple" }),
+                json!({ "type": "user_message", "content": "banana" }),
+            ]
+        );
     }
 
     #[test]
