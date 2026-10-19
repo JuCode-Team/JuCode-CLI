@@ -1220,6 +1220,18 @@ impl Adapter for Acp {
                     events: vec![self.pending_event()],
                 });
             }
+            // A waiting message taken back: `index`, negative from the last.
+            "unqueue" => {
+                let Some((content, images)) = queue_index(op["index"].as_i64(), self.queued.len())
+                    .and_then(|i| self.queued.remove(i))
+                else {
+                    return Ok(Output::default());
+                };
+                return Ok(Output::events(vec![
+                    self.pending_event(),
+                    json!({ "type": "unqueued", "content": content, "images": images }),
+                ]));
+            }
             "shutdown" => vec![],
             other => return Err(format!("ACP agents do not support {other}")),
         };
@@ -1944,6 +1956,23 @@ mod tests {
         let next = sent(&done.frames);
         assert_eq!(next[0]["method"], "session/prompt");
         assert_eq!(next[0]["params"]["prompt"][0]["text"], "three");
+    }
+
+    #[test]
+    fn a_waiting_message_can_be_taken_back() {
+        let mut a = opened();
+        for text in ["one", "two", "three"] {
+            a.encode(&json!({ "op": "user_message", "content": text }))
+                .unwrap();
+        }
+        let back = a.encode(&json!({ "op": "unqueue", "index": -1 })).unwrap();
+        assert_eq!(
+            back.events,
+            [
+                json!({ "type": "pending_messages", "messages": ["two"] }),
+                json!({ "type": "unqueued", "content": "three", "images": [] }),
+            ]
+        );
     }
 
     #[test]

@@ -21,11 +21,12 @@
 //!   subagents report through `system/task_*` and
 //!   `background_tasks_changed`; a finished background task also comes back
 //!   as a `<task-notification>` user message that starts a turn.
-//! - A user message sent mid-turn is taken into the running turn at the
-//!   next tool boundary (or starts the next turn), and replayed then; until
-//!   that replay it shows as queued (`pending_messages`). Claude saves it
-//!   only as a `queued_command` attachment row. `steer` stops the turn so
-//!   the queued messages run now.
+//! - A user message sent mid-turn waits here (`pending_messages`, where it
+//!   can be taken back with `unqueue`) and starts the next turn when this one
+//!   ends. `steer` writes it to the CLI now, which takes it into the running
+//!   turn at the next tool boundary and replays it then; until that replay it
+//!   stays listed, first and `fixed` (it can no longer be taken back). Claude
+//!   saves it only as a `queued_command` attachment row.
 //! - Full access (`bypassPermissions`) is only honored when the CLI starts
 //!   with `--dangerously-skip-permissions`, so switching into or out of it
 //!   restarts the engine on the same conversation.
@@ -38,7 +39,7 @@ mod runs;
 
 use super::{home, resolve, Adapter, HostCall, Line, Options, Output};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use jucode_agent_core::user_tools;
+use jucode_agent_core::{queue_index, user_tools};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -57,6 +58,15 @@ const EDIT_PREVIEW_EVERY: Duration = Duration::from_millis(200);
 /// The API takes an image of at most 5 MB base64 (3.75 MB raw); larger ones
 /// stay files the model opens with Read, which downsizes them.
 const IMAGE_CAP: u64 = 3_750_000;
+
+/// A message sent mid-turn, waiting to be written to the CLI.
+struct Held {
+    text: String,
+    /// As sent (`images` of the op), for a message taken back.
+    images: Value,
+    /// The stdin line that sends it.
+    frame: String,
+}
 
 /// The in-process MCP server carrying `user_tools` (see `command`).
 const MCP_SERVER: &str = "jucode";
@@ -737,10 +747,10 @@ pub struct Claude {
     streamed: HashMap<String, Tokens>,
     active_turn: bool,
     interrupting: bool,
-    /// The turn is being stopped for the queued messages, which then run.
-    steering: bool,
-    /// Messages sent mid-turn that Claude has not taken in (replayed) yet.
+    /// Messages written to the CLI that it has not taken in (replayed) yet.
     queued: Vec<String>,
+    /// Messages sent mid-turn, waiting here for the turn to end (or a steer).
+    held: Vec<Held>,
     /// The composer's slash commands: the CLI's `initialize` reply (with
     /// descriptions and argument hints), plus names only `system/init` lists.
     commands: Vec<Value>,
@@ -790,8 +800,8 @@ impl Claude {
             streamed: HashMap::new(),
             active_turn: false,
             interrupting: false,
-            steering: false,
             queued: Vec::new(),
+            held: Vec::new(),
             commands: Vec::new(),
             calls: Vec::new(),
             app_tools_off: options.app_tools_off.clone(),
@@ -880,8 +890,22 @@ impl Claude {
         content
     }
 
+    /// What waits: the messages the CLI has (`fixed`, first), then those held.
     fn queued_event(&self) -> Value {
-        json!({ "type": "pending_messages", "messages": self.queued })
+        let messages: Vec<&str> = self
+            .queued
+            .iter()
+            .map(String::as_str)
+            .chain(self.held.iter().map(|h| h.text.as_str()))
+            .collect();
+        json!({ "type": "pending_messages", "messages": messages, "fixed": self.queued.len() })
+    }
+
+    /// Hands held message `i` to the CLI.
+    fn release(&mut self, i: usize) -> String {
+        let held = self.held.remove(i);
+        self.queued.push(held.text);
+        held.frame
     }
 
     fn user_text(text: &str) -> String {
@@ -1587,17 +1611,22 @@ impl Claude {
         events
     }
 
+    /// The turn ended: the next held message starts the next one, unless
+    /// the CLI already has messages to run.
+    fn on_turn_end(&mut self, frame: &Value) -> Output {
+        let mut events = self.on_result(frame);
+        let mut frames = Vec::new();
+        if self.queued.is_empty() && !self.held.is_empty() {
+            frames.push(self.release(0));
+            events.push(self.queued_event());
+        }
+        Output { events, frames }
+    }
+
     fn on_result(&mut self, frame: &Value) -> Vec<Value> {
         self.active_turn = false;
         let was_interrupting = std::mem::take(&mut self.interrupting);
-        let was_steering = std::mem::take(&mut self.steering);
         let mut events = Vec::new();
-        // Stopped: what was waiting is not known to run; if it does, its
-        // replay still shows it.
-        if was_interrupting && !was_steering && !self.queued.is_empty() {
-            self.queued.clear();
-            events.push(self.queued_event());
-        }
         if let Some(usage) = frame["modelUsage"].as_object() {
             for (name, usage) in usage {
                 if let Some(window) = usage["contextWindow"].as_u64().filter(|w| *w > 0) {
@@ -2442,7 +2471,7 @@ impl Adapter for Claude {
             "stream_event" => self.on_stream_event(&frame),
             "assistant" => self.on_assistant(&frame),
             "user" => self.on_user(&frame),
-            "result" => self.on_result(&frame),
+            "result" => return self.on_turn_end(&frame),
             "control_request" => return self.on_control_request(&frame),
             "control_response" => self.on_control_response(&frame),
             "rate_limit_event" => rate_limit_events(&frame),
@@ -2464,11 +2493,12 @@ impl Adapter for Claude {
                         frames,
                     });
                 }
-                self.queued.push(text(&op["content"]).trim().to_string());
-                return Ok(Output {
-                    events: vec![self.queued_event()],
-                    frames,
+                self.held.push(Held {
+                    text: text(&op["content"]).trim().to_string(),
+                    images: op["images"].clone(),
+                    frame: frames.into_iter().next().unwrap_or_default(),
                 });
+                return Ok(Output::events(vec![self.queued_event()]));
             }
             "approve" => {
                 let call = text(&op["call_id"]);
@@ -2529,15 +2559,47 @@ impl Adapter for Claude {
                 self.interrupting = true;
                 vec![self.control_request(json!({ "subtype": "interrupt" }), "")]
             }
-            // Queued messages go now: they are in the CLI's input already and
-            // run once the turn stops (claude 2.1.296), in the order sent.
+            // A held message (`index` in the listed messages, negative from
+            // the last; all held without one) goes to the CLI now: it joins
+            // the running turn at the next tool boundary.
             "steer" => {
-                if !self.active_turn || self.queued.is_empty() {
+                if !self.active_turn {
                     return Ok(Output::default());
                 }
-                self.interrupting = true;
-                self.steering = true;
-                vec![self.control_request(json!({ "subtype": "interrupt" }), "")]
+                let fixed = self.queued.len();
+                let picked: Vec<usize> = match op["index"].as_i64() {
+                    None => (0..self.held.len()).collect(),
+                    index => queue_index(index, fixed + self.held.len())
+                        .filter(|i| *i >= fixed)
+                        .map(|i| vec![i - fixed])
+                        .unwrap_or_default(),
+                };
+                if picked.is_empty() {
+                    return Ok(Output::default());
+                }
+                let frames = picked
+                    .iter()
+                    .rev()
+                    .map(|i| self.release(*i))
+                    .collect::<Vec<_>>();
+                return Ok(Output {
+                    events: vec![self.queued_event()],
+                    frames: frames.into_iter().rev().collect(),
+                });
+            }
+            // A held message taken back (the CLI's own are past that).
+            "unqueue" => {
+                let fixed = self.queued.len();
+                let Some(i) = queue_index(op["index"].as_i64(), fixed + self.held.len())
+                    .filter(|i| *i >= fixed)
+                else {
+                    return Ok(Output::default());
+                };
+                let held = self.held.remove(i - fixed);
+                return Ok(Output::events(vec![
+                    self.queued_event(),
+                    json!({ "type": "unqueued", "content": held.text, "images": held.images }),
+                ]));
             }
             "set_approval_mode" => {
                 let mode = to_claude_mode(text(&op["mode"]));
@@ -4274,8 +4336,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             queued.events,
-            vec![json!({ "type": "pending_messages", "messages": [""] })]
+            vec![json!({ "type": "pending_messages", "messages": [""], "fixed": 0 })]
         );
+        c.encode(&json!({ "op": "steer" })).unwrap();
         let taken = frame(
             &mut c,
             json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "" }, image] } }),
@@ -4283,7 +4346,7 @@ mod tests {
         assert_eq!(
             taken,
             vec![
-                json!({ "type": "pending_messages", "messages": [] }),
+                json!({ "type": "pending_messages", "messages": [], "fixed": 0 }),
                 json!({ "type": "user_message", "content": "" })
             ]
         );
@@ -4337,8 +4400,8 @@ mod tests {
         assert_eq!(fs::read_dir(&images).unwrap().count(), 1);
     }
 
-    #[test]
-    fn queued_messages_taken_in_together_each_show_as_sent() {
+    /// A Claude with a turn running ("first"), then `texts` sent during it.
+    fn mid_turn(texts: &[&str]) -> Claude {
         let mut c = claude();
         c.encode(&json!({ "op": "user_message", "content": "first" }))
             .unwrap();
@@ -4346,53 +4409,21 @@ mod tests {
             &mut c,
             json!({ "type": "system", "subtype": "status", "status": "requesting" }),
         );
-        for text in ["apple", "banana"] {
+        for text in texts {
             c.encode(&json!({ "op": "user_message", "content": text }))
                 .unwrap();
         }
-        let taken = frame(
-            &mut c,
-            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "apple" }, { "type": "text", "text": "banana" }] } }),
-        );
-        assert_eq!(
-            taken,
-            vec![
-                json!({ "type": "pending_messages", "messages": [] }),
-                json!({ "type": "user_message", "content": "apple" }),
-                json!({ "type": "user_message", "content": "banana" }),
-            ]
-        );
+        c
     }
 
     #[test]
-    fn steering_stops_the_turn_and_the_queued_messages_stay_to_run() {
-        let mut c = claude();
-        c.encode(&json!({ "op": "user_message", "content": "first" }))
-            .unwrap();
-        frame(
-            &mut c,
-            json!({ "type": "system", "subtype": "status", "status": "requesting" }),
-        );
-        c.encode(&json!({ "op": "user_message", "content": "now this" }))
-            .unwrap();
-        let steer = c.encode(&json!({ "op": "steer", "index": 0 })).unwrap();
-        assert!(steer.frames[0].contains("\"interrupt\""));
-        let ended = frame(
-            &mut c,
-            json!({ "type": "result", "subtype": "error_during_execution", "is_error": true }),
-        );
-        assert!(!ended.iter().any(|e| e["type"] == "error"));
-        assert!(!ended.iter().any(|e| e["type"] == "pending_messages"));
-        assert_eq!(c.queued, ["now this"]);
-    }
-
-    #[test]
-    fn a_message_sent_mid_turn_shows_as_queued_until_claude_takes_it_in() {
+    fn a_message_sent_mid_turn_waits_and_starts_the_next_turn() {
         let mut c = claude();
         let idle = c
             .encode(&json!({ "op": "user_message", "content": "first" }))
             .unwrap();
         assert!(idle.events.is_empty());
+        assert_eq!(idle.frames.len(), 1);
         frame(
             &mut c,
             json!({ "type": "system", "subtype": "status", "status": "requesting" }),
@@ -4400,11 +4431,20 @@ mod tests {
         let queued = c
             .encode(&json!({ "op": "user_message", "content": "also this " }))
             .unwrap();
-        assert_eq!(queued.frames.len(), 1);
+        // Held here, not written to the CLI.
+        assert!(queued.frames.is_empty());
         assert_eq!(
             queued.events,
-            vec![json!({ "type": "pending_messages", "messages": ["also this"] })]
+            vec![json!({ "type": "pending_messages", "messages": ["also this"], "fixed": 0 })]
         );
+        // The turn ends: it goes, listed as fixed until the CLI replays it.
+        let ended = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "success" }),
+        ));
+        assert!(ended.frames[0].contains("also this"));
+        assert!(ended.events.contains(
+            &json!({ "type": "pending_messages", "messages": ["also this"], "fixed": 1 })
+        ));
         let taken = frame(
             &mut c,
             json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "also this " }] } }),
@@ -4412,8 +4452,75 @@ mod tests {
         assert_eq!(
             taken,
             vec![
-                json!({ "type": "pending_messages", "messages": [] }),
+                json!({ "type": "pending_messages", "messages": [], "fixed": 0 }),
                 json!({ "type": "user_message", "content": "also this " })
+            ]
+        );
+    }
+
+    #[test]
+    fn steering_writes_a_held_message_to_the_cli_now() {
+        let mut c = mid_turn(&["apple", "banana"]);
+        let steer = c.encode(&json!({ "op": "steer", "index": -1 })).unwrap();
+        assert_eq!(steer.frames.len(), 1);
+        assert!(steer.frames[0].contains("banana"));
+        assert_eq!(
+            steer.events,
+            vec![
+                json!({ "type": "pending_messages", "messages": ["banana", "apple"], "fixed": 1 })
+            ]
+        );
+        // The CLI has it: no steering or taking it back again.
+        assert!(c
+            .encode(&json!({ "op": "steer", "index": 0 }))
+            .unwrap()
+            .frames
+            .is_empty());
+        assert!(c
+            .encode(&json!({ "op": "unqueue", "index": 0 }))
+            .unwrap()
+            .events
+            .is_empty());
+        // The turn ends with banana not yet taken in: apple waits for it.
+        let ended = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "success" }),
+        ));
+        assert!(ended.frames.is_empty());
+    }
+
+    #[test]
+    fn a_held_message_can_be_taken_back() {
+        let mut c = mid_turn(&[]);
+        c.encode(&json!({ "op": "user_message", "content": "oops", "images": ["/tmp/a.png"] }))
+            .unwrap();
+        let back = c.encode(&json!({ "op": "unqueue", "index": 0 })).unwrap();
+        assert_eq!(
+            back.events,
+            vec![
+                json!({ "type": "pending_messages", "messages": [], "fixed": 0 }),
+                json!({ "type": "unqueued", "content": "oops", "images": ["/tmp/a.png"] }),
+            ]
+        );
+        let ended = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "success" }),
+        ));
+        assert!(ended.frames.is_empty());
+    }
+
+    #[test]
+    fn queued_messages_taken_in_together_each_show_as_sent() {
+        let mut c = mid_turn(&["apple", "banana"]);
+        c.encode(&json!({ "op": "steer" })).unwrap();
+        let taken = frame(
+            &mut c,
+            json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "apple" }, { "type": "text", "text": "banana" }] } }),
+        );
+        assert_eq!(
+            taken,
+            vec![
+                json!({ "type": "pending_messages", "messages": [], "fixed": 0 }),
+                json!({ "type": "user_message", "content": "apple" }),
+                json!({ "type": "user_message", "content": "banana" }),
             ]
         );
     }

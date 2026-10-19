@@ -676,6 +676,7 @@ fn record_headless_event(event: &AgentEvent, stats: &mut HeadlessStats) {
         AgentEvent::Startup { .. } => "startup",
         AgentEvent::ModelStatus { .. } => "model_status",
         AgentEvent::PendingMessages(_) => "pending_messages",
+        AgentEvent::Unqueued { .. } => "unqueued",
         AgentEvent::UserMessage(_) => "user_message",
         AgentEvent::FillInput(_) => "fill_input",
         AgentEvent::Connecting => "connecting",

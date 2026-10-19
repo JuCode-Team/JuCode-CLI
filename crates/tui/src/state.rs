@@ -314,6 +314,13 @@ impl TuiState {
                     self.mark_history_dirty();
                     true
                 }
+                // A queued message taken back goes back to the input to edit.
+                AgentEvent::Unqueued { content, .. } => {
+                    input.clear();
+                    input.push_text(&content);
+                    self.completion_index = 0;
+                    true
+                }
                 AgentEvent::FillInput(content) => {
                     input.clear();
                     input.push_text(&content);

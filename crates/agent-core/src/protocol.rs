@@ -56,6 +56,8 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
         "continue" => core.continue_turn(),
         // A queued message into the running turn: `index`, negative from the last.
         "steer" => core.steer(value.get("index").and_then(Value::as_i64)),
+        // A queued message taken back: `index`, negative from the last.
+        "unqueue" => core.unqueue(value.get("index").and_then(Value::as_i64)),
         "interrupt" => core.interrupt(),
         // Structured twin of the `/approve` text command (GUI convenience):
         // {"op":"approve","call_id":"...","decision":"allow|deny",
@@ -233,6 +235,9 @@ pub fn event_json(event: AgentEvent) -> Value {
         }),
         AgentEvent::PendingMessages(messages) => {
             json!({ "type": "pending_messages", "messages": messages })
+        }
+        AgentEvent::Unqueued { content, images } => {
+            json!({ "type": "unqueued", "content": content, "images": images })
         }
         AgentEvent::UserMessage(content) => json!({ "type": "user_message", "content": content }),
         AgentEvent::FillInput(content) => json!({ "type": "fill_input", "content": content }),

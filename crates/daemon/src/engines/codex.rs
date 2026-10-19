@@ -1878,6 +1878,22 @@ impl Adapter for Codex {
                     frames: vec![frame],
                 });
             }
+            // A waiting message taken back: `index`, negative from the last.
+            "unqueue" => {
+                let Some(i) = queue_index(op["index"].as_i64(), self.waiting.len()) else {
+                    return Ok(Output::default());
+                };
+                let (content, input) = self.waiting.remove(i);
+                let images: Vec<&str> = input
+                    .iter()
+                    .filter(|c| c["type"] == "localImage")
+                    .map(|c| text(&c["path"]))
+                    .collect();
+                return Ok(Output::events(vec![
+                    self.pending_event(),
+                    json!({ "type": "unqueued", "content": content, "images": images }),
+                ]));
+            }
             "rename" => match self.thread.clone() {
                 Some(thread) => vec![self.request(
                     "thread/name/set",
@@ -2476,6 +2492,24 @@ mod tests {
             .unwrap()
             .frames
             .is_empty());
+    }
+
+    #[test]
+    fn a_waiting_message_can_be_taken_back() {
+        let mut c = opened();
+        busy(&mut c);
+        for text in ["one", "two"] {
+            c.encode(&json!({ "op": "user_message", "content": text }))
+                .unwrap();
+        }
+        let back = c.encode(&json!({ "op": "unqueue", "index": 0 })).unwrap();
+        assert_eq!(
+            back.events,
+            vec![
+                json!({ "type": "pending_messages", "messages": ["two"] }),
+                json!({ "type": "unqueued", "content": "one", "images": [] }),
+            ]
+        );
     }
 
     #[test]

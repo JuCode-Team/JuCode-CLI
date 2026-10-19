@@ -137,6 +137,12 @@ pub enum AgentEvent {
         state: String,
     },
     PendingMessages(Vec<String>),
+    /// A queued message taken back (`unqueue`): its text and images, for the
+    /// client to edit again.
+    Unqueued {
+        content: String,
+        images: Vec<String>,
+    },
     UserMessage(String),
     /// Pre-fill the input box (e.g. with a checked-out user message).
     FillInput(String),

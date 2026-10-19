@@ -590,6 +590,17 @@ fn a_steer_by_index_takes_that_message_and_leaves_the_others_waiting() {
     )));
     // Out of range: nothing happens.
     assert!(core.steer(Some(4)).is_empty());
+    // Taken back: out of the queue, its text for the client to edit.
+    core.submit_user_message("third".to_string());
+    let back = core.unqueue(Some(0));
+    assert!(back.iter().any(|e| matches!(
+        e,
+        AgentEvent::PendingMessages(texts) if *texts == ["third"]
+    )));
+    assert!(back.iter().any(|e| matches!(
+        e,
+        AgentEvent::Unqueued { content, .. } if content == "first"
+    )));
     core.interrupt();
 }
 

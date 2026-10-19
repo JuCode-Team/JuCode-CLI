@@ -108,6 +108,17 @@ saved as the user's message). If the turn ends before reading it, it runs as
 the next turn. A queued message with images still stops the turn and starts
 a new one with it. No-op when idle or when the queue is empty.
 
+### `unqueue`
+
+```json
+{"op":"unqueue","index":0}
+```
+
+Takes a queued message back out of the queue (`index` as for `steer`).
+Emits the updated `pending_messages` and
+`{"type":"unqueued","content":"…","images":[…]}` with what it held, for the
+client to edit again. No-op when nothing is there.
+
 ### `interrupt`
 
 ```json

@@ -774,6 +774,20 @@ impl AgentCore {
         events
     }
 
+    /// Takes queued message `index` (negative from the last) back out of the
+    /// queue, for the client to edit.
+    pub fn unqueue(&mut self, index: Option<i64>) -> Vec<AgentEvent> {
+        let Some((content, images)) =
+            queue_index(index, self.queued.len()).and_then(|i| self.queued.remove(i))
+        else {
+            return Vec::new();
+        };
+        vec![
+            AgentEvent::PendingMessages(self.pending_texts()),
+            AgentEvent::Unqueued { content, images },
+        ]
+    }
+
     /// Stops the in-flight turn: signals the worker to abort, closes subagents,
     /// and clears all per-turn channels and state. Shared by interrupt and steer
     /// so the old turn's tools never run concurrently with a new one.
