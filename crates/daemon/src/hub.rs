@@ -315,7 +315,8 @@ impl Hub {
 
     /// Starts a new session in `cwd`, or in the chats directory for a chat,
     /// on `engine` (None: jucode) with its start options; `schedule`: it is
-    /// a run of that scheduled task.
+    /// a run of that scheduled task; `project`: the project it belongs to
+    /// ("": none; None: the one whose main directory is `cwd`).
     pub fn create_engine_session(
         self: &Arc<Self>,
         cwd: Option<PathBuf>,
@@ -323,6 +324,7 @@ impl Hub {
         chat: bool,
         engine: Option<engines::Kind>,
         options: engines::Options,
+        project: Option<&str>,
     ) -> Result<String, String> {
         let cwd = match cwd {
             None if chat => {
@@ -334,15 +336,20 @@ impl Hub {
         if !cwd.is_dir() {
             return Err(format!("not a directory: {}", cwd.display()));
         }
+        let project = crate::projects::for_new_session(self, &cwd, project)?;
+        let dirs = crate::projects::extra_dirs(self, &cwd, &project);
         let gateway = options.gateway == Some(true);
         let agent = options.agent.clone();
-        let mut options = options;
+        let mut options = engines::Options {
+            dirs: dirs.clone(),
+            ..options
+        };
         if let Some(kind) = engine {
             engines::pin_tool_provider(&self.store, kind, &mut options);
         }
         let tool_provider = options.tool_provider.clone();
         let (id, ops, generation) = match engine {
-            None => session::spawn(Arc::clone(self), cwd.clone(), None)?,
+            None => session::spawn(Arc::clone(self), cwd.clone(), None, dirs)?,
             Some(kind) => {
                 // Claude Code takes its conversation id from us; others name it.
                 let id = match kind {
@@ -360,6 +367,7 @@ impl Hub {
                 engine.map(engines::Kind::name),
                 gateway,
                 agent.as_deref(),
+                Some(&project),
             )
             .map_err(|error| error.to_string())?;
         if let Some(provider) = tool_provider {
@@ -440,6 +448,7 @@ impl Hub {
                     engine: engine.map(|kind| kind.name().to_string()),
                     gateway: false,
                     group: None,
+                    project: None,
                     agent: None,
                     agent_session: None,
                     tool_provider: None,
@@ -448,13 +457,22 @@ impl Hub {
             (None, None) => return Err(format!("unknown session {id}")),
         };
         let kind = engines::Kind::parse(record.engine.as_deref().unwrap_or_default())?;
+        let dirs = crate::projects::extra_dirs(
+            self,
+            &record.cwd,
+            &crate::projects::of_record(self, &record),
+        );
         let mut gateway = false;
         let mut tool_provider = None;
         let agent = record.agent.clone();
         let (ops, generation) = match kind {
             None => {
-                let (_, ops, generation) =
-                    session::spawn(Arc::clone(self), record.cwd.clone(), Some(id.to_string()))?;
+                let (_, ops, generation) = session::spawn(
+                    Arc::clone(self),
+                    record.cwd.clone(),
+                    Some(id.to_string()),
+                    dirs,
+                )?;
                 (ops, generation)
             }
             Some(kind) => {
@@ -478,6 +496,7 @@ impl Hub {
                 // from the first; one recorded before is the tool's own).
                 let mut options = engines::Options {
                     resume: saved.then(|| id.to_string()),
+                    dirs,
                     gateway: Some(options.gateway.unwrap_or(record.gateway)),
                     tool_provider: options.tool_provider.or_else(|| {
                         record
@@ -531,6 +550,7 @@ impl Hub {
                     record.engine.as_deref(),
                     gateway,
                     agent.as_deref(),
+                    record.project.as_deref(),
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -1185,6 +1205,7 @@ impl Hub {
     pub fn sessions_json(&self) -> Value {
         let records = self.store.sessions();
         let saved = saved_by_id(records.iter().map(|record| record.cwd.as_path()));
+        let projects = crate::projects::projects(self);
         let sessions = lock(&self.sessions);
         let list: Vec<Value> = records
             .into_iter()
@@ -1202,6 +1223,7 @@ impl Hub {
                     "title": shown_title(&record, summary.map(|s| s.label.as_str())),
                     "archived": record.archived,
                     "group": record.group,
+                    "project": Some(crate::projects::member(&projects, &record)).filter(|p| !p.is_empty()),
                     "gateway": record.gateway,
                     "engine": record.engine.as_deref().unwrap_or("jucode"),
                     "agent": record.agent,
@@ -1390,6 +1412,7 @@ mod tests {
             engine: None,
             gateway: false,
             group: None,
+            project: None,
             agent: None,
             agent_session: None,
             tool_provider: None,

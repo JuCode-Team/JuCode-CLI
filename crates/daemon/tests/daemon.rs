@@ -900,6 +900,94 @@ fn projects_are_shared_and_their_files_readable_but_nothing_else() {
 }
 
 #[test]
+fn a_session_belongs_to_the_project_it_names_wherever_it_runs() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let app = temp_dir("daemon-member-app");
+    let other = temp_dir("daemon-member-other");
+    fs::create_dir_all(&app).unwrap();
+    fs::create_dir_all(&other).unwrap();
+    let mut client = Client::connect(&daemon);
+    let added = request(&mut client, json!({ "op": "project_add", "path": app }));
+    let ws = added["workspaces"][0].clone();
+    let project = ws["projects"][0]["id"].as_str().unwrap().to_string();
+    let project_of = |client: &mut Client, session: &str| {
+        let list = request(client, json!({ "op": "session_list" }));
+        list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["session"] == session)
+            .unwrap_or_else(|| panic!("{list}"))["project"]
+            .clone()
+    };
+
+    // Not named: the project whose folder it runs in, or none.
+    let inside = client.create_session(&app.canonicalize().unwrap());
+    assert_eq!(project_of(&mut client, &inside), json!(project));
+    let outside = client.create_session(&other);
+    assert_eq!(project_of(&mut client, &outside), Value::Null);
+    // Named: that project, in another folder; "" or null: none.
+    let named = request(
+        &mut client,
+        json!({ "op": "session_create", "cwd": other, "project": project }),
+    );
+    let named = named["session"].as_str().unwrap().to_string();
+    assert_eq!(project_of(&mut client, &named), json!(project));
+    let loose = request(
+        &mut client,
+        json!({ "op": "session_create", "cwd": app.canonicalize().unwrap(), "project": null }),
+    );
+    let loose = loose["session"].as_str().unwrap().to_string();
+    assert_eq!(project_of(&mut client, &loose), Value::Null);
+    let unknown = request(
+        &mut client,
+        json!({ "op": "session_create", "cwd": other, "project": "nope" }),
+    );
+    assert_eq!(unknown["type"], "error", "{unknown}");
+
+    // Moved in and out.
+    client.send(json!({ "op": "session_meta", "session": outside, "project": project }));
+    assert_eq!(project_of(&mut client, &outside), json!(project));
+    client.send(json!({ "op": "session_meta", "session": outside, "project": "" }));
+    assert_eq!(project_of(&mut client, &outside), Value::Null);
+    let refused = request(
+        &mut client,
+        json!({ "op": "session_meta", "session": outside, "project": "nope" }),
+    );
+    assert_eq!(refused["type"], "error", "{refused}");
+
+    // Its project removed, a session belongs to none and is archived.
+    let removed = request(
+        &mut client,
+        json!({ "op": "project_remove", "workspace": ws["id"], "project": project }),
+    );
+    assert_eq!(removed["workspaces"][0]["projects"], json!([]));
+    let list = request(&mut client, json!({ "op": "session_list" }));
+    let entry = list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session"] == named.as_str())
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        (entry["project"].clone(), entry["archived"].clone()),
+        (Value::Null, json!(true))
+    );
+
+    // A project is in one workspace at a time.
+    let twice = request(
+        &mut client,
+        json!({ "op": "workspaces_set", "rev": removed["rev"], "workspaces": [
+            ws,
+            { "id": "w2", "name": "Two", "projects": ws["projects"] },
+        ] }),
+    );
+    assert_eq!(twice["type"], "error", "{twice}");
+}
+
+#[test]
 fn a_new_project_folder_is_made_under_home_and_credentials_stay_unreadable() {
     let _guard = setup();
     let daemon = start_daemon();

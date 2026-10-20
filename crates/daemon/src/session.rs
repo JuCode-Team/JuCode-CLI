@@ -17,19 +17,20 @@ use std::{
     time::Duration,
 };
 
-/// Opens an engine in `cwd` (resuming `resume` when given) on a new thread.
-/// Returns the session id once the engine is ready, with the thread's
+/// Opens an engine in `cwd` (resuming `resume` when given), which may also
+/// write in `dirs`, on a new thread. Returns the session id once the engine is ready, with the thread's
 /// generation (see `Hub::session_ended`), or the open error.
 pub fn spawn(
     hub: Arc<Hub>,
     cwd: PathBuf,
     resume: Option<String>,
+    dirs: Vec<PathBuf>,
 ) -> Result<(String, Sender<Value>, u64), String> {
     let (ops_tx, ops_rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
     let generation = hub.next_generation();
     thread::spawn(move || {
-        let core = match open(&hub, cwd, resume.as_deref()) {
+        let core = match open(&hub, cwd, resume.as_deref(), &dirs) {
             Ok(core) => core,
             Err(error) => {
                 let _ = ready_tx.send(Err(error));
@@ -47,8 +48,12 @@ pub fn spawn(
     Ok((id, ops_tx, generation))
 }
 
-fn open(hub: &Arc<Hub>, cwd: PathBuf, resume: Option<&str>) -> Result<AgentCore, String> {
-    let dirs = crate::projects::extra_dirs(hub, &cwd);
+fn open(
+    hub: &Arc<Hub>,
+    cwd: PathBuf,
+    resume: Option<&str>,
+    dirs: &[PathBuf],
+) -> Result<AgentCore, String> {
     let mut core = AgentCore::open(cwd)
         .map_err(|error| error.to_string())?
         .with_version(hub.version);
@@ -63,7 +68,7 @@ fn open(hub: &Arc<Hub>, cwd: PathBuf, resume: Option<&str>) -> Result<AgentCore,
     };
     result?;
     crate::gateway::proxy_core(&mut core, hub);
-    core.add_writable_dirs(&dirs);
+    core.add_writable_dirs(dirs);
     core.set_app_tools_off(crate::engines::app_tools_off(&hub.store));
     if resume.is_some_and(|id| crate::requirements::gated(hub, id)) {
         core.set_approval_mode(ApprovalMode::Manual);
@@ -227,7 +232,8 @@ fn terminal(
         }
         Err(error) => refuse(error),
     }
-    match open(&arc, cwd, Some(id)) {
+    let dirs = crate::projects::extra_dirs(&arc, &cwd, &crate::projects::of_session(&arc, id));
+    match open(&arc, cwd, Some(id), &dirs) {
         Ok(core) => {
             hub.broadcast(&json!({ "type": "surface", "surface": "gui", "session": id }));
             for event in core.state_events() {

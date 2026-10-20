@@ -514,8 +514,14 @@ impl Hub {
             approval_mode: Some(mode.to_string()),
             ..engines::Options::from_json(&schedule.options)
         };
-        let session =
-            self.create_engine_session(Some(cwd), Some(&schedule.id), false, engine, options)?;
+        let session = self.create_engine_session(
+            Some(cwd),
+            Some(&schedule.id),
+            false,
+            engine,
+            options,
+            None,
+        )?;
         let title = format!("{} · {}", schedule.name, Local::now().format("%m-%d %H:%M"));
         let _ = self
             .store

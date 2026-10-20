@@ -197,8 +197,9 @@ pub fn create(hub: &Arc<Hub>, op: &Value) -> Result<Value, String> {
         Some(project) => project_id(hub, project)?,
         None => from
             .and_then(|s| record(hub, s))
-            .and_then(|record| projects::project_of_cwd(hub, &record.cwd))
-            .map_or(Value::Null, |project| project["id"].clone()),
+            .map(|record| projects::of_record(hub, &record))
+            .filter(|project| !project.is_empty())
+            .map_or(Value::Null, Value::from),
     };
     let images = paths(&op["images"])
         .iter()
@@ -452,7 +453,14 @@ pub fn reply(hub: &Arc<Hub>, op: &Value) -> Result<Value, String> {
             false => None,
         };
         let options = reply_options(engine, op["agent"].as_str().or(agent))?;
-        let session = hub.create_engine_session(Some(cwd), None, false, engine, options)?;
+        // In the project the client picked, else the requirement's.
+        let project = op["project"].as_str().or_else(|| {
+            r["project"]
+                .as_str()
+                .filter(|p| projects::project(hub, p).is_some())
+        });
+        let session =
+            hub.create_engine_session(Some(cwd), None, false, engine, options, project)?;
         let gate = Gate {
             plan: op["plan"] == true,
             mode,
@@ -1357,7 +1365,7 @@ mod tests {
         let cwd = dir.join("app");
         fs::create_dir_all(&cwd).unwrap();
         hub.store
-            .record_engine_session("s", &cwd, None, None, false, None)
+            .record_engine_session("s", &cwd, None, None, false, None, None)
             .unwrap();
         let (ops, rx) = std::sync::mpsc::channel();
         hub.host("s".to_string(), ops, cwd, hub.next_generation());

@@ -71,6 +71,9 @@ pub struct SessionRecord {
     pub gateway: bool,
     /// The JuCode group its gateway requests route to (None: automatic).
     pub group: Option<String>,
+    /// The project it belongs to ("": none; None: recorded before sessions
+    /// named theirs, so the one whose main directory is `cwd`).
+    pub project: Option<String>,
     /// ACP: the built-in agent it runs (None: a desktop-registered one).
     pub agent: Option<String>,
     /// ACP: the agent's own id for the conversation.
@@ -159,6 +162,9 @@ impl Store {
             }
             if let Some(agent) = &record.agent {
                 open["acp_agent"] = json!(agent);
+            }
+            if let Some(project) = &record.project {
+                open["project"] = json!(project);
             }
             sessions.push(open);
             let mut meta = json!({ "kind": "meta", "session": record.id });
@@ -296,13 +302,14 @@ impl Store {
     }
 
     pub fn record_session(&self, id: &str, cwd: &std::path::Path) -> io::Result<()> {
-        self.record_engine_session(id, cwd, None, None, false, None)
+        self.record_engine_session(id, cwd, None, None, false, None, None)
     }
 
     /// Like `record_session`, for a session run by `engine` (None: jucode),
     /// as a run of `schedule` or not; `agent`: the ACP preset it runs (kept
     /// as `acp_agent`: `agent` marked the sessions of the removed agents,
-    /// see `migrate`).
+    /// see `migrate`); `project`: the project it belongs to ("": none).
+    #[allow(clippy::too_many_arguments)]
     pub fn record_engine_session(
         &self,
         id: &str,
@@ -311,6 +318,7 @@ impl Store {
         engine: Option<&str>,
         gateway: bool,
         agent: Option<&str>,
+        project: Option<&str>,
     ) -> io::Result<()> {
         let mut entry = json!({
             "kind": "open", "session": id, "cwd": cwd.display().to_string(), "at": now(),
@@ -327,6 +335,9 @@ impl Store {
         if let Some(agent) = agent {
             entry["acp_agent"] = json!(agent);
         }
+        if let Some(project) = project {
+            entry["project"] = json!(project);
+        }
         self.append(SESSIONS, entry)
     }
 
@@ -338,10 +349,11 @@ impl Store {
     }
 
     /// Renames, (un)archives, hides or regroups a session from `changes`
-    /// (`title`, `archived`, `hidden`, `group`; the daemon's own `gateway`,
+    /// (`title`, `archived`, `hidden`, `group`, `project`; the daemon's own `gateway`,
     /// `agent_session` and `tool_provider`); fields left out are
     /// unchanged, an empty title goes back to the engine's label and an
-    /// empty group to automatic routing. False when `changes` names none.
+    /// empty group to automatic routing and an empty project to none. False
+    /// when `changes` names none.
     pub fn record_session_meta(&self, id: &str, changes: &Value) -> io::Result<bool> {
         let mut entry = json!({ "kind": "meta", "session": id, "at": now() });
         let mut changed = false;
@@ -360,6 +372,10 @@ impl Store {
         }
         if let Some(group) = changes["group"].as_str() {
             entry["group"] = json!(group.trim());
+            changed = true;
+        }
+        if let Some(project) = changes["project"].as_str() {
+            entry["project"] = json!(project.trim());
             changed = true;
         }
         if let Some(gateway) = changes["gateway"].as_bool() {
@@ -438,6 +454,7 @@ impl Store {
                             engine: entry["engine"].as_str().map(str::to_string),
                             gateway: false,
                             group: None,
+                            project: None,
                             agent: None,
                             agent_session: None,
                             tool_provider: None,
@@ -446,6 +463,9 @@ impl Store {
                     record.closed = false;
                     record.gateway = entry["gateway"] == true;
                     record.agent = entry["acp_agent"].as_str().map(str::to_string);
+                    if let Some(project) = entry["project"].as_str() {
+                        record.project = Some(project.to_string());
+                    }
                 }
                 Some("close") => {
                     if let Some(record) = records.get_mut(id) {
@@ -466,6 +486,9 @@ impl Store {
                         }
                         if let Some(group) = entry["group"].as_str() {
                             record.group = Some(group.to_string()).filter(|g| !g.is_empty());
+                        }
+                        if let Some(project) = entry["project"].as_str() {
+                            record.project = Some(project.to_string());
                         }
                         if let Some(gateway) = entry["gateway"].as_bool() {
                             record.gateway = gateway;
@@ -852,6 +875,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .unwrap();
         store.record_session_closed("a").unwrap();
@@ -882,7 +906,7 @@ mod tests {
         let store = store("compact");
         let cwd = std::path::Path::new("/p");
         store
-            .record_engine_session("a", cwd, Some("sch-1"), Some("claude"), true, None)
+            .record_engine_session("a", cwd, Some("sch-1"), Some("claude"), true, None, None)
             .unwrap();
         store.record_session("b", cwd).unwrap();
         for title in ["one", "two", "three"] {
@@ -898,7 +922,7 @@ mod tests {
             .unwrap();
         store.record_session_closed("a").unwrap();
         store
-            .record_engine_session("a", cwd, Some("sch-1"), Some("claude"), true, None)
+            .record_engine_session("a", cwd, Some("sch-1"), Some("claude"), true, None, None)
             .unwrap();
         store.record_session_closed("b").unwrap();
         let deferred = |id: &str| {
@@ -930,16 +954,44 @@ mod tests {
     }
 
     #[test]
+    fn a_session_keeps_its_project_through_compaction() {
+        let store = store("project");
+        store
+            .record_session("old", std::path::Path::new("/p/app"))
+            .unwrap();
+        store
+            .record_engine_session(
+                "new",
+                std::path::Path::new("/p/other"),
+                None,
+                None,
+                false,
+                None,
+                Some("p1"),
+            )
+            .unwrap();
+        store
+            .record_session_meta("old", &json!({ "project": "" }))
+            .unwrap();
+        let dir = store.dir.clone();
+        drop(store);
+        let store = Store::open(dir).unwrap();
+        let projects: Vec<Option<String>> =
+            store.sessions().into_iter().map(|r| r.project).collect();
+        assert_eq!(projects, [Some(String::new()), Some("p1".into())]);
+    }
+
+    #[test]
     fn a_session_remembers_whether_it_last_ran_through_the_gateway() {
         let store = store("gateway");
         let cwd = std::path::Path::new("/p");
         store
-            .record_engine_session("c", cwd, None, Some("claude"), true, None)
+            .record_engine_session("c", cwd, None, Some("claude"), true, None, None)
             .unwrap();
         assert!(store.sessions()[0].gateway);
         store.record_session_closed("c").unwrap();
         store
-            .record_engine_session("c", cwd, None, Some("claude"), false, None)
+            .record_engine_session("c", cwd, None, Some("claude"), false, None, None)
             .unwrap();
         assert!(!store.sessions()[0].gateway);
     }
@@ -952,7 +1004,7 @@ mod tests {
         let store = Store::open(dir.clone()).unwrap();
         let cwd = std::path::Path::new("/p");
         store
-            .record_engine_session("s", cwd, None, Some("acp"), false, Some("omp"))
+            .record_engine_session("s", cwd, None, Some("acp"), false, Some("omp"), None)
             .unwrap();
         assert!(store
             .record_session_meta("s", &json!({ "agent_session": "a-1" }))
@@ -962,7 +1014,7 @@ mod tests {
             .unwrap());
         store.record_session_closed("s").unwrap();
         store
-            .record_engine_session("s", cwd, None, Some("acp"), true, Some("omp"))
+            .record_engine_session("s", cwd, None, Some("acp"), true, Some("omp"), None)
             .unwrap();
         let record = store.sessions()[0].clone();
         assert_eq!(record.agent.as_deref(), Some("omp"));
@@ -984,6 +1036,7 @@ mod tests {
                 None,
                 Some("codex"),
                 true,
+                None,
                 None,
             )
             .unwrap();

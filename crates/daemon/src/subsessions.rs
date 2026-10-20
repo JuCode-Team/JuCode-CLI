@@ -108,8 +108,16 @@ fn start(
         gateway: kind.map(|_| parent.gateway),
         ..engines::Options::default()
     };
-    let session =
-        hub.create_engine_session(Some(parent.cwd.clone()), None, false, kind, options)?;
+    // The child belongs to its parent's project, wherever the parent runs.
+    let project = crate::projects::of_session(hub, &parent.session);
+    let session = hub.create_engine_session(
+        Some(parent.cwd.clone()),
+        None,
+        false,
+        kind,
+        options,
+        Some(&project),
+    )?;
     let title = match title {
         "" => prompt
             .lines()

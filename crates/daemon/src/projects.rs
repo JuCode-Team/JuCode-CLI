@@ -90,6 +90,17 @@ fn set(hub: &Hub, op: &Value) -> Result<Value, String> {
             check_dirs(&project["dirs"])?;
         }
     }
+    // A project belongs to one workspace: its sessions name it by id. (One
+    // listed twice in a workspace, as older desktops could save, is one.)
+    let mut owner = std::collections::HashMap::new();
+    for ws in &incoming {
+        for project in ws["projects"].as_array().into_iter().flatten() {
+            let id = text(project, "id")?;
+            if *owner.entry(id).or_insert(&ws["id"]) != &ws["id"] {
+                return Err(format!("project {id} is in two workspaces"));
+            }
+        }
+    }
     let rev = op["rev"].as_u64().ok_or("workspaces_set requires rev")?;
     let current = hub.store.workspaces()["rev"].as_u64().unwrap_or(0);
     if rev != current {
@@ -137,13 +148,44 @@ fn add(hub: &Hub, op: &Value, path: PathBuf) -> Result<Value, String> {
     })
 }
 
+/// Saves a change to the list. The sessions of a project it removes now
+/// belong to none: they are archived, so they wait out of the way instead
+/// of filling every client's list of sessions of no project.
 fn save(
     hub: &Hub,
     change: impl FnOnce(&mut Vec<Value>) -> Result<(), String>,
 ) -> Result<Value, String> {
+    let before = projects(hub);
     hub.store.update_workspaces(change)?;
+    let after = projects(hub);
+    let gone: Vec<&str> = before
+        .iter()
+        .filter_map(|p| p["id"].as_str())
+        .filter(|id| !after.iter().any(|p| p["id"] == *id))
+        .collect();
+    let orphans: Vec<String> = hub
+        .store
+        .sessions()
+        .into_iter()
+        // One recorded before sessions named their project may now resolve
+        // to another of its folder's.
+        .filter(|r| {
+            !r.archived
+                && gone.contains(&member(&before, r).as_str())
+                && member(&after, r).is_empty()
+        })
+        .map(|r| r.id)
+        .collect();
+    for id in &orphans {
+        hub.store
+            .record_session_meta(id, &json!({ "archived": true }))
+            .map_err(|error| error.to_string())?;
+    }
     let frame = workspaces_json(hub);
     hub.broadcast(&frame);
+    if !orphans.is_empty() {
+        hub.broadcast(&hub.sessions_json());
+    }
     Ok(frame)
 }
 
@@ -201,7 +243,8 @@ fn check_dirs(dirs: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn projects(hub: &Hub) -> Vec<Value> {
+/// Every workspace's projects.
+pub fn projects(hub: &Hub) -> Vec<Value> {
     hub.store.workspaces()["workspaces"]
         .as_array()
         .into_iter()
@@ -244,10 +287,105 @@ pub fn project_of_cwd(hub: &Hub, cwd: &Path) -> Option<Value> {
         .find(|project| project["path"].as_str().map(Path::new) == Some(cwd))
 }
 
-/// The extra directories of the project at `cwd` that still exist: an
-/// engine started there may work in them too.
-pub fn extra_dirs(hub: &Hub, cwd: &Path) -> Vec<PathBuf> {
-    project_of_cwd(hub, cwd)
-        .map(|project| dirs(&project).filter(|dir| dir.is_dir()).collect())
+/// The directories of project `project` (main and extra) that still exist,
+/// besides `cwd`: an engine started there for the project may work in them
+/// too. None for no project.
+pub fn extra_dirs(hub: &Hub, cwd: &Path, project: &str) -> Vec<PathBuf> {
+    let Some(project) = (!project.is_empty())
+        .then(|| self::project(hub, project))
+        .flatten()
+    else {
+        return Vec::new();
+    };
+    let main = project["path"].as_str().map(PathBuf::from);
+    let mut list: Vec<PathBuf> = Vec::new();
+    for dir in main.into_iter().chain(dirs(&project)) {
+        if dir != cwd && dir.is_dir() && !list.contains(&dir) {
+            list.push(dir);
+        }
+    }
+    list
+}
+
+/// The project session `id` belongs to ("": none, or one since removed).
+pub fn of_session(hub: &Hub, id: &str) -> String {
+    hub.store
+        .sessions()
+        .into_iter()
+        .find(|record| record.id == id)
+        .map(|record| of_record(hub, &record))
         .unwrap_or_default()
+}
+
+/// The project `record` belongs to ("": none, or one since removed); one
+/// recorded before sessions named theirs, the one whose main directory is
+/// its cwd.
+pub fn of_record(hub: &Hub, record: &crate::store::SessionRecord) -> String {
+    member(&projects(hub), record)
+}
+
+/// `of_record` among `projects` (every project, read once for a list).
+pub fn member(projects: &[Value], record: &crate::store::SessionRecord) -> String {
+    let found = match &record.project {
+        Some(id) => projects.iter().find(|p| p["id"] == id.as_str()),
+        None => projects
+            .iter()
+            .find(|p| p["path"].as_str().map(Path::new) == Some(record.cwd.as_path())),
+    };
+    found
+        .and_then(|p| p["id"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The project a new session in `cwd` belongs to: `requested` when the
+/// client named one ("": none), else the one whose main directory is `cwd`.
+pub fn for_new_session(hub: &Hub, cwd: &Path, requested: Option<&str>) -> Result<String, String> {
+    match requested.map(str::trim) {
+        Some("") => Ok(String::new()),
+        Some(id) => project(hub, id)
+            .map(|_| id.to_string())
+            .ok_or_else(|| format!("unknown project {id}")),
+        None => Ok(project_of_cwd(hub, cwd)
+            .and_then(|p| p["id"].as_str().map(str::to_string))
+            .unwrap_or_default()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::SessionRecord;
+
+    fn record(cwd: &str, project: Option<&str>) -> SessionRecord {
+        SessionRecord {
+            id: "s".into(),
+            cwd: cwd.into(),
+            schedule: None,
+            created_at: 0,
+            closed: false,
+            title: None,
+            title_auto: false,
+            archived: false,
+            hidden: false,
+            engine: None,
+            gateway: false,
+            group: None,
+            project: project.map(str::to_string),
+            agent: None,
+            agent_session: None,
+            tool_provider: None,
+        }
+    }
+
+    #[test]
+    fn a_session_with_no_recorded_project_belongs_to_its_folders() {
+        let projects = [json!({ "id": "p1", "path": "/p/app" })];
+        assert_eq!(member(&projects, &record("/p/app", None)), "p1");
+        assert_eq!(member(&projects, &record("/p/other", None)), "");
+        // Named: that one, wherever it runs; "" or a removed one: none.
+        assert_eq!(member(&projects, &record("/p/other", Some("p1"))), "p1");
+        assert_eq!(member(&projects, &record("/p/app", Some(""))), "");
+        assert_eq!(member(&projects, &record("/p/app", Some("gone"))), "");
+    }
 }

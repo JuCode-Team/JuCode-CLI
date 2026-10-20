@@ -94,7 +94,7 @@ pub struct Options {
     /// Claude: show thinking summaries (Some(false) hides them).
     pub thinking: Option<bool>,
     /// Claude / Codex: directories besides `cwd` the engine may work in (the
-    /// project's extra directories; set by `spawn`, never by a client).
+    /// session's project's; set by the hub, never by a client).
     pub dirs: Vec<PathBuf>,
     /// The app tools (`user_tools::NAMES`) the user turned off (set by
     /// `spawn` from the daemon's settings, never by a client).
@@ -810,7 +810,6 @@ pub fn spawn(
             .model
             .clone()
             .or_else(|| custom.and_then(|p| p["model"].as_str().map(str::to_string))),
-        dirs: crate::projects::extra_dirs(&hub, &cwd),
         app_tools_off: app_tools_off(&hub.store),
         approval_mode: if gated {
             Some("read-only".to_string())
@@ -1119,7 +1118,14 @@ impl Session<'_> {
                             .record_session_meta(id, &json!({ "tool_provider": provider }));
                     }
                     next.approval_mode = next.approval_mode.or(options.approval_mode.clone());
-                    next.dirs = crate::projects::extra_dirs(self.hub, &self.cwd);
+                    next.dirs = crate::projects::extra_dirs(
+                        self.hub,
+                        &self.cwd,
+                        &crate::projects::of_session(
+                            self.hub,
+                            self.id.as_deref().unwrap_or_default(),
+                        ),
+                    );
                     next.app_tools_off = app_tools_off(&self.hub.store);
                     current = next.clone();
                     process.stop();
