@@ -650,6 +650,9 @@ const STATE_EVENTS: &[&str] = &[
     "engine_caps",
     "session_options",
     "tool_provider",
+    // Messages waiting for the turn: a client that attaches (another
+    // device, a desktop back from another workspace) shows them too.
+    "pending_messages",
 ];
 
 impl Snapshot {
@@ -1143,11 +1146,11 @@ impl Session<'_> {
                             process = started;
                             adapter = self::adapter(self.kind, &self.cwd, &next);
                             process.write(adapter.start());
-                            self.publish(vec![tool_provider_event(
-                                &self.hub.store,
-                                self.kind,
-                                &next,
-                            )]);
+                            // The new engine waits on nothing.
+                            self.publish(vec![
+                                tool_provider_event(&self.hub.store, self.kind, &next),
+                                json!({ "type": "pending_messages", "messages": [] }),
+                            ]);
                         }
                         Err(error) => {
                             self.publish(vec![json!({ "type": "error", "message": error })]);
@@ -1167,7 +1170,10 @@ impl Session<'_> {
                         // grace period in which a cut-off turn still writes it.
                         process.kill();
                         // Its background tasks went with the process.
-                        let mut ended = vec![json!({ "type": "background_tasks", "tasks": [] })];
+                        let mut ended = vec![
+                            json!({ "type": "background_tasks", "tasks": [] }),
+                            json!({ "type": "pending_messages", "messages": [] }),
+                        ];
                         if busy {
                             ended.push(json!({ "type": "status", "message": "interrupted" }));
                         }
@@ -1748,6 +1754,23 @@ mod tests {
         assert!(snapshot.holds(Kind::Codex));
         snapshot.apply(&json!({ "type": "status", "message": "ready" }));
         assert!(!snapshot.holds(Kind::Codex));
+    }
+
+    #[test]
+    fn a_client_that_attaches_sees_the_messages_waiting_for_the_turn() {
+        let mut snapshot = Snapshot::default();
+        snapshot.apply(&json!({ "type": "pending_messages", "messages": ["one"], "fixed": 0 }));
+        snapshot
+            .apply(&json!({ "type": "pending_messages", "messages": ["one", "two"], "fixed": 1 }));
+        let events = snapshot.events(true);
+        let queued: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["type"] == "pending_messages")
+            .collect();
+        assert_eq!(
+            queued,
+            [&json!({ "type": "pending_messages", "messages": ["one", "two"], "fixed": 1 })]
+        );
     }
 
     #[test]

@@ -488,6 +488,8 @@ impl AgentCore {
             // Servers still connecting report state "connecting"; a follow-up
             // event is emitted from poll_events when their state settles.
             self.mcp_servers_event(),
+            // Messages waiting for the running turn.
+            AgentEvent::PendingMessages(self.pending_texts()),
         ];
         if trust::project_has_local_resources(&self.cwd)
             && self.trust.decision_for(&self.cwd).is_none()
