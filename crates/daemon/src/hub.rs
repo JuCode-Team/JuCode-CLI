@@ -830,6 +830,9 @@ impl Hub {
         };
         if changed {
             self.touch(session);
+            // Every client follows which sessions run, watched or not (the
+            // desktop counts the replies its other workspaces finished).
+            self.broadcast(&self.sessions_json());
         }
     }
 
@@ -1207,6 +1210,7 @@ impl Hub {
         let saved = saved_by_id(records.iter().map(|record| record.cwd.as_path()));
         let projects = crate::projects::projects(self);
         let sessions = lock(&self.sessions);
+        let busy = lock(&self.busy);
         let list: Vec<Value> = records
             .into_iter()
             .filter(|record| !record.hidden)
@@ -1229,6 +1233,7 @@ impl Hub {
                     "agent": record.agent,
                     "schedule": record.schedule,
                     "open": hosted.is_some(),
+                    "busy": busy.contains(&record.id),
                     "watchers": hosted.map(|h| h.watchers.len()).unwrap_or(0),
                 })
             })
@@ -1504,6 +1509,28 @@ mod tests {
         // An open that fails leaves it asleep.
         assert!(hub.open_session("old", None).is_err());
         assert!(lock(&hub.asleep).contains_key("old"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn every_client_learns_when_a_session_starts_and_stops_running() {
+        let (hub, dir) = idle_hub("busy-list");
+        hub.store.record_session("s", std::path::Path::new("/tmp")).unwrap();
+        let _s = host_idle(&hub, "s", now(), 0);
+        let (outbox, frames) = Hub::outbox();
+        hub.add_client(outbox, None);
+        let running = |frames: &mpsc::Receiver<String>| {
+            let list: Value = serde_json::from_str(&frames.try_recv().unwrap()).unwrap();
+            assert_eq!(list["type"], "sessions");
+            list["sessions"][0]["busy"].as_bool().unwrap()
+        };
+
+        hub.set_busy("s", true);
+        assert!(running(&frames));
+        hub.set_busy("s", true);
+        assert!(frames.try_recv().is_err(), "only a change is sent");
+        hub.set_busy("s", false);
+        assert!(!running(&frames));
         let _ = fs::remove_dir_all(dir);
     }
 
