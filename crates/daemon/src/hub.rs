@@ -1515,7 +1515,9 @@ mod tests {
     #[test]
     fn every_client_learns_when_a_session_starts_and_stops_running() {
         let (hub, dir) = idle_hub("busy-list");
-        hub.store.record_session("s", std::path::Path::new("/tmp")).unwrap();
+        hub.store
+            .record_session("s", std::path::Path::new("/tmp"))
+            .unwrap();
         let _s = host_idle(&hub, "s", now(), 0);
         let (outbox, frames) = Hub::outbox();
         hub.add_client(outbox, None);
