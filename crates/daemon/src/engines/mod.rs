@@ -993,11 +993,12 @@ impl Session<'_> {
     fn run(&mut self, mut process: Process, options: Options, ops: Receiver<Value>) {
         let mut adapter = adapter(self.kind, &self.cwd, &options);
         process.write(adapter.start());
-        self.publish(vec![tool_provider_event(
-            &self.hub.store,
-            self.kind,
-            &options,
-        )]);
+        // A new process runs no background task yet (the last one's went
+        // with it); Claude Code reports none at startup.
+        self.publish(vec![
+            tool_provider_event(&self.hub.store, self.kind, &options),
+            json!({ "type": "background_tasks", "tasks": [] }),
+        ]);
         // What the process runs as now (a restart changes it).
         let mut current = options.clone();
         // Session tools answer from their own threads (`wait_session` blocks).
@@ -1151,10 +1152,11 @@ impl Session<'_> {
                             process = started;
                             adapter = self::adapter(self.kind, &self.cwd, &next);
                             process.write(adapter.start());
-                            // The new engine waits on nothing.
+                            // The new engine waits on nothing and runs nothing.
                             self.publish(vec![
                                 tool_provider_event(&self.hub.store, self.kind, &next),
                                 json!({ "type": "pending_messages", "messages": [] }),
+                                json!({ "type": "background_tasks", "tasks": [] }),
                             ]);
                         }
                         Err(error) => {

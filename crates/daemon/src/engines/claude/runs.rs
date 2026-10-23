@@ -30,6 +30,11 @@ pub(super) struct Runs {
     seeded: bool,
 }
 
+/// A task status after which it runs no more.
+pub(super) fn is_final(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "killed" | "stopped")
+}
+
 /// One agent of a `workflow_progress` list.
 fn workflow_agent(item: &Value) -> Value {
     json!({
@@ -134,6 +139,20 @@ impl Runs {
         false
     }
 
+    /// `task_updated` with a final status (a stop may say so only here).
+    pub fn updated(&mut self, frame: &Value) -> bool {
+        let status = &frame["patch"]["status"];
+        if !is_final(text(status)) {
+            return false;
+        }
+        let id = text(&frame["task_id"]);
+        let Some(run) = find(&mut self.workflows, id).or_else(|| find(&mut self.agents, id)) else {
+            return false;
+        };
+        run["status"] = status.clone();
+        true
+    }
+
     /// `task_notification`: the run ended.
     pub fn finished(&mut self, frame: &Value) -> bool {
         let id = text(&frame["task_id"]);
@@ -180,11 +199,17 @@ impl Runs {
             .filter_map(|p| serde_json::from_slice::<Value>(&fs::read(p).ok()?).ok())
             .map(|w| {
                 let (phases, agents) = phases_and_agents(&w["workflowProgress"]);
+                // Saved by a process that is gone: one it left running
+                // is not running any more.
+                let status = match text(&w["status"]) {
+                    s if is_final(s) => w["status"].clone(),
+                    _ => json!("stopped"),
+                };
                 json!({
                     "id": w["taskId"],
                     "name": w["workflowName"],
                     "description": w["summary"],
-                    "status": w["status"],
+                    "status": status,
                     "started_at": w["startTime"],
                     "duration_ms": w["durationMs"],
                     "tokens": w["totalTokens"],

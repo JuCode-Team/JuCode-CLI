@@ -1225,10 +1225,10 @@ impl Codex {
             "turn/started" => agent["status"] = json!("running"),
             "turn/completed" => {
                 let turn = &params["turn"];
-                agent["status"] = json!(if turn["status"] == "failed" {
-                    "failed"
-                } else {
-                    "completed"
+                agent["status"] = json!(match text(&turn["status"]) {
+                    "failed" => "failed",
+                    "interrupted" => "stopped",
+                    _ => "completed",
                 });
                 if let Some(ms) = turn["durationMs"].as_u64() {
                     agent["duration_ms"] = json!(agent["duration_ms"].as_u64().unwrap_or(0) + ms);
@@ -2539,6 +2539,9 @@ mod tests {
         assert_eq!(runs["agents"][0]["tokens"], 900);
         assert_eq!(runs["agents"][0]["status"], "completed");
         assert_eq!(runs["agents"][0]["duration_ms"], 3814);
+        // Stopped by the user: not done.
+        let stopped = frame(&mut c, json!({ "method": "turn/completed", "params": { "threadId": "child", "turn": { "id": "c2", "status": "interrupted" } } })).events;
+        assert_eq!(stopped[0]["status"], "stopped");
         // Its conversation is read back from its thread.
         let ask = sent(
             &c.encode(&json!({ "op": "subagent_transcript", "agent_id": "child" }))

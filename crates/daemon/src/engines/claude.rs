@@ -2011,11 +2011,18 @@ impl Claude {
         let traced = match text(&frame["subtype"]) {
             "task_started" => self.runs.started(frame),
             "task_progress" => self.runs.progress(frame),
+            "task_updated" => self.runs.updated(frame),
             "task_notification" => self.runs.finished(frame),
             _ => false,
         };
         let mut events = self.task_events(frame);
         if traced {
+            // The list replaces the client's: with the runs saved before
+            // this process, or a restarted engine would drop them.
+            if !self.conversation.is_empty() {
+                let session = self.session_dir();
+                self.runs.seed(&session);
+            }
             events.push(self.runs.event());
         }
         events
@@ -2058,20 +2065,37 @@ impl Claude {
                 }
             }
             "task_updated" => {
-                if let (Some(task), true) = (
-                    self.tasks.get_mut(&id),
-                    frame["patch"]["is_backgrounded"] == true,
-                ) {
+                let Some(task) = self.tasks.get_mut(&id) else {
+                    return vec![];
+                };
+                if frame["patch"]["is_backgrounded"] == true {
                     task.background = true;
                 }
-                vec![]
+                // A stopped task may say so only here; the notification, if
+                // any, still announces it.
+                let status = text(&frame["patch"]["status"]);
+                if task.kind == "local_agent" && runs::is_final(status) {
+                    vec![agent(
+                        status,
+                        text(&frame["patch"]["error"]),
+                        &task.description,
+                    )]
+                } else {
+                    vec![]
+                }
             }
             "task_notification" => {
                 let task = self.tasks.remove(&id);
                 let status = text(&frame["status"]);
                 let mut events = Vec::new();
-                if let Some(task) = task.as_ref().filter(|t| t.kind == "local_agent") {
-                    events.push(agent(status, text(&frame["summary"]), &task.description));
+                match &task {
+                    Some(task) if task.kind == "local_agent" => {
+                        events.push(agent(status, text(&frame["summary"]), &task.description));
+                    }
+                    Some(_) => {}
+                    // Started before this process: a subagent the client
+                    // shows ends; the client starts no row for it.
+                    None => events.push(agent(status, text(&frame["summary"]), "")),
                 }
                 let background = task.as_ref().is_none_or(|t| t.background);
                 if background && frame["skip_transcript"] != true && frame["ambient"] != true {
@@ -4052,6 +4076,58 @@ mod tests {
             json!({ "type": "control_response", "response": { "subtype": "error", "request_id": request_id(&boot, "get_settings"), "error": "unknown subtype" } }),
         );
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_subagent_stopped_by_an_update_or_from_before_this_process_ends() {
+        let mut c = claude();
+        let system = |extra: Value| {
+            let mut frame = json!({ "type": "system" });
+            frame
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            frame
+        };
+        frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_started", "task_id": "a1", "task_type": "local_agent", "description": "Scan" }),
+            ),
+        );
+        let killed = frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_updated", "task_id": "a1", "patch": { "status": "killed" } }),
+            ),
+        );
+        assert_eq!(killed[0]["type"], "subagent_lifecycle");
+        assert_eq!(killed[0]["status"], "killed");
+        assert_eq!(killed.last().unwrap()["agents"][0]["status"], "killed");
+        // Still running: nothing to report.
+        frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_started", "task_id": "a2", "task_type": "local_agent", "description": "Watch" }),
+            ),
+        );
+        let paused = frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_updated", "task_id": "a2", "patch": { "status": "paused" } }),
+            ),
+        );
+        assert!(paused.is_empty());
+        // Started under another process: its end still reaches the client.
+        let ended = frame(
+            &mut c,
+            system(
+                json!({ "subtype": "task_notification", "task_id": "old", "status": "stopped", "summary": "" }),
+            ),
+        );
+        assert_eq!(ended[0]["type"], "subagent_lifecycle");
+        assert_eq!(ended[0]["path"], "old");
+        assert_eq!(ended[0]["status"], "stopped");
     }
 
     #[test]

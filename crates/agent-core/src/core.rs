@@ -490,6 +490,8 @@ impl AgentCore {
             self.mcp_servers_event(),
             // Messages waiting for the running turn.
             AgentEvent::PendingMessages(self.pending_texts()),
+            // Subagents running or run: a client that attaches counts them.
+            self.agent_runs_event(),
         ];
         if trust::project_has_local_resources(&self.cwd)
             && self.trust.decision_for(&self.cwd).is_none()
