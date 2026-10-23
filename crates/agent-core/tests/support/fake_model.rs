@@ -22,6 +22,8 @@ pub fn setup() -> std::sync::MutexGuard<'static, ()> {
         let home = temp_dir("home");
         env::set_var("HOME", &home);
         env::remove_var("USERPROFILE");
+        // Not `~/.claude`, so Claude Code's state is looked up where it is.
+        env::set_var("CLAUDE_CONFIG_DIR", home.join("claude-config"));
         env::set_var("JUCODE_FAKE_KEY", "test-key");
         let base_url = start_fake_model();
         let profile = home.join(".jucode");

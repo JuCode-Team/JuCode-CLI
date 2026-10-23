@@ -2287,7 +2287,10 @@ fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
         &mut desktop,
         json!({ "op": "skills_catalog", "backend": "claude" }),
     );
-    assert_eq!(catalog["installDir"], json!(home.join(".claude/skills")));
+    assert_eq!(
+        catalog["installDir"],
+        json!(home.join("claude-config/skills"))
+    );
     assert_eq!(entry(&catalog, "jucode", "review")["installed"], false);
     for op in [
         json!({ "op": "skill_install", "source": "elsewhere", "skill": "review" }),

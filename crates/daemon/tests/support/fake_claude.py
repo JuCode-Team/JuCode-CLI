@@ -15,8 +15,13 @@ def arg(flag):
 session = arg("--resume") or arg("--session-id")
 mode = "bypassPermissions" if "--dangerously-skip-permissions" in args else (arg("--permission-mode") or "default")
 cwd = os.getcwd()
-saved = os.path.join(os.environ["HOME"], ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd))
+config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.environ["HOME"], ".claude")
+saved = os.path.join(config, "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd))
 os.makedirs(saved, exist_ok=True)
+# Like Claude Code: a saved conversation can only be resumed.
+if "--session-id" in args and os.path.exists(os.path.join(saved, session + ".jsonl")):
+    sys.stderr.write("Error: Session ID " + session + " is already in use.\n")
+    sys.exit(1)
 
 def out(frame):
     sys.stdout.write(json.dumps(frame) + "\n")

@@ -815,7 +815,7 @@ impl Claude {
 
     /// Where Claude Code keeps this conversation's Workflows and subagents.
     fn session_dir(&self) -> PathBuf {
-        project_dir(&home(), &self.cwd).join(&self.conversation)
+        project_dir(&config_dir(), &self.cwd).join(&self.conversation)
     }
 
     fn control_request(&mut self, request: Value, tag: &str) -> String {
@@ -2905,17 +2905,26 @@ fn limit_banner(frame: &Value, info: &Value) -> Vec<Value> {
 
 // --- saved conversations ---
 
+/// Where Claude Code keeps its state: `CLAUDE_CONFIG_DIR`, which the engine
+/// inherits from the daemon, else `~/.claude`.
+pub fn config_dir() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".claude"))
+}
+
 /// Claude Code's project directory for `cwd`: every character of the real
 /// path (Claude Code resolves symlinks, e.g. macOS `/tmp` → `/private/tmp`)
 /// that is not ASCII alphanumeric becomes `-`.
-fn project_dir(home: &Path, cwd: &Path) -> PathBuf {
+fn project_dir(config: &Path, cwd: &Path) -> PathBuf {
     let real = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let munged: String = real
         .to_string_lossy()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    home.join(".claude").join("projects").join(munged)
+    config.join("projects").join(munged)
 }
 
 fn is_conversation_id(id: &str) -> bool {
@@ -3100,16 +3109,16 @@ fn rows(path: &Path, limit: u64) -> impl Iterator<Item = Value> {
 /// The user and assistant text of a saved conversation, as transcript items
 /// (the newest 500). The user's images are written under `uploads`.
 pub fn transcript(cwd: &Path, id: &str, uploads: &Path) -> Vec<Value> {
-    transcript_in(&home(), cwd, id, &uploads.join("claude"))
+    transcript_in(&config_dir(), cwd, id, &uploads.join("claude"))
 }
 
-fn transcript_in(home: &Path, cwd: &Path, id: &str, images: &Path) -> Vec<Value> {
+fn transcript_in(config: &Path, cwd: &Path, id: &str, images: &Path) -> Vec<Value> {
     if !is_conversation_id(id) {
         return vec![];
     }
     let mut user_calls = HashMap::new();
     let mut items: Vec<Value> = rows(
-        &project_dir(home, cwd).join(format!("{id}.jsonl")),
+        &project_dir(config, cwd).join(format!("{id}.jsonl")),
         64 * 1024 * 1024,
     )
     .filter(|row| !is_synthetic(row))
@@ -3133,20 +3142,20 @@ fn transcript_in(home: &Path, cwd: &Path, id: &str, images: &Path) -> Vec<Value>
 
 /// Conversations saved for `cwd`, newest first: (id, title, updated ms).
 pub fn saved(cwd: &Path) -> Vec<(String, String, u64)> {
-    saved_in(&home(), cwd)
+    saved_in(&config_dir(), cwd)
 }
 
 /// Whether Claude Code saved conversation `id` for `cwd` (it has at least one
 /// turn and can be resumed). Unlike `saved`, not limited to the newest ones.
 pub fn is_saved(cwd: &Path, id: &str) -> bool {
     is_conversation_id(id)
-        && project_dir(&home(), cwd)
+        && project_dir(&config_dir(), cwd)
             .join(format!("{id}.jsonl"))
             .is_file()
 }
 
-fn saved_in(home: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
-    let Ok(entries) = fs::read_dir(project_dir(home, cwd)) else {
+fn saved_in(config: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
+    let Ok(entries) = fs::read_dir(project_dir(config, cwd)) else {
         return vec![];
     };
     let mut found: Vec<(String, u64, PathBuf)> = entries
@@ -4382,7 +4391,7 @@ mod tests {
         )
         .unwrap();
         let images = home.join("images");
-        let items = transcript_in(&home, cwd, "33-44", &images);
+        let items = transcript_in(&home.join(".claude"), cwd, "33-44", &images);
         let path = items[0]["images"][0].as_str().unwrap().to_string();
         assert!(path.starts_with(images.to_str().unwrap()) && path.ends_with(".png"));
         assert_eq!(fs::read(&path).unwrap(), b"png bytes");
@@ -4396,7 +4405,10 @@ mod tests {
             ]
         );
         // Read again, the same file.
-        assert_eq!(transcript_in(&home, cwd, "33-44", &images), items);
+        assert_eq!(
+            transcript_in(&home.join(".claude"), cwd, "33-44", &images),
+            items
+        );
         assert_eq!(fs::read_dir(&images).unwrap().count(), 1);
     }
 
@@ -4658,8 +4670,8 @@ mod tests {
             .collect::<String>(),
         )
         .unwrap();
-        let items = transcript_in(&home, cwd, "11-22", &home.join("images"));
-        let listed = saved_in(&home, cwd);
+        let items = transcript_in(&home.join(".claude"), cwd, "11-22", &home.join("images"));
+        let listed = saved_in(&home.join(".claude"), cwd);
         assert_eq!(
             items,
             vec![
@@ -4671,7 +4683,9 @@ mod tests {
         );
         assert_eq!(listed[0].0, "11-22");
         assert_eq!(listed[0].1, "hello there");
-        assert!(transcript_in(&home, cwd, "../etc", &home.join("images")).is_empty());
+        assert!(
+            transcript_in(&home.join(".claude"), cwd, "../etc", &home.join("images")).is_empty()
+        );
 
         // A symlinked directory is saved under its real path.
         let real = home.join("real-dir");
