@@ -721,6 +721,9 @@ pub struct Claude {
     thinking: bool,
     /// Running tasks (subagents, background work) by task id.
     tasks: HashMap<String, Task>,
+    /// Messages sent with images, oldest first: (text, image paths). The
+    /// echo carries the images inline; the clients show them by path.
+    sent_images: Vec<(String, Value)>,
     /// Workflows and Task subagents, for the agent trace.
     runs: runs::Runs,
     /// The project directory, where Claude Code keeps the conversation.
@@ -784,6 +787,7 @@ impl Claude {
             fast_blocked: String::new(),
             thinking: options.thinking.unwrap_or(true),
             tasks: HashMap::new(),
+            sent_images: Vec::new(),
             runs: runs::Runs::default(),
             cwd: PathBuf::new(),
             engine_mode: String::new(),
@@ -1557,7 +1561,13 @@ impl Claude {
             {
                 return events;
             }
-            events.push(json!({ "type": "user_message", "content": message }));
+            let mut echo = json!({ "type": "user_message", "content": message });
+            if has_image(content) {
+                if let Some(i) = self.sent_images.iter().position(|(t, _)| t == trimmed) {
+                    echo["images"] = self.sent_images.remove(i).1;
+                }
+            }
+            events.push(echo);
             return events;
         }
         let mut events: Vec<Value> = content
@@ -2519,6 +2529,18 @@ impl Adapter for Claude {
         let frames = match text(&op["op"]) {
             "user_message" => {
                 let frames = vec![json!({ "type": "user", "message": { "role": "user", "content": Self::user_content(op) } }).to_string()];
+                if op["images"]
+                    .as_array()
+                    .is_some_and(|images| !images.is_empty())
+                {
+                    self.sent_images.push((
+                        text(&op["content"]).trim().to_string(),
+                        op["images"].clone(),
+                    ));
+                    // Echoes that never came (a crash, a rewind) do not pile up.
+                    let excess = self.sent_images.len().saturating_sub(32);
+                    self.sent_images.drain(..excess);
+                }
                 if !self.active_turn {
                     return Ok(Output {
                         events: Vec::new(),
@@ -4635,6 +4657,7 @@ mod tests {
             &mut c,
             json!({ "type": "user", "isReplay": true, "message": { "content": [{ "type": "text", "text": "" }, image] } }),
         );
+        // Not sent from here: its images have no path to show.
         assert_eq!(echo, vec![json!({ "type": "user_message", "content": "" })]);
         // Sent mid-turn, it leaves the queue when Claude takes it in.
         frame(
@@ -4657,7 +4680,8 @@ mod tests {
             taken,
             vec![
                 json!({ "type": "pending_messages", "messages": [], "fixed": 0 }),
-                json!({ "type": "user_message", "content": "" })
+                // Sent from here: by the paths it was sent with.
+                json!({ "type": "user_message", "content": "", "images": ["/no/such.png"] })
             ]
         );
         // Nothing to show without text or image.
