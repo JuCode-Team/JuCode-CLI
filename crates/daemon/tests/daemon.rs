@@ -1891,6 +1891,52 @@ fn full_access_restarts_claude_on_the_same_conversation_and_reopening_resumes_it
         .any(|w| w == ["--resume", session.as_str()]));
 }
 
+#[test]
+fn a_conversation_saved_where_the_sessions_environment_says_reopens_by_resuming() {
+    let _guard = setup();
+    let log = fake_claude();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-claude-env-config");
+    fs::create_dir_all(&dir).unwrap();
+    // Set for the engine only (the Desktop's per-engine variables), not for
+    // the daemon.
+    let options = json!({ "env": { "CLAUDE_CONFIG_DIR": temp_dir("claude-env-config") } });
+    let mut client = Client::connect(&daemon);
+    let created = request(
+        &mut client,
+        json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": options }),
+    );
+    let session = created["session"].as_str().unwrap().to_string();
+    client.send(json!({ "op": "watch", "session": session }));
+    client.until(is_ready(&session));
+    client.send(json!({ "op": "user_message", "session": session, "content": "first" }));
+    client.until(turn_done(&session));
+    client.send(json!({ "op": "session_close", "session": session }));
+    client.until(|f| f["type"] == "session_closed" && f["session"] == session.as_str());
+
+    let opened = request(
+        &mut client,
+        json!({ "op": "session_open", "session": session, "options": options }),
+    );
+    assert_eq!(opened["type"], "session_opened", "{opened}");
+    client.send(json!({ "op": "watch", "session": session }));
+    let frames = client.until(|f| f["session"] == session.as_str() && f["type"] == "transcript");
+    assert_eq!(
+        frames.last().unwrap()["items"],
+        json!([
+            { "role": "user", "content": "first" },
+            { "role": "assistant", "content": "ok: first" },
+        ])
+    );
+    let again = starts(&log).pop().unwrap();
+    assert!(
+        again
+            .windows(2)
+            .any(|w| w == ["--resume", session.as_str()]),
+        "{again:?}"
+    );
+}
+
 fn fake_codex() -> PathBuf {
     let log = temp_dir("fake-codex").with_extension("log");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_codex.py");

@@ -422,9 +422,11 @@ impl Hub {
                         .map_err(|error| error.to_string())?
                         .iter()
                         .any(|summary| summary.id == id),
-                    Some(engines::Kind::Claude) => engines::claude::saved(&cwd)
-                        .iter()
-                        .any(|(saved, _, _)| saved == id),
+                    Some(engines::Kind::Claude) => {
+                        engines::claude::saved(&engines::claude::config_dir_in(&options.env), &cwd)
+                            .iter()
+                            .any(|(saved, _, _)| saved == id)
+                    }
                     Some(engines::Kind::Codex) => engines::codex::saved(&cwd)
                         .iter()
                         .any(|(saved, _, _)| saved == id),
@@ -480,15 +482,21 @@ impl Hub {
                 // again under the same id instead of resuming it.
                 // Codex resumes through its protocol, which also sends the
                 // history back.
+                let claude_config = engines::claude::config_dir_in(&options.env);
                 let saved = match kind {
-                    engines::Kind::Claude => engines::claude::is_saved(&record.cwd, id),
+                    engines::Kind::Claude => {
+                        engines::claude::is_saved(&claude_config, &record.cwd, id)
+                    }
                     engines::Kind::Codex => true,
                     engines::Kind::Acp => false,
                 };
                 let transcript = match kind {
-                    engines::Kind::Claude => {
-                        engines::claude::transcript(&record.cwd, id, self.uploads.dir())
-                    }
+                    engines::Kind::Claude => engines::claude::transcript(
+                        &claude_config,
+                        &record.cwd,
+                        id,
+                        self.uploads.dir(),
+                    ),
                     engines::Kind::Codex | engines::Kind::Acp => Vec::new(),
                 };
                 // A client that does not say (a phone) keeps how it last ran,
@@ -1281,7 +1289,7 @@ impl Hub {
                 )
             })
             .chain(
-                engines::claude::saved(cwd)
+                engines::claude::saved(&engines::claude::config_dir(), cwd)
                     .into_iter()
                     .map(|(id, title, updated_at)| {
                         item(id, title, updated_at, Value::Null, "claude")

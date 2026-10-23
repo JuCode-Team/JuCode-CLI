@@ -1192,11 +1192,17 @@ impl Session<'_> {
         }
     }
 
-    /// Whether the engine has saved conversation `id` (only then can its
-    /// TUI resume it).
-    fn saved(&self, id: &str) -> bool {
+    /// Whether the engine run with `options` has saved conversation `id`
+    /// (only then can its TUI resume it).
+    fn saved(&self, id: &str, options: &Options) -> bool {
         match self.kind {
-            Kind::Claude => !claude::transcript(&self.cwd, id, self.hub.uploads.dir()).is_empty(),
+            Kind::Claude => !claude::transcript(
+                &claude::config_dir_in(&options.env),
+                &self.cwd,
+                id,
+                self.hub.uploads.dir(),
+            )
+            .is_empty(),
             Kind::Codex => codex::saved(&self.cwd)
                 .iter()
                 .any(|(saved, ..)| saved == id),
@@ -1249,7 +1255,7 @@ impl Session<'_> {
             &session,
             &self.cwd,
             options,
-            self.saved(&id),
+            self.saved(&id, options),
         ) {
             Ok((tui, key)) => Some((id, tui, key)),
             Err(error) => {
@@ -1341,7 +1347,7 @@ impl Session<'_> {
         // Back to the engine, on the conversation as the TUI left it (none
         // when the TUI saved nothing: the engine starts it afresh).
         let id = match self.kind {
-            Kind::Codex if !self.saved(&id) => codex::saved(&self.cwd)
+            Kind::Codex if !self.saved(&id, &options) => codex::saved(&self.cwd)
                 .into_iter()
                 .map(|(id, ..)| id)
                 .find(|saved| !earlier.contains(saved))
@@ -1349,7 +1355,7 @@ impl Session<'_> {
             _ => id,
         };
         let next = Options {
-            resume: self.saved(&id).then(|| id.clone()),
+            resume: self.saved(&id, &options).then(|| id.clone()),
             resume_at: None,
             ..options
         };
@@ -1368,7 +1374,7 @@ impl Session<'_> {
                 // Codex replays its thread when it resumes; Claude Code's
                 // conversation is read from its file.
                 if self.kind == Kind::Claude {
-                    events.push(json!({ "type": "transcript", "items": claude::transcript(&self.cwd, &id, self.hub.uploads.dir()) }));
+                    events.push(json!({ "type": "transcript", "items": claude::transcript(&claude::config_dir_in(&next.env), &self.cwd, &id, self.hub.uploads.dir()) }));
                 }
                 self.publish(events);
                 Some((started, engine, next))

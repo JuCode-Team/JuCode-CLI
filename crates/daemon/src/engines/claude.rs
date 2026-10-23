@@ -758,6 +758,8 @@ pub struct Claude {
     calls: Vec<HostCall>,
     /// The `user_tools` the user turned off.
     app_tools_off: Vec<&'static str>,
+    /// The CLI's config directory (`config_dir_in`).
+    config: PathBuf,
 }
 
 impl Claude {
@@ -805,6 +807,7 @@ impl Claude {
             commands: Vec::new(),
             calls: Vec::new(),
             app_tools_off: options.app_tools_off.clone(),
+            config: config_dir_in(&options.env),
         }
     }
 
@@ -815,7 +818,7 @@ impl Claude {
 
     /// Where Claude Code keeps this conversation's Workflows and subagents.
     fn session_dir(&self) -> PathBuf {
-        project_dir(&config_dir(), &self.cwd).join(&self.conversation)
+        project_dir(&self.config, &self.cwd).join(&self.conversation)
     }
 
     fn control_request(&mut self, request: Value, tag: &str) -> String {
@@ -2914,6 +2917,21 @@ pub fn config_dir() -> PathBuf {
         .unwrap_or_else(|| home().join(".claude"))
 }
 
+/// `config_dir` of a CLI run with `env` (a session's `Options::env`) on top
+/// of the daemon's environment: the Desktop's per-engine variables may set
+/// `CLAUDE_CONFIG_DIR` where the daemon's own environment does not.
+pub fn config_dir_in(env: &[(String, String)]) -> PathBuf {
+    match env
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+    {
+        Some((_, dir)) if !dir.is_empty() => PathBuf::from(dir),
+        Some(_) => home().join(".claude"),
+        None => config_dir(),
+    }
+}
+
 /// Claude Code's project directory for `cwd`: every character of the real
 /// path (Claude Code resolves symlinks, e.g. macOS `/tmp` → `/private/tmp`)
 /// that is not ASCII alphanumeric becomes `-`.
@@ -3107,9 +3125,10 @@ fn rows(path: &Path, limit: u64) -> impl Iterator<Item = Value> {
 }
 
 /// The user and assistant text of a saved conversation, as transcript items
-/// (the newest 500). The user's images are written under `uploads`.
-pub fn transcript(cwd: &Path, id: &str, uploads: &Path) -> Vec<Value> {
-    transcript_in(&config_dir(), cwd, id, &uploads.join("claude"))
+/// (the newest 500), from config directory `config`. The user's images are
+/// written under `uploads`.
+pub fn transcript(config: &Path, cwd: &Path, id: &str, uploads: &Path) -> Vec<Value> {
+    transcript_in(config, cwd, id, &uploads.join("claude"))
 }
 
 fn transcript_in(config: &Path, cwd: &Path, id: &str, images: &Path) -> Vec<Value> {
@@ -3140,16 +3159,18 @@ fn transcript_in(config: &Path, cwd: &Path, id: &str, images: &Path) -> Vec<Valu
     items
 }
 
-/// Conversations saved for `cwd`, newest first: (id, title, updated ms).
-pub fn saved(cwd: &Path) -> Vec<(String, String, u64)> {
-    saved_in(&config_dir(), cwd)
+/// Conversations saved for `cwd` in config directory `config`, newest
+/// first: (id, title, updated ms).
+pub fn saved(config: &Path, cwd: &Path) -> Vec<(String, String, u64)> {
+    saved_in(config, cwd)
 }
 
-/// Whether Claude Code saved conversation `id` for `cwd` (it has at least one
-/// turn and can be resumed). Unlike `saved`, not limited to the newest ones.
-pub fn is_saved(cwd: &Path, id: &str) -> bool {
+/// Whether Claude Code saved conversation `id` for `cwd` in config directory
+/// `config` (it has at least one turn and can be resumed). Unlike `saved`,
+/// not limited to the newest ones.
+pub fn is_saved(config: &Path, cwd: &Path, id: &str) -> bool {
     is_conversation_id(id)
-        && project_dir(&config_dir(), cwd)
+        && project_dir(config, cwd)
             .join(format!("{id}.jsonl"))
             .is_file()
 }
@@ -4241,6 +4262,14 @@ mod tests {
         assert_eq!(content[1]["source"]["data"], "iVBORw==");
         assert_eq!(content[2]["type"], "text");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_sessions_environment_names_the_config_directory() {
+        let env = |dir: &str| vec![("CLAUDE_CONFIG_DIR".to_string(), dir.to_string())];
+        assert_eq!(config_dir_in(&env("/tmp/c")), PathBuf::from("/tmp/c"));
+        assert_eq!(config_dir_in(&env("")), home().join(".claude"));
+        assert_eq!(config_dir_in(&[]), config_dir());
     }
 
     #[test]
