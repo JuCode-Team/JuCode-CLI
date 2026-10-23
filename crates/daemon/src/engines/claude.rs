@@ -721,6 +721,11 @@ pub struct Claude {
     thinking: bool,
     /// Running tasks (subagents, background work) by task id.
     tasks: HashMap<String, Task>,
+    /// The last usage-limit notice that was not "ok" (a `rate_limit` event):
+    /// what a turn stopped by the limit reports.
+    limit: Value,
+    /// This turn was stopped by a usage limit: its error is that notice.
+    limit_hit: bool,
     /// Messages sent with images, oldest first: (text, image paths). The
     /// echo carries the images inline; the clients show them by path.
     sent_images: Vec<(String, Value)>,
@@ -788,6 +793,8 @@ impl Claude {
             thinking: options.thinking.unwrap_or(true),
             tasks: HashMap::new(),
             sent_images: Vec::new(),
+            limit: Value::Null,
+            limit_hit: false,
             runs: runs::Runs::default(),
             cwd: PathBuf::new(),
             engine_mode: String::new(),
@@ -1467,6 +1474,21 @@ impl Claude {
     }
 
     fn on_assistant(&mut self, frame: &Value) -> Vec<Value> {
+        // Claude Code's own "You've hit your limit · resets …" is no reply:
+        // it is the usage limit, with what the last rate-limit event said.
+        if frame["error"] == "rate_limit" {
+            self.limit_hit = true;
+            let mut limit = match &self.limit {
+                Value::Null => {
+                    json!({ "type": "rate_limit", "window": null, "used": null, "resets_at": null })
+                }
+                known => known.clone(),
+            };
+            limit["level"] = json!("limited");
+            limit["message"] =
+                json!(content_text(&frame["message"]["content"]).unwrap_or_default());
+            return vec![limit];
+        }
         let mut events = Vec::new();
         for block in frame["message"]["content"]
             .as_array()
@@ -1682,10 +1704,11 @@ impl Claude {
                 .to_string();
             if detail.contains("No conversation found with session ID") {
                 events.push(json!({ "type": "resume_failed" }));
-            } else {
+            } else if !self.limit_hit {
                 events.push(error_event(&detail));
             }
         }
+        self.limit_hit = false;
         events.extend(self.fast_state(frame));
         events.push(json!({ "type": "status", "message": "ready" }));
         events
@@ -2516,7 +2539,17 @@ impl Adapter for Claude {
             "result" => return self.on_turn_end(&frame),
             "control_request" => return self.on_control_request(&frame),
             "control_response" => self.on_control_response(&frame),
-            "rate_limit_event" => rate_limit_events(&frame),
+            "rate_limit_event" => {
+                let events = rate_limit_events(&frame);
+                if let Some(limit) = events.iter().find(|e| e["type"] == "rate_limit") {
+                    self.limit = if limit["level"] == "ok" {
+                        Value::Null
+                    } else {
+                        limit.clone()
+                    };
+                }
+                events
+            }
             "prompt_suggestion" => {
                 vec![json!({ "type": "prompt_suggestion", "text": frame["suggestion"] })]
             }
@@ -2932,24 +2965,29 @@ fn limit_banner(frame: &Value, info: &Value) -> Vec<Value> {
     } else {
         Value::Null
     };
-    let message = [
-        text(&info["message"]),
-        text(&frame["message"]),
-        status.as_str(),
-    ]
-    .into_iter()
-    .find(|m| !m.is_empty())
-    .unwrap_or_default()
-    .to_string();
+    // Words for the user, if the engine sent any (the status is a code).
+    let message = [text(&info["message"]), text(&frame["message"])]
+        .into_iter()
+        .find(|m| !m.is_empty())
+        .unwrap_or_default();
+    // Which limit: `five_hour`, `seven_day`, `seven_day_opus`, `overage`…,
+    // and how much of it is used, in percent.
+    let notice = |level: &str| {
+        json!({
+            "type": "rate_limit",
+            "level": level,
+            "message": message,
+            "resets_at": resets_at,
+            "window": info["rateLimitType"].as_str(),
+            "used": info["utilization"].as_f64().map(|u| (u * 1000.0).round() / 10.0),
+            "overage": info["isUsingOverage"] == true,
+        })
+    };
     let has = |words: &[&str]| words.iter().any(|word| status.contains(word));
     if has(&["reject", "exceed", "limit_reached", "throttl"]) {
-        vec![
-            json!({ "type": "rate_limit", "level": "limited", "message": message, "resets_at": resets_at }),
-        ]
+        vec![notice("limited")]
     } else if has(&["warn", "approaching"]) {
-        vec![
-            json!({ "type": "rate_limit", "level": "warning", "message": message, "resets_at": resets_at }),
-        ]
+        vec![notice("warning")]
     } else if has(&["allow", "ok", "normal"]) {
         vec![json!({ "type": "rate_limit", "level": "ok", "message": "", "resets_at": null })]
     } else {
@@ -3384,6 +3422,8 @@ fn transcript_in(config: &Path, cwd: &Path, id: &str, images: &Path) -> Vec<Valu
         let mut items = user_tool_rows(&row, &mut user_calls);
         items.extend(match text(&row["type"]) {
             "user" => user_item(&row["message"]["content"], images),
+            // The usage-limit notice Claude Code saves as a reply is none.
+            "assistant" if row["error"] == "rate_limit" => None,
             "assistant" => {
                 row_text(&row).map(|content| json!({ "role": "assistant", "content": content }))
             }
@@ -3621,6 +3661,10 @@ mod tests {
         );
         assert_eq!(types(&events), ["rate_limit", "plan_usage"]);
         assert_eq!(events[0]["level"], "warning");
+        assert_eq!(events[0]["window"], "five_hour");
+        assert_eq!(events[0]["used"], 83.0);
+        // The status is a code, not words for the user.
+        assert_eq!(events[0]["message"], "");
         assert_eq!(events[0]["resets_at"], 1_790_800_000_000u64);
         let windows = events[1]["windows"].as_array().unwrap();
         assert_eq!(windows.len(), 2);
@@ -3642,6 +3686,40 @@ mod tests {
             json!({ "type": "rate_limit_event", "rate_limit_info": { "status": "allowed" } }),
         );
         assert_eq!(types(&events), ["rate_limit"]);
+    }
+
+    #[test]
+    fn a_turn_stopped_by_the_usage_limit_reports_the_limit_not_a_reply() {
+        let mut c = claude();
+        frame(
+            &mut c,
+            json!({ "type": "rate_limit_event", "rate_limit_info": {
+                "status": "rejected", "resetsAt": 1790800000, "rateLimitType": "five_hour", "utilization": 1.0 } }),
+        );
+        let hit = frame(
+            &mut c,
+            json!({ "type": "assistant", "error": "rate_limit", "message": { "model": "<synthetic>", "content": [
+                { "type": "text", "text": "You've hit your session limit · resets 12:40pm" } ] } }),
+        );
+        assert_eq!(types(&hit), ["rate_limit"]);
+        assert_eq!(hit[0]["level"], "limited");
+        assert_eq!(hit[0]["window"], "five_hour");
+        assert_eq!(hit[0]["resets_at"], 1_790_800_000_000u64);
+        assert_eq!(
+            hit[0]["message"],
+            "You've hit your session limit · resets 12:40pm"
+        );
+        let end = frame(
+            &mut c,
+            json!({ "type": "result", "subtype": "success", "is_error": true, "result": "You've hit your session limit · resets 12:40pm" }),
+        );
+        assert!(!end.iter().any(|e| e["type"] == "error"));
+        // The next failure is an error again.
+        let end = frame(
+            &mut c,
+            json!({ "type": "result", "subtype": "error_during_execution", "is_error": true, "result": "boom" }),
+        );
+        assert!(end.iter().any(|e| e["type"] == "error"));
     }
 
     #[test]

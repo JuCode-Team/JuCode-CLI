@@ -192,6 +192,10 @@ fn sandbox_mode(sandbox: &Value) -> &'static str {
 }
 
 fn error_event(message: &str, info: &Value) -> Value {
+    // Out of plan usage: the usage-limit notice, not an error.
+    if info == "usageLimitExceeded" || info.get("usageLimitExceeded").is_some() {
+        return json!({ "type": "rate_limit", "level": "limited", "message": message, "resets_at": null, "window": null, "used": null });
+    }
     let lower = message.to_lowercase();
     let unauthorized = info == "unauthorized"
         || info
@@ -227,6 +231,53 @@ fn plan_usage(snapshot: &Value) -> Option<Value> {
         .collect();
     let plan = snapshot["planType"].as_str();
     (!windows.is_empty()).then(|| json!({ "type": "plan_usage", "plan": plan, "windows": windows }))
+}
+
+/// Codex sends no warning before a limit: from 90% of a window on, its usage
+/// is one (the fullest window); at 100% the limit is hit.
+const LIMIT_WARNING: f64 = 90.0;
+
+/// The usage-limit notice of a rate-limit snapshot (`plan_usage`'s windows).
+fn limit_notice(usage: &Value) -> Option<Value> {
+    let fullest = usage["windows"].as_array()?.iter().max_by(|a, b| {
+        a["used"]
+            .as_f64()
+            .unwrap_or(0.0)
+            .total_cmp(&b["used"].as_f64().unwrap_or(0.0))
+    })?;
+    let used = fullest["used"].as_f64().unwrap_or(0.0);
+    let level = if used >= 100.0 {
+        "limited"
+    } else if used >= LIMIT_WARNING {
+        "warning"
+    } else {
+        return Some(
+            json!({ "type": "rate_limit", "level": "ok", "message": "", "resets_at": null }),
+        );
+    };
+    // Codex names windows primary/secondary: by their length instead.
+    let window = match fullest["minutes"].as_u64() {
+        Some(300) => json!("five_hour"),
+        Some(10_080) => json!("seven_day"),
+        _ => fullest["key"].clone(),
+    };
+    Some(json!({
+        "type": "rate_limit",
+        "level": level,
+        "message": "",
+        "resets_at": fullest["resets_at"],
+        "window": window,
+        "used": used,
+    }))
+}
+
+/// `plan_usage` and the usage-limit notice of a rate-limit snapshot.
+fn usage_events(snapshot: &Value) -> Vec<Value> {
+    let Some(usage) = plan_usage(snapshot) else {
+        return vec![];
+    };
+    let notice = limit_notice(&usage);
+    std::iter::once(usage).chain(notice).collect()
 }
 
 fn file_change_output(changes: &[Value], error: Option<&str>) -> String {
@@ -955,9 +1006,7 @@ impl Codex {
             }
             "thread/start" => self.thread_opened(result, false),
             "thread/resume" => self.thread_opened(result, true),
-            "account/rateLimits/read" => {
-                Output::events(plan_usage(&result["rateLimits"]).into_iter().collect())
-            }
+            "account/rateLimits/read" => Output::events(usage_events(&result["rateLimits"])),
             "model/list" => {
                 self.catalog = result["data"]
                     .as_array()
@@ -1540,7 +1589,7 @@ impl Codex {
             }
         }
         match method {
-            "account/rateLimits/updated" => plan_usage(&params["rateLimits"]).into_iter().collect(),
+            "account/rateLimits/updated" => usage_events(&params["rateLimits"]),
             "turn/started" => {
                 self.busy = true;
                 if let Some(turn) = params["turn"]["id"].as_str() {
@@ -2967,7 +3016,9 @@ mod tests {
             &mut c,
             json!({ "id": read["id"], "result": { "rateLimits": snapshot } }),
         );
-        assert_eq!(types(&out.events), ["plan_usage"]);
+        // Under 90%: the limit notice says all is well.
+        assert_eq!(types(&out.events), ["plan_usage", "rate_limit"]);
+        assert_eq!(out.events[1]["level"], "ok");
         assert_eq!(out.events[0]["plan"], "plus");
         assert_eq!(
             out.events[0]["windows"][0],
@@ -2979,6 +3030,21 @@ mod tests {
         );
         assert_eq!(out.events[0]["windows"][0]["used"], 40.0);
         assert_eq!(out.events[0]["windows"][0]["resets_at"], Value::Null);
+        // The fullest window, named by its length.
+        let out = frame(
+            &mut c,
+            json!({ "method": "account/rateLimits/updated", "params": { "rateLimits": {
+                "primary": { "usedPercent": 20, "windowDurationMins": 300 },
+                "secondary": { "usedPercent": 93, "windowDurationMins": 10080, "resetsAt": 1791300000 } } } }),
+        );
+        assert_eq!(out.events[1]["level"], "warning");
+        assert_eq!(out.events[1]["window"], "seven_day");
+        assert_eq!(out.events[1]["used"], 93.0);
+        assert_eq!(out.events[1]["resets_at"], 1_791_300_000_000u64);
+        // Out of usage: the turn's error is the limit notice.
+        let limited = error_event("You've hit your usage limit.", &json!("usageLimitExceeded"));
+        assert_eq!(limited["type"], "rate_limit");
+        assert_eq!(limited["level"], "limited");
     }
 
     #[test]
