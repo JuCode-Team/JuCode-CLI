@@ -605,6 +605,34 @@ fn a_steer_by_index_takes_that_message_and_leaves_the_others_waiting() {
 }
 
 #[test]
+fn interrupt_and_send_starts_the_chosen_message_now() {
+    let _guard = setup();
+    let dir = temp_dir("interrupt-send");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+
+    let slow = if cfg!(windows) {
+        "RUN: Start-Sleep -Seconds 3".to_string()
+    } else {
+        "RUN: sleep 3".to_string()
+    };
+    core.submit_user_message(slow);
+    pump(&mut core, |e| matches!(e, AgentEvent::ToolStart { .. }));
+    core.submit_user_message("first".to_string());
+    core.submit_user_message("second".to_string());
+    let events = core.interrupt_send(Some(-1));
+    // "second" runs now as its own turn; "first" waits.
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::UserMessage(m) if m == "second")));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::PendingMessages(texts) if *texts == ["first"]
+    )));
+    assert!(core.interrupt_send(Some(4)).is_empty());
+    core.interrupt();
+}
+
+#[test]
 fn an_interrupt_requeues_unread_steers_ahead_of_later_messages() {
     let _guard = setup();
     let dir = temp_dir("steer-interrupt");

@@ -765,6 +765,26 @@ impl AgentCore {
                 AgentEvent::PendingMessages(self.pending_texts()),
             ];
         }
+        self.restart_with_first()
+    }
+
+    /// Stops the turn and starts queued message `index` (negative from the
+    /// last) now, ahead of the others: the user's "interrupt and send".
+    pub fn interrupt_send(&mut self, index: Option<i64>) -> Vec<AgentEvent> {
+        let Some(index) = queue_index(index, self.queued.len()) else {
+            return Vec::new();
+        };
+        if !self.running {
+            return Vec::new();
+        }
+        if let Some(chosen) = self.queued.remove(index) {
+            self.queued.push_front(chosen);
+        }
+        self.restart_with_first()
+    }
+
+    /// The running turn stops; the first queued message starts the next.
+    fn restart_with_first(&mut self) -> Vec<AgentEvent> {
         self.stop_current_turn();
         let Some((next, images)) = self.queued.pop_front() else {
             return Vec::new();

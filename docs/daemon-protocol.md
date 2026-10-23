@@ -289,7 +289,9 @@ Differences from a jucode session:
   last; every waiting message without one) writes it to Claude Code now,
   which takes it into the running turn at its next tool boundary. Until
   Claude Code takes it in it stays first in `pending_messages`, counted in
-  `fixed`: those can no longer be taken back or steered.
+  `fixed`: those can no longer be taken back or steered. `interrupt` with
+  `index` moves that held message to the front and stops the turn, so it
+  starts the next one.
 - `decide_action`, `mcp_set`/`mcp_remove` and the jucode-only
   commands (`/resume`, `/rewind`, `/tree`, ...) are refused with an `error`
   event. Other slash commands go to Claude Code as a user message, as Claude

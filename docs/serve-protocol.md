@@ -131,6 +131,14 @@ closes subagents, clears pending approvals. Emits
 auto-start as the next turn; send `interrupt` again (or avoid queueing) to
 stop those too. No-op when idle.
 
+```json
+{"op":"interrupt","index":-1}
+```
+
+With `index` (as for `steer`), queued message `index` moves to the front and
+starts the next turn at once: the client's "interrupt and send". The daemon's
+Claude Code, Codex and ACP sessions take the same field.
+
 ### `approve`
 
 ```json

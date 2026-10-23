@@ -2639,9 +2639,18 @@ impl Adapter for Claude {
                 };
                 vec![json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request_id, "response": result } }).to_string()]
             }
+            // With `index` (a held message, negative from the last): that
+            // one goes first once the turn has stopped.
             "interrupt" => {
                 if !self.active_turn {
                     return Ok(Output::default());
+                }
+                let fixed = self.queued.len();
+                if let Some(i) = queue_index(op["index"].as_i64(), fixed + self.held.len())
+                    .filter(|i| *i >= fixed)
+                {
+                    let chosen = self.held.remove(i - fixed);
+                    self.held.insert(0, chosen);
                 }
                 self.interrupting = true;
                 vec![self.control_request(json!({ "subtype": "interrupt" }), "")]
@@ -4901,6 +4910,20 @@ mod tests {
             json!({ "type": "result", "subtype": "success" }),
         ));
         assert!(ended.frames.is_empty());
+    }
+
+    #[test]
+    fn interrupting_for_a_held_message_sends_it_first() {
+        let mut c = mid_turn(&["apple", "banana", "cherry"]);
+        let stop = c
+            .encode(&json!({ "op": "interrupt", "index": -1 }))
+            .unwrap();
+        assert!(stop.frames[0].contains("interrupt"));
+        let ended = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "error_during_execution", "is_error": true }),
+        ));
+        assert_eq!(ended.frames.len(), 1);
+        assert!(ended.frames[0].contains("cherry"));
     }
 
     #[test]

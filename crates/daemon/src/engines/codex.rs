@@ -2042,7 +2042,24 @@ impl Adapter for Codex {
                 };
                 vec![json!({ "jsonrpc": "2.0", "id": request, "result": result }).to_string()]
             }
+            // With `index` (a waiting message, negative from the last): that
+            // one starts the next turn once this one has stopped.
             "interrupt" => match (self.thread.clone(), self.active_turn.clone()) {
+                (Some(thread), Some(turn)) if op["index"].is_i64() => {
+                    if let Some(i) = queue_index(op["index"].as_i64(), self.waiting.len()) {
+                        let chosen = self.waiting.remove(i);
+                        self.waiting.insert(0, chosen);
+                    }
+                    let frame = self.request(
+                        "turn/interrupt",
+                        json!({ "threadId": thread, "turnId": turn }),
+                        "",
+                    );
+                    return Ok(Output {
+                        events: vec![self.pending_event()],
+                        frames: vec![frame],
+                    });
+                }
                 (Some(thread), Some(turn)) => vec![self.request(
                     "turn/interrupt",
                     json!({ "threadId": thread, "turnId": turn }),
@@ -2541,6 +2558,29 @@ mod tests {
             .unwrap()
             .frames
             .is_empty());
+    }
+
+    #[test]
+    fn interrupting_for_a_waiting_message_starts_it_next() {
+        let mut c = opened();
+        busy(&mut c);
+        for text in ["one", "two"] {
+            c.encode(&json!({ "op": "user_message", "content": text }))
+                .unwrap();
+        }
+        let stop = c.encode(&json!({ "op": "interrupt", "index": 1 })).unwrap();
+        assert_eq!(sent(&stop.frames)[0]["method"], "turn/interrupt");
+        assert_eq!(
+            stop.events,
+            vec![json!({ "type": "pending_messages", "messages": ["two", "one"] })]
+        );
+        let next = frame(
+            &mut c,
+            json!({ "method": "turn/completed", "params": { "threadId": "th-1", "turn": { "id": "turn-1", "status": "interrupted" } } }),
+        );
+        let started = sent(&next.frames);
+        assert_eq!(started[0]["method"], "turn/start");
+        assert_eq!(started[0]["params"]["input"][0]["text"], "two");
     }
 
     #[test]

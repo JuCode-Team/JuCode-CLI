@@ -58,7 +58,10 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
         "steer" => core.steer(value.get("index").and_then(Value::as_i64)),
         // A queued message taken back: `index`, negative from the last.
         "unqueue" => core.unqueue(value.get("index").and_then(Value::as_i64)),
-        "interrupt" => core.interrupt(),
+        "interrupt" => match value.get("index").and_then(Value::as_i64) {
+            Some(index) => core.interrupt_send(Some(index)),
+            None => core.interrupt(),
+        },
         // Structured twin of the `/approve` text command (GUI convenience):
         // {"op":"approve","call_id":"...","decision":"allow|deny",
         //  "hunks":["f0h1"],"always":false} — routes to the same handler.

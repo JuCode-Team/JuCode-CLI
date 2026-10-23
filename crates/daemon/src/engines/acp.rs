@@ -1188,7 +1188,8 @@ impl Adapter for Acp {
                 let Some(session) = self.session.clone() else {
                     return Ok(Output::default());
                 };
-                let steer = op["op"] == "steer";
+                // `interrupt` with `index`: as `steer`, which interrupts here.
+                let steer = op["op"] == "steer" || op["index"].is_i64();
                 if steer {
                     let Some(index) = queue_index(op["index"].as_i64(), self.queued.len()) else {
                         return Ok(Output::default());
