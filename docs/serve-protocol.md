@@ -265,7 +265,7 @@ Every line is `{"type": <name>, ...}`. All types emitted by the engine:
 | `pending_messages` | `messages` | The queued-message list after it changed. |
 | `fill_input` | `content` | Front-end should pre-fill its input box (e.g. after `/checkout`). |
 | `connecting` | — | A model request is starting. |
-| `thinking_start` | — | Reasoning output begins. |
+| `thinking_start` | — | The model answered the request; its first token is on the way. |
 | `reasoning_delta` | `delta` | Reasoning text chunk. |
 | `assistant_start` | — | Assistant reply begins. |
 | `assistant_delta` | `delta` | Reply text chunk. |
@@ -305,7 +305,7 @@ A normal turn looks like:
 {"op":"user_message","content":"fix the test"}
 < {"type":"user_message","content":"fix the test"}
 < {"type":"connecting"}
-< {"type":"thinking_start"}            // reasoning models only
+< {"type":"thinking_start"}            // the model answered
 < {"type":"reasoning_delta","delta":"..."}
 < {"type":"assistant_start"}
 < {"type":"assistant_delta","delta":"..."}
@@ -338,7 +338,7 @@ Suggested rendering (as used by JuCode Desktop):
 | Events | UI |
 | --- | --- |
 | `assistant_start` / `assistant_delta` | streaming message bubble |
-| `thinking_start` / `reasoning_delta` | collapsible thinking section |
+| `reasoning_delta` | collapsible thinking section |
 | `tool_start` / `tool_update` / `tool_output` | tool cards keyed by `call_id` |
 | `approval_request` | approval dialog → `approve` op |
 | `model_view` / `tree_view` / `resume_view` / `checkpoint_view` | pickers/sidebars |
