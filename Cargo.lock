@@ -983,6 +983,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
  "jucode-agent-core",
+ "libc",
  "llm-provider-kit",
  "portable-pty",
  "rustls",

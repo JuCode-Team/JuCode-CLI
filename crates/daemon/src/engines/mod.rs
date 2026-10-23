@@ -99,6 +99,9 @@ pub struct Options {
     /// The app tools (`user_tools::NAMES`) the user turned off (set by
     /// `spawn` from the daemon's settings, never by a client).
     pub app_tools_off: Vec<&'static str>,
+    /// Claude: the config directory the session's CLI keeps its state in,
+    /// once found (`claude::config_with`; set by the hub, never by a client).
+    pub claude_config: Option<PathBuf>,
 }
 
 impl Options {
@@ -140,6 +143,7 @@ impl Options {
             thinking: value["thinking"].as_bool(),
             dirs: Vec::new(),
             app_tools_off: Vec::new(),
+            claude_config: None,
         }
     }
 
@@ -1107,6 +1111,7 @@ impl Session<'_> {
                     // and gateway.
                     next.bin = options.bin.clone();
                     next.env = options.env.clone();
+                    next.claude_config = options.claude_config.clone();
                     next.agent = options.agent.clone();
                     next.command = options.command.clone();
                     next.args = options.args.clone();
@@ -1197,7 +1202,7 @@ impl Session<'_> {
     fn saved(&self, id: &str, options: &Options) -> bool {
         match self.kind {
             Kind::Claude => !claude::transcript(
-                &claude::config_dir_in(&options.env),
+                &claude::config_with(options, &self.cwd, id),
                 &self.cwd,
                 id,
                 self.hub.uploads.dir(),
@@ -1374,7 +1379,7 @@ impl Session<'_> {
                 // Codex replays its thread when it resumes; Claude Code's
                 // conversation is read from its file.
                 if self.kind == Kind::Claude {
-                    events.push(json!({ "type": "transcript", "items": claude::transcript(&claude::config_dir_in(&next.env), &self.cwd, &id, self.hub.uploads.dir()) }));
+                    events.push(json!({ "type": "transcript", "items": claude::transcript(&claude::config_with(&next, &self.cwd, &id), &self.cwd, &id, self.hub.uploads.dir()) }));
                 }
                 self.publish(events);
                 Some((started, engine, next))

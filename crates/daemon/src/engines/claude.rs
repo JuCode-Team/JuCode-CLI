@@ -807,7 +807,7 @@ impl Claude {
             commands: Vec::new(),
             calls: Vec::new(),
             app_tools_off: options.app_tools_off.clone(),
-            config: config_dir_in(&options.env),
+            config: known_config(options).unwrap_or_else(|| config_dir_in(&options.env)),
         }
     }
 
@@ -2930,6 +2930,194 @@ pub fn config_dir_in(env: &[(String, String)]) -> PathBuf {
         Some(_) => home().join(".claude"),
         None => config_dir(),
     }
+}
+
+/// The config directories programs set for themselves (`probe`), by the
+/// program and the environment it runs with.
+type ProbeKey = (String, Vec<(String, String)>);
+static PROBED: std::sync::Mutex<Option<HashMap<ProbeKey, PathBuf>>> = std::sync::Mutex::new(None);
+
+/// The config directory a CLI run with `options` keeps its state in: the
+/// one already found for the session, else for a program of the user's
+/// (`bin`, e.g. an account switcher that sets `CLAUDE_CONFIG_DIR` itself
+/// before running Claude Code) the one it was seen to use, probed if never
+/// seen; else `config_dir_in` its environment.
+pub fn config_for(options: &Options) -> PathBuf {
+    known_config(options)
+        .or_else(|| {
+            let bin = options.bin.clone()?;
+            reprobe((bin, options.env.clone()))
+        })
+        .unwrap_or_else(|| config_dir_in(&options.env))
+}
+
+/// `config_for` as far as it is known without probing.
+fn known_config(options: &Options) -> Option<PathBuf> {
+    if let Some(dir) = &options.claude_config {
+        return Some(dir.clone());
+    }
+    let key = (options.bin.clone()?, options.env.clone());
+    PROBED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .get(&key)
+        .cloned()
+}
+
+/// `config_for`, where conversation `id` of `cwd` is looked for: a program
+/// of the user's not seen to save it where it was last seen to (an account
+/// switched since) is asked again.
+pub fn config_with(options: &Options, cwd: &Path, id: &str) -> PathBuf {
+    let dir = config_for(options);
+    match &options.bin {
+        Some(bin) if options.claude_config.is_none() && !is_saved(&dir, cwd, id) => {
+            reprobe((bin.clone(), options.env.clone())).unwrap_or(dir)
+        }
+        _ => dir,
+    }
+}
+
+/// Runs `probe` for `key` and remembers what it found.
+fn reprobe(key: ProbeKey) -> Option<PathBuf> {
+    let dir = probe(&key.0, &key.1)?;
+    PROBED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(key, dir.clone());
+    Some(dir)
+}
+
+/// Where program `bin` run with `env` has Claude Code keep its state: the
+/// `CLAUDE_CONFIG_DIR` in the environment of the Claude Code it starts,
+/// which reports its pid once initialized; None when that cannot be read.
+fn probe(bin: &str, env: &[(String, String)]) -> Option<PathBuf> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(bin)
+        .args([
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ])
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .current_dir(home())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // Kept open (Claude Code running) until its environment is read.
+    let mut stdin = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+    let request = json!({ "type": "control_request", "request_id": "probe", "request": { "subtype": "initialize" } });
+    let _ = writeln!(stdin, "{request}");
+    let fallback = child.id();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if frame["type"] == "control_response" {
+                let pid = frame["response"]["response"]["pid"].as_u64();
+                let _ = sender.send(pid.map_or(fallback, |pid| pid as u32));
+                return;
+            }
+        }
+    });
+    let dir = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .ok()
+        .and_then(environment)
+        .map(|vars| {
+            vars.into_iter()
+                .find(|(name, _)| name == "CLAUDE_CONFIG_DIR")
+                .map(|(_, dir)| dir)
+                .filter(|dir| !dir.is_empty())
+                .map_or_else(|| home().join(".claude"), PathBuf::from)
+        });
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    dir
+}
+
+/// The environment of process `pid` (one of the user's).
+#[cfg(target_os = "linux")]
+fn environment(pid: u32) -> Option<Vec<(String, String)>> {
+    let raw = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    Some(env_pairs(raw.split(|b| *b == 0)))
+}
+
+/// The environment of process `pid` (one of the user's): the strings after
+/// its arguments in `KERN_PROCARGS2` (argc, the executable path, padding,
+/// the arguments, then the environment).
+#[cfg(target_os = "macos")]
+fn environment(pid: u32) -> Option<Vec<(String, String)>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size: libc::size_t = 0;
+    // SAFETY: a size query (null buffer) on a valid mib.
+    let sized = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if sized != 0 || size < 4 {
+        return None;
+    }
+    let mut buffer = vec![0u8; size];
+    // SAFETY: `buffer` holds `size` bytes, which `sysctl` writes at most.
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return None;
+    }
+    buffer.truncate(size);
+    let argc = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?) as usize;
+    let rest = &buffer[4..];
+    // The executable path, the NULs padding it, then argc arguments.
+    let path_end = rest.iter().position(|b| *b == 0)?;
+    let start = path_end + rest[path_end..].iter().position(|b| *b != 0)?;
+    let env = rest[start..]
+        .split(|b| *b == 0)
+        .skip(argc)
+        .take_while(|s| !s.is_empty());
+    Some(env_pairs(env))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn environment(_pid: u32) -> Option<Vec<(String, String)>> {
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn env_pairs<'a>(strings: impl Iterator<Item = &'a [u8]>) -> Vec<(String, String)> {
+    strings
+        .filter_map(|s| {
+            let s = std::str::from_utf8(s).ok()?;
+            let (name, value) = s.split_once('=')?;
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 /// Claude Code's project directory for `cwd`: every character of the real

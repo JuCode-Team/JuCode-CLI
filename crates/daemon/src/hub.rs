@@ -423,7 +423,7 @@ impl Hub {
                         .iter()
                         .any(|summary| summary.id == id),
                     Some(engines::Kind::Claude) => {
-                        engines::claude::saved(&engines::claude::config_dir_in(&options.env), &cwd)
+                        engines::claude::saved(&engines::claude::config_for(&options), &cwd)
                             .iter()
                             .any(|(saved, _, _)| saved == id)
                     }
@@ -478,33 +478,34 @@ impl Hub {
                 (ops, generation)
             }
             Some(kind) => {
+                // Where the CLI saves its conversations (a program of the
+                // user's may set that itself).
+                let claude_config = (kind == engines::Kind::Claude)
+                    .then(|| engines::claude::config_with(&options, &record.cwd, id));
                 // A conversation with no turn yet was never saved: start it
                 // again under the same id instead of resuming it.
                 // Codex resumes through its protocol, which also sends the
                 // history back.
-                let claude_config = engines::claude::config_dir_in(&options.env);
                 let saved = match kind {
-                    engines::Kind::Claude => {
-                        engines::claude::is_saved(&claude_config, &record.cwd, id)
-                    }
+                    engines::Kind::Claude => claude_config
+                        .as_deref()
+                        .is_some_and(|config| engines::claude::is_saved(config, &record.cwd, id)),
                     engines::Kind::Codex => true,
                     engines::Kind::Acp => false,
                 };
-                let transcript = match kind {
-                    engines::Kind::Claude => engines::claude::transcript(
-                        &claude_config,
-                        &record.cwd,
-                        id,
-                        self.uploads.dir(),
-                    ),
-                    engines::Kind::Codex | engines::Kind::Acp => Vec::new(),
-                };
+                let transcript = claude_config
+                    .as_deref()
+                    .map(|config| {
+                        engines::claude::transcript(config, &record.cwd, id, self.uploads.dir())
+                    })
+                    .unwrap_or_default();
                 // A client that does not say (a phone) keeps how it last ran,
                 // on the provider it last ran on off the gateway (recorded
                 // from the first; one recorded before is the tool's own).
                 let mut options = engines::Options {
                     resume: saved.then(|| id.to_string()),
                     dirs,
+                    claude_config,
                     gateway: Some(options.gateway.unwrap_or(record.gateway)),
                     tool_provider: options.tool_provider.or_else(|| {
                         record
