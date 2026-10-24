@@ -23,10 +23,14 @@
 //!   as a `<task-notification>` user message that starts a turn.
 //! - A user message sent mid-turn waits here (`pending_messages`, where it
 //!   can be taken back with `unqueue`) and starts the next turn when this one
-//!   ends. `steer` writes it to the CLI now, which takes it into the running
-//!   turn at the next tool boundary and replays it then; until that replay it
-//!   stays listed, first and `fixed` (it can no longer be taken back). Claude
-//!   saves it only as a `queued_command` attachment row.
+//!   ends. `steer` writes it to the CLI now with priority `now`, which stops
+//!   the running turn's generation and tool calls and takes the message in at
+//!   once (as T3 Code does). A subagent the turn runs in the foreground would
+//!   be one of those calls, so it is moved to the background first
+//!   (`background_tasks`) and reports back as a task notification. Until the
+//!   CLI replays the message it stays listed, first and `fixed` (it can no
+//!   longer be taken back). Claude saves it only as a `queued_command`
+//!   attachment row.
 //! - Full access (`bypassPermissions`) is only honored when the CLI starts
 //!   with `--dangerously-skip-permissions`, so switching into or out of it
 //!   restarts the engine on the same conversation.
@@ -68,6 +72,18 @@ struct Held {
     files: Vec<String>,
     /// The stdin line that sends it.
     frame: String,
+}
+
+/// How long a steer waits for its subagents to move to the background
+/// before it is sent anyway (T3 Code waits as long).
+const STEER_MOVE_WAIT: Duration = Duration::from_secs(5);
+
+/// Steered messages waiting for the foreground subagents to move to the
+/// background (`background_tasks` answers) before they go to the CLI.
+struct Steering {
+    frames: Vec<String>,
+    waiting: usize,
+    deadline: Instant,
 }
 
 /// The in-process MCP server carrying `user_tools` (see `command`).
@@ -752,6 +768,10 @@ struct Task {
     /// Runs in the background: its end is news. A foreground subagent's
     /// result is its Agent call's card.
     background: bool,
+    /// The tool call that started it.
+    tool_use_id: String,
+    /// The subagent that launched it (empty: the main loop).
+    parent: String,
 }
 
 struct ToolMeta {
@@ -831,6 +851,11 @@ pub struct Claude {
     queued: Vec<String>,
     /// Messages sent mid-turn, waiting here for the turn to end (or a steer).
     held: Vec<Held>,
+    /// A steer waiting for its subagents to move to the background.
+    steering: Option<Steering>,
+    /// A steer went to the CLI during this turn: priority `now` ends it
+    /// as `error_during_execution`, which is no error to report.
+    steered: bool,
     /// The composer's slash commands: the CLI's `initialize` reply (with
     /// descriptions and argument hints), plus names only `system/init` lists.
     commands: Vec<Value>,
@@ -887,6 +912,8 @@ impl Claude {
             interrupting: false,
             queued: Vec::new(),
             held: Vec::new(),
+            steering: None,
+            steered: false,
             commands: Vec::new(),
             calls: Vec::new(),
             app_tools_off: options.app_tools_off.clone(),
@@ -989,6 +1016,30 @@ impl Claude {
             .chain(self.held.iter().map(|h| h.text.as_str()))
             .collect();
         json!({ "type": "pending_messages", "messages": messages, "fixed": self.queued.len() })
+    }
+
+    /// The steered messages, once their subagents are in the background,
+    /// the wait is over or the turn has ended (they start the next one).
+    fn steer_ready(&mut self) -> Vec<String> {
+        let ready = self
+            .steering
+            .as_ref()
+            .is_some_and(|s| s.waiting == 0 || !self.active_turn || Instant::now() >= s.deadline);
+        if !ready {
+            return Vec::new();
+        }
+        self.steered |= self.active_turn;
+        self.steering.take().map(|s| s.frames).unwrap_or_default()
+    }
+
+    /// The tool calls of the subagents the main loop runs in the foreground.
+    fn foreground_subagents(&self) -> Vec<String> {
+        self.tasks
+            .values()
+            .filter(|t| t.kind == "local_agent" && !t.background && t.parent.is_empty())
+            .map(|t| t.tool_use_id.clone())
+            .filter(|id| !id.is_empty())
+            .collect()
     }
 
     /// Hands held message `i` to the CLI.
@@ -1692,6 +1743,7 @@ impl Claude {
     fn on_result(&mut self, frame: &Value) -> Vec<Value> {
         self.active_turn = false;
         let was_interrupting = std::mem::take(&mut self.interrupting);
+        let was_steered = std::mem::take(&mut self.steered);
         let mut events = Vec::new();
         if let Some(usage) = frame["modelUsage"].as_object() {
             for (name, usage) in usage {
@@ -1714,7 +1766,8 @@ impl Claude {
         }
         let subtype = text(&frame["subtype"]);
         let failed = frame["is_error"] == true || subtype.to_lowercase().starts_with("error");
-        if failed && !was_interrupting {
+        let cut_by_steer = was_steered && subtype == "error_during_execution";
+        if failed && !was_interrupting && !cut_by_steer {
             let errors = frame["errors"]
                 .as_array()
                 .into_iter()
@@ -1874,6 +1927,12 @@ impl Claude {
         let Some((subtype, tag)) = self.pending.remove(text(&response["request_id"])) else {
             return vec![];
         };
+        // Moved or not, the steer waits for one answer fewer.
+        if subtype == "background_tasks" && tag == "steer" {
+            if let Some(steering) = &mut self.steering {
+                steering.waiting = steering.waiting.saturating_sub(1);
+            }
+        }
         if response["subtype"] == "error" {
             if subtype == "set_model" {
                 self.pending_model.clear();
@@ -1900,6 +1959,7 @@ impl Claude {
                 | "mcp_reconnect"
                 | "list_permission_rules"
                 | "stop_task"
+                | "background_tasks"
                 | "rename_session"
                 | "set_max_thinking_tokens" => {
                     vec![json!({ "type": "info", "message": format!("[claude] {message}") })]
@@ -2098,6 +2158,8 @@ impl Claude {
                         || (kind != "local_agent" && frame["is_backgrounded"] != false),
                     kind,
                     description: text(&frame["description"]).to_string(),
+                    tool_use_id: text(&frame["tool_use_id"]).to_string(),
+                    parent: text(&frame["parent_task_id"]).to_string(),
                 };
                 let events = if task.kind == "local_agent" {
                     vec![agent("running", "", &task.description)]
@@ -2364,66 +2426,23 @@ fn model_totals(usage: &Value) -> HashMap<String, Tokens> {
         .collect()
 }
 
+/// A user message frame sent with priority `now` (a steer).
+fn now_priority(frame: &str) -> String {
+    match serde_json::from_str::<Value>(frame) {
+        Ok(mut value) => {
+            value["priority"] = json!("now");
+            value.to_string()
+        }
+        Err(_) => frame.to_string(),
+    }
+}
+
 fn command_entry(name: &str, args: &str, description: &str) -> Value {
     json!({ "command": format!("/{name}"), "marker": null, "args": args, "description": description })
 }
 
-impl Adapter for Claude {
-    fn start(&mut self) -> Vec<String> {
-        let mut frames = if self.mode == "bypassPermissions" {
-            vec![self.control_request(json!({ "subtype": "list_models" }), "boot")]
-        } else {
-            let mode = self.mode;
-            vec![
-                self.control_request(
-                    json!({ "subtype": "set_permission_mode", "mode": mode }),
-                    "",
-                ),
-                self.control_request(json!({ "subtype": "list_models" }), ""),
-            ]
-        };
-        if self.fast_wanted {
-            frames.push(self.control_request(
-                json!({ "subtype": "apply_flag_settings", "settings": { "fastMode": true } }),
-                "",
-            ));
-        }
-        // The command list with descriptions, before the first turn. The
-        // desktop has a stop button per background task, so an interrupt
-        // spares them.
-        // The in-process server, unless `command` left it out.
-        let servers: &[&str] = if user_tools::offered(&self.app_tools_off).is_empty() {
-            &[]
-        } else {
-            &[MCP_SERVER]
-        };
-        frames.push(self.control_request(
-            json!({ "subtype": "initialize", "promptSuggestions": true, "agentProgressSummaries": true, "perTaskStopAffordance": true, "sdkMcpServers": servers }),
-            "",
-        ));
-        if self.ultracode {
-            frames.push(self.control_request(
-                json!({ "subtype": "apply_flag_settings", "settings": { "ultracode": true } }),
-                "",
-            ));
-        }
-        if !self.thinking {
-            let frame = self.thinking_request(false);
-            frames.push(frame);
-        }
-        frames.push(self.control_request(json!({ "subtype": "get_settings" }), ""));
-        frames.push(self.control_request(json!({ "subtype": "mcp_status" }), ""));
-        // A resumed conversation's totals start from what it spent before.
-        if self.model_totals.is_none() {
-            frames.push(self.control_request(
-                json!({ "subtype": "get_usage", "skip_behaviors": true }),
-                "",
-            ));
-        }
-        frames
-    }
-
-    fn translate(&mut self, line: Line) -> Output {
+impl Claude {
+    fn translate_line(&mut self, line: Line) -> Output {
         let frame = match line {
             // Diagnostics, kept for an exit message (Session::note_stderr);
             // only a failed resume is acted on.
@@ -2587,7 +2606,7 @@ impl Adapter for Claude {
         Output::events(events)
     }
 
-    fn encode(&mut self, op: &Value) -> Result<Output, String> {
+    fn encode_op(&mut self, op: &Value) -> Result<Output, String> {
         let frames = match text(&op["op"]) {
             "user_message" => {
                 let frames = vec![json!({ "type": "user", "message": { "role": "user", "content": Self::user_content(op) } }).to_string()];
@@ -2686,8 +2705,9 @@ impl Adapter for Claude {
                 vec![self.control_request(json!({ "subtype": "interrupt" }), "")]
             }
             // A held message (`index` in the listed messages, negative from
-            // the last; all held without one) goes to the CLI now: it joins
-            // the running turn at the next tool boundary.
+            // the last; all held without one) goes to the CLI now, with
+            // priority `now`: the running turn stops what it does and takes
+            // it in. Foreground subagents move to the background first.
             "steer" => {
                 if !self.active_turn {
                     return Ok(Output::default());
@@ -2703,14 +2723,43 @@ impl Adapter for Claude {
                 if picked.is_empty() {
                     return Ok(Output::default());
                 }
-                let frames = picked
+                let mut steered = picked
                     .iter()
                     .rev()
-                    .map(|i| self.release(*i))
+                    .map(|i| now_priority(&self.release(*i)))
                     .collect::<Vec<_>>();
+                steered.reverse();
+                let events = vec![self.queued_event()];
+                // Already waiting for moves: these go with those.
+                if let Some(steering) = &mut self.steering {
+                    steering.frames.extend(steered);
+                    return Ok(Output::events(events));
+                }
+                let moves: Vec<String> = self
+                    .foreground_subagents()
+                    .into_iter()
+                    .map(|id| {
+                        self.control_request(
+                            json!({ "subtype": "background_tasks", "tool_use_id": id }),
+                            "steer",
+                        )
+                    })
+                    .collect();
+                if moves.is_empty() {
+                    self.steered = true;
+                    return Ok(Output {
+                        events,
+                        frames: steered,
+                    });
+                }
+                self.steering = Some(Steering {
+                    frames: steered,
+                    waiting: moves.len(),
+                    deadline: Instant::now() + STEER_MOVE_WAIT,
+                });
                 return Ok(Output {
-                    events: vec![self.queued_event()],
-                    frames: frames.into_iter().rev().collect(),
+                    events,
+                    frames: moves,
                 });
             }
             // A held message taken back (the CLI's own are past that).
@@ -2909,6 +2958,74 @@ impl Adapter for Claude {
             events: Vec::new(),
             frames,
         })
+    }
+}
+
+impl Adapter for Claude {
+    fn start(&mut self) -> Vec<String> {
+        let mut frames = if self.mode == "bypassPermissions" {
+            vec![self.control_request(json!({ "subtype": "list_models" }), "boot")]
+        } else {
+            let mode = self.mode;
+            vec![
+                self.control_request(
+                    json!({ "subtype": "set_permission_mode", "mode": mode }),
+                    "",
+                ),
+                self.control_request(json!({ "subtype": "list_models" }), ""),
+            ]
+        };
+        if self.fast_wanted {
+            frames.push(self.control_request(
+                json!({ "subtype": "apply_flag_settings", "settings": { "fastMode": true } }),
+                "",
+            ));
+        }
+        // The command list with descriptions, before the first turn. The
+        // desktop has a stop button per background task, so an interrupt
+        // spares them.
+        // The in-process server, unless `command` left it out.
+        let servers: &[&str] = if user_tools::offered(&self.app_tools_off).is_empty() {
+            &[]
+        } else {
+            &[MCP_SERVER]
+        };
+        frames.push(self.control_request(
+            json!({ "subtype": "initialize", "promptSuggestions": true, "agentProgressSummaries": true, "perTaskStopAffordance": true, "sdkMcpServers": servers }),
+            "",
+        ));
+        if self.ultracode {
+            frames.push(self.control_request(
+                json!({ "subtype": "apply_flag_settings", "settings": { "ultracode": true } }),
+                "",
+            ));
+        }
+        if !self.thinking {
+            let frame = self.thinking_request(false);
+            frames.push(frame);
+        }
+        frames.push(self.control_request(json!({ "subtype": "get_settings" }), ""));
+        frames.push(self.control_request(json!({ "subtype": "mcp_status" }), ""));
+        // A resumed conversation's totals start from what it spent before.
+        if self.model_totals.is_none() {
+            frames.push(self.control_request(
+                json!({ "subtype": "get_usage", "skip_behaviors": true }),
+                "",
+            ));
+        }
+        frames
+    }
+
+    fn translate(&mut self, line: Line) -> Output {
+        let mut output = self.translate_line(line);
+        output.frames.extend(self.steer_ready());
+        output
+    }
+
+    fn encode(&mut self, op: &Value) -> Result<Output, String> {
+        let mut output = self.encode_op(op)?;
+        output.frames.extend(self.steer_ready());
+        Ok(output)
     }
 
     fn busy(&self) -> bool {
@@ -5144,6 +5261,88 @@ mod tests {
             json!({ "type": "result", "subtype": "success" }),
         ));
         assert!(ended.frames.is_empty());
+    }
+
+    #[test]
+    fn a_steer_goes_with_priority_now() {
+        let mut c = mid_turn(&["apple"]);
+        let steer = c.encode(&json!({ "op": "steer" })).unwrap();
+        let frame: Value = serde_json::from_str(&steer.frames[0]).unwrap();
+        assert_eq!(frame["priority"], "now");
+        assert_eq!(frame["message"]["content"][0]["text"], "apple");
+        // It cuts the turn short (claude 2.1 ends it as
+        // error_during_execution): no error, just the end of that turn.
+        let ended = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "error_during_execution", "is_error": true }),
+        ));
+        assert!(ended.events.iter().all(|e| e["type"] != "error"));
+        // The next turn's failure is reported again.
+        let failed = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "error_during_execution", "is_error": true }),
+        ));
+        assert!(failed.events.iter().any(|e| e["type"] == "error"));
+    }
+
+    #[test]
+    fn a_steer_moves_foreground_subagents_to_the_background_first() {
+        let mut c = mid_turn(&["apple"]);
+        let started = |id: &str, tool: &str, extra: Value| {
+            let mut frame = json!({ "type": "system", "subtype": "task_started", "task_id": id, "tool_use_id": tool, "task_type": "local_agent", "description": "look", "is_backgrounded": false });
+            for (k, v) in extra.as_object().unwrap() {
+                frame[k] = v.clone();
+            }
+            Line::Frame(frame)
+        };
+        c.translate(started("a1", "t1", json!({})));
+        // Already in the background, or launched by a subagent: left alone.
+        c.translate(started("a2", "t2", json!({ "is_backgrounded": true })));
+        c.translate(started("a3", "t3", json!({ "parent_task_id": "a1" })));
+        let steer = c.encode(&json!({ "op": "steer" })).unwrap();
+        assert_eq!(steer.frames.len(), 1);
+        let moved: Value = serde_json::from_str(&steer.frames[0]).unwrap();
+        assert_eq!(
+            moved["request"],
+            json!({ "subtype": "background_tasks", "tool_use_id": "t1" })
+        );
+        // Listed as handed over already.
+        assert_eq!(
+            steer.events,
+            vec![json!({ "type": "pending_messages", "messages": ["apple"], "fixed": 1 })]
+        );
+        // Other output meanwhile: still waiting.
+        let streamed = c.translate(Line::Frame(
+            json!({ "type": "system", "subtype": "status", "status": "requesting" }),
+        ));
+        assert!(streamed.frames.is_empty());
+        // Moved: the message goes.
+        let answered = c.translate(Line::Frame(json!({ "type": "control_response", "response": { "subtype": "success", "request_id": moved["request_id"], "response": { "backgrounded": true } } })));
+        assert_eq!(answered.frames.len(), 1);
+        assert!(
+            answered.frames[0].contains("apple")
+                && answered.frames[0].contains("\"priority\":\"now\"")
+        );
+        assert!(answered.events.is_empty());
+    }
+
+    #[test]
+    fn a_steer_waiting_for_moves_goes_when_the_turn_ends_or_a_move_fails() {
+        let mut c = mid_turn(&["apple"]);
+        c.translate(Line::Frame(json!({ "type": "system", "subtype": "task_started", "task_id": "a1", "tool_use_id": "t1", "task_type": "local_agent", "is_backgrounded": false })));
+        c.encode(&json!({ "op": "steer" })).unwrap();
+        let ended = c.translate(Line::Frame(
+            json!({ "type": "result", "subtype": "success" }),
+        ));
+        assert_eq!(ended.frames.len(), 1);
+        assert!(ended.frames[0].contains("apple"));
+
+        let mut c = mid_turn(&["apple"]);
+        c.translate(Line::Frame(json!({ "type": "system", "subtype": "task_started", "task_id": "a1", "tool_use_id": "t1", "task_type": "local_agent", "is_backgrounded": false })));
+        let steer = c.encode(&json!({ "op": "steer" })).unwrap();
+        let moved: Value = serde_json::from_str(&steer.frames[0]).unwrap();
+        let failed = c.translate(Line::Frame(json!({ "type": "control_response", "response": { "subtype": "error", "request_id": moved["request_id"], "error": "background tasks are disabled" } })));
+        assert_eq!(failed.frames.len(), 1);
+        // Not an error that ends the turn.
+        assert!(failed.events.iter().all(|e| e["type"] != "error"));
     }
 
     #[test]
