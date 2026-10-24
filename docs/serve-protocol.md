@@ -75,7 +75,12 @@ Every command is a JSON object with an `op` field.
 ```
 
 Submits a user turn. `images` is an optional array of local image paths;
-unattachable paths produce `info` events and are skipped.
+unattachable paths produce `info` events and are skipped. `files` is an
+optional array of other local files (absolute paths, any type): they are not
+inlined; the model is told where each is saved, one line
+`[Attached file "<name>" is saved at: <path>]` per file after the text, and
+opens it with its own tools. Events and the transcript carry them back as
+`files` next to `content`, without those lines.
 
 If a turn is already running, the message is queued instead: the engine emits
 `pending_messages` (the full queue) and `status:"queued: N"`. Queued messages
@@ -116,7 +121,8 @@ a new one with it. No-op when idle or when the queue is empty.
 
 Takes a queued message back out of the queue (`index` as for `steer`).
 Emits the updated `pending_messages` and
-`{"type":"unqueued","content":"…","images":[…]}` with what it held, for the
+`{"type":"unqueued","content":"…","images":[…],"files":[…]}` (`files` only
+when it had some) with what it held, for the
 client to edit again. No-op when nothing is there.
 
 ### `interrupt`

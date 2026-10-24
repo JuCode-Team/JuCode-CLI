@@ -736,3 +736,36 @@ fn context_breakdown_counts_the_prompt_tools_and_conversation_by_kind() {
     assert_eq!(tokens("Memory files"), None);
     assert!(memory_files.is_empty());
 }
+
+#[test]
+fn attached_files_reach_the_model_as_lines_and_come_back_as_files() {
+    use jucode_agent_core::protocol::{apply_op, event_json};
+    use serde_json::{json, Value};
+    let _guard = setup();
+    let dir = temp_dir("files");
+    let mut core = open(&dir, ApprovalMode::FullAccess);
+    let op = json!({ "op": "user_message", "content": "read it", "files": ["/tmp/my report.pdf"] });
+    let (_, events) = apply_op(&mut core, &op);
+    let echo = events
+        .into_iter()
+        .map(event_json)
+        .find(|event| event["type"] == "user_message")
+        .unwrap();
+    assert_eq!(echo["content"], "read it");
+    assert_eq!(echo["files"], json!(["/tmp/my report.pdf"]));
+
+    let events = pump(&mut core, is_ready);
+    assert!(assistant_text(&events).ends_with(
+        "user said: read it\n\n[Attached file \"my report.pdf\" is saved at: /tmp/my report.pdf]"
+    ));
+
+    let transcript = event_json(core.transcript_event());
+    let user: Vec<&Value> = transcript["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["role"] == "user")
+        .collect();
+    assert_eq!(user[0]["content"], "read it");
+    assert_eq!(user[0]["files"], json!(["/tmp/my report.pdf"]));
+}

@@ -761,6 +761,26 @@ const STATE_EVENTS: &[&str] = &[
     "pending_messages",
 ];
 
+/// The non-image files a `user_message` op attaches (`files`, absolute
+/// paths). The model is told where each is (`attachments`) and opens it
+/// with its own tools.
+pub(crate) fn op_files(op: &Value) -> Vec<String> {
+    op["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+/// `files` on a user message event or item, when there are any.
+pub(crate) fn set_files(value: &mut Value, files: &[String]) {
+    if !files.is_empty() {
+        value["files"] = json!(files);
+    }
+}
+
 /// Now, ms since the epoch: when a snapshot item happened.
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -790,6 +810,9 @@ impl Snapshot {
                     json!({ "role": "user", "content": event["content"], "at": now_ms() });
                 if event["images"].is_array() {
                     item["images"] = event["images"].clone();
+                }
+                if event["files"].is_array() {
+                    item["files"] = event["files"].clone();
                 }
                 self.transcript.push(item);
             }

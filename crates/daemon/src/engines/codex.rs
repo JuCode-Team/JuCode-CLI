@@ -21,8 +21,8 @@
 //!   the conversation. `thread/turns/list` reads one back.
 //! - A rewind is `thread/revert` to before a user message's turn.
 
-use super::{home, resolve, Adapter, HostCall, Line, Options, Output};
-use jucode_agent_core::{queue_index, queue_move_target, user_tools};
+use super::{home, op_files, resolve, set_files, Adapter, HostCall, Line, Options, Output};
+use jucode_agent_core::{attachments, queue_index, queue_move_target, user_tools};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -382,12 +382,13 @@ fn transcript(turns: &Value) -> Vec<Value> {
     {
         match text(&item["type"]) {
             "userMessage" => {
-                let (content, images) = user_input(&item["content"]);
-                if !content.is_empty() || !images.is_empty() {
+                let (content, images, files) = user_input(&item["content"]);
+                if !content.is_empty() || !images.is_empty() || !files.is_empty() {
                     let mut row = json!({ "role": "user", "content": content });
                     if !images.is_empty() {
                         row["images"] = json!(images);
                     }
+                    set_files(&mut row, &files);
                     rows.push(row);
                 }
             }
@@ -463,14 +464,24 @@ fn tool_row(item: &Value) -> Value {
     row
 }
 
-/// A user message's text and its images (local paths).
-fn user_input(content: &Value) -> (String, Vec<String>) {
+/// A user message's text, its images (local paths) and the files its
+/// attached-file items name (one text item each, as sent; inputs merged from
+/// several messages keep every message's files).
+fn user_input(content: &Value) -> (String, Vec<String>, Vec<String>) {
     let blocks = content.as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut files = Vec::new();
     let text_part = blocks
         .iter()
         .filter(|c| c["type"] == "text")
         .map(|c| text(&c["text"]))
         .filter(|t| !t.is_empty())
+        .filter(|t| match attachments::line_path(t) {
+            Some(path) => {
+                files.push(path);
+                false
+            }
+            None => true,
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let images = blocks
@@ -479,7 +490,7 @@ fn user_input(content: &Value) -> (String, Vec<String>) {
         .map(|c| text(&c["path"]).to_string())
         .filter(|p| !p.is_empty())
         .collect();
-    (text_part, images)
+    (text_part, images, files)
 }
 
 /// A subagent's short name from its path (`/root/pong` → `pong`).
@@ -1428,14 +1439,15 @@ impl Codex {
                 if !turn.is_empty() {
                     self.user_turns.push(turn.to_string());
                 }
-                let (content, images) = user_input(&item["content"]);
-                if content.is_empty() && images.is_empty() {
+                let (content, images, files) = user_input(&item["content"]);
+                if content.is_empty() && images.is_empty() && files.is_empty() {
                     vec![]
                 } else {
                     let mut event = json!({ "type": "user_message", "content": content });
                     if !images.is_empty() {
                         event["images"] = json!(images);
                     }
+                    set_files(&mut event, &files);
                     vec![event]
                 }
             }
@@ -1980,6 +1992,9 @@ impl Adapter for Codex {
                 for image in op["images"].as_array().into_iter().flatten() {
                     input.push(json!({ "type": "localImage", "path": image }));
                 }
+                for file in op_files(op) {
+                    input.push(json!({ "type": "text", "text": attachments::file_line(&file), "text_elements": [] }));
+                }
                 if self.thread.is_none() {
                     self.queued.extend(input);
                     return Ok(Output::default());
@@ -2039,10 +2054,17 @@ impl Adapter for Codex {
                     .filter(|c| c["type"] == "localImage")
                     .map(|c| text(&c["path"]))
                     .collect();
-                return Ok(Output::events(vec![
-                    self.pending_event(),
-                    json!({ "type": "unqueued", "content": content, "images": images }),
-                ]));
+                // The first text item is the message itself.
+                let files: Vec<String> = input
+                    .iter()
+                    .filter(|c| c["type"] == "text")
+                    .skip(1)
+                    .filter_map(|c| attachments::line_path(text(&c["text"])))
+                    .collect();
+                let mut unqueued =
+                    json!({ "type": "unqueued", "content": content, "images": images });
+                set_files(&mut unqueued, &files);
+                return Ok(Output::events(vec![self.pending_event(), unqueued]));
             }
             // A waiting message to another place: `index` to `to`.
             "queue_move" => {
@@ -2710,6 +2732,55 @@ mod tests {
                 json!({ "type": "pending_messages", "messages": ["two"] }),
                 json!({ "type": "unqueued", "content": "one", "images": [] }),
             ]
+        );
+    }
+
+    #[test]
+    fn attached_files_go_as_text_items_and_come_back_as_files() {
+        let mut c = opened();
+        let line = attachments::file_line("/tmp/my report.pdf");
+        let turn = sent(
+            &c.encode(&json!({ "op": "user_message", "content": "read", "images": ["/tmp/a.png"], "files": ["/tmp/my report.pdf"] }))
+                .unwrap()
+                .frames,
+        );
+        assert_eq!(
+            turn[0]["params"]["input"],
+            json!([
+                { "type": "text", "text": "read", "text_elements": [] },
+                { "type": "localImage", "path": "/tmp/a.png" },
+                { "type": "text", "text": line, "text_elements": [] },
+            ])
+        );
+        // The echo, a saved thread and a message taken back: `files`.
+        let content = turn[0]["params"]["input"].clone();
+        let echo = frame(
+            &mut c,
+            json!({ "method": "item/started", "params": { "item": { "id": "u1", "type": "userMessage", "content": content } } }),
+        );
+        assert_eq!(
+            echo.events,
+            vec![
+                json!({ "type": "user_message", "content": "read", "images": ["/tmp/a.png"], "files": ["/tmp/my report.pdf"] })
+            ]
+        );
+        let item = json!({ "type": "userMessage", "content": content });
+        assert_eq!(
+            transcript(&json!([{ "items": [item] }])),
+            vec![
+                json!({ "role": "user", "content": "read", "images": ["/tmp/a.png"], "files": ["/tmp/my report.pdf"] })
+            ]
+        );
+        let mut c = opened();
+        busy(&mut c);
+        c.encode(
+            &json!({ "op": "user_message", "content": "oops", "files": ["/tmp/my report.pdf"] }),
+        )
+        .unwrap();
+        let back = c.encode(&json!({ "op": "unqueue", "index": 0 })).unwrap();
+        assert_eq!(
+            back.events[1],
+            json!({ "type": "unqueued", "content": "oops", "images": [], "files": ["/tmp/my report.pdf"] })
         );
     }
 

@@ -22,10 +22,10 @@
 
 use super::{
     acp_presets::{self, Mode, Preset},
-    claude, find_program, Adapter, Line, Options, Output,
+    claude, find_program, op_files, set_files, Adapter, Line, Options, Output,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
-use jucode_agent_core::{queue_index, queue_move_target};
+use jucode_agent_core::{attachments, queue_index, queue_move_target};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
@@ -315,8 +315,9 @@ pub struct Acp {
     busy_announced: bool,
     /// The running turn produced a reply, thought or tool call.
     replied: bool,
-    /// Messages waiting for the session or the running turn: text, images.
-    queued: VecDeque<(String, Vec<String>)>,
+    /// Messages waiting for the session or the running turn: text, images,
+    /// other files.
+    queued: VecDeque<(String, Vec<String>, Vec<String>)>,
     session_failed: bool,
     /// Synthetic call id → (request id, what was asked).
     approvals: HashMap<String, (Value, Ask)>,
@@ -384,9 +385,9 @@ impl Acp {
             .to_string()
     }
 
-    /// A prompt for the agent, now: its blocks (images as data) and the
-    /// `user_message` clients see.
-    fn send(&mut self, content: String, images: Vec<String>) -> Output {
+    /// A prompt for the agent, now: its blocks (images as data, other files
+    /// as `resource_link`s) and the `user_message` clients see.
+    fn send(&mut self, content: String, images: Vec<String>, files: Vec<String>) -> Output {
         let mut blocks = vec![json!({ "type": "text", "text": content })];
         let mut events = Vec::new();
         if !images.is_empty() && !self.image_prompts {
@@ -398,7 +399,12 @@ impl Acp {
             }
             blocks.extend(sent);
         }
-        events.push(json!({ "type": "user_message", "content": content }));
+        blocks.extend(files.iter().map(|path| {
+            json!({ "type": "resource_link", "uri": attachments::file_uri(path), "name": attachments::file_name(path) })
+        }));
+        let mut echo = json!({ "type": "user_message", "content": content });
+        set_files(&mut echo, &files);
+        events.push(echo);
         self.prompt_in_flight = true;
         self.busy_announced = false;
         self.replied = false;
@@ -413,11 +419,11 @@ impl Acp {
     }
 
     /// A prompt now, or once the session is open and the running turn ended.
-    fn submit(&mut self, content: String, images: Vec<String>) -> Output {
+    fn submit(&mut self, content: String, images: Vec<String>, files: Vec<String>) -> Output {
         if self.session.is_some() && !self.prompt_in_flight {
-            return self.send(content, images);
+            return self.send(content, images, files);
         }
-        self.queued.push_back((content, images));
+        self.queued.push_back((content, images, files));
         let mut output = Output::events(vec![
             self.pending_event(),
             json!({ "type": "status", "message": format!("queued: {}", self.queued.len()) }),
@@ -430,15 +436,15 @@ impl Acp {
     }
 
     fn pending_event(&self) -> Value {
-        let texts: Vec<&str> = self.queued.iter().map(|(text, _)| text.as_str()).collect();
+        let texts: Vec<&str> = self.queued.iter().map(|(text, ..)| text.as_str()).collect();
         json!({ "type": "pending_messages", "messages": texts })
     }
 
     /// The next queued message starts, if the session is open.
     fn next_queued(&mut self) -> Option<Output> {
         self.session.as_ref()?;
-        let (content, images) = self.queued.pop_front()?;
-        let mut output = self.send(content, images);
+        let (content, images, files) = self.queued.pop_front()?;
+        let mut output = self.send(content, images, files);
         output.events.insert(0, self.pending_event());
         output.events.push(json!({ "type": "connecting" }));
         Some(output)
@@ -786,6 +792,22 @@ impl Acp {
                 } else {
                     "assistant"
                 };
+                // A file the user attached (as `send` links it).
+                let link = &update["content"];
+                if let Some(path) = (role == "user" && link["type"] == "resource_link")
+                    .then(|| attachments::uri_path(text(&link["uri"])))
+                    .flatten()
+                {
+                    if !items.last().is_some_and(|last| last["role"] == "user") {
+                        items.push(json!({ "role": "user", "content": "" }));
+                    }
+                    if let Some(last) = items.last_mut() {
+                        let mut files = last["files"].as_array().cloned().unwrap_or_default();
+                        files.push(json!(path));
+                        last["files"] = json!(files);
+                    }
+                    return;
+                }
                 let chunk = block_text(&update["content"]);
                 match items.last_mut() {
                     Some(last) if last["role"] == role => {
@@ -1202,7 +1224,7 @@ impl Acp {
         if !known {
             return Err(format!("{name} is not available in this agent session"));
         }
-        Ok(self.submit(input.trim().to_string(), Vec::new()))
+        Ok(self.submit(input.trim().to_string(), Vec::new(), Vec::new()))
     }
 
     fn set_session_option(&mut self, op: &Value) -> Result<Output, String> {
@@ -1304,7 +1326,7 @@ impl Adapter for Acp {
                     .flatten()
                     .map(|image| text(image).to_string())
                     .collect();
-                return Ok(self.submit(text(&op["content"]).to_string(), images));
+                return Ok(self.submit(text(&op["content"]).to_string(), images, op_files(op)));
             }
             "command" => return self.command(text(&op["input"])),
             "set_session_option" => return self.set_session_option(op),
@@ -1392,18 +1414,19 @@ impl Adapter for Acp {
             }
             // A waiting message taken back: `index`, negative from the last.
             "unqueue" => {
-                let Some((content, images)) = queue_index(op["index"].as_i64(), self.queued.len())
-                    .and_then(|i| self.queued.remove(i))
+                let Some((content, images, files)) =
+                    queue_index(op["index"].as_i64(), self.queued.len())
+                        .and_then(|i| self.queued.remove(i))
                 else {
                     return Ok(Output::default());
                 };
                 if op["discard"] == true {
                     return Ok(Output::events(vec![self.pending_event()]));
                 }
-                return Ok(Output::events(vec![
-                    self.pending_event(),
-                    json!({ "type": "unqueued", "content": content, "images": images }),
-                ]));
+                let mut unqueued =
+                    json!({ "type": "unqueued", "content": content, "images": images });
+                set_files(&mut unqueued, &files);
+                return Ok(Output::events(vec![self.pending_event(), unqueued]));
             }
             // A waiting message to another place: `index` to `to`.
             "queue_move" => {
@@ -2242,6 +2265,62 @@ mod tests {
                 json!({ "type": "pending_messages", "messages": ["two"] }),
                 json!({ "type": "unqueued", "content": "three", "images": [] }),
             ]
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn attached_files_go_as_resource_links_and_replay_as_files() {
+        let mut a = opened();
+        let out = a
+            .encode(&json!({ "op": "user_message", "content": "read", "files": ["/tmp/my report.pdf"] }))
+            .unwrap();
+        assert_eq!(
+            sent(&out.frames)[0]["params"]["prompt"],
+            json!([
+                { "type": "text", "text": "read" },
+                { "type": "resource_link", "uri": "file:///tmp/my%20report.pdf", "name": "my report.pdf" },
+            ])
+        );
+        assert_eq!(
+            out.events.last().unwrap(),
+            &json!({ "type": "user_message", "content": "read", "files": ["/tmp/my report.pdf"] })
+        );
+        // Mid-turn it waits, and comes back with its files.
+        a.encode(&json!({ "op": "user_message", "content": "oops", "files": ["/tmp/x.zip"] }))
+            .unwrap();
+        let back = a.encode(&json!({ "op": "unqueue", "index": 0 })).unwrap();
+        assert_eq!(
+            back.events[1],
+            json!({ "type": "unqueued", "content": "oops", "images": [], "files": ["/tmp/x.zip"] })
+        );
+
+        let (mut a, _) = started(
+            Options {
+                resume: Some("s1".into()),
+                ..omp()
+            },
+            json!({ "loadSession": true }),
+        );
+        for u in [
+            json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "text", "text": "read" } }),
+            json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "resource_link", "uri": "file:///tmp/my%20report.pdf", "name": "my report.pdf" } }),
+            json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "ok" } }),
+            json!({ "sessionUpdate": "user_message_chunk", "content": { "type": "resource_link", "uri": "file:///tmp/x.zip", "name": "x.zip" } }),
+        ] {
+            update(&mut a, u);
+        }
+        let open = frame(
+            &mut a,
+            json!({ "id": 2, "result": { "configOptions": config() } }),
+        );
+        assert_eq!(
+            open.events[0]["items"],
+            json!([
+                { "role": "user", "content": "read", "files": ["/tmp/my report.pdf"] },
+                { "role": "assistant", "content": "ok" },
+                { "role": "user", "content": "", "files": ["/tmp/x.zip"] },
+            ])
         );
     }
 
