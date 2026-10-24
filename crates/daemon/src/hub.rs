@@ -57,11 +57,17 @@ pub struct Hub {
     pub terminals: crate::terminal::Terminals,
     /// Dev servers the sessions' commands started.
     pub dev_servers: crate::devservers::DevServers,
+    /// Keeps the computer from idle sleep while any feature needs it.
+    pub awake: crate::awake::Awake,
     pub version: &'static str,
     pub relay: Relay,
     sessions: Mutex<HashMap<String, Hosted>>,
     /// Sessions whose engine is running a turn or has queued messages.
     busy: Mutex<HashSet<String>>,
+    /// Sessions with background work the turn left going (background
+    /// commands, agents, workflows): not a turn, so not `busy`. True when
+    /// some of it comes back to the conversation (agents, workflows).
+    background: Mutex<HashMap<String, bool>>,
     /// A newer daemon waits to replace this one (`restart_when_idle`).
     restart_pending: AtomicBool,
     /// Messages the daemon sent (`send_to_session`) that a session thread
@@ -154,10 +160,12 @@ impl Hub {
             push: crate::push::Push::load(store.dir()),
             terminals: Default::default(),
             dev_servers: Default::default(),
+            awake: Default::default(),
             store,
             version,
             sessions: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashSet::new()),
+            background: Mutex::new(HashMap::new()),
             restart_pending: AtomicBool::new(false),
             claims: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
@@ -454,6 +462,8 @@ impl Hub {
                     agent: None,
                     agent_session: None,
                     tool_provider: None,
+                    worktree: None,
+                    parent: None,
                 }
             }
             (None, None) => return Err(format!("unknown session {id}")),
@@ -727,6 +737,7 @@ impl Hub {
             }
         }
         lock(&self.busy).remove(id);
+        lock(&self.background).remove(id);
         lock(&self.claims).remove(id);
         // Images waiting for an echo the closed engine will not send.
         lock(&self.sent_images).remove(id);
@@ -857,6 +868,44 @@ impl Hub {
         (!tail.is_empty()).then(|| tail.to_string())
     }
 
+    /// Called by a session thread every tick: whether background work the
+    /// turn left going runs (`any`), and whether some of it comes back to
+    /// the conversation (`awaited`). Clients follow `any` in the session
+    /// list; a scheduled run waits on `awaited`.
+    pub fn set_background(&self, session: &str, any: bool, awaited: bool) {
+        let before = if any {
+            lock(&self.background).insert(session.to_string(), awaited)
+        } else {
+            lock(&self.background).remove(session)
+        };
+        if before != any.then_some(awaited) {
+            if before.is_none() || !any {
+                self.broadcast(&self.sessions_json());
+            }
+            self.run_activity(session);
+        }
+    }
+
+    /// A session has background work going (`set_background`).
+    pub fn is_background(&self, session: &str) -> bool {
+        lock(&self.background).contains_key(session)
+    }
+
+    /// A session has background work going that comes back to it.
+    pub fn is_awaited(&self, session: &str) -> bool {
+        lock(&self.background).get(session) == Some(&true)
+    }
+
+    /// This hub, for a thread to hold.
+    pub(crate) fn arc(&self) -> Option<Arc<Hub>> {
+        self.me.upgrade()
+    }
+
+    /// A session's engine is open here.
+    pub(crate) fn is_hosted(&self, session: &str) -> bool {
+        lock(&self.sessions).contains_key(session)
+    }
+
     /// Sends `content` to a session as the user's next message; it is busy
     /// until the engine has read it (see `claims`).
     pub fn send_to_session(&self, session: &str, content: &str) -> Result<(), String> {
@@ -944,6 +993,10 @@ impl Hub {
             return;
         }
         self.time_out_runs(at);
+        self.settle_runs();
+        if let Some(hub) = self.me.upgrade() {
+            hub.check_budgets();
+        }
         self.close_idle(at);
     }
 
@@ -1220,6 +1273,7 @@ impl Hub {
         let projects = crate::projects::projects(self);
         let sessions = lock(&self.sessions);
         let busy = lock(&self.busy);
+        let background = lock(&self.background);
         let list: Vec<Value> = records
             .into_iter()
             .filter(|record| !record.hidden)
@@ -1241,8 +1295,11 @@ impl Hub {
                     "engine": record.engine.as_deref().unwrap_or("jucode"),
                     "agent": record.agent,
                     "schedule": record.schedule,
+                    "worktree": record.worktree,
+                    "parent": record.parent,
                     "open": hosted.is_some(),
                     "busy": busy.contains(&record.id),
+                    "background": background.contains_key(&record.id),
                     "watchers": hosted.map(|h| h.watchers.len()).unwrap_or(0),
                 })
             })
@@ -1430,6 +1487,8 @@ mod tests {
             agent: None,
             agent_session: None,
             tool_provider: None,
+            worktree: None,
+            parent: None,
         };
         assert_eq!(
             shown_title(&record, Some(scheduled)).as_deref(),

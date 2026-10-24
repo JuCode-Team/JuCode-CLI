@@ -54,6 +54,15 @@ impl Turns {
             Some("error") if self.running => {
                 self.error = Some(event["message"].as_str().unwrap_or_default().to_string());
             }
+            // A turn the engine starts itself (Claude Code, when background
+            // work it left going finishes) has no message. A subagent's
+            // output (`nested`) is not the conversation's.
+            Some("assistant_start" | "assistant_delta" | "tool_start")
+                if !self.running && event["nested"] != true =>
+            {
+                self.running = true;
+                self.error = None;
+            }
             Some("assistant_start" | "assistant_delta") => self.error = None,
             Some("status") if event["message"] == "ready" && self.running => {
                 self.running = false;
@@ -333,5 +342,21 @@ mod tests {
         assert_eq!(clean("“修复登录”").as_deref(), Some("修复登录"));
         assert_eq!(clean("修复登录」").as_deref(), Some("修复登录"));
         assert_eq!(clean("「修复登录").as_deref(), Some("修复登录"));
+    }
+
+    #[test]
+    fn a_turn_the_engine_starts_itself_runs_and_ends() {
+        let mut turns = Turns::default();
+        turns.observe(&json!({ "type": "status", "message": "ready" }));
+        assert!(!turns.running());
+        // A background subagent at work after the turn starts none.
+        turns.observe(&json!({ "type": "tool_start", "call_id": "s", "nested": true }));
+        assert!(!turns.running());
+        turns.observe(&json!({ "type": "tool_start", "call_id": "t" }));
+        assert!(turns.running());
+        turns.observe(&json!({ "type": "error", "message": "HTTP 529" }));
+        turns.observe(&json!({ "type": "status", "message": "ready" }));
+        assert!(!turns.running());
+        assert_eq!(turns.take_failed().as_deref(), Some("HTTP 529"));
     }
 }

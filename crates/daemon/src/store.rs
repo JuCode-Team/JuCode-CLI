@@ -81,6 +81,11 @@ pub struct SessionRecord {
     /// Claude / Codex: the custom provider it last ran on off the gateway
     /// ("": the tool's own configuration; None: not recorded).
     pub tool_provider: Option<String>,
+    /// The git worktree the daemon made for it (a scheduled run's):
+    /// `{repo, path, branch, base, slug}`.
+    pub worktree: Option<Value>,
+    /// The session that started it (`start_session`).
+    pub parent: Option<String>,
 }
 
 /// A paired remote device (a phone's browser). Only a hash of its token is
@@ -187,6 +192,12 @@ impl Store {
             }
             if let Some(provider) = &record.tool_provider {
                 meta["tool_provider"] = json!(provider);
+            }
+            if let Some(tree) = &record.worktree {
+                meta["worktree"] = tree.clone();
+            }
+            if let Some(parent) = &record.parent {
+                meta["parent"] = json!(parent);
             }
             if meta.as_object().is_some_and(|fields| fields.len() > 2) {
                 sessions.push(meta);
@@ -390,6 +401,14 @@ impl Store {
             entry["tool_provider"] = json!(provider);
             changed = true;
         }
+        if changes["worktree"].is_object() {
+            entry["worktree"] = changes["worktree"].clone();
+            changed = true;
+        }
+        if let Some(parent) = changes["parent"].as_str() {
+            entry["parent"] = json!(parent);
+            changed = true;
+        }
         if changed {
             self.append(SESSIONS, entry)?;
         }
@@ -458,6 +477,8 @@ impl Store {
                             agent: None,
                             agent_session: None,
                             tool_provider: None,
+                            worktree: None,
+                            parent: None,
                         }
                     });
                     record.closed = false;
@@ -498,6 +519,12 @@ impl Store {
                         }
                         if let Some(provider) = entry["tool_provider"].as_str() {
                             record.tool_provider = Some(provider.to_string());
+                        }
+                        if entry["worktree"].is_object() {
+                            record.worktree = Some(entry["worktree"].clone());
+                        }
+                        if let Some(parent) = entry["parent"].as_str() {
+                            record.parent = Some(parent.to_string());
                         }
                     }
                 }

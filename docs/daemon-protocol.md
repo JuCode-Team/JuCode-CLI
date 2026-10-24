@@ -126,7 +126,7 @@ every connected client.
 
 | Op | Fields | Reply |
 | --- | --- | --- |
-| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `schedule` (the scheduled task it is a run of, or null), `open`, `watchers`, `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at`, `engine`, `agent` (an ACP session's built-in agent, else null), `project` (the id of the project it belongs to, else null) |
+| `session_list` | — | `sessions`: each with `session`, `cwd`, `chat`, `schedule` (the scheduled task it is a run of, or null), `open`, `watchers`, `title` (set with `session_meta`, else the engine's label), `archived`, `updated_at`, `engine`, `agent` (an ACP session's built-in agent, else null), `project` (the id of the project it belongs to, else null), `busy` (running a turn or with messages waiting), `background` (background work its turn left going — background commands, agents, workflows — runs: not a turn, so not `busy`; only agents and workflows hold a scheduled run), `parent` (the session that started it with `start_session`, else null) |
 | `gateway_catalog` | — | `gateway_catalog`: `models` (the JuCode models the user chose to show, `jucode_models` in config.json) and `groups` (the gateway's groups with their models and multipliers); empty when not signed in or offline. For clients that cannot read this machine's login (the remote page) |
 | `tool_providers` | `tool`: `claude` or `codex` | `tool_providers` with `tool`, `config: {selected, providers}`. Provider rows expose `has_key`, never the key. Local desktop only |
 | `tool_provider_save` | `tool`, `provider: {id, name, base_url, format, model, key}` | Updated `tool_providers`. An empty key preserves the saved key on edit. Claude requires `anthropic`; Codex requires `responses`. Local desktop only |
@@ -162,7 +162,7 @@ every connected client.
 | `session_usage` | `session` (its id) | `session_usage` with `totals`, `sessions` and `turns`: persisted and live usage, with settled gateway charges |
 | `schedule_list` | — | `schedules`. See "Scheduled tasks" |
 | `schedule_usage` | `schedule` (its id) | `schedule_usage` with `totals` and `sessions`: token counts and costs of the task's run sessions, including follow-ups |
-| `schedule_save` | `schedule`: without `id` creates one (`name`, `prompt`, `cwd`, `repeat`, `time`, and `days` / `date` as `repeat` needs; optional `engine`, `mode`, `options`, `enabled`); with `id` changes the fields present. A paired device may only send `id` and `enabled` | `schedule_saved` with `schedule`; `next_run_at` is computed again. An enabled task needs a `cwd` that is a directory |
+| `schedule_save` | `schedule`: without `id` creates one (`name`, `prompt`, `cwd`, `repeat`, `time`, and `days` / `date` as `repeat` needs; optional `engine`, `mode`, `options`, `enabled`, `worktree`, `budget`); with `id` changes the fields present. A paired device may only send `id` and `enabled` | `schedule_saved` with `schedule`; `next_run_at` is computed again. An enabled task needs a `cwd` that is a directory |
 | `schedule_delete` | `schedule` (its id) | `schedule_deleted` with `schedule`; its runs' sessions stay |
 | `schedule_run` | `schedule` (its id) | `schedule_started` with `schedule` and `session`; runs it now, enabled or not, without changing `next_run_at`. An error while its last run is still going |
 | `item_close` | `kind` (`action`), `item` (its id), optional `reason` | `item_closed` with `item`; closes an open deferred action without deciding it, then broadcasts `actions` |
@@ -480,7 +480,11 @@ directory, on an engine and in a permission mode. The tasks are saved in
   "created_at": 1790812800000,
   "next_run_at": 1790996400000,
   "last_run": { "at": 1790910000000, "session": "s…", "status": "done", "error": null },
-  "skipped": 0
+  "skipped": 0,
+  "worktree": false,
+  "budget": null,
+  "failures": 0,
+  "history": []
 }
 ```
 
@@ -495,8 +499,12 @@ directory, on an engine and in a permission mode. The tasks are saved in
 | `days` | `weekly` only, not empty: 0 = Sunday … 6 = Saturday. |
 | `date` | `once` only: local `YYYY-MM-DD`. |
 | `next_run_at` | ms; null for a disabled task and for a `once` task whose time has passed. |
-| `last_run` | The latest run: `status` `running`, `waiting` (an approval waits), `done` or `failed` (with `error`). |
+| `last_run` | The latest run: `status` `running`, `waiting` (an approval waits), `background` (its turn ended; background work it left going runs), `done` or `failed` (with `error`). |
 | `skipped` | Times skipped in a row since the last run started. |
+| `worktree` | Each run starts in a new git worktree of `cwd`'s repository (see below). |
+| `budget` | What one run may cost, with the sessions it started (`start_session`), or null: gateway points for runs through the JuCode gateway, estimated US dollars for others (whichever passes it first). Clear it with `null`; it must be above 0. |
+| `failures` | Runs failed in a row while the task was on; a run that ends well, or switching the task on, sets it back to 0. |
+| `history` | The runs before `last_run`, newest first, up to 20, shaped as `last_run`. |
 
 Times follow this machine's time zone, daylight saving included: a local
 time skipped by a clock change runs an hour later, one that occurs twice
@@ -505,19 +513,62 @@ runs at the first. The scheduler checks every second. A due task's
 daemon or the computer was off fire once when it starts again, not once per
 missed time.
 
+A run whose turn ends while work it left going will come back to it —
+background agents or workflows, or a session it started still working — is
+`background` until that work ends: it still keeps the computer awake,
+counts against its budget and timeout, and holds the next time off. A
+background command (a dev server) never comes back, so it holds no run.
+A run stopped for its budget or its time has its turn interrupted and, on
+Claude Code, its background tasks stopped. A turn
+the engine starts by itself (Claude Code reporting on finished background
+work) makes it `running` again, and its end settles it again. A turn is
+one from a message, or one the engine starts with output of its own (not a
+subagent's: Claude Code's subagent events carry `nested: true`).
+
+Once a run's turn has ended (`background` or `done`), a message the user
+sends in its session is theirs: the run is `done` (`followed_up` in
+`last_run`), and no timeout, budget or alert applies there.
+
 A run is a new session (its `schedule` is the task's id) named
 `<name> · MM-DD HH:mm`, switched to the task's mode and sent its prompt.
 Earlier runs of the task are archived then, unless they are running or have
 a deferred action open. A time that comes while the last run is `running`
 or `waiting` is skipped. A run going for more than 2 hours, working or
 waiting, is interrupted and counts as failed; a deferred action it left
-stays open. A run working when the daemon stopped counts as failed.
+stays open. A run working when the daemon stopped counts as failed. After
+3 failures in a row the task switches itself off.
 
-The user hears of a run when it fails (it could not start, its turn ended on
-an error, or it timed out), when it waits for an approval, and when a time
+A run of a `worktree` task starts in
+`<repo parent>/.jucode-worktrees/<repo name>/<task id>-MMDD-HHmm` (a free
+name), on a new branch `jucode/<that name>` from the branch the repository
+has checked out (its commit when detached), and works in `cwd`'s place
+inside it; the session keeps `cwd`'s project and lists `worktree`
+(`{repo, path, branch, base, slug}`, plus `gone: true` once removed) in
+`session_list`. A `cwd` outside a
+repository fails the run. When the run is archived, its worktree and branch
+are removed if nothing was left in them: no uncommitted or untracked files
+and no commit past `base`; while its engine is still open, when the
+engine closes. The
+project's main directory is not one of the session's extra directories (nor
+of any session working in a worktree of it).
+
+Once a minute the daemon checks the costs of runs with a `budget`, as
+`schedule_usage` reads them (gateway charges arrive from the account's
+ledger a little late), and interrupts a run that has passed it; it fails.
+
+While a run is `running` the daemon keeps the computer from idle sleep
+(macOS `caffeinate -i`, Linux `systemd-inhibit --what=idle:sleep`, Windows
+`SetThreadExecutionState`). One hold covers every feature that needs one.
+On macOS and Windows closing the lid or choosing Sleep still sleeps; on
+Linux the inhibitor also holds off a suspend the user asks for, unless it
+is forced (`systemctl suspend -i`).
+
+The user hears of a run when it fails the first time in a row (it could not
+start, its turn ended on an error, it timed out or passed its budget), when
+the task switches itself off, when it waits for an approval, and when a time
 is skipped (the first in a row): every client gets
 `{"type":"schedule_event","schedule":"sch-…","name":"…","kind":"failed","detail":"…","session":"s…"}`
-(`kind`: `failed`, `waiting` or `skipped`), and the paired phones a
+(`kind`: `failed`, `stopped`, `waiting` or `skipped`), and the paired phones a
 notification that opens the session. Every client receives the full
 `schedules` list after any change.
 
@@ -525,7 +576,8 @@ notification that opens the session. Every client receives the full
 `schedule` is absent; that `id` is then the request id too, echoed in the
 reply.
 
-`schedule_usage` joins the task's run sessions with persisted turns in
+`schedule_usage` joins the task's run sessions, and the sessions they started
+(rows with `parent`), with persisted turns in
 `usage.jsonl`, including any turn still running. Each unique session is counted
 once, including follow-up turns. `totals` and each row in `sessions` carry the
 five token counters, `turns`, `gateway_cost` (settled points, including group

@@ -4,6 +4,7 @@
 //! `session` field on every session op and event. See
 //! `docs/daemon-protocol.md`.
 
+mod awake;
 mod devservers;
 mod engines;
 mod files;
@@ -27,6 +28,7 @@ mod titles;
 mod tool_providers;
 mod uploads;
 mod usage;
+mod worktrees;
 
 pub use store::Store;
 
@@ -77,6 +79,7 @@ pub fn serve(
     let hub = Hub::new(store, version, relay);
     // Runs left going by the last daemon ended with it.
     hub.interrupt_schedule_runs();
+    hub.clean_run_worktrees();
     if hub.relay.url().is_some() {
         let relay = Arc::clone(&hub);
         thread::spawn(move || relay::run(&relay));
@@ -383,6 +386,20 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         });
         return;
     }
+    // A run may make a worktree first (git, submodules over the network).
+    if name == "schedule_run" {
+        let hub = Arc::clone(hub);
+        thread::spawn(move || {
+            let result = match op["schedule"].as_str().or(op["id"].as_str()) {
+                Some(id) => hub.run_schedule(id).map(|session| {
+                    json!({ "type": "schedule_started", "schedule": id, "id": id, "session": session })
+                }),
+                None => Err("schedule_run requires schedule".to_string()),
+            };
+            respond(&hub, client, &request, result);
+        });
+        return;
+    }
     // Ledger reads wait on the network; input and interrupts must keep flowing.
     if matches!(name, "session_usage" | "schedule_usage") {
         let hub = Arc::clone(hub);
@@ -398,14 +415,30 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                     let sessions = if key == "session" {
                         vec![id.to_string()]
                     } else {
-                        hub.store
-                            .sessions()
-                            .into_iter()
-                            .filter(|record| record.schedule.as_deref() == Some(id))
-                            .map(|record| record.id)
-                            .collect()
+                        // The runs and the sessions they started.
+                        hub.with_children(
+                            hub.store
+                                .sessions()
+                                .into_iter()
+                                .filter(|record| record.schedule.as_deref() == Some(id))
+                                .map(|record| record.id)
+                                .collect(),
+                        )
                     };
                     let mut usage = hub.usage.sessions_json(&sessions);
+                    if key == "schedule" {
+                        let parents: std::collections::HashMap<String, String> = hub
+                            .store
+                            .sessions()
+                            .into_iter()
+                            .filter_map(|r| Some((r.id, r.parent?)))
+                            .collect();
+                        for row in usage["sessions"].as_array_mut().into_iter().flatten() {
+                            if let Some(parent) = row["session"].as_str().and_then(|s| parents.get(s)) {
+                                row["parent"] = json!(parent);
+                            }
+                        }
+                    }
                     usage["type"] = json!(name);
                     usage[key] = json!(id);
                     Ok(usage)
@@ -618,18 +651,13 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             .save_schedule(&op["schedule"], hub.is_local(client))
             .map(|schedule| json!({ "type": "schedule_saved", "schedule": schedule.to_json() })),
         // The schedule's id comes as `schedule`, or as `id`, which then also
-        // serves as the request id.
-        ("schedule_delete" | "schedule_run", _) => {
-            match op["schedule"].as_str().or(op["id"].as_str()) {
-                Some(id) if name == "schedule_delete" => hub
-                    .delete_schedule(id, hub.is_local(client))
-                    .map(|()| json!({ "type": "schedule_deleted", "schedule": id, "id": id })),
-                Some(id) => hub.run_schedule(id).map(|session| {
-                    json!({ "type": "schedule_started", "schedule": id, "id": id, "session": session })
-                }),
-                None => Err(format!("{name} requires schedule")),
-            }
-        }
+        // serves as the request id (`schedule_run` too, above).
+        ("schedule_delete", _) => match op["schedule"].as_str().or(op["id"].as_str()) {
+            Some(id) => hub
+                .delete_schedule(id, hub.is_local(client))
+                .map(|()| json!({ "type": "schedule_deleted", "schedule": id, "id": id })),
+            None => Err(format!("{name} requires schedule")),
+        },
         // An action can be decided after its session closed or the daemon
         // restarted: reopen the session so its engine can run the action.
         ("decide_action", Some(session)) => hub

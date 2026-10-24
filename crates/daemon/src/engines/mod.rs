@@ -733,16 +733,27 @@ impl Snapshot {
     }
 
     /// Work outside a turn keeps the engine open (`Hub::set_held`):
-    /// background tasks, subagents or workflows running, approvals waiting.
-    /// Claude Code's run list is rebuilt from its transcript (a run that
-    /// never ended stays "running" there); its live background work is in
-    /// `background_tasks`, so only other engines' runs count.
+    /// background work, approvals waiting.
     fn holds(&self, kind: Kind) -> bool {
-        let tasks = self
+        self.background(kind).0 || !self.approvals.is_empty()
+    }
+
+    /// Background work the turn left going (`Hub::set_background`): any
+    /// (background commands, agents, workflows), and whether some of it will
+    /// come back to the conversation (agents, workflows; a dev server never
+    /// does). Claude Code's run list is rebuilt from its transcript (a run
+    /// that never ended stays "running" there); its live background work is
+    /// in `background_tasks`, so only other engines' runs count.
+    fn background(&self, kind: Kind) -> (bool, bool) {
+        let list = self
             .state
             .get("background_tasks")
-            .and_then(|event| event["tasks"].as_array())
-            .is_some_and(|tasks| !tasks.is_empty());
+            .and_then(|event| event["tasks"].as_array());
+        let tasks = list.is_some_and(|tasks| !tasks.is_empty());
+        let agents = list.into_iter().flatten().any(|task| {
+            let kind = task["kind"].as_str().unwrap_or_default();
+            kind.starts_with("local_agent") || kind.starts_with("local_workflow")
+        });
         let runs = kind != Kind::Claude
             && self.state.get("agent_runs").is_some_and(|event| {
                 let workflows = event["workflows"].as_array().into_iter().flatten();
@@ -761,7 +772,7 @@ impl Snapshot {
                         running(state.unwrap_or_default())
                     })
             });
-        tasks || runs || !self.approvals.is_empty()
+        (tasks || runs, agents || runs)
     }
 
     fn answered(&mut self, call: &str) {
@@ -1099,6 +1110,8 @@ impl Session<'_> {
                     || self.restart.is_some()
                     || self.tui_request.is_some();
                 self.hub.set_held(id, held);
+                let (any, awaited) = self.snapshot.background(self.kind);
+                self.hub.set_background(id, any, awaited);
             }
             if !busy && self.pending_mode.take().is_some() {
                 self.publish(vec![

@@ -148,6 +148,8 @@ fn run(hub: &Hub, mut core: AgentCore, id: &str, ops: Receiver<Value>) {
         // engine error) does not hold a running slot.
         hub.set_busy(id, status["state"] != "ready");
         hub.set_held(id, core.has_background_work());
+        // Its subagents end with the turn: what is left are shells.
+        hub.set_background(id, core.has_background_work(), false);
         if last_status.as_ref() != Some(&status) {
             hub.broadcast(&status);
             last_status = Some(status);

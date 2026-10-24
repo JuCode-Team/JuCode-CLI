@@ -128,9 +128,10 @@ fn start(
             .collect(),
         title => title.to_string(),
     };
-    let _ = hub
-        .store
-        .record_session_meta(&session, &json!({ "title": title }));
+    let _ = hub.store.record_session_meta(
+        &session,
+        &json!({ "title": title, "parent": parent.session }),
+    );
     lock(&hub.children).insert(
         session.clone(),
         Child {

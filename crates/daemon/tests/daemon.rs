@@ -2899,3 +2899,65 @@ fn a_run_that_cannot_start_fails_and_tells_the_clients() {
         .unwrap()
         .contains("not a directory"));
 }
+
+#[test]
+fn a_worktree_task_runs_apart_and_an_unused_worktree_goes_with_its_run() {
+    let _guard = setup();
+    let daemon = start_daemon();
+    let dir = temp_dir("daemon-schedule-worktree").join("repo");
+    fs::create_dir_all(&dir).unwrap();
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "a"],
+    ] {
+        git(&dir, args);
+    }
+    let mut client = Client::connect(&daemon);
+    let saved = request(
+        &mut client,
+        json!({ "op": "schedule_save", "schedule": {
+            "name": "巡检", "prompt": "check", "repeat": "daily", "time": "09:00",
+            "cwd": dir, "worktree": true,
+        } }),
+    );
+    let id = saved["schedule"]["id"].as_str().unwrap().to_string();
+    assert_eq!(saved["schedule"]["worktree"], true);
+    let run = |client: &mut Client| {
+        let started = request(client, json!({ "op": "schedule_run", "schedule": id }));
+        assert_eq!(started["type"], "schedule_started", "{started}");
+        let session = started["session"].as_str().unwrap().to_string();
+        client.until(ready(&session));
+        schedule_when(client, &id, |s| {
+            s["last_run"]["session"] == session.as_str() && s["last_run"]["status"] == "done"
+        });
+        session
+    };
+    let first = run(&mut client);
+    let entry = session_entry(&mut client, &first);
+    let tree = entry["worktree"].clone();
+    let path = PathBuf::from(tree["path"].as_str().unwrap());
+    let container = dir.canonicalize().unwrap().parent().unwrap().join(".jucode-worktrees/repo");
+    assert_eq!(path.parent(), Some(container.as_path()), "{entry}");
+    assert_eq!(entry["cwd"], tree["path"]);
+    assert_eq!(tree["base"], "main");
+    assert!(tree["branch"].as_str().unwrap().starts_with("jucode/sch-"));
+    assert!(path.is_dir());
+
+    // The next run archives this one; nothing was left in its worktree,
+    // which goes once its engine closes.
+    let second = run(&mut client);
+    assert_eq!(session_entry(&mut client, &first)["archived"], true);
+    assert!(path.is_dir(), "kept while its engine is open");
+    client.send(json!({ "op": "session_close", "session": first }));
+    let start = Instant::now();
+    while path.exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "worktree kept");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_ne!(session_entry(&mut client, &second)["worktree"]["path"], tree["path"]);
+    let start = Instant::now();
+    while session_entry(&mut client, &first)["worktree"]["gone"] != true {
+        assert!(start.elapsed() < Duration::from_secs(10), "listed as gone");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
