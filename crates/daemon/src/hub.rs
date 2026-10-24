@@ -66,6 +66,8 @@ pub struct Hub {
     /// commands, agents, workflows): not a turn, so not `busy`. True when
     /// some of it comes back to the conversation (agents, workflows).
     background: Mutex<HashMap<String, bool>>,
+    /// Sessions whose latest turn ended in an error, until the next starts.
+    failed: Mutex<HashSet<String>>,
     /// A newer daemon waits to replace this one (`restart_when_idle`).
     restart_pending: AtomicBool,
     /// Messages the daemon sent (`send_to_session`) that a session thread
@@ -157,6 +159,7 @@ impl Hub {
             sessions: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashSet::new()),
             background: Mutex::new(HashMap::new()),
+            failed: Mutex::new(HashSet::new()),
             restart_pending: AtomicBool::new(false),
             claims: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
@@ -1140,13 +1143,33 @@ impl Hub {
             self.adopt_engine_title(session, event["title"].as_str().unwrap_or_default());
         }
         // `over`: a turn ended.
-        let (due, over, failed) = {
+        let (due, started, over, failed) = {
             let mut turns = lock(&self.turns);
             let turns = turns.entry(session.to_string()).or_default();
             let running = turns.running();
             let due = turns.observe(event);
-            (due, running && !turns.running(), turns.take_failed())
+            (
+                due,
+                !running && turns.running(),
+                running && !turns.running(),
+                turns.take_failed(),
+            )
         };
+        // Every client follows which sessions failed, watched or not (the
+        // desktop marks them on its other workspaces).
+        if started || over {
+            let changed = {
+                let mut set = lock(&self.failed);
+                if over && failed.is_some() {
+                    set.insert(session.to_string())
+                } else {
+                    set.remove(session)
+                }
+            };
+            if changed {
+                self.broadcast(&self.sessions_json());
+            }
+        }
         if due {
             self.retitle(session);
         }
@@ -1296,6 +1319,7 @@ impl Hub {
         let sessions = lock(&self.sessions);
         let busy = lock(&self.busy);
         let background = lock(&self.background);
+        let failed = lock(&self.failed);
         let list: Vec<Value> = records
             .into_iter()
             .filter(|record| !record.hidden)
@@ -1323,6 +1347,7 @@ impl Hub {
                     "open": hosted.is_some(),
                     "busy": busy.contains(&record.id),
                     "background": background.contains_key(&record.id),
+                    "failed": failed.contains(&record.id),
                     "watchers": hosted.map(|h| h.watchers.len()).unwrap_or(0),
                 })
             })
@@ -1625,6 +1650,39 @@ mod tests {
         assert!(frames.try_recv().is_err(), "only a change is sent");
         hub.set_busy("s", false);
         assert!(!running(&frames));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn every_client_learns_when_a_turn_fails_until_the_next_starts() {
+        let (hub, dir) = idle_hub("failed-list");
+        hub.store
+            .record_session("s", std::path::Path::new("/tmp"))
+            .unwrap();
+        let (outbox, frames) = Hub::outbox();
+        hub.add_client(outbox, None);
+        let failed = |frames: &mpsc::Receiver<String>| {
+            let list: Value = frames
+                .try_iter()
+                .map(|f| serde_json::from_str::<Value>(&f).unwrap())
+                .filter(|f| f["type"] == "sessions")
+                .last()
+                .unwrap();
+            list["sessions"][0]["failed"].as_bool().unwrap()
+        };
+        let ready = json!({ "type": "status", "message": "ready" });
+
+        hub.observe("s", &json!({ "type": "user_message", "content": "go" }));
+        hub.observe("s", &json!({ "type": "error", "message": "rate limited" }));
+        hub.observe("s", &ready);
+        assert!(failed(&frames));
+        hub.observe("s", &json!({ "type": "user_message", "content": "again" }));
+        assert!(!failed(&frames));
+        hub.observe("s", &ready);
+        assert!(
+            frames.try_iter().all(|f| !f.contains("\"sessions\"")),
+            "a good turn changes nothing"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
