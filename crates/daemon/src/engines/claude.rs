@@ -515,11 +515,11 @@ fn result_card(meta: &ToolMeta, block: &Value, structured: &Value) -> String {
             }
         }
         "read" => {
-            let path = text(&meta.input["file_path"]);
             if is_error {
+                let path = text(&meta.input["file_path"]);
                 json!({ "path": path, "error": failed() }).to_string()
             } else {
-                json!({ "path": path }).to_string()
+                read_card(&meta.input).to_string()
             }
         }
         "ripgrep" => {
@@ -535,6 +535,16 @@ fn result_card(meta: &ToolMeta, block: &Value, structured: &Value) -> String {
     }
 }
 
+/// A Read card: the file, and the line the reading started at (`offset`,
+/// 1-based) when not the first, where the card opens it.
+fn read_card(input: &Value) -> Value {
+    let mut card = json!({ "path": text(&input["file_path"]) });
+    if let Some(line) = input["offset"].as_u64().filter(|line| *line > 1) {
+        card["line"] = json!(line);
+    }
+    card
+}
+
 /// The tool-card JSON Desktop's cards understand, from a tool input.
 fn card_json(name: &str, input: &Value) -> String {
     let card = match tool_name(name) {
@@ -544,7 +554,7 @@ fn card_json(name: &str, input: &Value) -> String {
             let paths: Vec<&str> = if path.is_empty() { vec![] } else { vec![path] };
             json!({ "path": path, "paths": paths, "diff": edit_diff(name, input) })
         }
-        "read" => json!({ "path": text(&input["file_path"]) }),
+        "read" => read_card(input),
         "ripgrep" => {
             let mut card = json!({ "pattern": text(&input["pattern"]) });
             if !text(&input["path"]).is_empty() {
@@ -4620,6 +4630,22 @@ mod tests {
             .events;
         assert_eq!(missing[0]["type"], "subagent_transcript");
         assert!(missing[0]["error"].is_string());
+    }
+
+    #[test]
+    fn a_read_card_names_the_line_it_started_at() {
+        assert_eq!(
+            read_card(&json!({ "file_path": "/a.rs" })),
+            json!({ "path": "/a.rs" })
+        );
+        assert_eq!(
+            read_card(&json!({ "file_path": "/a.rs", "offset": 1 })),
+            json!({ "path": "/a.rs" })
+        );
+        assert_eq!(
+            read_card(&json!({ "file_path": "/a.rs", "offset": 120, "limit": 40 })),
+            json!({ "path": "/a.rs", "line": 120 })
+        );
     }
 
     #[test]
