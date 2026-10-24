@@ -474,7 +474,9 @@ impl Acp {
     /// while it has no model config option of its own.
     fn with_model_state(&mut self) {
         self.config.retain(|option| option["id"] != MODEL_STATE);
-        let models = self.models["availableModels"].as_array().filter(|m| !m.is_empty());
+        let models = self.models["availableModels"]
+            .as_array()
+            .filter(|m| !m.is_empty());
         let (Some(models), None) = (models, self.select("model")) else {
             return;
         };
@@ -493,7 +495,10 @@ impl Acp {
     fn auth_method(&self) -> Option<Value> {
         self.auths
             .iter()
-            .find(|m| !matches!(text(&m["type"]), "terminal" | "env_var") && m["_meta"]["terminal-auth"].is_null())
+            .find(|m| {
+                !matches!(text(&m["type"]), "terminal" | "env_var")
+                    && m["_meta"]["terminal-auth"].is_null()
+            })
             .cloned()
     }
 
@@ -674,7 +679,10 @@ impl Acp {
         let session = self.session.clone();
         // A model of the agent's `models`: `session/set_model`.
         if id == MODEL_STATE {
-            return self.request("session/set_model", json!({ "sessionId": session, "modelId": value }));
+            return self.request(
+                "session/set_model",
+                json!({ "sessionId": session, "modelId": value }),
+            );
         }
         let mut params = json!({ "sessionId": session, "configId": id, "value": value });
         if value.is_boolean() {
@@ -981,7 +989,10 @@ impl Acp {
                 self.resume_session = caps["sessionCapabilities"]["resume"].is_object();
                 self.agent = result["agentInfo"].clone();
                 self.auth = result["authMethods"][0].clone();
-                self.auths = result["authMethods"].as_array().cloned().unwrap_or_default();
+                self.auths = result["authMethods"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
                 self.mcp_http = caps["mcpCapabilities"]["http"] == true;
                 self.open()
             }
@@ -1037,26 +1048,38 @@ impl Acp {
         };
         // Not signed in: once, the way the agent signs in by itself (it may
         // open the browser); then the session again (`authenticate` above).
-        if method == "session/new" && error["code"] == -32000 && !self.authenticated && !self.probing {
+        if method == "session/new"
+            && error["code"] == -32000
+            && !self.authenticated
+            && !self.probing
+        {
             if let Some(how) = self.auth_method() {
                 self.authenticated = true;
-                let name = [&how["name"], &how["id"]].into_iter().map(text).find(|n| !n.is_empty()).unwrap_or_default().to_string();
+                let name = [&how["name"], &how["id"]]
+                    .into_iter()
+                    .map(text)
+                    .find(|n| !n.is_empty())
+                    .unwrap_or_default()
+                    .to_string();
                 return Output {
                     frames: vec![self.request("authenticate", json!({ "methodId": how["id"] }))],
-                    events: vec![json!({ "type": "info", "message": format!("[acp] signing in to {} ({name})…", self.agent_name()) })],
+                    events: vec![
+                        json!({ "type": "info", "message": format!("[acp] signing in to {} ({name})…", self.agent_name()) }),
+                    ],
                 };
             }
         }
-        let message = if (method == "session/new" && error["code"] == -32000) || method == "authenticate" {
-            let how = [&self.auth["description"], &self.auth["name"]]
-                .into_iter()
-                .map(text)
-                .find(|how| !how.is_empty())
-                .unwrap_or(&message);
-            format!("[acp] {} needs sign-in: {how}", self.agent_name())
-        } else {
-            format!("[acp] {message}")
-        };
+        let message =
+            if (method == "session/new" && error["code"] == -32000) || method == "authenticate" {
+                let how = [&self.auth["description"], &self.auth["name"]]
+                    .into_iter()
+                    .map(text)
+                    .find(|how| !how.is_empty())
+                    .unwrap_or(&message);
+                format!("[acp] {} needs sign-in: {how}", self.agent_name())
+            } else {
+                format!("[acp] {message}")
+            };
         let mut output = Output::events(vec![json!({ "type": "error", "message": message })]);
         match method {
             "session/prompt" => {
@@ -1972,7 +1995,10 @@ mod tests {
             json!({ "id": 2, "error": { "code": -32000, "message": "Authentication required" } }),
         );
         let sent = sent(&out.frames);
-        assert_eq!((sent[0]["method"].as_str(), &sent[0]["params"]["methodId"]), (Some("authenticate"), &json!("agent")));
+        assert_eq!(
+            (sent[0]["method"].as_str(), &sent[0]["params"]["methodId"]),
+            (Some("authenticate"), &json!("agent"))
+        );
         let out = frame(&mut a, json!({ "id": 3, "result": {} }));
         assert_eq!(super::tests::sent(&out.frames)[0]["method"], "session/new");
         // Still not: it says how, and does not try again.
@@ -1992,8 +2018,14 @@ mod tests {
         let mut a = Acp::new(Path::new("/p"), &omp());
         a.probing();
         a.start();
-        frame(&mut a, json!({ "id": 1, "result": { "protocolVersion": 1, "agentCapabilities": {}, "authMethods": [{ "id": "agent", "name": "Agent login" }] } }));
-        let out = frame(&mut a, json!({ "id": 2, "error": { "code": -32000, "message": "Authentication required" } }));
+        frame(
+            &mut a,
+            json!({ "id": 1, "result": { "protocolVersion": 1, "agentCapabilities": {}, "authMethods": [{ "id": "agent", "name": "Agent login" }] } }),
+        );
+        let out = frame(
+            &mut a,
+            json!({ "id": 2, "error": { "code": -32000, "message": "Authentication required" } }),
+        );
         assert!(out.frames.is_empty());
     }
 
@@ -2006,7 +2038,10 @@ mod tests {
         for (http, count) in [(false, 1), (true, 2)] {
             let mut a = Acp::new(Path::new("/p"), &omp()).with_mcp(servers.clone());
             a.start();
-            let out = frame(&mut a, json!({ "id": 1, "result": { "protocolVersion": 1, "agentCapabilities": { "mcpCapabilities": { "http": http } } } }));
+            let out = frame(
+                &mut a,
+                json!({ "id": 1, "result": { "protocolVersion": 1, "agentCapabilities": { "mcpCapabilities": { "http": http } } } }),
+            );
             let new = &sent(&out.frames)[0];
             assert_eq!(new["method"], "session/new");
             assert_eq!(new["params"]["mcpServers"].as_array().unwrap().len(), count);
@@ -2021,18 +2056,32 @@ mod tests {
             json!({ "id": 2, "result": { "sessionId": "s1", "models": { "currentModelId": "flash", "availableModels": [
                 { "modelId": "flash", "name": "Gemini Flash" }, { "modelId": "pro", "name": "Gemini Pro" }] } } }),
         );
-        let status = out.events.iter().find(|e| e["type"] == "model_status").unwrap();
+        let status = out
+            .events
+            .iter()
+            .find(|e| e["type"] == "model_status")
+            .unwrap();
         assert_eq!(status["model"], "flash");
-        let view = a.encode(&json!({ "op": "command", "input": "/model" })).unwrap();
+        let view = a
+            .encode(&json!({ "op": "command", "input": "/model" }))
+            .unwrap();
         assert_eq!(view.events[0]["models"].as_array().unwrap().len(), 2);
-        let set = a.encode(&json!({ "op": "command", "input": "/model pro" })).unwrap();
+        let set = a
+            .encode(&json!({ "op": "command", "input": "/model pro" }))
+            .unwrap();
         let sent = sent(&set.frames);
-        assert_eq!((sent[0]["method"].as_str(), &sent[0]["params"]["modelId"]), (Some("session/set_model"), &json!("pro")));
+        assert_eq!(
+            (sent[0]["method"].as_str(), &sent[0]["params"]["modelId"]),
+            (Some("session/set_model"), &json!("pro"))
+        );
         let id = sent[0]["id"].as_u64().unwrap();
         let out = frame(&mut a, json!({ "id": id, "result": {} }));
         assert_eq!(out.events[0]["model"], "pro");
         // Its own model option, once it has one, wins.
-        assert_eq!(a.session_options()["options"].as_array().map(Vec::len), Some(0));
+        assert_eq!(
+            a.session_options()["options"].as_array().map(Vec::len),
+            Some(0)
+        );
     }
 
     #[test]

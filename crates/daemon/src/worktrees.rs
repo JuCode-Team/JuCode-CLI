@@ -44,8 +44,12 @@ pub fn create(cwd: &Path, slug: &str) -> Result<(Value, PathBuf), String> {
     let cwd = cwd
         .canonicalize()
         .map_err(|error| format!("{}: {error}", cwd.display()))?;
-    let root = git(&cwd, &["rev-parse", "--show-toplevel"])
-        .map_err(|_| format!("{} 不在 git 仓库里，不能在独立 worktree 中运行", cwd.display()))?;
+    let root = git(&cwd, &["rev-parse", "--show-toplevel"]).map_err(|_| {
+        format!(
+            "{} 不在 git 仓库里，不能在独立 worktree 中运行",
+            cwd.display()
+        )
+    })?;
     let root = PathBuf::from(root)
         .canonicalize()
         .map_err(|error| format!("repository root: {error}"))?;
@@ -84,7 +88,10 @@ pub fn create(cwd: &Path, slug: &str) -> Result<(Value, PathBuf), String> {
     let branch = format!("jucode/{slug}");
     let path = container.join(&slug);
     let path_text = path.display().to_string();
-    git(&root, &["worktree", "add", "-b", &branch, &path_text, &base])?;
+    git(
+        &root,
+        &["worktree", "add", "-b", &branch, &path_text, &base],
+    )?;
     let _ = git(
         &root,
         &["config", &format!("branch.{branch}.jucode-base"), &base],
@@ -125,7 +132,12 @@ pub fn remove_if_unused(tree: &Value) -> bool {
     // untracked files, count. `--force` below skips git's own check.
     let clean = git(
         path,
-        &["status", "--porcelain", "--ignore-submodules=none", "--untracked-files=all"],
+        &[
+            "status",
+            "--porcelain",
+            "--ignore-submodules=none",
+            "--untracked-files=all",
+        ],
     )
     .is_ok_and(|out| out.is_empty());
     let unmoved = git(repo, &["rev-list", "--count", &format!("{base}..{branch}")])
@@ -170,10 +182,7 @@ mod tests {
         let dir = repo("unused");
         let (tree, inside) = create(&dir.join("web"), "sch-1").unwrap();
         let root = dir.canonicalize().unwrap();
-        let path = root
-            .parent()
-            .unwrap()
-            .join(".jucode-worktrees/app/sch-1");
+        let path = root.parent().unwrap().join(".jucode-worktrees/app/sch-1");
         assert_eq!(tree["path"], path.display().to_string());
         assert_eq!(tree["branch"], "jucode/sch-1");
         assert_eq!(tree["base"], "main");
@@ -193,7 +202,16 @@ mod tests {
 
         assert!(remove_if_unused(&second));
         assert!(!Path::new(second["path"].as_str().unwrap()).exists());
-        assert!(git(&dir, &["rev-parse", "--verify", "--quiet", "refs/heads/jucode/sch-1-2"]).is_err());
+        assert!(git(
+            &dir,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/jucode/sch-1-2"
+            ]
+        )
+        .is_err());
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
@@ -203,7 +221,15 @@ mod tests {
         let dir = repo("sub-app");
         git(
             &dir,
-            &["-c", "protocol.file.allow=always", "submodule", "add", "-q", lib.to_str().unwrap(), "lib"],
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                lib.to_str().unwrap(),
+                "lib",
+            ],
         )
         .unwrap();
         git(&dir, &["commit", "-qm", "lib"]).unwrap();
@@ -231,7 +257,9 @@ mod tests {
     fn a_folder_outside_git_has_no_worktree() {
         let dir = std::env::temp_dir().join(format!("jucode-wt-none-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(create(&dir, "sch-1").unwrap_err().contains("不在 git 仓库里"));
+        assert!(create(&dir, "sch-1")
+            .unwrap_err()
+            .contains("不在 git 仓库里"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

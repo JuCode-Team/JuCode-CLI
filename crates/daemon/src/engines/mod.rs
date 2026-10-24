@@ -319,7 +319,9 @@ fn adapter(kind: Kind, cwd: &Path, options: &Options) -> Box<dyn Adapter> {
     match kind {
         Kind::Claude => Box::new(claude::Claude::new(options).at(cwd)),
         Kind::Codex => Box::new(codex::Codex::new(cwd, options)),
-        Kind::Acp => Box::new(acp::Acp::new(cwd, options).with_mcp(jucode_agent_core::acp_mcp_servers())),
+        Kind::Acp => {
+            Box::new(acp::Acp::new(cwd, options).with_mcp(jucode_agent_core::acp_mcp_servers()))
+        }
     }
 }
 
@@ -499,7 +501,13 @@ pub(crate) fn plan_window(
 /// A local gateway key is done with: no request may use it again.
 /// The events a probe keeps (the last of each kind): what a client shows of
 /// an engine before any conversation of it.
-const PROBE_KEEPS: &[&str] = &["model_status", "model_view", "engine_caps", "command_list", "session_options"];
+const PROBE_KEEPS: &[&str] = &[
+    "model_status",
+    "model_view",
+    "engine_caps",
+    "command_list",
+    "session_options",
+];
 /// A probe gives up after this long, and waits this long for the model list
 /// once the engine has said something.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(25);
@@ -538,7 +546,9 @@ pub fn probe(hub: &Hub, kind: Kind, cwd: &Path, options: &Options) -> Result<Vec
     let mut asked = false;
     loop {
         let until = settle.map_or(deadline, |at| at.min(deadline));
-        let Some(wait) = until.checked_duration_since(Instant::now()) else { break };
+        let Some(wait) = until.checked_duration_since(Instant::now()) else {
+            break;
+        };
         match process.lines.recv_timeout(wait) {
             Ok(Ok(line)) => {
                 let out = engine.translate(line);

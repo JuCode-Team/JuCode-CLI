@@ -5039,14 +5039,18 @@ mod tests {
             .unwrap();
         assert_eq!(
             moved.events,
-            vec![json!({ "type": "pending_messages", "messages": ["apple", "cherry", "banana"], "fixed": 1 })]
+            vec![
+                json!({ "type": "pending_messages", "messages": ["apple", "cherry", "banana"], "fixed": 1 })
+            ]
         );
         let dropped = c
             .encode(&json!({ "op": "unqueue", "index": 1, "discard": true }))
             .unwrap();
         assert_eq!(
             dropped.events,
-            vec![json!({ "type": "pending_messages", "messages": ["apple", "banana"], "fixed": 1 })]
+            vec![
+                json!({ "type": "pending_messages", "messages": ["apple", "banana"], "fixed": 1 })
+            ]
         );
     }
 

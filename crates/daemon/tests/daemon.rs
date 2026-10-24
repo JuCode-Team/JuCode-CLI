@@ -1513,10 +1513,19 @@ fn an_engine_probe_lists_its_models_without_a_session() {
     let daemon = start_daemon();
     let mut desktop = Client::connect(&daemon);
     let before = request(&mut desktop, json!({ "op": "session_list" }));
-    let probed = request(&mut desktop, json!({ "op": "engine_probe", "engine": "claude", "options": {} }));
+    let probed = request(
+        &mut desktop,
+        json!({ "op": "engine_probe", "engine": "claude", "options": {} }),
+    );
     assert_eq!(probed["type"], "engine_probed", "{probed}");
     let events = probed["events"].as_array().unwrap();
-    assert!(events.iter().any(|e| e["type"] == "model_view" && e["models"].as_array().is_some_and(|m| !m.is_empty())), "{probed}");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "model_view"
+                && e["models"].as_array().is_some_and(|m| !m.is_empty())),
+        "{probed}"
+    );
     assert_eq!(starts(&log).len(), 1);
     // No session came of it.
     let after = request(&mut desktop, json!({ "op": "session_list" }));

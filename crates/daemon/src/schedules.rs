@@ -121,7 +121,10 @@ impl LastRun {
             session: text("session"),
             status: text("status").unwrap_or_else(|| "done".to_string()),
             error: text("error"),
-            followed_up: run.get("followed_up").and_then(Value::as_bool).unwrap_or(false),
+            followed_up: run
+                .get("followed_up")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
 }
@@ -635,7 +638,11 @@ impl Hub {
         // task's folder.
         let (run_cwd, tree, project) = if schedule.worktree {
             let project = crate::projects::for_new_session(self, &cwd, None)?;
-            let slug = format!("{}-{}", slug(&schedule.id), Local::now().format("%m%d-%H%M"));
+            let slug = format!(
+                "{}-{}",
+                slug(&schedule.id),
+                Local::now().format("%m%d-%H%M")
+            );
             let (tree, inside) = crate::worktrees::create(&cwd, &slug)?;
             (inside, Some(tree), Some(project))
         } else {
@@ -894,7 +901,7 @@ impl Hub {
             let run = s.last_run.as_ref()?;
             (run.session.as_deref() == Some(session)
                 && matches!(run.status.as_str(), "running" | "background"))
-                .then(|| s.id.clone())
+            .then(|| s.id.clone())
         });
         if let Some(id) = id {
             self.fail_run(&id, Some(session), "会话在运行中关闭了，这次运行没有完成。");
@@ -999,11 +1006,17 @@ impl Hub {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .any(|row| row["session"] == session.as_str() && row["gateway_requests"].as_u64() > Some(0));
+                    .any(|row| {
+                        row["session"] == session.as_str()
+                            && row["gateway_requests"].as_u64() > Some(0)
+                    });
                 let (unit, cost) = if gateway {
                     ("点", usage["totals"]["gateway_cost"].as_f64())
                 } else {
-                    ("美元（估算）", usage["totals"]["estimated_cost_usd"].as_f64())
+                    (
+                        "美元（估算）",
+                        usage["totals"]["estimated_cost_usd"].as_f64(),
+                    )
                 };
                 if let Some(cost) = cost.filter(|cost| *cost > budget) {
                     for session in &sessions {
@@ -1064,7 +1077,9 @@ impl Hub {
         for run in list.iter_mut().filter_map(|s| s.last_run.as_mut()) {
             let waits_on_action = run.status == "waiting"
                 && run.session.as_ref().is_some_and(|s| deferred.contains(s));
-            if matches!(run.status.as_str(), "running" | "waiting" | "background") && !waits_on_action {
+            if matches!(run.status.as_str(), "running" | "waiting" | "background")
+                && !waits_on_action
+            {
                 run.status = "failed".to_string();
                 run.error = Some("后台服务重启，这次运行没有完成。".to_string());
                 changed = true;
@@ -1452,13 +1467,21 @@ mod tests {
         let (hub, dir, id) = hub_with_run("failures");
         hub.save_schedule(&json!({ "id": id, "enabled": true }), true)
             .unwrap();
-        let task = |hub: &Hub| lock(&hub.schedules).iter().find(|s| s.id == id).cloned().unwrap();
+        let task = |hub: &Hub| {
+            lock(&hub.schedules)
+                .iter()
+                .find(|s| s.id == id)
+                .cloned()
+                .unwrap()
+        };
         let fail = |n: usize| {
             if n > 0 {
                 assert!(hub.claim_run(&id).unwrap().is_some());
             }
             let session = format!("s{}", n + 1);
-            hub.update_schedule(&id, |s| s.last_run.as_mut().unwrap().session = Some(session.clone()));
+            hub.update_schedule(&id, |s| {
+                s.last_run.as_mut().unwrap().session = Some(session.clone())
+            });
             hub.run_session_ended(&session);
         };
         fail(0);
@@ -1467,7 +1490,9 @@ mod tests {
         assert!(task(&hub).enabled);
         // A good run starts the count again.
         assert!(hub.claim_run(&id).unwrap().is_some());
-        hub.update_schedule(&id, |s| s.last_run.as_mut().unwrap().session = Some("ok".into()));
+        hub.update_schedule(&id, |s| {
+            s.last_run.as_mut().unwrap().session = Some("ok".into())
+        });
         hub.observe("ok", &json!({ "type": "user_message", "content": "check" }));
         hub.observe("ok", &json!({ "type": "status", "message": "ready" }));
         assert_eq!(task(&hub).failures, 0);
@@ -1479,7 +1504,11 @@ mod tests {
         assert!(!stopped.enabled);
         assert_eq!(stopped.next_run_at, None);
         // Earlier runs are kept, newest first.
-        let sessions: Vec<_> = stopped.history.iter().map(|r| r.session.clone().unwrap()).collect();
+        let sessions: Vec<_> = stopped
+            .history
+            .iter()
+            .map(|r| r.session.clone().unwrap())
+            .collect();
         assert_eq!(sessions, ["s5", "s4", "ok", "s2", "s1"]);
         // Switching it on again forgives them.
         hub.save_schedule(&json!({ "id": id, "enabled": true }), false)
@@ -1494,7 +1523,10 @@ mod tests {
         assert_eq!(hub.awake.keys(), [format!("schedule:{id}")]);
         hub.observe("s1", &json!({ "type": "user_message", "content": "check" }));
         hub.observe("s1", &json!({ "type": "approval_request", "call_id": "c" }));
-        assert!(hub.awake.keys().is_empty(), "waiting on the user is no work");
+        assert!(
+            hub.awake.keys().is_empty(),
+            "waiting on the user is no work"
+        );
         hub.observe("s1", &json!({ "type": "action_decided" }));
         assert_eq!(hub.awake.keys().len(), 1);
         hub.observe("s1", &json!({ "type": "status", "message": "ready" }));
@@ -1510,9 +1542,15 @@ mod tests {
         hub.observe("s1", &json!({ "type": "status", "message": "ready" }));
         assert_eq!(status(&hub, &id), "background");
         assert_eq!(hub.awake.keys().len(), 1, "background work keeps it awake");
-        assert!(hub.claim_run(&id).unwrap().is_none(), "the next time is skipped");
+        assert!(
+            hub.claim_run(&id).unwrap().is_none(),
+            "the next time is skipped"
+        );
         // A background subagent at work is not the run working.
-        hub.observe("s1", &json!({ "type": "tool_start", "call_id": "s", "nested": true }));
+        hub.observe(
+            "s1",
+            &json!({ "type": "tool_start", "call_id": "s", "nested": true }),
+        );
         assert_eq!(status(&hub, &id), "background");
         // The work ends; the engine reports on it in a turn of its own.
         hub.set_background("s1", false, false);
@@ -1560,15 +1598,25 @@ mod tests {
         assert!(hub.awake.keys().is_empty());
 
         assert!(hub.claim_run(&id).unwrap().is_some());
-        hub.update_schedule(&id, |s| s.last_run.as_mut().unwrap().session = Some("s2".into()));
+        hub.update_schedule(&id, |s| {
+            s.last_run.as_mut().unwrap().session = Some("s2".into())
+        });
         lock(&hub.children).insert(
             "c1".into(),
-            crate::subsessions::Child { parent: "s2".into(), status: "running".into(), ..Default::default() },
+            crate::subsessions::Child {
+                parent: "s2".into(),
+                status: "running".into(),
+                ..Default::default()
+            },
         );
         hub.set_busy("c1", true);
         hub.observe("s2", &json!({ "type": "user_message", "content": "check" }));
         hub.observe("s2", &json!({ "type": "status", "message": "ready" }));
-        assert_eq!(status(&hub, &id), "background", "a session it started still works");
+        assert_eq!(
+            status(&hub, &id),
+            "background",
+            "a session it started still works"
+        );
         // The child's turn ends; the sweep settles the run.
         hub.set_busy("c1", false);
         hub.settle_runs();
@@ -1582,7 +1630,10 @@ mod tests {
         hub.observe("s1", &json!({ "type": "user_message", "content": "check" }));
         hub.observe("s1", &json!({ "type": "approval_request", "call_id": "c" }));
         assert_eq!(status(&hub, &id), "waiting");
-        hub.observe("s1", &json!({ "type": "tool_start", "call_id": "s", "nested": true }));
+        hub.observe(
+            "s1",
+            &json!({ "type": "tool_start", "call_id": "s", "nested": true }),
+        );
         assert_eq!(status(&hub, &id), "running");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1597,7 +1648,14 @@ mod tests {
         assert_eq!(status(&hub, &id), "background");
         hub.set_background("s1", false, false);
         assert_eq!(status(&hub, &id), "done");
-        assert_eq!(lock(&hub.schedules).iter().find(|s| s.id == id).unwrap().failures, 0);
+        assert_eq!(
+            lock(&hub.schedules)
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .failures,
+            0
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

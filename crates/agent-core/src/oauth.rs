@@ -181,7 +181,9 @@ pub enum RefreshError {
 pub fn refresh(api_url: &str, refresh_token: &str) -> Result<Tokens, RefreshError> {
     let api_url = api_url.trim().trim_end_matches('/');
     if api_url.is_empty() {
-        return Err(RefreshError::Failed("JuCode API URL cannot be empty".to_string()));
+        return Err(RefreshError::Failed(
+            "JuCode API URL cannot be empty".to_string(),
+        ));
     }
     let url = format!("{}/v1/oauth/token", api_url);
     // ureq::Error is large; it is ureq's own type, passed through as is.
@@ -200,7 +202,13 @@ pub fn refresh(api_url: &str, refresh_token: &str) -> Result<Tokens, RefreshErro
     let refused = matches!(&response, Err(ureq::Error::Status(400 | 401, _)));
     json_response(response)
         .and_then(|value| parse_tokens(&value))
-        .map_err(|error| if refused { RefreshError::Rejected(error) } else { RefreshError::Failed(error) })
+        .map_err(|error| {
+            if refused {
+                RefreshError::Rejected(error)
+            } else {
+                RefreshError::Failed(error)
+            }
+        })
 }
 
 /// Serializes session checks within the process. Refresh tokens are single
@@ -552,10 +560,22 @@ mod tests {
 
     #[test]
     fn a_refused_refresh_token_is_rejected_and_a_server_error_is_not() {
-        assert!(matches!(refresh(&answering(401), "rt"), Err(RefreshError::Rejected(_))));
-        assert!(matches!(refresh(&answering(400), "rt"), Err(RefreshError::Rejected(_))));
-        assert!(matches!(refresh(&answering(500), "rt"), Err(RefreshError::Failed(_))));
-        assert!(matches!(refresh("http://127.0.0.1:1", "rt"), Err(RefreshError::Failed(_))));
+        assert!(matches!(
+            refresh(&answering(401), "rt"),
+            Err(RefreshError::Rejected(_))
+        ));
+        assert!(matches!(
+            refresh(&answering(400), "rt"),
+            Err(RefreshError::Rejected(_))
+        ));
+        assert!(matches!(
+            refresh(&answering(500), "rt"),
+            Err(RefreshError::Failed(_))
+        ));
+        assert!(matches!(
+            refresh("http://127.0.0.1:1", "rt"),
+            Err(RefreshError::Failed(_))
+        ));
     }
 
     #[test]

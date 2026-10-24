@@ -415,7 +415,9 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                             .filter_map(|r| Some((r.id, r.parent?)))
                             .collect();
                         for row in usage["sessions"].as_array_mut().into_iter().flatten() {
-                            if let Some(parent) = row["session"].as_str().and_then(|s| parents.get(s)) {
+                            if let Some(parent) =
+                                row["session"].as_str().and_then(|s| parents.get(s))
+                            {
                                 row["parent"] = json!(parent);
                             }
                         }

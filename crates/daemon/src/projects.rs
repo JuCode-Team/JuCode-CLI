@@ -314,10 +314,14 @@ pub fn extra_dirs(hub: &Hub, cwd: &Path, project: &str) -> Vec<PathBuf> {
 fn in_worktree_of(cwd: &Path, dir: &Path) -> bool {
     let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let cwd = real(cwd);
-    real(dir).ancestors().any(|repo| match (repo.parent(), repo.file_name()) {
-        (Some(parent), Some(name)) => cwd.starts_with(parent.join(".jucode-worktrees").join(name)),
-        _ => false,
-    })
+    real(dir)
+        .ancestors()
+        .any(|repo| match (repo.parent(), repo.file_name()) {
+            (Some(parent), Some(name)) => {
+                cwd.starts_with(parent.join(".jucode-worktrees").join(name))
+            }
+            _ => false,
+        })
 }
 
 /// The project session `id` belongs to ("": none, or one since removed).
@@ -397,8 +401,14 @@ mod tests {
     #[test]
     fn a_worktree_of_the_main_directory_is_apart_from_it() {
         let main = Path::new("/w/app");
-        assert!(in_worktree_of(Path::new("/w/.jucode-worktrees/app/sch-1/web"), main));
-        assert!(!in_worktree_of(Path::new("/w/.jucode-worktrees/app2/sch-1"), main));
+        assert!(in_worktree_of(
+            Path::new("/w/.jucode-worktrees/app/sch-1/web"),
+            main
+        ));
+        assert!(!in_worktree_of(
+            Path::new("/w/.jucode-worktrees/app2/sch-1"),
+            main
+        ));
         assert!(!in_worktree_of(Path::new("/w/app/web"), main));
         // A project in a folder of the repository, and another folder of it.
         let tree = Path::new("/w/.jucode-worktrees/repo/sch-1/web");
