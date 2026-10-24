@@ -18,7 +18,7 @@ use std::{
 const MAX_READ: u64 = 1024 * 1024;
 const MAX_ENTRIES: usize = 2000;
 const MAX_DIFF: usize = 1024 * 1024;
-/// Largest image sent to a client.
+/// Largest image or video sent to a client.
 const MAX_IMAGE: u64 = 16 * 1024 * 1024;
 
 pub fn handle(hub: &Hub, name: &str, op: &Value) -> Result<Value, String> {
@@ -235,7 +235,11 @@ fn image(hub: &Hub, path: &Path) -> Result<Value, String> {
         Some("jpg" | "jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
-        _ => return Err(format!("not an image: {}", real.display())),
+        // Short recordings an agent presents.
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mov") => "video/quicktime",
+        _ => return Err(format!("not an image or a video: {}", real.display())),
     };
     let meta = fs::metadata(&real).map_err(|error| format!("{}: {error}", real.display()))?;
     if meta.len() > MAX_IMAGE {

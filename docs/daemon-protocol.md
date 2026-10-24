@@ -156,7 +156,7 @@ every connected client.
 | `project_remove` | `workspace`, `project` | `workspaces`; the files stay |
 | `fs_list` | `path` (`~` is the home directory), optional `dirs_only` | `fs_list` with `path`, `git`, `entries: [{name, dir, size}]`, `truncated`. Git-ignored entries and `.git` are left out |
 | `fs_read` | `path` | `fs_read` with `size`, `binary`, `text` (first 1 MiB), `truncated` |
-| `fs_image` | `path` (a png/jpeg/gif/webp in a known directory or an upload, up to 16 MiB) | `fs_image` with `data`, a data URL: how the remote page shows a message's images |
+| `fs_image` | `path` (a png/jpeg/gif/webp image or an mp4/m4v/webm/mov video in a known directory or an upload, up to 16 MiB) | `fs_image` with `data`, a data URL: how the remote page shows a message's images and the images and videos an agent presented |
 | `git_status` | `path` | `git_status` with `repo`, `branch`, `files: [{path, status, from}]` (porcelain codes) |
 | `git_diff` | `path`, optional `file` | `git_diff` with `diff` (unified, untracked files included, first 1 MiB), `truncated` |
 | `session_usage` | `session` (its id) | `session_usage` with `totals`, `sessions` and `turns`: persisted and live usage, with settled gateway charges |
