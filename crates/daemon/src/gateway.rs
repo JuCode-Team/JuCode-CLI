@@ -590,6 +590,28 @@ fn serve_with(
         }
     }
     head.push_str("Connection: close\r\n\r\n");
+    // A custom Anthropic-format API that refuses Claude Code's mid-conversation
+    // system messages: told as Claude Code's gateway contract names it (same
+    // status), so it resends without them for the rest of the conversation.
+    if custom
+        .as_ref()
+        .is_some_and(|p| p["format"] == "anthropic" && matches!(response.status(), 400 | 422))
+    {
+        let mut body = Vec::new();
+        let _ = response.into_reader().take(1 << 20).read_to_end(&mut body);
+        if let Some(class) = capability_rejected(&request.body, &body) {
+            body = json!({"type": "error", "error": {
+                "type": "invalid_request_error",
+                "message": format!("capability_rejected: {class}"),
+            }})
+            .to_string()
+            .into_bytes();
+        }
+        return out
+            .write_all(head.as_bytes())
+            .and_then(|()| out.write_all(&body))
+            .map_err(|error| error.to_string());
+    }
     out.write_all(head.as_bytes())
         .map_err(|error| error.to_string())?;
     // Relayed as it arrives (server-sent events); a client that hangs up
@@ -647,6 +669,34 @@ fn serve_with(
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+/// The capability class (Claude Code's `capability_rejected: <class>`) an
+/// upstream's 400 refuses, when it is one the client can recover from. Only
+/// `mid_conv_system`: the request has a `{role: "system"}` message and the
+/// error names that message's path or a system role.
+fn capability_rejected(request: &[u8], reply: &[u8]) -> Option<&'static str> {
+    let body: Value = serde_json::from_slice(request).ok()?;
+    let system: Vec<usize> = body["messages"]
+        .as_array()?
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m["role"] == "system")
+        .map(|(i, _)| i)
+        .collect();
+    if system.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(reply).to_ascii_lowercase();
+    // `messages.1` / `messages[1]`, not `messages.12`.
+    let names = |path: &str| {
+        text.match_indices(path)
+            .any(|(at, _)| !text[at + path.len()..].starts_with(|c: char| c.is_ascii_digit()))
+    };
+    let at_path = system
+        .iter()
+        .any(|i| names(&format!("messages.{i}")) || names(&format!("messages[{i}]")));
+    (at_path || (text.contains("role") && text.contains("system"))).then_some("mid_conv_system")
 }
 
 /// Bounded incremental SSE/JSON usage reader; bytes forwarded remain untouched.
@@ -845,6 +895,27 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn a_refused_mid_conversation_system_message_is_named_for_claude_code() {
+        let request =
+            br#"{"messages":[{"role":"user","content":"hi"},{"role":"system","content":"env"}]}"#;
+        let refused = br#"{"type":"error","error":{"message":"Invalid input at messages.1.role"}}"#;
+        assert_eq!(
+            capability_rejected(request, refused),
+            Some("mid_conv_system")
+        );
+        let worded = br#"{"error":{"message":"Unexpected role 'system' in messages"}}"#;
+        assert_eq!(
+            capability_rejected(request, worded),
+            Some("mid_conv_system")
+        );
+        // Another message's path, or no system message: left as it is.
+        let other = br#"{"error":{"message":"Invalid input at messages.12.content"}}"#;
+        assert_eq!(capability_rejected(request, other), None);
+        let plain = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        assert_eq!(capability_rejected(plain, refused), None);
+    }
 
     #[test]
     fn hosts_must_be_loopback() {

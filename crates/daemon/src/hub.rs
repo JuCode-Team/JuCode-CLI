@@ -49,7 +49,6 @@ const SWEEP_EVERY_MS: u64 = 60 * 1000;
 
 pub struct Hub {
     pub store: Store,
-    pub requirements: crate::requirements::Requirements,
     pub uploads: crate::uploads::Uploads,
     pub push: crate::push::Push,
     /// Terminals (session TUIs, clients' shells) and the clients viewing
@@ -141,11 +140,6 @@ impl Hub {
         // `~/.jucode`: uploads live beside the daemon's state, not in it.
         let jucode_dir = store.dir().parent().unwrap_or(store.dir()).to_path_buf();
         let uploads = crate::uploads::Uploads::load(&jucode_dir);
-        let requirements = crate::requirements::Requirements::load(
-            store.dir(),
-            uploads.dir().join("requirements"),
-            &store.workspaces(),
-        );
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
             schedules,
@@ -155,7 +149,6 @@ impl Hub {
             children: Mutex::new(HashMap::new()),
             relay: Relay::new(relay, &store),
             usage: Usage::new(&store),
-            requirements,
             uploads,
             push: crate::push::Push::load(store.dir()),
             terminals: Default::default(),
@@ -356,8 +349,31 @@ impl Hub {
             engines::pin_tool_provider(&self.store, kind, &mut options);
         }
         let tool_provider = options.tool_provider.clone();
+        // Where a fork comes from, kept with it (a Claude fork that never got
+        // its first turn is made again from it, see `open_engine_session`).
+        let forked = options.fork_from.clone().map(
+            |from| json!({ "session": from, "turns": options.fork_turns, "at": options.resume_at }),
+        );
         let (id, ops, generation) = match engine {
-            None => session::spawn(Arc::clone(self), cwd.clone(), None, dirs)?,
+            None => {
+                // A fork: a copy of the conversation's first turns, resumed.
+                let resume = match &options.fork_from {
+                    Some(from) => Some(
+                        jucode_agent_core::fork_session(
+                            options.fork_cwd.as_deref().unwrap_or(&cwd),
+                            &cwd,
+                            from,
+                            options.fork_turns.map(|turns| turns as usize),
+                        )
+                        .map_err(|error| format!("cannot fork {from}: {error}"))?,
+                    ),
+                    None => None,
+                };
+                session::spawn(Arc::clone(self), cwd.clone(), resume, dirs)?
+            }
+            Some(engines::Kind::Acp) if options.fork_from.is_some() => {
+                return Err("an ACP agent's conversation cannot be forked".to_string());
+            }
             Some(kind) => {
                 // Claude Code takes its conversation id from us; others name it.
                 let id = match kind {
@@ -381,6 +397,11 @@ impl Hub {
         if let Some(provider) = tool_provider {
             self.store
                 .record_session_meta(&id, &json!({ "tool_provider": provider }))
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(source) = forked {
+            self.store
+                .record_session_meta(&id, &json!({ "forked_from": source }))
                 .map_err(|error| error.to_string())?;
         }
         lock(&self.untitled).insert(id.clone());
@@ -462,6 +483,7 @@ impl Hub {
                     agent: None,
                     agent_session: None,
                     tool_provider: None,
+                    forked_from: None,
                     worktree: None,
                     parent: None,
                 }
@@ -525,6 +547,14 @@ impl Hub {
                     }),
                     ..options
                 };
+                // A Claude fork closed before its first turn was never
+                // saved: fork it again rather than start it empty.
+                if let (engines::Kind::Claude, false, Some(source)) =
+                    (kind, saved, &record.forked_from)
+                {
+                    options.fork_from = source["session"].as_str().map(str::to_string);
+                    options.resume_at = source["at"].as_str().map(str::to_string);
+                }
                 engines::pin_tool_provider(&self.store, kind, &mut options);
                 tool_provider = options.tool_provider.clone();
                 // An ACP agent names its conversation itself: the session
@@ -769,10 +799,7 @@ impl Hub {
         }
     }
 
-    pub fn forward(&self, session: &str, mut op: Value) -> Result<(), String> {
-        if op["op"] == "set_approval_mode" && crate::requirements::gated(self, session) {
-            op["mode"] = json!(crate::requirements::read_only(self, session));
-        }
+    pub fn forward(&self, session: &str, op: Value) -> Result<(), String> {
         let mut sessions = lock(&self.sessions);
         let hosted = sessions
             .get_mut(session)
@@ -861,13 +888,6 @@ impl Hub {
         lock(&self.busy).contains(session)
     }
 
-    /// The end of a session's latest reply, as far as this daemon saw it.
-    pub fn last_reply(&self, session: &str) -> Option<String> {
-        let turns = lock(&self.turns);
-        let tail = turns.get(session)?.tail().trim();
-        (!tail.is_empty()).then(|| tail.to_string())
-    }
-
     /// Called by a session thread every tick: whether background work the
     /// turn left going runs (`any`), and whether some of it comes back to
     /// the conversation (`awaited`). Clients follow `any` in the session
@@ -928,28 +948,6 @@ impl Hub {
         if let Some(hub) = self.me.upgrade() {
             crate::push::notify(&hub, title, body, tag);
         }
-    }
-
-    /// `notify` whose notification opens `url` on the remote page.
-    pub fn notify_at(&self, title: &str, body: &str, tag: &str, url: &str) {
-        if let Some(hub) = self.me.upgrade() {
-            crate::push::notify_at(&hub, title, body, tag, url);
-        }
-    }
-
-    /// A session's conversation as the title model sees it for a note: its
-    /// first and latest requests and the end of its latest reply.
-    pub fn turn_excerpt(&self, session: &str) -> Option<String> {
-        let title = self
-            .store
-            .sessions()
-            .into_iter()
-            .find(|record| record.id == session)
-            .and_then(|record| record.title)
-            .unwrap_or_default();
-        lock(&self.turns)
-            .get(session)
-            .map(|turns| turns.excerpt(&title))
     }
 
     /// The session thread has handed a delivered message to its engine.
@@ -1109,27 +1107,19 @@ impl Hub {
         if event["type"] == "session_title" {
             self.adopt_engine_title(session, event["title"].as_str().unwrap_or_default());
         }
-        // `ended`: a turn with a reply ended; `over`: any turn did.
-        let (due, ended, over, failed) = {
+        // `over`: a turn ended.
+        let (due, over, failed) = {
             let mut turns = lock(&self.turns);
             let turns = turns.entry(session.to_string()).or_default();
-            let (done, running) = (turns.done(), turns.running());
+            let running = turns.running();
             let due = turns.observe(event);
-            (
-                due,
-                turns.done() != done,
-                running && !turns.running(),
-                turns.take_failed(),
-            )
+            (due, running && !turns.running(), turns.take_failed())
         };
         if due {
             self.retitle(session);
         }
         self.observe_run(session, event, over, failed.as_deref());
         crate::subsessions::observe(self, session, event, over, failed.as_deref());
-        if let Some(hub) = self.me.upgrade() {
-            crate::requirements::observe(&hub, session, event, ended);
-        }
     }
 
     /// Asks the title model for a title in the background, unless a client
@@ -1295,6 +1285,7 @@ impl Hub {
                     "engine": record.engine.as_deref().unwrap_or("jucode"),
                     "agent": record.agent,
                     "schedule": record.schedule,
+                    "forked_from": record.forked_from,
                     "worktree": record.worktree,
                     "parent": record.parent,
                     "open": hosted.is_some(),
@@ -1487,6 +1478,7 @@ mod tests {
             agent: None,
             agent_session: None,
             tool_provider: None,
+            forked_from: None,
             worktree: None,
             parent: None,
         };

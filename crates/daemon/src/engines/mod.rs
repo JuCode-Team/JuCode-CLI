@@ -13,7 +13,7 @@ pub mod codex;
 use crate::hub::Hub;
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -22,7 +22,7 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// How long a retired engine gets to exit on its own after its stdin closes.
@@ -67,6 +67,15 @@ pub struct Options {
     pub resume: Option<String>,
     /// Claude: resume the conversation as it was at this message.
     pub resume_at: Option<String>,
+    /// A new session that forks this conversation (the engine's id) instead
+    /// of starting empty; it goes on apart from it. Only the start uses it.
+    pub fork_from: Option<String>,
+    /// Codex / jucode: how many of `fork_from`'s user turns the fork keeps
+    /// (None: all). Claude forks at `resume_at` instead.
+    pub fork_turns: Option<u64>,
+    /// jucode: the directory `fork_from` was saved for, when the fork works
+    /// elsewhere (its own worktree). None: the fork's own.
+    pub fork_cwd: Option<PathBuf>,
     /// ACP: a built-in agent (`acp_presets`), by id.
     pub agent: Option<String>,
     /// ACP: the agent's command line.
@@ -118,6 +127,9 @@ impl Options {
             model: text("model"),
             resume: None,
             resume_at: text("resume_at"),
+            fork_from: text("fork_from"),
+            fork_turns: value["fork_turns"].as_u64(),
+            fork_cwd: text("fork_cwd").map(PathBuf::from),
             agent: text("agent"),
             command: text("command"),
             bin: text("bin"),
@@ -259,6 +271,9 @@ type Answer = (Value, Result<Value, String>);
 pub trait Adapter: Send {
     /// Frames to send once the engine started.
     fn start(&mut self) -> Vec<String>;
+    /// A probe's run (`probe`): nothing that waits on the user (a sign-in
+    /// in the browser) starts from it.
+    fn probing(&mut self) {}
     fn translate(&mut self, line: Line) -> Output;
     /// Frames for a client op; Err when the engine cannot do it.
     fn encode(&mut self, op: &Value) -> Result<Output, String>;
@@ -304,7 +319,7 @@ fn adapter(kind: Kind, cwd: &Path, options: &Options) -> Box<dyn Adapter> {
     match kind {
         Kind::Claude => Box::new(claude::Claude::new(options).at(cwd)),
         Kind::Codex => Box::new(codex::Codex::new(cwd, options)),
-        Kind::Acp => Box::new(acp::Acp::new(cwd, options)),
+        Kind::Acp => Box::new(acp::Acp::new(cwd, options).with_mcp(jucode_agent_core::acp_mcp_servers())),
     }
 }
 
@@ -482,6 +497,83 @@ pub(crate) fn plan_window(
 }
 
 /// A local gateway key is done with: no request may use it again.
+/// The events a probe keeps (the last of each kind): what a client shows of
+/// an engine before any conversation of it.
+const PROBE_KEEPS: &[&str] = &["model_status", "model_view", "engine_caps", "command_list", "session_options"];
+/// A probe gives up after this long, and waits this long for the model list
+/// once the engine has said something.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(25);
+const PROBE_SETTLE: Duration = Duration::from_secs(4);
+
+/// What an engine says of itself before any conversation (as t3code probes
+/// its providers): started in `cwd` as a session of it would be, out of every
+/// list, asked for its models, then stopped. Returns the last event of each
+/// PROBE_KEEPS kind it sent.
+pub fn probe(hub: &Hub, kind: Kind, cwd: &Path, options: &Options) -> Result<Vec<Value>, String> {
+    let id = new_uuid()?;
+    let (command, key) = command(hub, kind, &id, cwd, options)?;
+    let started = Process::spawn(command, cwd);
+    let process = match started {
+        Ok(process) => process,
+        Err(error) => {
+            if let Some(key) = &key {
+                release_key(kind, key);
+            }
+            return Err(error);
+        }
+    };
+    let mut engine = adapter(kind, cwd, options);
+    engine.probing();
+    process.write(engine.start());
+    let mut kept: HashMap<String, Value> = HashMap::new();
+    let keep = |events: Vec<Value>, kept: &mut HashMap<String, Value>| {
+        for event in events {
+            if let Some(kind) = event["type"].as_str().filter(|t| PROBE_KEEPS.contains(t)) {
+                kept.insert(kind.to_string(), event);
+            }
+        }
+    };
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let mut settle: Option<Instant> = None;
+    let mut asked = false;
+    loop {
+        let until = settle.map_or(deadline, |at| at.min(deadline));
+        let Some(wait) = until.checked_duration_since(Instant::now()) else { break };
+        match process.lines.recv_timeout(wait) {
+            Ok(Ok(line)) => {
+                let out = engine.translate(line);
+                process.write(out.frames);
+                keep(out.events, &mut kept);
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+        // Talking: it has a little longer to say the rest. Its conversation
+        // open (it said which model it is on): its models, asked for.
+        if settle.is_none() && !kept.is_empty() {
+            settle = Some(Instant::now() + PROBE_SETTLE);
+        }
+        if !asked && kept.contains_key("model_status") {
+            asked = true;
+            settle = Some(Instant::now() + PROBE_SETTLE);
+            if let Ok(out) = engine.encode(&json!({ "op": "command", "input": "/model" })) {
+                process.write(out.frames);
+                keep(out.events, &mut kept);
+            }
+        }
+        if kept.contains_key("model_view") {
+            break;
+        }
+    }
+    process.kill();
+    if let Some(key) = &key {
+        release_key(kind, key);
+    }
+    if kept.is_empty() {
+        return Err(format!("{} said nothing about itself", kind.name()));
+    }
+    Ok(kept.into_values().collect())
+}
+
 fn release_key(kind: Kind, key: &str) {
     crate::gateway::revoke(key);
     if kind == Kind::Claude {
@@ -659,6 +751,13 @@ const STATE_EVENTS: &[&str] = &[
     "pending_messages",
 ];
 
+/// Now, ms since the epoch: when a snapshot item happened.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
 impl Snapshot {
     pub fn seed(&mut self, transcript: Vec<Value>) {
         self.transcript = transcript;
@@ -677,7 +776,8 @@ impl Snapshot {
             }
             "user_message" => {
                 self.in_reply = false;
-                let mut item = json!({ "role": "user", "content": event["content"] });
+                let mut item =
+                    json!({ "role": "user", "content": event["content"], "at": now_ms() });
                 if event["images"].is_array() {
                     item["images"] = event["images"].clone();
                 }
@@ -686,13 +786,13 @@ impl Snapshot {
             "assistant_start" => {
                 self.in_reply = true;
                 self.transcript
-                    .push(json!({ "role": "assistant", "content": "" }));
+                    .push(json!({ "role": "assistant", "content": "", "at": now_ms() }));
             }
             "assistant_delta" => {
                 if !self.in_reply {
                     self.in_reply = true;
                     self.transcript
-                        .push(json!({ "role": "assistant", "content": "" }));
+                        .push(json!({ "role": "assistant", "content": "", "at": now_ms() }));
                 }
                 if let Some(last) = self.transcript.last_mut() {
                     let text = format!(
@@ -705,9 +805,14 @@ impl Snapshot {
             }
             "tool_start" => {
                 self.in_reply = false;
-                self.transcript.push(json!({
-                    "role": "tool", "name": event["name"], "output": "", "call_id": event["call_id"],
-                }));
+                let mut item = json!({
+                    "role": "tool", "name": event["name"], "output": "", "call_id": event["call_id"], "at": now_ms(),
+                });
+                // A subagent's call: the client keeps it out of this conversation.
+                if event["subagent"].is_string() {
+                    item["subagent"] = event["subagent"].clone();
+                }
+                self.transcript.push(item);
             }
             "tool_output" => {
                 if let Some(item) = self
@@ -717,6 +822,9 @@ impl Snapshot {
                     .find(|item| item["call_id"] == event["call_id"])
                 {
                     item["output"] = event["output"].clone();
+                    if event["is_error"] == true {
+                        item["is_error"] = json!(true);
+                    }
                 }
             }
             "approval_request" => {
@@ -818,10 +926,6 @@ pub fn spawn(
     options: Options,
     transcript: Vec<Value>,
 ) -> Result<(String, Sender<Value>, u64), String> {
-    let gated = id
-        .as_deref()
-        .or(options.resume.as_deref())
-        .is_some_and(|session| crate::requirements::gated(&hub, session));
     let custom = custom_provider(&hub.store, kind, &options)?;
     let options = Options {
         model: options
@@ -829,11 +933,6 @@ pub fn spawn(
             .clone()
             .or_else(|| custom.and_then(|p| p["model"].as_str().map(str::to_string))),
         app_tools_off: app_tools_off(&hub.store),
-        approval_mode: if gated {
-            Some("read-only".to_string())
-        } else {
-            options.approval_mode
-        },
         ..options
     };
     let (command, gateway_key) = command(
@@ -1010,8 +1109,14 @@ impl Session<'_> {
             tool_provider_event(&self.hub.store, self.kind, &options),
             json!({ "type": "background_tasks", "tasks": [] }),
         ]);
-        // What the process runs as now (a restart changes it).
-        let mut current = options.clone();
+        // What the process runs as now (a restart changes it). A fork is made
+        // once: a restart goes on with the forked conversation.
+        let mut current = Options {
+            fork_from: None,
+            fork_turns: None,
+            fork_cwd: None,
+            ..options.clone()
+        };
         // Session tools answer from their own threads (`wait_session` blocks).
         let (answers_tx, answers) = mpsc::channel::<Answer>();
         // ACP: the agent's conversation id as last recorded.
@@ -1811,6 +1916,8 @@ mod tests {
             json!({ "type": "assistant_delta", "delta": "lo" }),
             json!({ "type": "tool_start", "call_id": "t1", "name": "bash" }),
             json!({ "type": "tool_output", "call_id": "t1", "name": "bash", "output": "ok", "is_error": false }),
+            json!({ "type": "tool_start", "call_id": "t2", "name": "read", "subagent": "Scan" }),
+            json!({ "type": "tool_output", "call_id": "t2", "name": "read", "output": "no", "is_error": true }),
             json!({ "type": "approval_request", "call_id": "a1", "name": "bash" }),
             json!({ "type": "approval_request", "call_id": "a2", "name": "write" }),
         ] {
@@ -1820,12 +1927,25 @@ mod tests {
         let events = snapshot.events(true);
         assert_eq!(events[0], json!({ "type": "startup", "model": "b" }));
         let transcript = events.iter().find(|e| e["type"] == "transcript").unwrap();
+        // Each item says when it happened.
+        let items: Vec<Value> = transcript["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                assert!(item["at"].as_u64().is_some_and(|at| at > 0), "{item}");
+                let mut item = item.clone();
+                item.as_object_mut().unwrap().remove("at");
+                item
+            })
+            .collect();
         assert_eq!(
-            transcript["items"],
+            json!(items),
             json!([
                 { "role": "user", "content": "hi" },
                 { "role": "assistant", "content": "hello" },
                 { "role": "tool", "name": "bash", "output": "ok" },
+                { "role": "tool", "name": "read", "output": "no", "subagent": "Scan", "is_error": true },
             ])
         );
         let open: Vec<&Value> = events

@@ -81,6 +81,8 @@ pub struct SessionRecord {
     /// Claude / Codex: the custom provider it last ran on off the gateway
     /// ("": the tool's own configuration; None: not recorded).
     pub tool_provider: Option<String>,
+    /// The conversation it was forked from: `{session, turns, at}`.
+    pub forked_from: Option<Value>,
     /// The git worktree the daemon made for it (a scheduled run's):
     /// `{repo, path, branch, base, slug}`.
     pub worktree: Option<Value>,
@@ -192,6 +194,9 @@ impl Store {
             }
             if let Some(provider) = &record.tool_provider {
                 meta["tool_provider"] = json!(provider);
+            }
+            if let Some(source) = &record.forked_from {
+                meta["forked_from"] = source.clone();
             }
             if let Some(tree) = &record.worktree {
                 meta["worktree"] = tree.clone();
@@ -401,6 +406,10 @@ impl Store {
             entry["tool_provider"] = json!(provider);
             changed = true;
         }
+        if changes["forked_from"].is_object() {
+            entry["forked_from"] = changes["forked_from"].clone();
+            changed = true;
+        }
         if changes["worktree"].is_object() {
             entry["worktree"] = changes["worktree"].clone();
             changed = true;
@@ -477,6 +486,7 @@ impl Store {
                             agent: None,
                             agent_session: None,
                             tool_provider: None,
+                            forked_from: None,
                             worktree: None,
                             parent: None,
                         }
@@ -519,6 +529,9 @@ impl Store {
                         }
                         if let Some(provider) = entry["tool_provider"].as_str() {
                             record.tool_provider = Some(provider.to_string());
+                        }
+                        if entry["forked_from"].is_object() {
+                            record.forked_from = Some(entry["forked_from"].clone());
                         }
                         if entry["worktree"].is_object() {
                             record.worktree = Some(entry["worktree"].clone());
@@ -1021,6 +1034,35 @@ mod tests {
             .record_engine_session("c", cwd, None, Some("claude"), false, None, None)
             .unwrap();
         assert!(!store.sessions()[0].gateway);
+    }
+
+    #[test]
+    fn a_fork_keeps_where_it_came_from() {
+        let dir =
+            std::env::temp_dir().join(format!("jucode-daemon-store-fork-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = Store::open(dir.clone()).unwrap();
+        store
+            .record_engine_session(
+                "f",
+                std::path::Path::new("/p"),
+                None,
+                Some("claude"),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let source = json!({ "session": "orig", "turns": 2, "at": "u-1" });
+        assert!(store
+            .record_session_meta("f", &json!({ "forked_from": source }))
+            .unwrap());
+        assert_eq!(store.sessions()[0].forked_from, Some(source.clone()));
+        // Kept when the log is rewritten.
+        drop(store);
+        let store = Store::open(dir.clone()).unwrap();
+        assert_eq!(store.sessions()[0].forked_from, Some(source));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

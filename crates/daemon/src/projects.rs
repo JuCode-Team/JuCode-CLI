@@ -388,6 +388,7 @@ mod tests {
             agent: None,
             agent_session: None,
             tool_provider: None,
+            forked_from: None,
             worktree: None,
             parent: None,
         }

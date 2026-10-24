@@ -25,7 +25,7 @@ use super::{
     claude, find_program, Adapter, Line, Options, Output,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
-use jucode_agent_core::queue_index;
+use jucode_agent_core::{queue_index, queue_move_target};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
@@ -120,6 +120,10 @@ fn image_block(path: &str) -> Option<Value> {
 }
 
 /// A select option's choices, groups flattened.
+/// The id of the model select made of an agent's `models` (it sets them with
+/// `session/set_model`), for one with no model config option.
+const MODEL_STATE: &str = "_models";
+
 fn choices(option: &Value) -> Vec<&Value> {
     option["options"]
         .as_array()
@@ -177,16 +181,48 @@ struct Tool {
     name: String,
     kind: String,
     path: String,
+    /// A terminal call's command (`rawInput.command`, as OpenCode and
+    /// oh-my-pi send it; the title may only name the tool).
+    command: String,
     text: String,
     diff: String,
+    /// The call ended `failed` (a replayed one keeps it).
+    failed: bool,
 }
 
 impl Tool {
+    /// The name clients render it by: a terminal call is a `bash` card (its
+    /// command and output), whatever the agent titles it.
+    fn display_name(&self) -> &str {
+        if self.kind == "execute" {
+            "bash"
+        } else {
+            &self.name
+        }
+    }
+
+    /// The input an update reports (`rawInput`, sent whole each time).
+    fn take_input(&mut self, input: &Value) {
+        if let Some(command) = [&input["command"], &input["cmd"]]
+            .into_iter()
+            .map(text)
+            .find(|c| !c.is_empty())
+        {
+            self.command = command.to_string();
+        }
+    }
+
     fn output(&self) -> String {
         let mut out = json!({ "kind": self.kind });
+        let text_key = if self.kind == "execute" {
+            "stdout"
+        } else {
+            "content"
+        };
         for (key, value) in [
             ("path", &self.path),
-            ("content", &self.text),
+            ("command", &self.command),
+            (text_key, &self.text),
             ("diff", &self.diff),
         ] {
             if !value.is_empty() {
@@ -249,6 +285,18 @@ pub struct Acp {
     mode: Mode,
     agent: Value,
     auth: Value,
+    /// Every way it signs in (`authMethods`), and whether one was tried.
+    auths: Vec<Value>,
+    authenticated: bool,
+    /// A probe's run: no sign-in starts from it.
+    probing: bool,
+    /// The user's MCP servers (jucode_agent_core::acp_mcp_servers), and
+    /// whether the agent takes http ones.
+    mcp: Vec<Value>,
+    mcp_http: bool,
+    /// The agent's `models` (SessionModelState), for one with no model
+    /// config option: a select of them is kept among `config` (MODEL_STATE).
+    models: Value,
     load_session: bool,
     resume_session: bool,
     image_prompts: bool,
@@ -290,6 +338,12 @@ impl Acp {
             mode: Mode::of(options.approval_mode.as_deref()),
             agent: Value::Null,
             auth: Value::Null,
+            auths: Vec::new(),
+            authenticated: false,
+            probing: false,
+            mcp: Vec::new(),
+            mcp_http: false,
+            models: Value::Null,
             load_session: false,
             resume_session: false,
             image_prompts: false,
@@ -390,16 +444,65 @@ impl Acp {
         Some(output)
     }
 
+    /// The MCP servers it is given: every stdio one, http ones if it takes them.
+    pub fn with_mcp(mut self, servers: Vec<Value>) -> Self {
+        self.mcp = servers;
+        self
+    }
+
+    fn mcp_servers(&self) -> Vec<Value> {
+        self.mcp
+            .iter()
+            .filter(|server| server["type"] != "http" || self.mcp_http)
+            .cloned()
+            .collect()
+    }
+
     fn new_session(&mut self) -> String {
         let cwd = self.cwd.clone();
-        self.request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
+        let mcp = self.mcp_servers();
+        self.request("session/new", json!({ "cwd": cwd, "mcpServers": mcp }))
+    }
+
+    /// Whether the agent has config options of its own (not only the model
+    /// select made of its `models`).
+    fn has_config(&self) -> bool {
+        self.config.iter().any(|option| option["id"] != MODEL_STATE)
+    }
+
+    /// The model select made of the agent's `models`, kept among `config`
+    /// while it has no model config option of its own.
+    fn with_model_state(&mut self) {
+        self.config.retain(|option| option["id"] != MODEL_STATE);
+        let models = self.models["availableModels"].as_array().filter(|m| !m.is_empty());
+        let (Some(models), None) = (models, self.select("model")) else {
+            return;
+        };
+        let choices: Vec<Value> = models
+            .iter()
+            .map(|m| json!({ "value": m["modelId"], "name": m["name"], "description": m["description"] }))
+            .collect();
+        self.config.push(json!({
+            "id": MODEL_STATE, "name": "Model", "category": "model", "type": "select",
+            "currentValue": self.models["currentModelId"], "options": choices,
+        }));
+    }
+
+    /// A way to sign in the agent runs itself (`authenticate`): not one that
+    /// needs a terminal or an environment variable set.
+    fn auth_method(&self) -> Option<Value> {
+        self.auths
+            .iter()
+            .find(|m| !matches!(text(&m["type"]), "terminal" | "env_var") && m["_meta"]["terminal-auth"].is_null())
+            .cloned()
     }
 
     /// Opens the conversation: the one to reopen when the agent can, else a
     /// new one (and the user is told).
     fn open(&mut self) -> Output {
         let cwd = self.cwd.clone();
-        let params = |id: &str| json!({ "sessionId": id, "cwd": cwd, "mcpServers": [] });
+        let mcp = self.mcp_servers();
+        let params = |id: &str| json!({ "sessionId": id, "cwd": cwd, "mcpServers": mcp });
         match self.resume.clone() {
             Some(id) if self.load_session => {
                 self.replay = Some(Vec::new());
@@ -486,7 +589,7 @@ impl Acp {
             .flatten()
             .map(|option| &option["id"])
             .collect();
-        let options: Vec<Value> = if self.config.is_empty() {
+        let options: Vec<Value> = if !self.has_config() {
             self.modes["availableModes"]
                 .as_array()
                 .map(|modes| {
@@ -558,6 +661,7 @@ impl Acp {
         if let Some(options) = options.as_array() {
             self.config = options.clone();
         }
+        self.with_model_state();
         let mut events: Vec<Value> = self.model_status().into_iter().collect();
         events.push(self.session_options());
         events.extend(self.caps_changed());
@@ -568,6 +672,10 @@ impl Acp {
     /// boolean).
     fn set_option(&mut self, id: &Value, value: &Value) -> String {
         let session = self.session.clone();
+        // A model of the agent's `models`: `session/set_model`.
+        if id == MODEL_STATE {
+            return self.request("session/set_model", json!({ "sessionId": session, "modelId": value }));
+        }
         let mut params = json!({ "sessionId": session, "configId": id, "value": value });
         if value.is_boolean() {
             params["type"] = json!("boolean");
@@ -582,6 +690,8 @@ impl Acp {
             .cloned()
             .unwrap_or_default();
         self.modes = result["modes"].clone();
+        self.models = result["models"].clone();
+        self.with_model_state();
         let mut events = Vec::new();
         if let Some(mut items) = self.replay.take() {
             self.tools.clear();
@@ -698,8 +808,17 @@ impl Acp {
                 }
                 set(&mut tool.name, text(&update["title"]));
                 set(&mut tool.path, text(&update["locations"][0]["path"]));
+                tool.take_input(&update["rawInput"]);
                 tool.absorb(&update["content"]);
-                let item = json!({ "role": "tool", "name": tool.name, "output": tool.output(), "call_id": id });
+                match text(&update["status"]) {
+                    "failed" => tool.failed = true,
+                    "completed" => tool.failed = false,
+                    _ => {}
+                }
+                let mut item = json!({ "role": "tool", "name": tool.display_name(), "output": tool.output(), "call_id": id });
+                if tool.failed {
+                    item["is_error"] = json!(true);
+                }
                 match items.iter_mut().find(|item| item["call_id"] == id.as_str()) {
                     Some(known) => *known = item,
                     None => items.push(item),
@@ -763,14 +882,15 @@ impl Acp {
                     path: text(&update["locations"][0]["path"]).to_string(),
                     ..Tool::default()
                 };
+                tool.take_input(&update["rawInput"]);
                 tool.absorb(&update["content"]);
                 let mut events = vec![
-                    json!({ "type": "tool_start", "call_id": id, "name": tool.name }),
+                    json!({ "type": "tool_start", "call_id": id, "name": tool.display_name() }),
                     json!({ "type": "tool_update", "call_id": id, "output": tool.output() }),
                 ];
                 let status = text(&update["status"]);
                 if matches!(status, "completed" | "failed") {
-                    events.push(json!({ "type": "tool_output", "call_id": id, "name": tool.name, "output": tool.output(), "is_error": status == "failed" }));
+                    events.push(json!({ "type": "tool_output", "call_id": id, "name": tool.display_name(), "output": tool.output(), "is_error": status == "failed" }));
                 } else {
                     self.tools.insert(id, tool);
                 }
@@ -787,12 +907,13 @@ impl Acp {
                 if !text(&update["locations"][0]["path"]).is_empty() {
                     tool.path = text(&update["locations"][0]["path"]).to_string();
                 }
+                tool.take_input(&update["rawInput"]);
                 tool.absorb(&update["content"]);
                 let status = text(&update["status"]);
                 if matches!(status, "completed" | "failed") {
                     let tool = self.tools.remove(&id).unwrap_or_default();
                     vec![
-                        json!({ "type": "tool_output", "call_id": id, "name": tool.name, "output": tool.output(), "is_error": status == "failed" }),
+                        json!({ "type": "tool_output", "call_id": id, "name": tool.display_name(), "output": tool.output(), "is_error": status == "failed" }),
                     ]
                 } else {
                     vec![json!({ "type": "tool_update", "call_id": id, "output": tool.output() })]
@@ -800,7 +921,7 @@ impl Acp {
             }
             "plan" => vec![plan(update)],
             "config_option_update" => self.config_changed(&update["configOptions"]),
-            "current_mode_update" if self.config.is_empty() => {
+            "current_mode_update" if !self.has_config() => {
                 self.modes["currentModeId"] = update["currentModeId"].clone();
                 vec![self.session_options()]
             }
@@ -860,7 +981,16 @@ impl Acp {
                 self.resume_session = caps["sessionCapabilities"]["resume"].is_object();
                 self.agent = result["agentInfo"].clone();
                 self.auth = result["authMethods"][0].clone();
+                self.auths = result["authMethods"].as_array().cloned().unwrap_or_default();
+                self.mcp_http = caps["mcpCapabilities"]["http"] == true;
                 self.open()
+            }
+            // Signed in: the session it could not open before.
+            "authenticate" => self.open(),
+            "session/set_model" => {
+                self.models["currentModelId"] = params["modelId"].clone();
+                self.with_model_state();
+                Output::events(self.model_status().into_iter().collect())
             }
             "session/new" => {
                 self.session = result["sessionId"]
@@ -905,7 +1035,19 @@ impl Acp {
             "" => format!("JSON-RPC error {}", error["code"]),
             message => message.to_string(),
         };
-        let message = if method == "session/new" && error["code"] == -32000 {
+        // Not signed in: once, the way the agent signs in by itself (it may
+        // open the browser); then the session again (`authenticate` above).
+        if method == "session/new" && error["code"] == -32000 && !self.authenticated && !self.probing {
+            if let Some(how) = self.auth_method() {
+                self.authenticated = true;
+                let name = [&how["name"], &how["id"]].into_iter().map(text).find(|n| !n.is_empty()).unwrap_or_default().to_string();
+                return Output {
+                    frames: vec![self.request("authenticate", json!({ "methodId": how["id"] }))],
+                    events: vec![json!({ "type": "info", "message": format!("[acp] signing in to {} ({name})…", self.agent_name()) })],
+                };
+            }
+        }
+        let message = if (method == "session/new" && error["code"] == -32000) || method == "authenticate" {
             let how = [&self.auth["description"], &self.auth["name"]]
                 .into_iter()
                 .map(text)
@@ -929,13 +1071,13 @@ impl Acp {
                 output.events.push(json!({ "type": "info", "message": "[acp] this agent cannot reopen conversations; a new one started" }));
                 output.frames.push(self.new_session());
             }
-            "session/new" | "initialize" => {
+            "session/new" | "initialize" | "authenticate" => {
                 if !self.queued.is_empty() {
                     self.queued.clear();
                     output.events.push(json!({ "type": "error", "message": "The agent could not open a session; the messages waiting for it were not sent" }));
                     output.events.push(self.pending_event());
                 }
-                self.session_failed = method == "session/new";
+                self.session_failed = method != "initialize";
                 output
                     .events
                     .push(json!({ "type": "status", "message": "ready" }));
@@ -1043,7 +1185,7 @@ impl Acp {
     fn set_session_option(&mut self, op: &Value) -> Result<Output, String> {
         let id = text(&op["id"]);
         let value = &op["value"];
-        if self.config.is_empty() && id == "mode" && self.modes.is_object() {
+        if !self.has_config() && id == "mode" && self.modes.is_object() {
             let session = self.session.clone();
             let frame = self.request(
                 "session/set_mode",
@@ -1075,6 +1217,10 @@ fn plan(update: &Value) -> Value {
 }
 
 impl Adapter for Acp {
+    fn probing(&mut self) {
+        self.probing = true;
+    }
+
     fn start(&mut self) -> Vec<String> {
         vec![self.request(
             "initialize",
@@ -1228,10 +1374,25 @@ impl Adapter for Acp {
                 else {
                     return Ok(Output::default());
                 };
+                if op["discard"] == true {
+                    return Ok(Output::events(vec![self.pending_event()]));
+                }
                 return Ok(Output::events(vec![
                     self.pending_event(),
                     json!({ "type": "unqueued", "content": content, "images": images }),
                 ]));
+            }
+            // A waiting message to another place: `index` to `to`.
+            "queue_move" => {
+                let Some((from, to)) =
+                    queue_move_target(op["index"].as_i64(), op["to"].as_i64(), self.queued.len())
+                else {
+                    return Ok(Output::default());
+                };
+                if let Some(item) = self.queued.remove(from) {
+                    self.queued.insert(to, item);
+                }
+                return Ok(Output::events(vec![self.pending_event()]));
             }
             "shutdown" => vec![],
             other => return Err(format!("ACP agents do not support {other}")),
@@ -1803,16 +1964,75 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_that_needs_sign_in_says_how() {
+    fn an_agent_that_needs_sign_in_signs_in_once_then_says_how() {
         let (mut a, _) = started(omp(), json!({}));
+        // Not signed in: the agent's own way, then the session again.
         let out = frame(
             &mut a,
             json!({ "id": 2, "error": { "code": -32000, "message": "Authentication required" } }),
         );
+        let sent = sent(&out.frames);
+        assert_eq!((sent[0]["method"].as_str(), &sent[0]["params"]["methodId"]), (Some("authenticate"), &json!("agent")));
+        let out = frame(&mut a, json!({ "id": 3, "result": {} }));
+        assert_eq!(super::tests::sent(&out.frames)[0]["method"], "session/new");
+        // Still not: it says how, and does not try again.
+        let out = frame(
+            &mut a,
+            json!({ "id": 4, "error": { "code": -32000, "message": "Authentication required" } }),
+        );
+        assert!(out.frames.is_empty());
         assert_eq!(
             out.events[0]["message"],
             "[acp] Oh My Pi needs sign-in: Run omp login"
         );
+    }
+
+    #[test]
+    fn a_probe_does_not_sign_in() {
+        let mut a = Acp::new(Path::new("/p"), &omp());
+        a.probing();
+        a.start();
+        frame(&mut a, json!({ "id": 1, "result": { "protocolVersion": 1, "agentCapabilities": {}, "authMethods": [{ "id": "agent", "name": "Agent login" }] } }));
+        let out = frame(&mut a, json!({ "id": 2, "error": { "code": -32000, "message": "Authentication required" } }));
+        assert!(out.frames.is_empty());
+    }
+
+    #[test]
+    fn mcp_servers_go_to_the_agent_http_ones_only_if_it_takes_them() {
+        let servers = vec![
+            json!({ "name": "files", "command": "mcp-files", "args": [], "env": [] }),
+            json!({ "type": "http", "name": "web", "url": "https://x/mcp", "headers": [] }),
+        ];
+        for (http, count) in [(false, 1), (true, 2)] {
+            let mut a = Acp::new(Path::new("/p"), &omp()).with_mcp(servers.clone());
+            a.start();
+            let out = frame(&mut a, json!({ "id": 1, "result": { "protocolVersion": 1, "agentCapabilities": { "mcpCapabilities": { "http": http } } } }));
+            let new = &sent(&out.frames)[0];
+            assert_eq!(new["method"], "session/new");
+            assert_eq!(new["params"]["mcpServers"].as_array().unwrap().len(), count);
+        }
+    }
+
+    #[test]
+    fn an_agents_models_without_a_config_option_are_picked_with_set_model() {
+        let (mut a, _) = started(omp(), json!({}));
+        let out = frame(
+            &mut a,
+            json!({ "id": 2, "result": { "sessionId": "s1", "models": { "currentModelId": "flash", "availableModels": [
+                { "modelId": "flash", "name": "Gemini Flash" }, { "modelId": "pro", "name": "Gemini Pro" }] } } }),
+        );
+        let status = out.events.iter().find(|e| e["type"] == "model_status").unwrap();
+        assert_eq!(status["model"], "flash");
+        let view = a.encode(&json!({ "op": "command", "input": "/model" })).unwrap();
+        assert_eq!(view.events[0]["models"].as_array().unwrap().len(), 2);
+        let set = a.encode(&json!({ "op": "command", "input": "/model pro" })).unwrap();
+        let sent = sent(&set.frames);
+        assert_eq!((sent[0]["method"].as_str(), &sent[0]["params"]["modelId"]), (Some("session/set_model"), &json!("pro")));
+        let id = sent[0]["id"].as_u64().unwrap();
+        let out = frame(&mut a, json!({ "id": id, "result": {} }));
+        assert_eq!(out.events[0]["model"], "pro");
+        // Its own model option, once it has one, wins.
+        assert_eq!(a.session_options()["options"].as_array().map(Vec::len), Some(0));
     }
 
     #[test]
@@ -2137,6 +2357,30 @@ mod tests {
         );
         assert_eq!(done.events[0]["type"], "tool_output");
         assert!(text(&done.events[0]["output"]).contains("a.rs"));
+    }
+
+    #[test]
+    fn terminal_calls_are_bash_cards_with_their_command() {
+        // OpenCode: announced as "shell" before the input streams in; the
+        // command comes in a later update's `rawInput`.
+        let mut a = opened();
+        let start = update(
+            &mut a,
+            json!({ "sessionUpdate": "tool_call", "toolCallId": "t", "title": "shell", "kind": "execute", "status": "pending", "rawInput": { "cwd": "/p" }, "locations": [{ "path": "/p" }] }),
+        );
+        assert_eq!(start.events[0]["name"], "bash");
+        update(
+            &mut a,
+            json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t", "status": "in_progress", "kind": "execute", "title": "ls -a", "rawInput": { "command": "ls -a", "description": "List", "cwd": "/p" } }),
+        );
+        let done = update(
+            &mut a,
+            json!({ "sessionUpdate": "tool_call_update", "toolCallId": "t", "status": "completed", "content": [{ "type": "content", "content": { "type": "text", "text": "a.rs" } }] }),
+        );
+        assert_eq!(done.events[0]["name"], "bash");
+        let output: Value = serde_json::from_str(text(&done.events[0]["output"])).unwrap();
+        assert_eq!(output["command"], "ls -a");
+        assert_eq!(output["stdout"], "a.rs");
     }
 
     #[test]

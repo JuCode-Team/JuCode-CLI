@@ -56,8 +56,20 @@ pub fn apply_op(core: &mut AgentCore, value: &Value) -> (bool, Vec<AgentEvent>) 
         "continue" => core.continue_turn(),
         // A queued message into the running turn: `index`, negative from the last.
         "steer" => core.steer(value.get("index").and_then(Value::as_i64)),
-        // A queued message taken back: `index`, negative from the last.
-        "unqueue" => core.unqueue(value.get("index").and_then(Value::as_i64)),
+        // A queued message taken back (dropped with `discard`): `index`,
+        // negative from the last.
+        "unqueue" => core.unqueue(
+            value.get("index").and_then(Value::as_i64),
+            value
+                .get("discard")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+        // A queued message to another place: `index` to `to`.
+        "queue_move" => core.queue_move(
+            value.get("index").and_then(Value::as_i64),
+            value.get("to").and_then(Value::as_i64),
+        ),
         "interrupt" => match value.get("index").and_then(Value::as_i64) {
             Some(index) => core.interrupt_send(Some(index)),
             None => core.interrupt(),
@@ -499,7 +511,8 @@ pub fn event_json(event: AgentEvent) -> Value {
         }),
         AgentEvent::Transcript(items) => json!({
             "type": "transcript",
-            "items": items.into_iter().map(|item| match item {
+            "items": items.into_iter().map(|(item, at)| {
+                let mut row = match item {
                 crate::TranscriptItem::User(content) => json!({ "role": "user", "content": content }),
                 crate::TranscriptItem::UserWithImages { content, images } => {
                     json!({ "role": "user", "content": content, "images": images })
@@ -510,6 +523,12 @@ pub fn event_json(event: AgentEvent) -> Value {
                 crate::TranscriptItem::Plan { id, title, content, status } => json!({
                     "role": "plan", "id": id, "title": title, "content": content, "status": status,
                 }),
+                };
+                // When it was written, ms.
+                if at > 0 {
+                    row["at"] = json!(at * 1000);
+                }
+                row
             }).collect::<Vec<_>>()
         }),
         AgentEvent::Info(message) => json!({ "type": "info", "message": message }),

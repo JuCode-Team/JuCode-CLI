@@ -97,7 +97,7 @@ fn start(
         return Err("engine must be claude, codex or jucode".to_string());
     }
     let kind = engines::Kind::parse(engine)?;
-    let mode = crate::requirements::engine_mode(kind, &parent.mode).unwrap_or(if kind.is_none() {
+    let mode = crate::schedules::engine_mode(kind, &parent.mode).unwrap_or(if kind.is_none() {
         "manual"
     } else {
         "read-only"

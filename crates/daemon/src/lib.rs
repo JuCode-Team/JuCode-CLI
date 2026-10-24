@@ -17,7 +17,6 @@ pub mod noise;
 mod projects;
 mod push;
 mod relay;
-mod requirements;
 mod schedules;
 mod session;
 mod skills;
@@ -233,7 +232,6 @@ fn pump(
         projects::workspaces_json(hub),
         hub.schedules_json(),
         hub.actions_json(),
-        hub.requirements.json(hub),
         hub.dev_servers.json(),
     ] {
         link.send(&frame.to_string())?;
@@ -341,10 +339,23 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     }
     if matches!(
         name,
-        "tool_providers" | "tool_provider_save" | "tool_provider_remove" | "tool_provider_select"
+        "tool_providers"
+            | "tool_provider_save"
+            | "tool_provider_remove"
+            | "tool_provider_select"
+            | "tool_provider_models"
     ) {
         if !hub.is_local(client) {
             reply(json!({"type":"error","message":"only the desktop can manage tool providers"}));
+            return;
+        }
+        // Asks the provider's API: off this connection's thread.
+        if name == "tool_provider_models" {
+            let hub = Arc::clone(hub);
+            thread::spawn(move || {
+                let result = tool_providers::models(&hub.store, &op);
+                respond(&hub, client, &request, result);
+            });
             return;
         }
         respond(
@@ -480,7 +491,7 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     }
     // A program to run (an ACP agent, an engine binary, its environment):
     // only the desktop names one. A built-in ACP agent is the daemon's.
-    if matches!(name, "session_create" | "session_open") {
+    if matches!(name, "session_create" | "session_open" | "engine_probe") {
         let options = engines::Options::from_json(&op["options"]);
         let acp = op["engine"] == "acp";
         if options.runs_programs() && !hub.is_local(client) {
@@ -500,6 +511,24 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             reply(json!({ "type": "error", "message": message }));
             return;
         }
+    }
+    // What an engine says of itself before any conversation (its models,
+    // commands, options), from a run of it that no list shows. It takes
+    // seconds, so it answers from a thread of its own.
+    if name == "engine_probe" {
+        let options = engines::Options::from_json(&op["options"]);
+        let cwd = op["cwd"].as_str().map_or_else(engines::home, PathBuf::from);
+        let engine = op["engine"].as_str().unwrap_or_default().to_string();
+        let hub = Arc::clone(hub);
+        thread::spawn(move || {
+            let result = engines::Kind::parse(&engine).and_then(|kind| match kind {
+                Some(kind) => engines::probe(&hub, kind, &cwd, &options)
+                    .map(|events| json!({ "type": "engine_probed", "events": events })),
+                None => Err("the jucode engine needs no probe".to_string()),
+            });
+            respond(&hub, client, &request, result);
+        });
+        return;
     }
     let result = match (name, session) {
         ("ping", _) => Ok(json!({ "type": "pong" })),
@@ -584,31 +613,6 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 )
             })
             .map(|session| json!({ "type": "session_created", "session": session })),
-        // The requirement's id comes as `requirement` (`id` is the request's).
-        ("requirement_list", _) => Ok(hub.requirements.json(hub)),
-        ("requirement_create", _) => requirements::create(hub, &op),
-        ("requirement_update", _) => requirements::update(hub, &op),
-        ("requirement_delete", _) => {
-            requirements::delete(hub, op["requirement"].as_str().unwrap_or_default())
-        }
-        ("requirement_link" | "requirement_unlink", Some(session)) => {
-            let id = op["requirement"].as_str().unwrap_or_default();
-            if name == "requirement_link" {
-                requirements::link(hub, id, &session)
-                    .map(|()| json!({ "type": "requirement_linked", "requirement": id, "session": session }))
-            } else {
-                requirements::unlink(hub, id, &session)
-                    .map(|()| json!({ "type": "requirement_unlinked", "requirement": id, "session": session }))
-            }
-        }
-        ("requirement_image", _) => requirements::image(
-            hub,
-            op["requirement"].as_str().unwrap_or_default(),
-            op["index"].as_u64().unwrap_or(0) as usize,
-        ),
-        ("requirement_reply", _) => requirements::reply(hub, &op),
-        ("requirement_begin", _) => requirements::begin(hub, &op),
-        ("requirement_confirm", _) => requirements::confirm(hub, &op),
         ("upload", _) => hub.uploads.receive(&op, || hub.new_id("u")),
         // A phone's browser or the Android app asks to be notified (see `push`).
         ("push_subscribe", _) => match hub.device_of(client) {

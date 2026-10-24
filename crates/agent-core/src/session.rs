@@ -775,21 +775,33 @@ impl SessionStore {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn transcript_items(&self) -> Vec<TranscriptItem> {
-        let mut items: Vec<TranscriptItem> = Vec::new();
+        self.transcript_stamped()
+            .into_iter()
+            .map(|(item, _)| item)
+            .collect()
+    }
+
+    /// The transcript, each item with when it was written (seconds).
+    pub fn transcript_stamped(&self) -> Vec<(TranscriptItem, u64)> {
+        let mut items: Vec<(TranscriptItem, u64)> = Vec::new();
         for entry in self.branch() {
             // A message's images are recorded right after it: they belong to it.
-            if let (EntryKind::UserImage { paths }, Some(TranscriptItem::User(_))) =
+            if let (EntryKind::UserImage { paths }, Some((TranscriptItem::User(_), _))) =
                 (&entry.kind, items.last())
             {
                 if !paths.is_empty() {
-                    let Some(TranscriptItem::User(content)) = items.pop() else {
+                    let Some((TranscriptItem::User(content), at)) = items.pop() else {
                         unreachable!()
                     };
-                    items.push(TranscriptItem::UserWithImages {
-                        content,
-                        images: paths.clone(),
-                    });
+                    items.push((
+                        TranscriptItem::UserWithImages {
+                            content,
+                            images: paths.clone(),
+                        },
+                        at,
+                    ));
                 }
                 continue;
             }
@@ -807,14 +819,14 @@ impl SessionStore {
                     status: status.clone(),
                 };
                 match items.iter_mut().find(
-                    |item| matches!(item, TranscriptItem::Plan { id: known, .. } if known == id),
+                    |(item, _)| matches!(item, TranscriptItem::Plan { id: known, .. } if known == id),
                 ) {
-                    Some(item) => *item = latest,
-                    None => items.push(latest),
+                    Some((item, _)) => *item = latest,
+                    None => items.push((latest, entry.created_at)),
                 }
                 continue;
             }
-            items.extend(Self::transcript_item(entry));
+            items.extend(Self::transcript_item(entry).map(|item| (item, entry.created_at)));
         }
         items
     }
@@ -848,6 +860,34 @@ impl SessionStore {
             EntryKind::ProposedPlan { .. } => None,
             EntryKind::Compaction { .. } => None,
         })
+    }
+
+    /// A new session holding this one's active branch up to its first
+    /// `keep` user turns (all of it when None): a fork, which goes on apart
+    /// from this session. Entries keep their ids, so a compaction still
+    /// names the entries it replaced.
+    pub fn forked(&self, keep: Option<usize>) -> SessionStore {
+        let mut branch = self.branch();
+        if let Some(keep) = keep {
+            let cut = branch
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| matches!(entry.kind, EntryKind::User { .. }))
+                .nth(keep)
+                .map_or(branch.len(), |(index, _)| index);
+            branch.truncate(cut);
+        }
+        let mut fork = SessionStore {
+            next_id: self.next_id,
+            needs_snapshot: true,
+            ..SessionStore::new()
+        };
+        for entry in branch {
+            fork.by_id.insert(entry.id, fork.entries.len());
+            fork.entries.push(entry.clone());
+            fork.leaf_id = Some(entry.id);
+        }
+        fork
     }
 
     // Saving must not bump `updated_at`: every content mutation already does,
@@ -2310,6 +2350,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_fork_keeps_the_first_turns_under_a_new_id() {
+        let mut session = SessionStore::new();
+        for turn in ["one", "two", "three"] {
+            session.append(EntryKind::User {
+                content: turn.to_string(),
+            });
+            session.append(EntryKind::ResponseItem {
+                item: json!({ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": format!("re {turn}") }] }),
+            });
+        }
+        let fork = session.forked(Some(2));
+        assert_ne!(fork.session_id(), session.session_id());
+        let users: Vec<_> = fork
+            .transcript_items()
+            .into_iter()
+            .filter_map(|item| match item {
+                TranscriptItem::User(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, ["one", "two"]);
+        assert_eq!(fork.transcript_items().len(), 4);
+        // The source is untouched, and a fork of all of it holds all of it.
+        assert_eq!(session.transcript_items().len(), 6);
+        assert_eq!(session.forked(None).transcript_items().len(), 6);
+
+        let dir = std::env::temp_dir().join(format!("fork-{}", std::process::id()));
+        let cwd = Path::new("/work/fork");
+        let mut fork = fork;
+        fork.save_for_cwd(&dir, cwd).unwrap();
+        let loaded = SessionStore::load_for_cwd(&dir, cwd, fork.session_id()).unwrap();
+        assert_eq!(loaded.transcript_items().len(), 4);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

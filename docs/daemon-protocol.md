@@ -111,7 +111,7 @@ Each WebSocket text message is one JSON frame. The daemon first sends:
 {"type":"workspaces","rev":1,"workspaces":[...]}
 ```
 
-followed by the current `schedules`, `actions` and `requirements` lists.
+followed by the current `schedules` and `actions` lists.
 
 A client that does not speak `protocol` 2 must disconnect.
 
@@ -133,6 +133,7 @@ every connected client.
 | `tool_provider_select` | `tool`, `provider_id` (empty restores the tool’s own configuration) | Updated `tool_providers`. Applies to new sessions (and to one leaving the JuCode gateway for the first time); a session keeps the provider it started on. Local desktop only |
 | `tool_provider_remove` | `tool`, `provider_id` | Updated `tool_providers`; removing the selected provider clears the selection. Sessions on it no longer start until moved (see "Custom provider traffic and usage"). Local desktop only |
 | `acp_presets` | — | `acp_presets` with `presets: [{id, name, status, path, version, min_version, approvals, gateway, install, tui}]`: the built-in ACP agents and whether each can start here (`status`: `ready`, `missing` or `unsupported`, older than `min_version`). Each program is asked its `--version` (10 s at most). See "ACP agents" |
+| `engine_probe` | `engine` (`claude`, `codex`, `acp`), `options` (as `session_create`'s), `cwd`? (home) | `engine_probed` with `events`: the last `model_status`, `model_view`, `engine_caps`, `command_list` and `session_options` the engine sent, from a run of it that no list shows, asked for its models and then stopped (25 s at most). What a client shows of an engine before any session of it. ACP agents do not sign in from a probe. Desktop only for options that run programs |
 | `restart_when_idle` | — | none. Desktop only: this daemon exits once no session is running (after a `daemon_restarting` broadcast), so the desktop can start a newer one without cutting off a task |
 | `session_meta` | `session`, and any of `title`, `archived`, `hidden`, `group`, `project` | none; `project` moves the session into that project (an unknown id is an error) or, empty, out of any; every client receives the new `sessions` list. An empty title goes back to the engine's label; a hidden session leaves `session_list` and `session_history` (its conversation stays on disk). A session created here is titled after its first user message (first line, 40 characters) unless a client titled it first. After its 1st and 3rd turns, then every 5th, the title model (`title_model` in config.json, else the main `model`) renames it from the project name, the current title, the first and latest requests and the start of the latest reply. A title a client set with `session_meta` is never replaced |
 | `session_history` | `cwd` | `session_history`: every session saved in `cwd`, newest first, whoever ran it (daemon, TUI, `jucode serve`), with `title`, `updated_at`, `entries`, `archived`, `schedule`, `open` |
@@ -291,7 +292,10 @@ Differences from a jucode session:
   Claude Code takes it in it stays first in `pending_messages`, counted in
   `fixed`: those can no longer be taken back or steered. `interrupt` with
   `index` moves that held message to the front and stops the turn, so it
-  starts the next one.
+  starts the next one. `unqueue` with `discard: true` drops the message
+  instead of sending it back (`unqueued`), and `queue_move` (`index` to
+  `to`, both in `pending_messages`) reorders the waiting ones; neither
+  touches those counted in `fixed`.
 - `decide_action`, `mcp_set`/`mcp_remove` and the jucode-only
   commands (`/resume`, `/rewind`, `/tree`, ...) are refused with an `error`
   event. Other slash commands go to Claude Code as a user message, as Claude
@@ -319,7 +323,8 @@ and `/login` (a device code to sign Codex in to ChatGPT, as an `info`). A
 message sent mid-turn waits in the daemon (`pending_messages`) and starts the
 next turn; `steer` sends it into the running one (`turn/steer`): the
 message at `index` (negative from the last), or all that wait without one;
-`unqueue` takes one back. Approval
+`unqueue` takes one back (drops it with `discard: true`), and `queue_move`
+(`index` to `to`) reorders them. Approval
 mode `plan` is Codex's plan collaboration mode and `auto` its `auto_review`
 reviewer. Codex's own requests for permissions, for the user's answers
 (`ask_question` with `questions`) and MCP elicitations come as approval
@@ -366,6 +371,17 @@ own directory first on `PATH`. A missing or too old one fails the start
 (`"<name> is not installed: <install>"`, `"<name> <version> is too old
 (needs <min>)"`); an unknown id is `"unknown ACP agent <id>"`.
 
+Every ACP agent is given the user's enabled MCP servers (JuCode's, not those
+signing in by OAuth) in `session/new`, `session/load` and `session/resume`:
+stdio ones always, http ones when its `mcpCapabilities.http` says it takes
+them. An agent that answers `session/new` with "authentication required"
+(`-32000`) is signed in once its own way (`authenticate` with its first
+method that needs no terminal or environment variable; it may open the
+browser), then the session is asked again; still not signed in, the error
+says how (`"[acp] <name> needs sign-in: <how>"`). Its models come from its
+`model` config option, else from the `models` it reports
+(`availableModels`, `currentModelId`), switched with `session/set_model`.
+
 On the gateway, oh-my-pi and Pi run on JuCode's own agent directory,
 `~/.jucode/daemon/acp/<agent>` (`PI_CODING_AGENT_DIR`), written at each
 start: the JuCode models (Claude models over Anthropic Messages, others over
@@ -384,9 +400,8 @@ starts a new conversation and says so in an `info`. A session of a built-in
 agent starts and reopens from any client that may open sessions; one the
 desktop registered only from the desktop (`"this agent's session can only be
 reopened on the desktop"`). Built-in agents also have their own TUI (`tui`
-in `acp_presets`; see "A conversation in its TUI"), run scheduled tasks
-(see "Scheduled tasks") and take requirements (`requirement_reply` with
-`agent`); registered ones do none of these.
+in `acp_presets`; see "A conversation in its TUI") and run scheduled tasks
+(see "Scheduled tasks"); registered ones do neither.
 
 What the agent offers arrives as these state events (part of a watcher's
 snapshot), sent at open and whenever they change:
@@ -451,7 +466,8 @@ The rest uses the usual events:
   not sent.
 - `steer` (`index`, negative from the last) cancels the turn the same way
   but keeps the waiting messages, the chosen one first: it runs as soon as
-  the turn settles. `unqueue` takes a waiting message back.
+  the turn settles. `unqueue` takes a waiting message back (drops it with
+  `discard: true`); `queue_move` (`index` to `to`) reorders them.
 - `interrupt` cancels open questions, drops waiting messages and sends
   `session/cancel`; the turn ends with `status: "interrupted"`.
 - Agent notices are `info` (or `error`), a turn that ends with no reply
@@ -624,6 +640,28 @@ its attachments: images in `user_message`'s `images`, other files as paths
 in its text. The session's `user_message` event, and the user items of its
 `transcript`, carry those `images` too, whichever engine runs it.
 
+A `transcript` item is `user`/`assistant`/`reasoning` with `content`, `tool`
+with `name` and `output`, `branch` or `plan`. Items carry `at` (ms) when the
+engine knows when they were written: Claude's saved rows, jucode's session
+entries and the daemon's own snapshot do; a resumed Codex thread and an ACP
+replay do not. A `tool` item carries `is_error: true` when the call failed,
+its `call_id` when the replay knows it, and `subagent` when it was a
+subagent's call (Claude), which the desktop keeps out of the conversation.
+A Claude replay has every tool call the turn showed, not only its text.
+
+A fork is a `session_create` whose `options` carry `fork_from` (the
+engine's id of the conversation it forks): the new session goes on from it
+while the original stays as it is. Claude Code resumes it at `resume_at`
+(the uuid of the reply it forks after, which Claude replays carry as
+`uuid`) as a new conversation (`--fork-session`); Codex forks the thread
+through the turn before its `fork_turns`-th user turn ends (`thread/fork`
+with `lastTurnId`); jucode copies the session's first `fork_turns` user
+turns into a new session (read from `fork_cwd`'s sessions when the fork
+works in another directory, its own worktree; Claude Code and Codex find
+the conversation by id from any directory). An ACP agent's conversation cannot fork. The
+session list names the source as `forked_from` (`session`, `turns`, `at`);
+a Claude fork closed before its first turn is forked again when reopened.
+
 ## Terminals
 
 A terminal runs on a pty of this computer and is one of two kinds:
@@ -726,92 +764,6 @@ Variables that would mark the TUI as a nested
 Claude Code session (`CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`, …) are
 removed so it saves its transcript.
 
-## Requirements
-
-A requirement is what the user means to get done: their words (`text`),
-screenshots, the project it belongs to (`project`, a project id, or `null`),
-and the sessions that work on it. A session works on one requirement at a
-time. After each turn of a linked session, the title model rewrites the
-requirement's `progress` from the previous record and the session's first
-and latest requests and the end of its reply, so a new session starts from
-where the last one stopped. The requirement's id comes as `requirement`
-(`id` is the request's).
-
-| Op | Reply | |
-| --- | --- | --- |
-| `{"op":"requirement_list"}` | `requirements` | |
-| `{"op":"requirement_create","text":"…","project":"p…","images":["/…/.jucode/uploads/…/u-…-shot.png"],"source":"phone","session":"s…"}` | `requirement_created` with `requirement` | All but `text` optional. `project`: a known project's id, or `null` for none; left out, a requirement noted in `session` belongs to the project whose main directory is that session's `cwd`. `images`: up to 4 uploaded images (see "Uploads"; any other path is refused), moved to `~/.jucode/uploads/requirements/<id>/`. |
-| `{"op":"requirement_update","requirement":"R-1","text":"…","project":"p…","state":"done"}` | `requirement_saved` | Any of the fields. `project: null` leaves it unassigned. `state`: `idea`, `open`, `done`, `parked`. |
-| `{"op":"requirement_delete","requirement":"R-1"}` | `requirement_deleted` | Its sessions stay. |
-| `{"op":"requirement_link","requirement":"R-1","session":"s…"}` | `requirement_linked` | The session leaves any other requirement (and its gate); the requirement becomes `open`. |
-| `{"op":"requirement_unlink","requirement":"R-1","session":"s…"}` | `requirement_unlinked` | A gate on that session ends. |
-| `{"op":"requirement_image","requirement":"R-1","index":0}` | `requirement_image` with `data` (a data URL) | |
-| `{"op":"requirement_begin","requirement":"R-1","session":"s…","plan":false,"mode":"edits","text":"…","lang":"zh"}` | `requirement_begun` with `requirement`, `session` | Starts work behind the gate (below): links the session, switches it to read-only and sends the requirement with the ask to only explain its understanding. `text`: the user's added words (optional). `lang`: `zh` (default) or `en`. |
-| `{"op":"requirement_confirm","requirement":"R-1","text":"…","lang":"zh"}` | `requirement_confirmed` with `requirement`, `stage` (`plan` or `go`) | The user confirms the gate's current step; an error without a gate or while its session runs a turn. `text` (optional) goes with the next message. |
-| `{"op":"requirement_reply","requirement":"R-1","text":"…","new_session":false,"cwd":"/path","engine":"claude","plan":false,"mode":"auto","lang":"zh"}` | `requirement_replied` with `session` | Sends `text` to its latest session (reopened if closed). With `new_session`, or no session yet, starts one in `cwd` (default: the latest session's, else the project's main directory; neither is an error), belonging to `project` (default: the requirement's), on `engine` (default: the latest session's, else jucode; `acp` needs `agent`, a built-in agent's id, which defaults to the latest session's when `engine` is left out: `"an ACP session needs options.agent"`) and runs `requirement_begin` on it with `plan` (default `false`), `mode` (default `auto`) and `text`. |
-
-### The start gate
-
-A session starts on a requirement in steps, each confirmed by the user, so
-nothing changes before they agreed what is to be done. `gate` on the
-requirement, for one session:
-
-```json
-"gate": {"session":"s…","stage":"understand","plan":true,"mode":"auto","answered":false}
-```
-
-`answered` turns true when a turn of that session ends at the stage; only
-then does the requirement show `confirm` (an engine also reports ready when
-it starts or switches modes). While the gate stands the session is held
-read-only: a client's `set_approval_mode` and the mode its engine starts or
-restarts in are replaced by the read-only one.
-
-1. `understand`: the session runs read-only (jucode `manual`, Claude Code
-   and Codex `read-only`) and replies with the goal, scope, assumptions and
-   open questions, and whether the work is worth doing, then stops.
-2. With `plan`, confirming moves to `plan`: still read-only, it writes an
-   implementation plan and stops.
-3. The last confirmation switches the session to `mode` and sends it to
-   work; `gate` is removed.
-
-`mode` is the permission mode to work in, as the client names it (`ask`,
-`plan`, `auto`, `edits`, `all`) or an engine does (`manual`, `read-only`,
-`auto-edit`, `full-auto`, `full-access`); the daemon translates it for the
-session's engine (`plan` is `manual` on jucode). A user who replies in the
-session instead of confirming has it revise its understanding or plan; the
-gate stays at its step.
-
-`requirements` is also sent on connect and broadcast on every change:
-
-```json
-{"type":"requirements","requirements":[{
-  "id":"R-1","text":"…","title":"…","title_auto":false,"images":["/abs/1.png"],
-  "project":"p…","state":"open","sessions":["s…"],
-  "progress":{"goal":"…","decided":[],"done":[],"doing":[],"blocked":[],"next":[],"files":[],"note":"…"},
-  "progress_at":0,"source":"desktop","source_session":null,
-  "gate":{"session":"s…","stage":"understand","plan":false,"mode":"auto"},
-  "status":"confirm","session_states":{"s…":"idle"},"last_reply":"…",
-  "created_at":0,"updated_at":0}]}
-```
-
-Words longer than 40 characters get a title from the title model
-(`title_auto`). `source` is `desktop`, `phone` or `session` (`agent` on
-ones long-lived agents noted). `status` is `state`, except while `open`:
-`approval` (a session waits for an approval), `confirm` (the gate's session
-is idle: the user confirms its understanding or plan), `failed` (the latest
-session's turn failed), `running`, else `review` (the user's turn: the work
-is done or the agent asks something), or `open` with no session.
-
-`session_states`: `running`, `waiting`, `failed`, `idle`. `last_reply` (the
-end of the latest session's reply) comes with `review`, `confirm` and
-`failed`.
-
-Requirements saved before projects had ids carry `projects: ["/path"]`;
-once the workspaces have projects, the daemon replaces it with the `project`
-whose main directory is the first path (or `null`). A requirement a
-long-lived agent proposed (`state: "proposed"`, `proposal`) becomes an
-`idea` without the proposal.
-
 ## Notifications
 
 A paired device's browser registers its Web Push subscription with
@@ -820,14 +772,13 @@ the JuCode Android app its 个推 (Getui) client id with
 `{"op":"push_subscribe","subscription":{"provider":"getui","client_id":"…"}}`
 (only paired devices; dropped when the device is revoked) and removes it with
 `{"op":"push_unsubscribe","endpoint":"…"}` or `{"op":"push_unsubscribe","client_id":"…"}`.
-A client id registered again by another device moves to that device. The daemon notifies when an
-open requirement turns to `review`, `confirm` or `approval`, and for
+A client id registered again by another device moves to that device. The daemon notifies for
 scheduled runs as described in "Scheduled tasks", through the relay (relay-protocol.md, Web Push). `{"op":"push_test"}` (paired devices
 only) sends a test notification to that device's browsers now and replies
 `push_tested` with `results: [{service, status}]` (or `error`): the push
 service's host (`getui` for the Android app) and its answer, as the relay passed it on. A notification's `url` is
-the remote page, with `?requirement=R-1` for a requirement; one about a session
-also carries `session`, which the Android app opens.
+the remote page; one about a session also carries `session`, which the
+Android app opens.
 
 ## Session ops
 

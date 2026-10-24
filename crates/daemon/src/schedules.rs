@@ -43,7 +43,7 @@ pub const RUN_TIMEOUT_MS: u64 = 2 * 60 * 60 * 1000;
 pub const MAX_FAILURES: u32 = 3;
 /// Earlier runs kept with a task (`history`).
 const HISTORY: usize = 20;
-/// Permission modes in the clients' names (see `requirements::engine_mode`).
+/// Permission modes in the clients' names (see `engine_mode`).
 const MODES: [&str; 4] = ["ask", "edits", "auto", "all"];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -409,6 +409,37 @@ pub fn load(dir: &Path) -> Vec<Schedule> {
         .collect()
 }
 
+/// A permission mode, in a client's names (`ask`, `plan`, `auto`, `edits`,
+/// `all`) or an engine's, as `engine` (None: jucode) takes it.
+pub(crate) fn engine_mode(
+    engine: Option<engines::Kind>,
+    mode: &str,
+) -> Result<&'static str, String> {
+    let jucode = engine.is_none();
+    Ok(match mode {
+        "ask" | "manual" | "read-only" => {
+            if jucode {
+                "manual"
+            } else {
+                "read-only"
+            }
+        }
+        // jucode has no plan mode: it asks before every change.
+        "plan" if jucode => "manual",
+        "plan" => "plan",
+        "edits" | "auto-edit" => "auto-edit",
+        "auto" => "auto",
+        "all" | "full-auto" | "full-access" => {
+            if jucode {
+                "full-access"
+            } else {
+                "full-auto"
+            }
+        }
+        other => return Err(format!("unknown permission mode {other}")),
+    })
+}
+
 impl Hub {
     pub fn schedules_json(&self) -> Value {
         let list: Vec<Value> = lock(&self.schedules)
@@ -595,7 +626,7 @@ impl Hub {
     fn open_run(self: &Arc<Self>, schedule: &Schedule) -> Result<String, String> {
         let cwd = schedule.cwd.clone().ok_or("定时任务没有设置运行目录")?;
         let engine = engines::Kind::parse(schedule.engine.as_deref().unwrap_or_default())?;
-        let mode = crate::requirements::engine_mode(engine, &schedule.mode)?;
+        let mode = engine_mode(engine, &schedule.mode)?;
         let options = engines::Options {
             approval_mode: Some(mode.to_string()),
             ..engines::Options::from_json(&schedule.options)

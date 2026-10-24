@@ -288,7 +288,9 @@ pub enum AgentEvent {
     McpServers {
         servers: Vec<McpServerView>,
     },
-    Transcript(Vec<TranscriptItem>),
+    /// The conversation, each item with when it was written (seconds; 0:
+    /// unknown).
+    Transcript(Vec<(TranscriptItem, u64)>),
     Info(String),
     Error(String),
     Status(String),

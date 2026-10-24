@@ -36,7 +36,7 @@ pub use config::{
     builtin_providers, jucode_visible_models, models_for_provider, ApprovalMode, ModelConfig,
     SubagentModel,
 };
-pub use core::{queue_index, title_completion, AgentCore};
+pub use core::{queue_index, queue_move_target, title_completion, AgentCore};
 pub use event::{
     AgentEvent, CommandView, GoalView, LoginProviderView, McpServerView, McpToolView,
     ModelOptionView, PlanItem, SessionListItemView, TranscriptItem, TreeNodeView,
@@ -120,6 +120,34 @@ fn gateway_credentials(config: config::Config) -> Result<(String, String, u64), 
     ))
 }
 
+/// The user's enabled MCP servers as an ACP agent takes them in
+/// `session/new` (`McpServer`): stdio ones by command, http ones by URL
+/// (`"type": "http"`, for agents that take those). Those signing in by OAuth
+/// are left out: their tokens are JuCode's to keep.
+pub fn acp_mcp_servers() -> Vec<serde_json::Value> {
+    let Ok(config) = config::Config::load_or_create() else {
+        return Vec::new();
+    };
+    let pairs = |map: &std::collections::BTreeMap<String, String>| {
+        map.iter()
+            .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+            .collect::<Vec<_>>()
+    };
+    config
+        .mcp_servers
+        .iter()
+        .filter(|server| server.enabled && server.oauth.is_none())
+        .map(|server| match server.transport {
+            config::McpTransportKind::Stdio => serde_json::json!({
+                "name": server.name, "command": server.command, "args": server.args, "env": pairs(&server.env),
+            }),
+            config::McpTransportKind::Http => serde_json::json!({
+                "type": "http", "name": server.name, "url": server.url, "headers": pairs(&server.headers),
+            }),
+        })
+        .collect()
+}
+
 /// Saves an MCP server change to config.json: `mcp_set` (`server`, a config
 /// entry), `mcp_remove` (`name`) or `mcp_toggle` (`name`, `enabled`), the
 /// session ops, for a client with no session to send it to. Running sessions
@@ -168,4 +196,19 @@ pub fn change_mcp_config(op: &serde_json::Value) -> Result<(), String> {
 /// seconds).
 pub fn saved_sessions(cwd: &std::path::Path) -> std::io::Result<Vec<SessionSummary>> {
     session::SessionStore::list_for_cwd(&config::profile_dir()?, cwd)
+}
+
+/// Forks session `from` of `from_cwd` into a new session saved for `cwd`
+/// (another directory when the fork works in its own worktree) that holds
+/// its first `keep` user turns (all when None); the new session's id.
+pub fn fork_session(
+    from_cwd: &std::path::Path,
+    cwd: &std::path::Path,
+    from: &str,
+    keep: Option<usize>,
+) -> std::io::Result<String> {
+    let profile = config::profile_dir()?;
+    let mut fork = session::SessionStore::load_for_cwd(&profile, from_cwd, from)?.forked(keep);
+    fork.save_for_cwd(&profile, cwd)?;
+    Ok(fork.session_id().to_string())
 }

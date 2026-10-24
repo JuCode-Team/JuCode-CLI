@@ -445,7 +445,7 @@ impl AgentCore {
     /// The current branch as a transcript, for a client that attaches to a
     /// running session and needs the conversation so far.
     pub fn transcript_event(&self) -> AgentEvent {
-        AgentEvent::Transcript(self.session.transcript_items())
+        AgentEvent::Transcript(self.session.transcript_stamped())
     }
 
     /// Startup batch: the session state plus the trust prompt and the
@@ -800,16 +800,29 @@ impl AgentCore {
 
     /// Takes queued message `index` (negative from the last) back out of the
     /// queue, for the client to edit.
-    pub fn unqueue(&mut self, index: Option<i64>) -> Vec<AgentEvent> {
+    /// A queued message taken back to the editor, or (`discard`) dropped.
+    pub fn unqueue(&mut self, index: Option<i64>, discard: bool) -> Vec<AgentEvent> {
         let Some((content, images)) =
             queue_index(index, self.queued.len()).and_then(|i| self.queued.remove(i))
         else {
             return Vec::new();
         };
-        vec![
-            AgentEvent::PendingMessages(self.pending_texts()),
-            AgentEvent::Unqueued { content, images },
-        ]
+        let mut events = vec![AgentEvent::PendingMessages(self.pending_texts())];
+        if !discard {
+            events.push(AgentEvent::Unqueued { content, images });
+        }
+        events
+    }
+
+    /// Queued message `from` moves to place `to` (both negative from the last).
+    pub fn queue_move(&mut self, from: Option<i64>, to: Option<i64>) -> Vec<AgentEvent> {
+        let Some((from, to)) = queue_move_target(from, to, self.queued.len()) else {
+            return Vec::new();
+        };
+        if let Some(item) = self.queued.remove(from) {
+            self.queued.insert(to, item);
+        }
+        vec![AgentEvent::PendingMessages(self.pending_texts())]
     }
 
     /// Stops the in-flight turn: signals the worker to abort, closes subagents,
@@ -908,7 +921,7 @@ impl AgentCore {
                         Ok(()) => {
                             let save_event = self.save_session_event();
                             let mut events =
-                                vec![AgentEvent::Transcript(self.session.transcript_items())];
+                                vec![AgentEvent::Transcript(self.session.transcript_stamped())];
                             if let Some(content) = fill {
                                 events.push(AgentEvent::FillInput(content));
                             }
@@ -925,7 +938,7 @@ impl AgentCore {
                     Ok(id) => {
                         let save_event = self.save_session_event();
                         vec![
-                            AgentEvent::Transcript(self.session.transcript_items()),
+                            AgentEvent::Transcript(self.session.transcript_stamped()),
                             AgentEvent::TreeView(self.session.tree_view()),
                             AgentEvent::Status(format!("forked {label}: {}", id.display())),
                         ]
@@ -942,7 +955,7 @@ impl AgentCore {
                     Ok(()) => {
                         let save_event = self.save_session_event();
                         vec![
-                            AgentEvent::Transcript(self.session.transcript_items()),
+                            AgentEvent::Transcript(self.session.transcript_stamped()),
                             AgentEvent::TreeView(self.session.tree_view()),
                             AgentEvent::Status(format!("deleted branch {label}")),
                         ]
@@ -3781,7 +3794,7 @@ impl AgentCore {
         let session_id = self.session.session_id().to_string();
         let save_event = self.save_session_event();
         vec![
-            AgentEvent::Transcript(self.session.transcript_items()),
+            AgentEvent::Transcript(self.session.transcript_stamped()),
             AgentEvent::PendingMessages(Vec::new()),
             self.model_status_event(),
             self.context_usage_event(),
@@ -4266,7 +4279,7 @@ impl AgentCore {
                 ),
                 Err(error) => {
                     return vec![
-                        AgentEvent::Transcript(self.session.transcript_items()),
+                        AgentEvent::Transcript(self.session.transcript_stamped()),
                         AgentEvent::Error(format!(
                             "conversation rewound, but file restore failed: {error}"
                         )),
@@ -4275,7 +4288,7 @@ impl AgentCore {
             };
         let save_event = self.save_session_event();
         vec![
-            AgentEvent::Transcript(self.session.transcript_items()),
+            AgentEvent::Transcript(self.session.transcript_stamped()),
             AgentEvent::Info(format!(
                 "rewound · restored {restored} file(s), removed {removed}"
             )),
@@ -4354,7 +4367,7 @@ impl AgentCore {
                 // Release the previous session's lock only after the switch.
                 self.session_lock = Some(lock);
                 vec![
-                    AgentEvent::Transcript(self.session.transcript_items()),
+                    AgentEvent::Transcript(self.session.transcript_stamped()),
                     AgentEvent::PendingMessages(Vec::new()),
                     self.model_status_event(),
                     self.context_usage_event(),
@@ -5738,6 +5751,15 @@ mod login_kind_tests {
 
 /// A queued message's position from a client's `index` (the first when
 /// absent; negative counts from the last), if there is one there.
+/// Where a queued message moves (`queue_move`): message `from` to place
+/// `to`, both as `queue_index` reads them; None when either is out of range
+/// or it would stay put.
+pub fn queue_move_target(from: Option<i64>, to: Option<i64>, len: usize) -> Option<(usize, usize)> {
+    let from = queue_index(from, len)?;
+    let to = queue_index(Some(to?), len)?;
+    (from != to).then_some((from, to))
+}
+
 pub fn queue_index(index: Option<i64>, len: usize) -> Option<usize> {
     let index = index.unwrap_or(0);
     let at = if index < 0 {

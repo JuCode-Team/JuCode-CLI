@@ -429,7 +429,7 @@ fn a_proposed_plan_waits_then_runs_in_the_approved_mode() {
     };
     let plans: Vec<_> = items
         .iter()
-        .filter_map(|item| match item {
+        .filter_map(|(item, _)| match item {
             jucode_agent_core::TranscriptItem::Plan { status, .. } => Some(status.clone()),
             _ => None,
         })
@@ -592,7 +592,7 @@ fn a_steer_by_index_takes_that_message_and_leaves_the_others_waiting() {
     assert!(core.steer(Some(4)).is_empty());
     // Taken back: out of the queue, its text for the client to edit.
     core.submit_user_message("third".to_string());
-    let back = core.unqueue(Some(0));
+    let back = core.unqueue(Some(0), false);
     assert!(back.iter().any(|e| matches!(
         e,
         AgentEvent::PendingMessages(texts) if *texts == ["third"]
@@ -601,6 +601,23 @@ fn a_steer_by_index_takes_that_message_and_leaves_the_others_waiting() {
         e,
         AgentEvent::Unqueued { content, .. } if content == "first"
     )));
+    // Reordered: the last goes first.
+    core.submit_user_message("fourth".to_string());
+    let moved = core.queue_move(Some(-1), Some(0));
+    assert!(moved.iter().any(|e| matches!(
+        e,
+        AgentEvent::PendingMessages(texts) if *texts == ["fourth", "third"]
+    )));
+    assert!(core.queue_move(Some(0), Some(0)).is_empty());
+    // Dropped: out of the queue, nothing back to the editor.
+    let dropped = core.unqueue(Some(0), true);
+    assert!(dropped.iter().any(|e| matches!(
+        e,
+        AgentEvent::PendingMessages(texts) if *texts == ["third"]
+    )));
+    assert!(!dropped
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Unqueued { .. })));
     core.interrupt();
 }
 

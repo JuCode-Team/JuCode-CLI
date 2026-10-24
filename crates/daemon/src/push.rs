@@ -148,14 +148,6 @@ pub fn notify(hub: &Arc<Hub>, title: &str, body: &str, tag: &str) {
     );
 }
 
-/// `notify` whose notification opens `url` on the remote page.
-pub fn notify_at(hub: &Arc<Hub>, title: &str, body: &str, tag: &str, url: &str) {
-    send(
-        hub,
-        json!({ "title": title, "body": clip(body, 300), "tag": tag, "url": url }),
-    );
-}
-
 fn send(hub: &Arc<Hub>, payload: Value) {
     let list = lock(&hub.push.subscriptions).clone();
     for subscription in list {

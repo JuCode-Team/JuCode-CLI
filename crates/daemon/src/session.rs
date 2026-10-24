@@ -4,7 +4,7 @@
 use crate::hub::Hub;
 use jucode_agent_core::{
     protocol::{self, session_event_json},
-    AgentCore, AgentEvent, ApprovalMode,
+    AgentCore, AgentEvent,
 };
 use serde_json::{json, Value};
 use std::{
@@ -70,9 +70,6 @@ fn open(
     crate::gateway::proxy_core(&mut core, hub);
     core.add_writable_dirs(dirs);
     core.set_app_tools_off(crate::engines::app_tools_off(&hub.store));
-    if resume.is_some_and(|id| crate::requirements::gated(hub, id)) {
-        core.set_approval_mode(ApprovalMode::Manual);
-    }
     // The session tools (`start_session` …), run by the daemon.
     let (me, session, mode) = (
         Arc::downgrade(hub),

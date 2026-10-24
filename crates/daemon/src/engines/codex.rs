@@ -22,7 +22,7 @@
 //! - A rewind is `thread/revert` to before a user message's turn.
 
 use super::{home, resolve, Adapter, HostCall, Line, Options, Output};
-use jucode_agent_core::{queue_index, user_tools};
+use jucode_agent_core::{queue_index, queue_move_target, user_tools};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -354,6 +354,23 @@ fn command_output(item: &Value, command: &str, streamed: &str) -> Value {
     out
 }
 
+/// The last turn a fork keeping `keep` user turns of `turns` goes through:
+/// the one before the next user turn (None: the fork keeps them all).
+fn fork_point(turns: &Value, keep: Option<u64>) -> Option<String> {
+    let turns = turns.as_array()?;
+    let next = turns
+        .iter()
+        .enumerate()
+        .filter(|(_, turn)| {
+            turn["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["type"] == "userMessage"))
+        })
+        .nth(usize::try_from(keep?).ok()?)?
+        .0;
+    Some(text(&turns[next.checked_sub(1)?]["id"]).to_string())
+}
+
 /// A resumed thread's history (`thread.turns[].items`) as transcript items.
 fn transcript(turns: &Value) -> Vec<Value> {
     let mut rows = Vec::new();
@@ -378,25 +395,72 @@ fn transcript(turns: &Value) -> Vec<Value> {
                 rows.push(json!({ "role": "assistant", "content": item["text"] }));
             }
             "reasoning" => {
-                let summary = item["summary"].as_array().into_iter().flatten().map(text).collect::<Vec<_>>().join("\n\n");
+                let summary = item["summary"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(text)
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
                 if !summary.is_empty() {
                     rows.push(json!({ "role": "reasoning", "content": summary }));
                 }
             }
-            "commandExecution" => rows.push(json!({ "role": "tool", "name": "bash", "output": command_output(item, "", "").to_string() })),
-            "fileChange" => rows.push(json!({
-                "role": "tool", "name": "apply_patch",
-                "output": file_change_output(item["changes"].as_array().map(Vec::as_slice).unwrap_or_default(), None),
-            })),
-            "mcpToolCall" => rows.push(json!({
-                "role": "tool", "name": format!("{}.{}", text(&item["server"]), text(&item["tool"])), "output": mcp_body(item),
-            })),
-            "webSearch" => rows.push(json!({ "role": "tool", "name": "web_search", "output": json!({ "query": item["query"] }).to_string() })),
-            "dynamicToolCall" => rows.push(json!({ "role": "tool", "name": item["tool"], "output": dynamic_body(item) })),
+            "commandExecution" | "fileChange" | "mcpToolCall" | "webSearch" | "dynamicToolCall" => {
+                rows.push(tool_row(item));
+            }
             _ => {}
         }
     }
     rows
+}
+
+/// A finished tool item of a resumed thread as the card its live
+/// `tool_output` showed, failed (`is_error`) the same way.
+fn tool_row(item: &Value) -> Value {
+    // An item saved before it finished has no status: not a failure.
+    let status = text(&item["status"]);
+    let unfinished = !matches!(status, "" | "completed");
+    let (name, output, failed) = match text(&item["type"]) {
+        "commandExecution" => {
+            let mut output = command_output(item, "", "");
+            if status == "declined" {
+                output["error"] = json!("declined");
+            }
+            (json!("bash"), output.to_string(), unfinished)
+        }
+        "fileChange" => {
+            let changes = item["changes"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            (
+                json!("apply_patch"),
+                file_change_output(changes, unfinished.then_some(status)),
+                unfinished,
+            )
+        }
+        "mcpToolCall" => (
+            json!(format!("{}.{}", text(&item["server"]), text(&item["tool"]))),
+            mcp_body(item),
+            !item["error"].is_null() || status == "failed",
+        ),
+        "webSearch" => (
+            json!("web_search"),
+            json!({ "query": item["query"] }).to_string(),
+            false,
+        ),
+        _ => (
+            item["tool"].clone(),
+            dynamic_body(item),
+            item["success"] == false || status == "failed",
+        ),
+    };
+    let mut row = json!({ "role": "tool", "name": name, "output": output, "call_id": item["id"] });
+    if failed {
+        row["is_error"] = json!(true);
+    }
+    row
 }
 
 /// A user message's text and its images (local paths).
@@ -482,6 +546,9 @@ pub struct Codex {
     pending: HashMap<u64, (String, String)>,
     thread: Option<String>,
     resume: Option<String>,
+    /// A new thread forked from this one, keeping its first so many user
+    /// turns (None: all of them).
+    fork: Option<(String, Option<u64>)>,
     /// The provider `use_gateway` configured (the JuCode gateway or a custom
     /// one): a resumed thread must use it too, whichever provider it was
     /// written with (`thread/resume` would use that one). None: Codex's own
@@ -555,6 +622,11 @@ impl Codex {
             pending: HashMap::new(),
             thread: None,
             resume: options.resume.clone(),
+            fork: options
+                .fork_from
+                .clone()
+                .filter(|_| options.resume.is_none())
+                .map(|from| (from, options.fork_turns)),
             gateway: if options.gateway == Some(true) {
                 Some(GATEWAY_PROVIDER)
             } else if options
@@ -978,8 +1050,8 @@ impl Codex {
                 self.open_params["dynamicTools"] = json!(tools);
                 let mut frames =
                     vec![json!({ "jsonrpc": "2.0", "method": "initialized" }).to_string()];
-                frames.push(match self.resume.clone() {
-                    Some(thread) => {
+                frames.push(match (self.resume.clone(), self.fork.clone()) {
+                    (Some(thread), _) => {
                         let mut params = open;
                         params["threadId"] = json!(thread);
                         if let Some(provider) = self.gateway {
@@ -987,7 +1059,13 @@ impl Codex {
                         }
                         self.request("thread/resume", params, "")
                     }
-                    None => {
+                    // A fork reads the thread's turns first, to know where to cut.
+                    (None, Some((from, _))) => self.request(
+                        "thread/read",
+                        json!({ "threadId": from, "includeTurns": true }),
+                        "fork",
+                    ),
+                    (None, None) => {
                         let params = self.open_params.clone();
                         self.request("thread/start", params, "")
                     }
@@ -1005,7 +1083,27 @@ impl Codex {
                 }
             }
             "thread/start" => self.thread_opened(result, false),
-            "thread/resume" => self.thread_opened(result, true),
+            "thread/resume" | "thread/fork" => self.thread_opened(result, true),
+            "thread/read" if tag == "fork" => {
+                let Some((from, keep)) = self.fork.clone() else {
+                    return Output::default();
+                };
+                let mut params = self.open_params.clone();
+                if let Some(fields) = params.as_object_mut() {
+                    fields.remove("dynamicTools");
+                }
+                params["threadId"] = json!(from);
+                if let Some(last) = fork_point(&result["thread"]["turns"], keep) {
+                    params["lastTurnId"] = json!(last);
+                }
+                if let Some(provider) = self.gateway {
+                    params["modelProvider"] = json!(provider);
+                }
+                Output {
+                    events: vec![],
+                    frames: vec![self.request("thread/fork", params, "")],
+                }
+            }
             "account/rateLimits/read" => Output::events(usage_events(&result["rateLimits"])),
             "model/list" => {
                 self.catalog = result["data"]
@@ -1933,6 +2031,9 @@ impl Adapter for Codex {
                     return Ok(Output::default());
                 };
                 let (content, input) = self.waiting.remove(i);
+                if op["discard"] == true {
+                    return Ok(Output::events(vec![self.pending_event()]));
+                }
                 let images: Vec<&str> = input
                     .iter()
                     .filter(|c| c["type"] == "localImage")
@@ -1942,6 +2043,17 @@ impl Adapter for Codex {
                     self.pending_event(),
                     json!({ "type": "unqueued", "content": content, "images": images }),
                 ]));
+            }
+            // A waiting message to another place: `index` to `to`.
+            "queue_move" => {
+                let Some((from, to)) =
+                    queue_move_target(op["index"].as_i64(), op["to"].as_i64(), self.waiting.len())
+                else {
+                    return Ok(Output::default());
+                };
+                let item = self.waiting.remove(from);
+                self.waiting.insert(to, item);
+                return Ok(Output::events(vec![self.pending_event()]));
             }
             "rename" => match self.thread.clone() {
                 Some(thread) => vec![self.request(
@@ -2602,6 +2714,30 @@ mod tests {
     }
 
     #[test]
+    fn waiting_messages_reorder_and_drop() {
+        let mut c = opened();
+        busy(&mut c);
+        for text in ["one", "two", "three"] {
+            c.encode(&json!({ "op": "user_message", "content": text }))
+                .unwrap();
+        }
+        let moved = c
+            .encode(&json!({ "op": "queue_move", "index": 2, "to": 0 }))
+            .unwrap();
+        assert_eq!(
+            moved.events,
+            vec![json!({ "type": "pending_messages", "messages": ["three", "one", "two"] })]
+        );
+        let dropped = c
+            .encode(&json!({ "op": "unqueue", "index": 1, "discard": true }))
+            .unwrap();
+        assert_eq!(
+            dropped.events,
+            vec![json!({ "type": "pending_messages", "messages": ["three", "two"] })]
+        );
+    }
+
+    #[test]
     fn a_subagents_thread_stays_out_of_the_conversation() {
         let mut c = opened();
         busy(&mut c);
@@ -3166,6 +3302,73 @@ mod tests {
             args[3].starts_with("model_providers.jucode_custom={name=\"My \\\"API\\\"\","),
             "{}",
             args[3]
+        );
+    }
+
+    #[test]
+    fn a_fork_reads_the_thread_then_forks_it_through_the_kept_turn() {
+        let mut c = Codex::new(
+            Path::new("/p"),
+            &Options {
+                fork_from: Some("th-1".into()),
+                fork_turns: Some(1),
+                ..Options::default()
+            },
+        );
+        c.start();
+        let opened = sent(&frame(&mut c, json!({ "id": 1, "result": {} })).frames);
+        let read = opened
+            .iter()
+            .find(|f| f["method"] == "thread/read")
+            .unwrap();
+        assert_eq!(
+            read["params"],
+            json!({ "threadId": "th-1", "includeTurns": true })
+        );
+        assert!(opened.iter().all(|f| f["method"] != "thread/start"));
+        let user =
+            |id: &str| json!({ "id": id, "items": [{ "type": "userMessage", "content": [] }] });
+        let turns = json!([user("t1"), { "id": "t1b", "items": [] }, user("t2")]);
+        let forked = sent(
+            &frame(
+                &mut c,
+                json!({ "id": read["id"], "result": { "thread": { "turns": turns } } }),
+            )
+            .frames,
+        );
+        assert_eq!(forked[0]["method"], "thread/fork");
+        assert_eq!(forked[0]["params"]["threadId"], "th-1");
+        assert_eq!(forked[0]["params"]["lastTurnId"], "t1b");
+        assert!(forked[0]["params"].get("dynamicTools").is_none());
+        let events = frame(&mut c, json!({ "id": forked[0]["id"], "result": { "thread": { "id": "th-2", "turns": [user("t1")] }, "model": "m" } })).events;
+        let startup = events.iter().find(|e| e["type"] == "startup").unwrap();
+        assert_eq!(startup["session_id"], "th-2");
+    }
+
+    #[test]
+    fn a_fork_point_is_the_turn_before_the_next_user_turn() {
+        let user = |id: &str| json!({ "id": id, "items": [{ "type": "userMessage" }] });
+        let turns = json!([user("a"), user("b"), { "id": "b2", "items": [] }]);
+        assert_eq!(fork_point(&turns, Some(1)).as_deref(), Some("a"));
+        assert_eq!(fork_point(&turns, Some(2)), None);
+        assert_eq!(fork_point(&turns, None), None);
+    }
+
+    #[test]
+    fn replayed_tools_keep_their_failure_and_id() {
+        let turns = json!([{ "items": [
+            { "id": "c1", "type": "commandExecution", "command": "false", "aggregatedOutput": "", "exitCode": 1, "status": "failed" },
+            { "id": "c2", "type": "commandExecution", "command": "true", "aggregatedOutput": "", "exitCode": 0, "status": "completed" },
+            { "id": "f1", "type": "fileChange", "changes": [{ "path": "a.rs", "diff": "+x" }], "status": "declined" },
+        ] }]);
+        let rows = transcript(&turns);
+        assert_eq!(rows[0]["call_id"], "c1");
+        assert_eq!(rows[0]["is_error"], true);
+        assert!(rows[1].get("is_error").is_none());
+        assert_eq!(rows[2]["is_error"], true);
+        assert_eq!(
+            serde_json::from_str::<Value>(text(&rows[2]["output"])).unwrap()["error"],
+            "declined"
         );
     }
 

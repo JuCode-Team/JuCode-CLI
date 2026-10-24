@@ -1164,6 +1164,23 @@ fn type_in(client: &mut Client, term: &str, text: &str) {
 }
 
 #[test]
+fn an_engine_probe_lists_its_models_without_a_session() {
+    let _guard = setup();
+    let log = fake_claude();
+    let daemon = start_daemon();
+    let mut desktop = Client::connect(&daemon);
+    let before = request(&mut desktop, json!({ "op": "session_list" }));
+    let probed = request(&mut desktop, json!({ "op": "engine_probe", "engine": "claude", "options": {} }));
+    assert_eq!(probed["type"], "engine_probed", "{probed}");
+    let events = probed["events"].as_array().unwrap();
+    assert!(events.iter().any(|e| e["type"] == "model_view" && e["models"].as_array().is_some_and(|m| !m.is_empty())), "{probed}");
+    assert_eq!(starts(&log).len(), 1);
+    // No session came of it.
+    let after = request(&mut desktop, json!({ "op": "session_list" }));
+    assert_eq!(before["sessions"], after["sessions"]);
+}
+
+#[test]
 fn a_claude_conversation_moves_to_its_tui_and_back() {
     let _guard = setup();
     let log = fake_claude();
@@ -1268,7 +1285,7 @@ fn a_claude_session_keeps_the_custom_provider_it_started_on() {
         json!({ "op": "session_create", "cwd": dir, "engine": "claude" }),
     );
     let session = created["session"].as_str().unwrap().to_string();
-    let p1 = json!({ "id": "p1", "name": "Name p1", "model": "model-p1" });
+    let p1 = json!({ "id": "p1", "name": "Name p1", "model": "model-p1", "models": ["model-p1"] });
     assert_eq!(provider_of(&mut desktop, &session), p1);
     // The engine's own start, once it has logged it.
     let start = |n: usize| -> Vec<String> {
@@ -1755,10 +1772,8 @@ fn a_claude_session_runs_turns_and_shares_approvals_with_every_client() {
     let snapshot =
         phone.until(|f| f["session"] == session.as_str() && f["type"] == "approval_request");
     let transcript = snapshot.iter().find(|f| f["type"] == "transcript").unwrap();
-    assert_eq!(
-        transcript["items"][1],
-        json!({ "role": "assistant", "content": "ok: hello" })
-    );
+    assert_eq!(transcript["items"][1]["role"], "assistant");
+    assert_eq!(transcript["items"][1]["content"], "ok: hello");
     let call = snapshot.last().unwrap()["call_id"].clone();
     phone
         .send(json!({ "op": "approve", "session": session, "call_id": call, "decision": "allow" }));
@@ -2447,14 +2462,6 @@ fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
     let _ = fs::remove_dir_all(jucode_dir.join("review"));
 }
 
-/// Requirement `id` in a `requirements` frame.
-fn requirement<'a>(frame: &'a Value, id: &str) -> Option<&'a Value> {
-    (frame["type"] == "requirements")
-        .then(|| frame["requirements"].as_array())
-        .flatten()
-        .and_then(|list| list.iter().find(|r| r["id"] == id))
-}
-
 #[test]
 fn a_message_shows_its_images_to_every_client() {
     use base64::{engine::general_purpose::STANDARD, Engine};
@@ -2496,160 +2503,6 @@ fn a_message_shows_its_images_to_every_client() {
         json!({ "op": "fs_image", "path": daemon.state.join("token") }),
     );
     assert_eq!(outside["type"], "error");
-}
-
-#[test]
-fn a_requirement_follows_its_sessions_and_continues_in_them() {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let _guard = setup();
-    let daemon = start_daemon();
-    let dir = temp_dir("daemon-requirement");
-    let mut client = Client::connect(&daemon);
-    let png = format!("data:image/png;base64,{}", STANDARD.encode(b"png bytes"));
-    let shot = request(
-        &mut client,
-        json!({ "op": "upload", "name": "shot.png", "data": STANDARD.encode(b"png bytes"), "last": true }),
-    );
-    let shot = shot["path"].as_str().unwrap().to_string();
-    // Only an upload is taken in, nothing else on the computer.
-    let outside = request(
-        &mut client,
-        json!({ "op": "requirement_create", "text": "steal", "images": [daemon.state.join("token")] }),
-    );
-    assert_eq!(outside["type"], "error");
-
-    fs::create_dir_all(&dir).unwrap();
-    let added = request(&mut client, json!({ "op": "project_add", "path": dir }));
-    let project = added["workspaces"][0]["projects"][0]["id"].clone();
-    let created = request(
-        &mut client,
-        json!({ "op": "requirement_create", "text": "export sessions as markdown", "project": project, "images": [shot] }),
-    );
-    let r = &created["requirement"];
-    let id = r["id"].as_str().unwrap().to_string();
-    assert!(id.starts_with("R-"));
-    assert_eq!(r["state"], "idea");
-    assert_eq!(r["title"], "export sessions as markdown");
-    assert_eq!(r["project"], project);
-    let image = request(
-        &mut client,
-        json!({ "op": "requirement_image", "requirement": id, "index": 0 }),
-    );
-    assert_eq!(image["data"], png);
-
-    // Started from the phone: a new session in its project, linked to it,
-    // that first only explains what it understood and waits.
-    let started = request(
-        &mut client,
-        json!({ "op": "requirement_reply", "requirement": id, "lang": "en" }),
-    );
-    let first = started["session"].as_str().unwrap().to_string();
-    let frames = client.until(|f| requirement(f, &id).is_some_and(|r| r["status"] == "confirm"));
-    let shown = requirement(frames.last().unwrap(), &id).unwrap();
-    assert_eq!(shown["state"], "open");
-    assert_eq!(shown["sessions"], json!([first]));
-    assert_eq!(shown["session_states"][&first], "idle");
-    assert_eq!(shown["gate"]["session"], first);
-    assert_eq!(shown["gate"]["stage"], "understand");
-    let reply = shown["last_reply"].as_str().unwrap();
-    assert!(
-        reply.ends_with("Then stop and wait for my confirmation."),
-        "{reply}"
-    );
-
-    // Until confirmed it stays read-only, whatever a client asks for.
-    client.send(json!({ "op": "watch", "session": first }));
-    client.send(json!({ "op": "set_approval_mode", "session": first, "mode": "full-access" }));
-    let frames = client.until(|f| {
-        f["type"] == "approval_mode" && f["session"] == first.as_str() && f["mode"] != "auto"
-    });
-    assert_eq!(frames.last().unwrap()["mode"], "manual");
-
-    // Confirmed, it goes to work in the chosen mode.
-    let confirmed = request(
-        &mut client,
-        json!({ "op": "requirement_confirm", "requirement": id, "lang": "en" }),
-    );
-    assert_eq!(confirmed["stage"], "go", "{confirmed}");
-    let frames = client.until(|f| requirement(f, &id).is_some_and(|r| r["status"] == "review"));
-    let shown = requirement(frames.last().unwrap(), &id).unwrap();
-    assert!(shown.get("gate").is_none());
-    assert!(shown["last_reply"]
-        .as_str()
-        .unwrap()
-        .contains("Now implement it."));
-
-    // Feedback goes to the latest session; asked for, a new one starts.
-    let again = request(
-        &mut client,
-        json!({ "op": "requirement_reply", "requirement": id, "text": "and the images" }),
-    );
-    assert_eq!(again["session"], first);
-    client.until(|f| {
-        requirement(f, &id).is_some_and(|r| {
-            r["status"] == "review"
-                && r["last_reply"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("and the images")
-        })
-    });
-    let fresh = request(
-        &mut client,
-        json!({ "op": "requirement_reply", "requirement": id, "text": "start over", "new_session": true }),
-    );
-    let second = fresh["session"].as_str().unwrap().to_string();
-    assert_ne!(second, first);
-    let frames = client.until(|f| {
-        requirement(f, &id)
-            .is_some_and(|r| r["status"] == "confirm" && r["sessions"] == json!([first, second]))
-    });
-    assert!(
-        requirement(frames.last().unwrap(), &id).unwrap()["last_reply"]
-            .as_str()
-            .unwrap()
-            .contains("start over")
-    );
-
-    // A session works on one requirement at a time.
-    let other = request(
-        &mut client,
-        json!({ "op": "requirement_create", "text": "second" }),
-    );
-    let other = other["requirement"]["id"].as_str().unwrap().to_string();
-    request(
-        &mut client,
-        json!({ "op": "requirement_link", "requirement": other, "session": second }),
-    );
-    let listed = request(&mut client, json!({ "op": "requirement_list" }));
-    assert_eq!(
-        requirement(&listed, &id).unwrap()["sessions"],
-        json!([first])
-    );
-    assert_eq!(
-        requirement(&listed, &other).unwrap()["sessions"],
-        json!([second])
-    );
-    assert_eq!(requirement(&listed, &other).unwrap()["state"], "open");
-
-    let done = request(
-        &mut client,
-        json!({ "op": "requirement_update", "requirement": id, "state": "done" }),
-    );
-    assert_eq!(done["requirement"]["state"], "done");
-    let bad = request(
-        &mut client,
-        json!({ "op": "requirement_update", "requirement": id, "state": "gone" }),
-    );
-    assert_eq!(bad["type"], "error");
-    request(
-        &mut client,
-        json!({ "op": "requirement_delete", "requirement": id }),
-    );
-    let listed = request(&mut client, json!({ "op": "requirement_list" }));
-    assert!(requirement(&listed, &id).is_none());
-    let kept = daemon.state.parent().unwrap().join("uploads/requirements");
-    assert!(!kept.join(&id).exists());
 }
 
 #[test]

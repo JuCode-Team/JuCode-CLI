@@ -39,7 +39,7 @@ mod runs;
 
 use super::{home, resolve, Adapter, HostCall, Line, Options, Output};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use jucode_agent_core::{queue_index, user_tools};
+use jucode_agent_core::{queue_index, queue_move_target, user_tools};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -190,11 +190,16 @@ pub fn command(id: &str, options: &Options) -> Command {
     } else {
         command.args(["--permission-mode", mode]);
     }
-    match &options.resume {
-        Some(resume) => {
+    match (&options.resume, &options.fork_from) {
+        (Some(resume), _) => {
             command.args(["--resume", resume]);
         }
-        None => {
+        // A fork: the conversation so far (to `resume_at`), as a new one
+        // under the id the daemon picked.
+        (None, Some(from)) => {
+            command.args(["--resume", from, "--fork-session", "--session-id", id]);
+        }
+        (None, None) => {
             command.args(["--session-id", id]);
         }
     }
@@ -445,6 +450,71 @@ fn edit_hunks(name: &str, input: &Value) -> Value {
         })
         .collect();
     json!(hunks)
+}
+
+/// The tool-card JSON of a call's result (`structured`: the frame's
+/// `tool_use_result`, a saved row's `toolUseResult`).
+fn result_card(meta: &ToolMeta, block: &Value, structured: &Value) -> String {
+    let is_error = block["is_error"] == true;
+    let body = result_text(&block["content"]);
+    let failed = || {
+        if body.is_empty() {
+            "failed".to_string()
+        } else {
+            body.clone()
+        }
+    };
+    match meta.name.as_str() {
+        "bash" => {
+            let mut card = json!({ "command": text(&meta.input["command"]) });
+            if is_error {
+                let stderr = text(&structured["stderr"]);
+                card["error"] = json!(if !body.is_empty() {
+                    body.clone()
+                } else if !stderr.is_empty() {
+                    stderr.to_string()
+                } else {
+                    "failed".to_string()
+                });
+            } else {
+                card["stdout"] = match structured["stdout"].as_str() {
+                    Some(stdout) => json!(stdout),
+                    None => json!(body),
+                };
+                if !text(&structured["stderr"]).is_empty() {
+                    card["stderr"] = structured["stderr"].clone();
+                }
+            }
+            card.to_string()
+        }
+        "write" | "str_replace" => {
+            let path = edit_path(&meta.input);
+            if is_error {
+                json!({ "path": path, "error": failed() }).to_string()
+            } else {
+                let paths: Vec<&str> = if path.is_empty() { vec![] } else { vec![path] };
+                json!({ "path": path, "paths": paths, "diff": edit_diff(&meta.claude_name, &meta.input) }).to_string()
+            }
+        }
+        "read" => {
+            let path = text(&meta.input["file_path"]);
+            if is_error {
+                json!({ "path": path, "error": failed() }).to_string()
+            } else {
+                json!({ "path": path }).to_string()
+            }
+        }
+        "ripgrep" => {
+            let mut card = json!({ "pattern": text(&meta.input["pattern"]) });
+            if is_error {
+                card["error"] = json!(failed());
+            } else {
+                card["stdout"] = json!(body);
+            }
+            card.to_string()
+        }
+        _ => body.clone(),
+    }
 }
 
 /// The tool-card JSON Desktop's cards understand, from a tool input.
@@ -1181,65 +1251,7 @@ impl Claude {
             return vec![];
         }
         let is_error = block["is_error"] == true;
-        let body = result_text(&block["content"]);
-        let failed = || {
-            if body.is_empty() {
-                "failed".to_string()
-            } else {
-                body.clone()
-            }
-        };
-        let output = match meta.name.as_str() {
-            "bash" => {
-                let mut card = json!({ "command": text(&meta.input["command"]) });
-                if is_error {
-                    let stderr = text(&structured["stderr"]);
-                    card["error"] = json!(if !body.is_empty() {
-                        body.clone()
-                    } else if !stderr.is_empty() {
-                        stderr.to_string()
-                    } else {
-                        "failed".to_string()
-                    });
-                } else {
-                    card["stdout"] = match structured["stdout"].as_str() {
-                        Some(stdout) => json!(stdout),
-                        None => json!(body),
-                    };
-                    if !text(&structured["stderr"]).is_empty() {
-                        card["stderr"] = structured["stderr"].clone();
-                    }
-                }
-                card.to_string()
-            }
-            "write" | "str_replace" => {
-                let path = edit_path(&meta.input);
-                if is_error {
-                    json!({ "path": path, "error": failed() }).to_string()
-                } else {
-                    let paths: Vec<&str> = if path.is_empty() { vec![] } else { vec![path] };
-                    json!({ "path": path, "paths": paths, "diff": edit_diff(&meta.claude_name, &meta.input) }).to_string()
-                }
-            }
-            "read" => {
-                let path = text(&meta.input["file_path"]);
-                if is_error {
-                    json!({ "path": path, "error": failed() }).to_string()
-                } else {
-                    json!({ "path": path }).to_string()
-                }
-            }
-            "ripgrep" => {
-                let mut card = json!({ "pattern": text(&meta.input["pattern"]) });
-                if is_error {
-                    card["error"] = json!(failed());
-                } else {
-                    card["stdout"] = json!(body);
-                }
-                card.to_string()
-            }
-            _ => body.clone(),
-        };
+        let output = result_card(&meta, block, structured);
         vec![
             json!({ "type": "tool_output", "call_id": id, "name": meta.name, "output": output, "is_error": is_error }),
         ]
@@ -2695,10 +2707,29 @@ impl Adapter for Claude {
                     return Ok(Output::default());
                 };
                 let held = self.held.remove(i - fixed);
+                if op["discard"] == true {
+                    return Ok(Output::events(vec![self.queued_event()]));
+                }
                 return Ok(Output::events(vec![
                     self.queued_event(),
                     json!({ "type": "unqueued", "content": held.text, "images": held.images }),
                 ]));
+            }
+            // A held message to another place among the held (`index` to
+            // `to`, in the listed messages; the CLI's own stay first).
+            "queue_move" => {
+                let fixed = self.queued.len();
+                let Some((from, to)) = queue_move_target(
+                    op["index"].as_i64(),
+                    op["to"].as_i64(),
+                    fixed + self.held.len(),
+                )
+                .filter(|(from, to)| *from >= fixed && *to >= fixed) else {
+                    return Ok(Output::default());
+                };
+                let item = self.held.remove(from - fixed);
+                self.held.insert(to - fixed, item);
+                return Ok(Output::events(vec![self.queued_event()]));
             }
             "set_approval_mode" => {
                 let mode = to_claude_mode(text(&op["mode"]));
@@ -3258,11 +3289,11 @@ fn is_conversation_id(id: &str) -> bool {
 
 /// Rows Claude adds that are not conversation: subagent streams, meta notes,
 /// the post-compaction summary.
-/// The `user_tools` calls in a saved row, which the replay keeps (their
-/// cards are what the user was shown): an assistant row's calls are noted
-/// in `calls` (tool_use id → name), a user row's results to them become
-/// tool items.
-fn user_tool_rows(row: &Value, calls: &mut HashMap<String, String>) -> Vec<Value> {
+/// The tool calls in a saved row, as the cards a live turn showed: an
+/// assistant row's calls are noted in `calls`, a user row's results to them
+/// become tool items (with `is_error` when the call failed). The todo list
+/// and the plan were not cards.
+fn tool_rows(row: &Value, calls: &mut HashMap<String, ToolMeta>) -> Vec<Value> {
     let blocks = row["message"]["content"]
         .as_array()
         .map(Vec::as_slice)
@@ -3270,21 +3301,41 @@ fn user_tool_rows(row: &Value, calls: &mut HashMap<String, String>) -> Vec<Value
     let mut items = Vec::new();
     for block in blocks {
         match text(&block["type"]) {
-            "tool_use" => {
-                let name = tool_name(text(&block["name"]));
-                if user_tools::NAMES.contains(&name) {
-                    calls.insert(text(&block["id"]).to_string(), name.to_string());
+            _ if is_tool_use(block) => {
+                let claude_name = text(&block["name"]);
+                if !matches!(claude_name, "TodoWrite" | "ExitPlanMode") {
+                    calls.insert(
+                        text(&block["id"]).to_string(),
+                        ToolMeta {
+                            claude_name: claude_name.to_string(),
+                            name: tool_name(claude_name).to_string(),
+                            input: object(&block["input"]),
+                        },
+                    );
                 }
             }
             "tool_result" => {
-                if let Some(name) = calls.remove(text(&block["tool_use_id"])) {
-                    items.push(json!({ "role": "tool", "name": name, "output": result_text(&block["content"]) }));
+                let id = text(&block["tool_use_id"]);
+                if let Some(meta) = calls.remove(id) {
+                    let output = result_card(&meta, block, &row["toolUseResult"]);
+                    let mut item = json!({ "role": "tool", "name": meta.name, "output": output, "call_id": id });
+                    if block["is_error"] == true {
+                        item["is_error"] = json!(true);
+                    }
+                    items.push(item);
                 }
             }
             _ => {}
         }
     }
     items
+}
+
+/// When a saved row was written, ms since the epoch.
+fn row_time(row: &Value) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(text(&row["timestamp"]))
+        .ok()
+        .map(|t| t.timestamp_millis())
 }
 
 fn is_synthetic(row: &Value) -> bool {
@@ -3428,9 +3479,10 @@ fn rows(path: &Path, limit: u64) -> impl Iterator<Item = Value> {
         .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
 }
 
-/// The user and assistant text of a saved conversation, as transcript items
-/// (the newest 500), from config directory `config`. The user's images are
-/// written under `uploads`.
+/// A saved conversation as transcript items (the newest 500): the user's and
+/// the model's text and the tool calls, each with when it was written
+/// (`at`), from config directory `config`. The user's images are written
+/// under `uploads`.
 pub fn transcript(config: &Path, cwd: &Path, id: &str, uploads: &Path) -> Vec<Value> {
     transcript_in(config, cwd, id, &uploads.join("claude"))
 }
@@ -3439,24 +3491,35 @@ fn transcript_in(config: &Path, cwd: &Path, id: &str, images: &Path) -> Vec<Valu
     if !is_conversation_id(id) {
         return vec![];
     }
-    let mut user_calls = HashMap::new();
+    let mut calls = HashMap::new();
     let mut items: Vec<Value> = rows(
         &project_dir(config, cwd).join(format!("{id}.jsonl")),
         64 * 1024 * 1024,
     )
     .filter(|row| !is_synthetic(row))
     .flat_map(|row| {
-        let mut items = user_tool_rows(&row, &mut user_calls);
+        let mut items = tool_rows(&row, &mut calls);
         items.extend(match text(&row["type"]) {
             "user" => user_item(&row["message"]["content"], images),
             // The usage-limit notice Claude Code saves as a reply is none.
             "assistant" if row["error"] == "rate_limit" => None,
-            "assistant" => {
-                row_text(&row).map(|content| json!({ "role": "assistant", "content": content }))
-            }
+            // Its uuid: where a rewind or a fork resumes the conversation.
+            "assistant" => row_text(&row).map(|content| {
+                let mut item = json!({ "role": "assistant", "content": content });
+                if let Some(uuid) = row["uuid"].as_str() {
+                    item["uuid"] = json!(uuid);
+                }
+                item
+            }),
             "attachment" => queued_prompt(&row).and_then(|prompt| user_item(prompt, images)),
             _ => None,
         });
+        // When each was said or ran: the turn's time and its line's clock.
+        if let Some(at) = row_time(&row) {
+            for item in &mut items {
+                item["at"] = json!(at);
+            }
+        }
         items
     })
     .collect();
@@ -4962,6 +5025,32 @@ mod tests {
     }
 
     #[test]
+    fn held_messages_reorder_and_drop_but_not_past_the_clis_own() {
+        let mut c = mid_turn(&["apple", "banana", "cherry"]);
+        c.encode(&json!({ "op": "steer", "index": 0 })).unwrap();
+        // apple is the CLI's now: the others move among themselves only.
+        assert!(c
+            .encode(&json!({ "op": "queue_move", "index": 2, "to": 0 }))
+            .unwrap()
+            .events
+            .is_empty());
+        let moved = c
+            .encode(&json!({ "op": "queue_move", "index": 2, "to": 1 }))
+            .unwrap();
+        assert_eq!(
+            moved.events,
+            vec![json!({ "type": "pending_messages", "messages": ["apple", "cherry", "banana"], "fixed": 1 })]
+        );
+        let dropped = c
+            .encode(&json!({ "op": "unqueue", "index": 1, "discard": true }))
+            .unwrap();
+        assert_eq!(
+            dropped.events,
+            vec![json!({ "type": "pending_messages", "messages": ["apple", "banana"], "fixed": 1 })]
+        );
+    }
+
+    #[test]
     fn a_held_message_can_be_taken_back() {
         let mut c = mid_turn(&[]);
         c.encode(&json!({ "op": "user_message", "content": "oops", "images": ["/tmp/a.png"] }))
@@ -5095,18 +5184,61 @@ mod tests {
     }
 
     #[test]
-    fn replay_keeps_user_tool_cards() {
+    fn a_fork_resumes_the_conversation_as_a_new_one() {
+        let options = Options {
+            fork_from: Some("orig".into()),
+            resume_at: Some("u-9".into()),
+            ..Options::default()
+        };
+        let args: Vec<String> = command("new-id", &options)
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let at = args.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(
+            args[at..at + 5],
+            [
+                "--resume",
+                "orig",
+                "--fork-session",
+                "--session-id",
+                "new-id"
+            ]
+        );
+        assert!(args.windows(2).any(|w| w == ["--resume-session-at", "u-9"]));
+    }
+
+    #[test]
+    fn replay_keeps_tool_cards() {
         let mut calls = HashMap::new();
-        let call = json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "id": "t1", "name": "mcp__jucode__present_files" }, { "type": "tool_use", "id": "t2", "name": "Bash" }] } });
-        assert!(user_tool_rows(&call, &mut calls).is_empty());
-        let result = json!({ "type": "user", "message": { "content": [
-            { "type": "tool_result", "tool_use_id": "t2", "content": "ls" },
+        let call = json!({ "type": "assistant", "message": { "content": [
+            { "type": "tool_use", "id": "t1", "name": "mcp__jucode__present_files" },
+            { "type": "tool_use", "id": "t2", "name": "Bash", "input": { "command": "ls" } },
+            { "type": "tool_use", "id": "t3", "name": "Edit", "input": { "file_path": "/a.rs", "old_string": "x", "new_string": "y" } },
+            { "type": "tool_use", "id": "t4", "name": "TodoWrite", "input": { "todos": [] } },
+        ] } });
+        assert!(tool_rows(&call, &mut calls).is_empty());
+        let result = json!({ "type": "user", "toolUseResult": { "stdout": "a\n", "stderr": "" }, "message": { "content": [
+            { "type": "tool_result", "tool_use_id": "t2", "content": "a" },
             { "type": "tool_result", "tool_use_id": "t1", "content": [{ "type": "text", "text": "{\"files\":[]}" }] },
+            { "type": "tool_result", "tool_use_id": "t3", "content": "String not found", "is_error": true },
+            { "type": "tool_result", "tool_use_id": "t4", "content": "ok" },
         ] } });
         assert_eq!(
-            user_tool_rows(&result, &mut calls),
-            vec![json!({ "role": "tool", "name": "present_files", "output": "{\"files\":[]}" })]
+            tool_rows(&result, &mut calls),
+            vec![
+                json!({ "role": "tool", "name": "bash", "output": "{\"command\":\"ls\",\"stdout\":\"a\\n\"}", "call_id": "t2" }),
+                json!({ "role": "tool", "name": "present_files", "output": "{\"files\":[]}", "call_id": "t1" }),
+                json!({ "role": "tool", "name": "str_replace", "output": "{\"error\":\"String not found\",\"path\":\"/a.rs\"}", "call_id": "t3", "is_error": true }),
+            ]
         );
+    }
+
+    #[test]
+    fn replay_stamps_when_each_row_was_written() {
+        let row = json!({ "timestamp": "2026-10-23T12:00:00.250Z" });
+        assert_eq!(row_time(&row), Some(1_792_756_800_250));
+        assert_eq!(row_time(&json!({})), None);
     }
 
     #[test]

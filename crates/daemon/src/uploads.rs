@@ -1,8 +1,8 @@
 //! Files a client sends to this computer (the remote page has no file
-//! system the engines can read): images and files attached to a message,
-//! screenshots of a requirement. They come in chunks of base64 over the
-//! client's connection, so through the relay they stay end to end encrypted
-//! and other frames keep flowing between chunks; the relay stores nothing.
+//! system the engines can read): images and files attached to a message.
+//! They come in chunks of base64 over the client's connection, so through
+//! the relay they stay end to end encrypted and other frames keep flowing
+//! between chunks; the relay stores nothing.
 //!
 //! A file lands in `~/.jucode/uploads/<date>/<upload id>-<name>` (outside
 //! the daemon's state directory, which the jucode sandbox does not let tools
@@ -121,18 +121,6 @@ impl Uploads {
             "image": is_image(&part.path),
         }))
     }
-
-    /// `path` when it is a finished upload: inside the uploads directory
-    /// (after resolving links), a file. Anything else a client names is
-    /// refused, so no other file on this computer can be taken in.
-    pub fn finished(&self, path: &str) -> Result<PathBuf, String> {
-        let real = fs::canonicalize(path).map_err(|_| format!("not an upload: {path}"))?;
-        let root = fs::canonicalize(&self.dir).map_err(|_| format!("not an upload: {path}"))?;
-        if !real.starts_with(&root) || !real.is_file() {
-            return Err(format!("not an upload: {path}"));
-        }
-        Ok(real)
-    }
 }
 
 pub fn is_image(path: &Path) -> bool {
@@ -206,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_arrives_in_chunks_and_only_uploads_are_taken() {
+    fn a_file_arrives_in_chunks() {
         let root = temp("chunks");
         let uploads = Uploads::load(&root);
         let first = uploads
@@ -226,11 +214,6 @@ mod tests {
         assert!(path.ends_with("u-1-截图 1.PNG"));
         assert_eq!(done["image"], true);
         assert_eq!(fs::read(path).unwrap(), b"abcd");
-        assert!(uploads.finished(path).is_ok());
-        assert!(uploads.finished(root.join("..").to_str().unwrap()).is_err());
-        let outside = root.join("secret");
-        fs::write(&outside, b"x").unwrap();
-        assert!(uploads.finished(outside.to_str().unwrap()).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
