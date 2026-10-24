@@ -4,7 +4,8 @@
 //! span several transport messages: each plaintext is a flag byte (0 = last
 //! chunk, 1 = more follows) and up to `CHUNK` bytes of the frame.
 
-use snow::{Builder, HandshakeState, TransportState};
+pub use snow::HandshakeState;
+use snow::{Builder, TransportState};
 
 pub const PATTERN: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 pub const PROLOGUE: &[u8] = b"jucode-relay-v1";

@@ -7,7 +7,7 @@ use crate::{
     relay::Relay,
     schedules::{self, Schedule},
     session,
-    store::{now, random_hex, token_hash, Closure, Device, SessionRecord, Store, CLOSED_KEEP_MS},
+    store::{now, Closure, Device, SessionRecord, Store, CLOSED_KEEP_MS},
     titles::{self, Turns},
     usage::{SessionInfo, Usage},
 };
@@ -50,7 +50,6 @@ const SWEEP_EVERY_MS: u64 = 60 * 1000;
 pub struct Hub {
     pub store: Store,
     pub uploads: crate::uploads::Uploads,
-    pub push: crate::push::Push,
     /// Terminals (session TUIs, clients' shells) and the clients viewing
     /// them.
     pub terminals: crate::terminal::Terminals,
@@ -150,7 +149,6 @@ impl Hub {
             relay: Relay::new(relay, &store),
             usage: Usage::new(&store),
             uploads,
-            push: crate::push::Push::load(store.dir()),
             terminals: Default::default(),
             dev_servers: Default::default(),
             awake: Default::default(),
@@ -206,24 +204,23 @@ impl Hub {
         Ok((code, expires_at))
     }
 
-    /// Trades a pairing code for a new device and its token. The token is
-    /// returned once and only its hash is stored.
-    pub fn pair(&self, code: &str, name: &str) -> Result<(Device, String), String> {
-        let token = random_hex(32).map_err(|error| error.to_string())?;
-        let device = self.pair_hash(code, name, token_hash(&token))?;
-        Ok((device, token))
-    }
-
-    /// Trades a pairing code for a new device identified by `token_hash`
-    /// (a token's hash, or a relay client's static key hash).
-    pub fn pair_hash(&self, code: &str, name: &str, token_hash: String) -> Result<Device, String> {
+    /// Uses up a pairing code; an error when it is wrong or expired.
+    pub fn redeem_pairing(&self, code: &str) -> Result<(), String> {
         let code = code.trim().to_ascii_uppercase();
         let valid = lock(&self.pairings)
             .remove(&code)
             .is_some_and(|expiry| expiry > now());
-        if !valid {
-            return Err("pairing code is wrong or expired".to_string());
+        if valid {
+            Ok(())
+        } else {
+            Err("pairing code is wrong or expired".to_string())
         }
+    }
+
+    /// Records a newly paired device: `key_hash` and the account fields
+    /// (`authz`, `client`, `user`) come in `device`; id, name and time are
+    /// set here.
+    pub fn add_device(&self, name: &str, device: Device) -> Result<Device, String> {
         let name = name.trim();
         let device = Device {
             id: self.new_id("dev"),
@@ -231,9 +228,9 @@ impl Hub {
                 .chars()
                 .take(60)
                 .collect(),
-            token_hash,
             paired_at: now(),
             revoked: false,
+            ..device
         };
         self.store
             .record_device(&device)
@@ -256,8 +253,22 @@ impl Hub {
             .map_err(|error| error.to_string())?;
         // Dropping the outbox ends that connection's loop.
         lock(&self.clients).retain(|_, client| client.device.as_deref() != Some(id));
-        self.push.forget_device(id);
         Ok(())
+    }
+
+    /// Revokes every paired device; returns how many there were.
+    pub fn revoke_all_devices(&self) -> Result<usize, String> {
+        let active: Vec<String> = self
+            .store
+            .devices()
+            .into_iter()
+            .filter(|device| !device.revoked)
+            .map(|device| device.id)
+            .collect();
+        for id in &active {
+            self.revoke_device(id)?;
+        }
+        Ok(active.len())
     }
 
     pub fn devices_json(&self) -> Value {
@@ -266,9 +277,28 @@ impl Hub {
             .devices()
             .iter()
             .filter(|device| !device.revoked)
-            .map(|device| json!({ "id": device.id, "name": device.name, "paired_at": device.paired_at }))
+            .map(|device| {
+                json!({
+                    "id": device.id, "name": device.name, "paired_at": device.paired_at,
+                    "client": device.client, "authz": device.authz, "user": device.user,
+                })
+            })
             .collect();
         json!({ "type": "devices", "devices": list })
+    }
+
+    /// Whether a local client (the desktop) is connected.
+    pub fn has_local_client(&self) -> bool {
+        lock(&self.clients)
+            .values()
+            .any(|client| client.device.is_none())
+    }
+
+    /// `broadcast` to local clients only.
+    pub fn broadcast_local(&self, frame: &Value) {
+        let text = frame.to_string();
+        lock(&self.clients)
+            .retain(|_, client| client.device.is_some() || Self::queue(client, text.clone()));
     }
 
     /// Drops the client, its watches, the terminals it viewed and its
@@ -938,15 +968,17 @@ impl Hub {
         .inspect_err(|_| self.release_claim(session))
     }
 
-    /// Notifies the paired phones (see `push`).
     /// This hub, for a thread that outlives the caller's borrow.
     pub fn handle(&self) -> Option<Arc<Hub>> {
         self.me.upgrade()
     }
 
-    pub fn notify(&self, title: &str, body: &str, tag: &str) {
-        if let Some(hub) = self.me.upgrade() {
-            crate::push::notify(&hub, title, body, tag);
+    /// Notifies the account's phones and browsers (see `notify`), opening
+    /// `session` when it names one. Only while remote access is on: a
+    /// notification leads to the computer through the relay.
+    pub fn notify(&self, title: &str, body: &str, session: Option<&str>) {
+        if self.relay.enabled() {
+            crate::notify::send(self.relay.host_id(), title, body, session);
         }
     }
 

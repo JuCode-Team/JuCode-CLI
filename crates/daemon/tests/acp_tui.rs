@@ -84,7 +84,7 @@ fn a_built_in_agents_conversation_moves_to_its_tui_and_back() {
     let address = listener.local_addr().unwrap().to_string();
     let store = Store::open(temp_dir("acp-tui-state").join("daemon")).unwrap();
     let token = store.token().unwrap();
-    thread::spawn(move || jucode_daemon::serve(listener, store, None, "test", None));
+    thread::spawn(move || jucode_daemon::serve(listener, store, "test", None));
     let (socket, _) = tungstenite::connect(format!("ws://{address}/?token={token}")).unwrap();
     if let MaybeTlsStream::Plain(stream) = socket.get_ref() {
         stream

@@ -35,6 +35,7 @@ This project implements a standard MCP client (stdio and streamable HTTP transpo
 - Do not enable `ureq`'s `try_proxy_from_env`: it reads `ALL_PROXY` first, has no SOCKS support built in and ignores `NO_PROXY`, so a common shell proxy setup fails every request.
 - Engine `Options` carried from one open to the next (a restart, an idle close's kept options) must drop the per-open fields: `resume`, `resume_at` (a rewind point) and `dirs`. A rewind point carried over silently cuts the conversation back.
 - An engine's `agent_runs` entries say `status`; only a workflow's nested agents say `state`. Code reading run states reads both (see `engines::Snapshot::holds`).
+- A `/login` can replace the saved JuCode login with another account's while the daemon runs, with no logout in between. Anything tied to the account (the relay registration, devices approved under it) must compare whose login is saved (`relay::token_user`), not only whether one is.
 
 ## TUI Guidelines
 

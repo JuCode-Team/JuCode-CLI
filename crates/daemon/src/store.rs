@@ -90,15 +90,21 @@ pub struct SessionRecord {
     pub parent: Option<String>,
 }
 
-/// A paired remote device (a phone's browser). Only a hash of its token is
-/// kept, so the state directory never holds a usable device token.
-#[derive(Debug, Clone, PartialEq)]
+/// A device paired over the relay: a client install known by its Noise
+/// static key, signed in to the account the computer is registered under.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Device {
     pub id: String,
     pub name: String,
-    pub token_hash: String,
+    /// Hex SHA-256 of the client's Noise static public key.
+    pub key_hash: String,
     pub paired_at: u64,
     pub revoked: bool,
+    /// The client's OAuth authorization, client id and user, as the relay
+    /// vouched for them when it paired.
+    pub authz: String,
+    pub client: String,
+    pub user: String,
 }
 
 impl Store {
@@ -643,7 +649,8 @@ impl Store {
             DEVICES,
             json!({
                 "kind": "paired", "id": device.id, "name": device.name,
-                "token_hash": device.token_hash, "at": device.paired_at,
+                "key_hash": device.key_hash, "at": device.paired_at,
+                "authz": device.authz, "client": device.client, "user": device.user,
             }),
         )
     }
@@ -664,28 +671,26 @@ impl Store {
             .filter(|entry| entry["kind"] == "paired")
             .filter_map(|entry| {
                 let id = entry["id"].as_str()?.to_string();
+                let text = |key: &str| entry[key].as_str().unwrap_or_default().to_string();
                 Some(Device {
                     revoked: revoked.contains(id.as_str()),
-                    id,
-                    name: entry["name"].as_str().unwrap_or_default().to_string(),
-                    token_hash: entry["token_hash"].as_str()?.to_string(),
+                    name: text("name"),
+                    key_hash: entry["key_hash"].as_str()?.to_string(),
                     paired_at: entry["at"].as_u64().unwrap_or_default(),
+                    authz: text("authz"),
+                    client: text("client"),
+                    user: text("user"),
+                    id,
                 })
             })
             .collect()
     }
 
-    /// The active device a token belongs to.
-    pub fn device_for_token(&self, token: &str) -> Option<Device> {
-        self.device_for_hash(&token_hash(token))
-    }
-
-    /// The active device with this token hash. A relay device's hash is of
-    /// its Noise static key.
-    pub fn device_for_hash(&self, hash: &str) -> Option<Device> {
+    /// The active device with this key hash.
+    pub fn device_for_key(&self, hash: &str) -> Option<Device> {
         self.devices()
             .into_iter()
-            .find(|device| !device.revoked && device.token_hash == hash)
+            .find(|device| !device.revoked && device.key_hash == hash)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -778,10 +783,6 @@ fn closure_from(entry: &Value) -> Option<Closure> {
         reason: entry["reason"].as_str().unwrap_or_default().to_string(),
         at: entry["at"].as_u64().unwrap_or_default(),
     })
-}
-
-pub fn token_hash(token: &str) -> String {
-    bytes_hash(token.as_bytes())
 }
 
 /// Lowercase hex SHA-256.
@@ -1169,19 +1170,20 @@ mod tests {
             return;
         };
         let token = store.token().unwrap();
+        let key = bytes_hash(b"phone key");
         store
             .record_device(&Device {
                 id: "d1".to_string(),
                 name: "phone".to_string(),
-                token_hash: token_hash("secret"),
+                key_hash: key.clone(),
                 paired_at: 1,
-                revoked: false,
+                ..Device::default()
             })
             .unwrap();
         // First run here: claimed, nothing reset.
         assert!(!store.claim_machine().unwrap());
         assert_eq!(store.token().unwrap(), token);
-        assert!(store.device_for_token("secret").is_some());
+        assert!(store.device_for_key(&key).is_some());
         assert_eq!(
             fs::read_to_string(store.dir.join(MACHINE)).unwrap().trim(),
             current
@@ -1190,29 +1192,29 @@ mod tests {
         fs::write(store.dir.join(MACHINE), "another-computer\n").unwrap();
         assert!(store.claim_machine().unwrap());
         assert_ne!(store.token().unwrap(), token);
-        assert!(store.device_for_token("secret").is_none());
+        assert!(store.device_for_key(&key).is_none());
         assert!(!store.claim_machine().unwrap());
     }
 
     #[test]
-    fn a_device_token_works_until_revoked() {
+    fn a_device_key_works_until_revoked_and_keeps_its_account() {
         let store = store("devices");
-        store
-            .record_device(&Device {
-                id: "d1".to_string(),
-                name: "phone".to_string(),
-                token_hash: token_hash("secret"),
-                paired_at: 1,
-                revoked: false,
-            })
-            .unwrap();
-        assert_eq!(store.device_for_token("secret").unwrap().id, "d1");
-        assert!(store.device_for_token("guess").is_none());
+        let key = bytes_hash(b"phone key");
+        let device = Device {
+            id: "d1".to_string(),
+            name: "phone".to_string(),
+            key_hash: key.clone(),
+            paired_at: 1,
+            revoked: false,
+            authz: "a1".to_string(),
+            client: "jucode-mobile".to_string(),
+            user: "u1".to_string(),
+        };
+        store.record_device(&device).unwrap();
+        assert_eq!(store.device_for_key(&key), Some(device));
+        assert!(store.device_for_key(&bytes_hash(b"guess")).is_none());
         store.record_device_revoked("d1").unwrap();
-        assert!(store.device_for_token("secret").is_none());
+        assert!(store.device_for_key(&key).is_none());
         assert!(store.devices()[0].revoked);
-        // Only the hash is on disk.
-        let log = fs::read_to_string(store.dir.join(DEVICES)).unwrap();
-        assert!(!log.contains("\"secret\""));
     }
 }

@@ -1100,12 +1100,11 @@ impl Hub {
             "detail": detail,
             "session": session,
         }));
-        let tag = if session.is_empty() {
-            &schedule.id
-        } else {
-            &session
-        };
-        self.notify(&format!("{head}：{}", schedule.name), detail, tag);
+        self.notify(
+            &format!("{head}：{}", schedule.name),
+            detail,
+            Some(session.as_str()).filter(|session| !session.is_empty()),
+        );
     }
 
     /// Applies `change` to schedule `id`, saves and broadcasts; returns it

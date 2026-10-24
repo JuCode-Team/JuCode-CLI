@@ -20,6 +20,42 @@ struct Daemon {
     address: String,
     token: String,
     state: PathBuf,
+    /// A relay daemon's fake relay listener and the JuCode login it runs
+    /// with, for as long as the test.
+    relay: Option<TcpListener>,
+    _login: Option<SignedIn>,
+}
+
+/// The test HOME signed in to JuCode until dropped: the relay needs a login.
+/// The JuCode API is a closed port, so nothing leaves the machine.
+struct SignedIn;
+
+const ACCESS_TOKEN: &str = "test-access";
+
+fn sign_in() -> SignedIn {
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    set_jucode_api_url(&format!("http://{}", closed.local_addr().unwrap()));
+    write_login(ACCESS_TOKEN);
+    SignedIn
+}
+
+fn auth_path() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap()).join(".jucode/auth.json")
+}
+
+fn write_login(access: &str) {
+    let far = 4_000_000_000u64;
+    let auth = json!({ "jucode": {
+        "access_token": access, "refresh_token": "test-refresh",
+        "access_expires_at": far, "refresh_expires_at": far,
+    } });
+    fs::write(auth_path(), auth.to_string()).unwrap();
+}
+
+impl Drop for SignedIn {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(auth_path());
+    }
 }
 
 /// A daemon on a free loopback port with its own state directory. Daemons
@@ -39,12 +75,13 @@ fn start_daemon_with(state: PathBuf, relay: Option<String>) -> Daemon {
     let address = listener.local_addr().unwrap().to_string();
     let store = Store::open(state.clone()).unwrap();
     let token = store.token().unwrap();
-    let web = state.parent().map(|root| root.join("web"));
-    thread::spawn(move || jucode_daemon::serve(listener, store, web, "test", relay));
+    thread::spawn(move || jucode_daemon::serve(listener, store, "test", relay));
     Daemon {
         address,
         token,
         state,
+        relay: None,
+        _login: None,
     }
 }
 
@@ -412,98 +449,23 @@ fn http(daemon: &Daemon, request: &str) -> (u16, String) {
     (status, response)
 }
 
-fn pair_request(code: &str) -> String {
-    let body = json!({ "code": code, "name": "phone" }).to_string();
-    format!(
-        "POST /api/pair HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    )
-}
-
 #[test]
-fn the_remote_page_is_served_over_plain_http() {
+fn plain_http_and_device_tokens_are_gone() {
     let _guard = setup();
     let daemon = start_daemon();
-    let web = daemon.state.parent().unwrap().join("web");
-    fs::create_dir_all(web.join("_app/immutable")).unwrap();
-    fs::write(web.join("index.html"), "<html>remote</html>").unwrap();
-    fs::write(web.join("_app/immutable/app.js"), "console.log(1)").unwrap();
-
-    let (status, response) = http(&daemon, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
-    assert_eq!(status, 302);
-    assert!(response.contains("Location: /remote"));
-    // A page route of the single-page app gets index.html.
-    let (status, response) = http(&daemon, "GET /remote HTTP/1.1\r\nHost: x\r\n\r\n");
-    assert_eq!(status, 200);
-    assert!(response.contains("text/html") && response.ends_with("<html>remote</html>"));
-    let (status, response) = http(
-        &daemon,
-        "GET /_app/immutable/app.js HTTP/1.1\r\nHost: x\r\n\r\n",
-    );
-    assert_eq!(status, 200);
-    assert!(response.contains("text/javascript") && response.contains("immutable"));
-    let (status, _) = http(&daemon, "GET /../daemon/token HTTP/1.1\r\nHost: x\r\n\r\n");
-    assert_eq!(status, 404);
-    let (status, _) = http(&daemon, "GET /missing.js HTTP/1.1\r\nHost: x\r\n\r\n");
-    assert_eq!(status, 404);
-}
-
-#[test]
-fn a_device_pairs_with_a_code_from_the_desktop_until_revoked() {
-    let _guard = setup();
-    let daemon = start_daemon();
-    let mut desktop = Client::connect(&daemon);
-    desktop.send(json!({ "op": "pair_start", "id": 1 }));
-    let frames = desktop.until(|frame| frame["id"] == 1);
-    let code = frames.last().unwrap()["code"].as_str().unwrap().to_string();
-    assert_eq!(code.len(), 8);
-
-    let (status, _) = http(&daemon, &pair_request("WRONG123"));
-    assert_eq!(status, 403);
-    let (status, response) = http(&daemon, &pair_request(&code.to_lowercase()));
-    assert_eq!(status, 200, "{response}");
-    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    let token = body["token"].as_str().unwrap().to_string();
-    let device = body["device"].as_str().unwrap().to_string();
-    // The code works once.
-    let (status, _) = http(&daemon, &pair_request(&code));
-    assert_eq!(status, 403);
-
-    // The phone reaches sessions, but cannot pair more devices.
-    let mut phone = Client::connect_with(&daemon, &token);
-    phone.send(json!({ "op": "session_list", "id": 2 }));
-    assert_eq!(
-        phone.until(|frame| frame["id"] == 2).last().unwrap()["type"],
-        "sessions"
-    );
-    phone.send(json!({ "op": "pair_start", "id": 3 }));
-    assert_eq!(
-        phone.until(|frame| frame["id"] == 3).last().unwrap()["type"],
-        "error"
-    );
-
-    desktop.send(json!({ "op": "device_list", "id": 4 }));
-    let frames = desktop.until(|frame| frame["id"] == 4);
-    assert_eq!(frames.last().unwrap()["devices"][0]["name"], "phone");
-    desktop.send(json!({ "op": "device_revoke", "device": device, "id": 5 }));
-    desktop.until(|frame| frame["id"] == 5);
-
-    // The open connection is dropped and the token no longer connects.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match phone.socket.read() {
-            Ok(Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) => break,
-            Err(tungstenite::Error::Io(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(_) => break,
-            Ok(_) => {}
-        }
-        assert!(Instant::now() < deadline, "revoked device still connected");
+    for request in [
+        "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET /remote HTTP/1.1\r\nHost: x\r\n\r\n",
+        "POST /api/pair HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+    ] {
+        assert_eq!(http(&daemon, request).0, 404, "{request}");
     }
-    assert!(tungstenite::connect(format!("ws://{}/?token={token}", daemon.address)).is_err());
+    let mut desktop = Client::connect(&daemon);
+    let refused = request(&mut desktop, json!({ "op": "pair_start" }));
+    assert_eq!(refused["type"], "error", "{refused}");
+    for op in ["push_subscribe", "push_unsubscribe", "push_test"] {
+        assert_eq!(request(&mut desktop, json!({ "op": op }))["type"], "error");
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -576,6 +538,89 @@ struct FakeRelay {
     host: WebSocket<TcpStream>,
 }
 
+/// The account the fake relay registers the computer under, and its clients.
+const USER: &str = "u1";
+
+/// What the relay sends with `open`: a client of `USER`.
+fn caller() -> Value {
+    json!({ "user": USER, "authz": "authz-1", "client": "jucode-mobile", "name": "Pixel" })
+}
+
+/// What a daemon sent when it connected as a host.
+struct HostRequest {
+    path: String,
+    query: String,
+    bearer: String,
+    auth: Value,
+}
+
+/// Accepts the host connection of `host_id` (other tests' daemons in this
+/// process may reach a reused port), checks nothing, and answers its
+/// challenge with `ready` for `USER`.
+fn accept_host(relay: &TcpListener, host_id: &str) -> (FakeRelay, HostRequest) {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let (mut host, path, query, bearer) = loop {
+        let (tcp, _) = relay.accept().unwrap();
+        let mut seen = (String::new(), String::new(), String::new());
+        // The error type is fixed by tungstenite's handshake callback.
+        #[allow(clippy::result_large_err)]
+        let record = |request: &tungstenite::handshake::server::Request,
+                      response: tungstenite::handshake::server::Response| {
+            seen = (
+                request.uri().path().to_string(),
+                request.uri().query().unwrap_or_default().to_string(),
+                request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            Ok(response)
+        };
+        if let Ok(host) = tungstenite::accept_hdr(tcp, record) {
+            if seen.1 == format!("host={host_id}") {
+                break (host, seen.0, seen.1, seen.2);
+            }
+        }
+    };
+    host.send(Message::text(
+        json!({ "t": "challenge", "nonce": URL_SAFE_NO_PAD.encode([7u8; 32]) }).to_string(),
+    ))
+    .unwrap();
+    let auth: Value = serde_json::from_str(host.read().unwrap().to_text().unwrap()).unwrap();
+    host.send(Message::text(
+        json!({ "t": "ready", "host": host_id, "user": USER }).to_string(),
+    ))
+    .unwrap();
+    host.get_ref()
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    (
+        FakeRelay { host },
+        HostRequest {
+            path,
+            query,
+            bearer,
+            auth,
+        },
+    )
+}
+
+/// The host id, Noise key and code of a pairing link.
+fn parse_link(link: &str) -> (String, Vec<u8>, String) {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let pair = link
+        .strip_prefix("https://app.jucode.net/remote#pair=")
+        .unwrap_or_else(|| panic!("{link}"));
+    let parts: Vec<&str> = pair.split('.').collect();
+    (
+        parts[0].to_string(),
+        URL_SAFE_NO_PAD.decode(parts[1]).unwrap(),
+        parts[2].to_string(),
+    )
+}
+
 impl FakeRelay {
     fn send(&mut self, kind: u8, stream: u32, payload: &[u8]) {
         let mut frame = vec![kind];
@@ -586,12 +631,17 @@ impl FakeRelay {
 
     /// The next binary frame from the host: (kind, stream, payload).
     fn next(&mut self) -> (u8, u32, Vec<u8>) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        self.next_within(Duration::from_secs(10))
+            .expect("no frame from the host")
+    }
+
+    fn next_within(&mut self, wait: Duration) -> Option<(u8, u32, Vec<u8>)> {
+        let deadline = Instant::now() + wait;
         while Instant::now() < deadline {
             match self.host.read() {
                 Ok(Message::Binary(bytes)) => {
                     let stream = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
-                    return (bytes[0], stream, bytes[5..].to_vec());
+                    return Some((bytes[0], stream, bytes[5..].to_vec()));
                 }
                 Ok(_) => {}
                 Err(tungstenite::Error::Io(error))
@@ -602,7 +652,7 @@ impl FakeRelay {
                 Err(error) => panic!("host connection failed: {error}"),
             }
         }
-        panic!("no frame from the host");
+        None
     }
 
     /// The next frame on `stream`, skipping other streams' traffic.
@@ -615,8 +665,8 @@ impl FakeRelay {
         }
     }
 
-    /// Opens a stream and runs the client's handshake; returns msg 2's
-    /// payload and the client transport.
+    /// Opens a stream for a client of `USER` and runs the client's
+    /// handshake; returns msg 2's payload and the client transport.
     fn connect(
         &mut self,
         stream: u32,
@@ -624,19 +674,57 @@ impl FakeRelay {
         host_key: &[u8],
         hello: Value,
     ) -> (Value, jucode_daemon::noise::Transport) {
+        self.connect_as(stream, &caller(), client_key, host_key, hello)
+    }
+
+    /// `connect` for the client the relay vouches for with `open`.
+    fn connect_as(
+        &mut self,
+        stream: u32,
+        open: &Value,
+        client_key: &[u8],
+        host_key: &[u8],
+        hello: Value,
+    ) -> (Value, jucode_daemon::noise::Transport) {
+        let initiator = self.start(stream, open, client_key, host_key, hello);
+        self.finish(stream, initiator)
+    }
+
+    /// Opens a stream and sends msg 1.
+    fn start(
+        &mut self,
+        stream: u32,
+        open: &Value,
+        client_key: &[u8],
+        host_key: &[u8],
+        hello: Value,
+    ) -> jucode_daemon::noise::HandshakeState {
         use jucode_daemon::noise;
-        self.send(1, stream, &[]);
+        self.send(1, stream, open.to_string().as_bytes());
         let mut initiator = noise::initiator(client_key, host_key).unwrap();
         let mut buffer = vec![0u8; noise::MAX_MESSAGE];
         let written = initiator
             .write_message(hello.to_string().as_bytes(), &mut buffer)
             .unwrap();
         self.send(2, stream, &buffer[..written]);
+        initiator
+    }
+
+    /// Reads msg 2.
+    fn finish(
+        &mut self,
+        stream: u32,
+        mut initiator: jucode_daemon::noise::HandshakeState,
+    ) -> (Value, jucode_daemon::noise::Transport) {
+        let mut buffer = vec![0u8; jucode_daemon::noise::MAX_MESSAGE];
         let (kind, message) = self.next_on(stream);
         assert_eq!(kind, 2);
         let read = initiator.read_message(&message, &mut buffer).unwrap();
         let reply = serde_json::from_slice(&buffer[..read]).unwrap();
-        (reply, noise::Transport::new(initiator).unwrap())
+        (
+            reply,
+            jucode_daemon::noise::Transport::new(initiator).unwrap(),
+        )
     }
 }
 
@@ -647,59 +735,39 @@ fn a_relay_client_pairs_gets_hello_and_is_dropped_on_revoke() {
     use sha2::{Digest, Sha256};
 
     let _guard = setup();
+    let _login = sign_in();
     let relay = TcpListener::bind("127.0.0.1:0").unwrap();
     let root = temp_dir("relay-state");
     let daemon = start_daemon_with(
         root.join("daemon"),
-        Some(format!("ws://{}/relay/v1", relay.local_addr().unwrap())),
+        Some(format!("ws://{}/v1/relay", relay.local_addr().unwrap())),
     );
     let mut desktop = Client::connect(&daemon);
-    desktop.send(json!({ "op": "relay_status", "id": 1 }));
-    let status = desktop.until(|frame| frame["id"] == 1).pop().unwrap();
-    assert_eq!(
-        (status["enabled"].clone(), status["connected"].clone()),
-        (json!(false), json!(false))
-    );
-    desktop.send(json!({ "op": "pair_link", "id": 2 }));
-    assert_eq!(
-        desktop.until(|frame| frame["id"] == 2).pop().unwrap()["type"],
-        "error"
-    );
-    desktop.send(json!({ "op": "relay_set", "enabled": true, "id": 3 }));
-    assert_eq!(
-        desktop.until(|frame| frame["id"] == 3).pop().unwrap()["enabled"],
-        true
-    );
-    desktop.send(json!({ "op": "pair_link", "id": 4 }));
-    let reply = desktop.until(|frame| frame["id"] == 4).pop().unwrap();
-    let link = reply["link"].as_str().unwrap();
-    let pair = link.split_once("/remote#pair=").unwrap().1;
-    let parts: Vec<&str> = pair.split('.').collect();
-    let (host_id, host_key, code) = (
-        parts[0],
-        URL_SAFE_NO_PAD.decode(parts[1]).unwrap(),
-        parts[2],
-    );
+    // On by default; off, there is no pairing link.
+    let status = request(&mut desktop, json!({ "op": "relay_status" }));
+    assert_eq!(status["enabled"], true, "{status}");
+    assert_eq!(status["signed_in"], true, "{status}");
+    let off = request(&mut desktop, json!({ "op": "relay_set", "enabled": false }));
+    assert_eq!(off["enabled"], false);
+    let refused = request(&mut desktop, json!({ "op": "pair_link" }));
+    assert_eq!(refused["type"], "error");
+    let on = request(&mut desktop, json!({ "op": "relay_set", "enabled": true }));
+    assert_eq!(on["enabled"], true);
+    let reply = request(&mut desktop, json!({ "op": "pair_link" }));
+    let (host_id, host_key, code) = parse_link(reply["link"].as_str().unwrap());
     assert_eq!(code, reply["code"].as_str().unwrap());
 
-    // The daemon connects and proves its identity.
-    let (tcp, _) = relay.accept().unwrap();
-    let mut path = String::new();
-    // The error type is fixed by tungstenite's handshake callback.
-    #[allow(clippy::result_large_err)]
-    let record_path = |request: &tungstenite::handshake::server::Request,
-                       response: tungstenite::handshake::server::Response| {
-        path = request.uri().path().to_string();
-        Ok(response)
-    };
-    let mut host = tungstenite::accept_hdr(tcp, record_path).unwrap();
-    assert_eq!(path, "/relay/v1/host");
-    let nonce = [7u8; 32];
-    host.send(Message::text(
-        json!({ "t": "challenge", "nonce": URL_SAFE_NO_PAD.encode(nonce) }).to_string(),
-    ))
-    .unwrap();
-    let auth: Value = serde_json::from_str(host.read().unwrap().to_text().unwrap()).unwrap();
+    // The daemon connects with its login and proves its identity.
+    let (mut relay, sent) = accept_host(&relay, &host_id);
+    assert_eq!(sent.path, "/v1/relay/host");
+    assert_eq!(sent.query, format!("host={host_id}"));
+    assert_eq!(sent.bearer, format!("Bearer {ACCESS_TOKEN}"));
+    let auth = sent.auth;
+    assert_eq!(auth["t"], "auth");
+    assert_eq!(auth["v"], "test");
+    assert_eq!(auth["static"], URL_SAFE_NO_PAD.encode(&host_key));
+    assert_eq!(auth["platform"], std::env::consts::OS);
+    assert!(auth["name"].is_string());
     let public: [u8; 32] = URL_SAFE_NO_PAD
         .decode(auth["pub"].as_str().unwrap())
         .unwrap()
@@ -713,7 +781,7 @@ fn a_relay_client_pairs_gets_hello_and_is_dropped_on_revoke() {
     VerifyingKey::from_bytes(&public)
         .unwrap()
         .verify(
-            &[b"jucode-relay-v1:".as_slice(), &nonce].concat(),
+            &[b"jucode-relay-v1:".as_slice(), &[7u8; 32]].concat(),
             &Signature::from_bytes(&signature),
         )
         .unwrap();
@@ -721,14 +789,6 @@ fn a_relay_client_pairs_gets_hello_and_is_dropped_on_revoke() {
         URL_SAFE_NO_PAD.encode(&Sha256::digest(public)[..16]),
         host_id
     );
-    host.send(Message::text(
-        json!({ "t": "ready", "host": host_id }).to_string(),
-    ))
-    .unwrap();
-    host.get_ref()
-        .set_read_timeout(Some(Duration::from_millis(50)))
-        .unwrap();
-    let mut relay = FakeRelay { host };
 
     // A new phone pairs with the code and gets the usual greeting.
     let (phone_key, _) = jucode_daemon::noise::generate_keypair().unwrap();
@@ -770,17 +830,26 @@ fn a_relay_client_pairs_gets_hello_and_is_dropped_on_revoke() {
         }
     }
 
-    // An unknown key without a code is refused and closed.
+    // An unknown key without a code is refused and closed; so is the paired
+    // key from another account.
     let (stranger_key, _) = jucode_daemon::noise::generate_keypair().unwrap();
     let (reply, _) = relay.connect(3, &stranger_key, &host_key, json!({ "name": "x" }));
-    assert_eq!(reply["ok"], false);
+    assert_eq!(reply, json!({ "ok": false, "error": "not paired" }));
     assert_eq!(relay.next_on(3), (3, Vec::new()));
+    let other = json!({ "user": "u2", "authz": "a2", "client": "jucode-web", "name": "x" });
+    let (reply, _) = relay.connect_as(4, &other, &phone_key, &host_key, json!({}));
+    assert_eq!(reply, json!({ "ok": false, "error": "wrong account" }));
+    assert_eq!(relay.next_on(4), (3, Vec::new()));
 
-    desktop.send(json!({ "op": "relay_status", "id": 5 }));
+    let status = request(&mut desktop, json!({ "op": "relay_status" }));
     assert_eq!(
-        desktop.until(|frame| frame["id"] == 5).pop().unwrap()["connected"],
-        true
+        (&status["connected"], &status["user"], &status["host"]),
+        (&json!(true), &json!(USER), &json!(host_id))
     );
+    let devices = request(&mut desktop, json!({ "op": "device_list" }));
+    assert_eq!(devices["devices"][0]["client"], "jucode-mobile");
+    assert_eq!(devices["devices"][0]["authz"], "authz-1");
+    assert_eq!(devices["devices"][0]["user"], USER);
 
     // Revoking the device closes both of its streams.
     desktop.send(json!({ "op": "device_revoke", "device": device, "id": 6 }));
@@ -794,6 +863,280 @@ fn a_relay_client_pairs_gets_hello_and_is_dropped_on_revoke() {
     }
     closed.sort();
     assert_eq!(closed, [1, 2]);
+}
+
+#[test]
+fn a_signed_out_computer_stays_off_the_relay_until_it_signs_in() {
+    let _guard = setup();
+    let _ = fs::remove_file(auth_path());
+    let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+    let daemon = start_daemon_with(
+        temp_dir("relay-signed-out").join("daemon"),
+        Some(format!("ws://{}/v1/relay", relay.local_addr().unwrap())),
+    );
+    let mut desktop = Client::connect(&daemon);
+    let status = request(&mut desktop, json!({ "op": "relay_status" }));
+    assert_eq!(
+        (
+            &status["enabled"],
+            &status["signed_in"],
+            &status["connected"],
+            &status["user"]
+        ),
+        (&json!(true), &json!(false), &json!(false), &Value::Null),
+        "{status}"
+    );
+    // Nothing reaches the relay while signed out.
+    relay.set_nonblocking(true).unwrap();
+    thread::sleep(Duration::from_millis(1500));
+    assert!(relay.accept().is_err(), "connected while signed out");
+    relay.set_nonblocking(false).unwrap();
+
+    let _login = sign_in();
+    let host_id = status["host"].as_str().unwrap();
+    let (_relay, sent) = accept_host(&relay, host_id);
+    assert_eq!(sent.bearer, format!("Bearer {ACCESS_TOKEN}"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = request(&mut desktop, json!({ "op": "relay_status" }));
+        if status["connected"] == true {
+            assert_eq!(status["signed_in"], true);
+            assert_eq!(status["user"], USER);
+            break;
+        }
+        assert!(Instant::now() < deadline, "{status}");
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Signing out takes it off again.
+    let _ = fs::remove_file(auth_path());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = request(&mut desktop, json!({ "op": "relay_status" }));
+        if status["connected"] == false {
+            assert_eq!(status["signed_in"], false);
+            break;
+        }
+        assert!(Instant::now() < deadline, "{status}");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_restarting_relay_is_reconnected_to_at_once() {
+    use tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+    let _guard = setup();
+    let (daemon, mut desktop, mut relay, _phone) = relay_phone("relay-restart");
+    let host_id = request(&mut desktop, json!({ "op": "relay_status" }))["host"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    relay
+        .host
+        .close(Some(CloseFrame {
+            code: CloseCode::from(4503),
+            reason: "server restarting".into(),
+        }))
+        .unwrap();
+    let _ = relay.host.flush();
+    let listener = daemon.relay.as_ref().unwrap();
+    let started = Instant::now();
+    let (_relay, _) = accept_host(listener, &host_id);
+    // 1 s, not the backoff's 1 s plus up to 1 s of jitter or more.
+    assert!(
+        started.elapsed() < Duration::from_millis(1900),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// The bearer token of the next host connection of `host_id`, refused with
+/// HTTP 401 or accepted (other tests' daemons may reach a reused port).
+fn next_bearer(relay: &TcpListener, host_id: &str, refuse: bool) -> String {
+    use tungstenite::handshake::server::{ErrorResponse, Request, Response};
+    loop {
+        let (tcp, _) = relay.accept().unwrap();
+        let mut seen = (String::new(), String::new());
+        // The error type is fixed by tungstenite's handshake callback.
+        #[allow(clippy::result_large_err)]
+        let answer = |request: &Request, response: Response| {
+            seen = (
+                request.uri().query().unwrap_or_default().to_string(),
+                request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            if refuse {
+                let mut denied = ErrorResponse::new(None);
+                *denied.status_mut() = tungstenite::http::StatusCode::UNAUTHORIZED;
+                Err(denied)
+            } else {
+                Ok(response)
+            }
+        };
+        let _ = tungstenite::accept_hdr(tcp, answer);
+        if seen.0 == format!("host={host_id}") {
+            return seen.1;
+        }
+    }
+}
+
+#[test]
+fn a_refused_login_is_refreshed_once_then_counts_as_signed_out() {
+    let _guard = setup();
+    let _login = sign_in();
+    set_jucode_api_url(&fake_jucode_api(json!({
+        "access_token": "refreshed", "refresh_token": "test-refresh-2", "expires_in": 3600,
+    })));
+    let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+    let daemon = start_daemon_with(
+        temp_dir("relay-refused").join("daemon"),
+        Some(format!("ws://{}/v1/relay", relay.local_addr().unwrap())),
+    );
+    let mut desktop = Client::connect(&daemon);
+    let status = request(&mut desktop, json!({ "op": "relay_status" }));
+    let host_id = status["host"].as_str().unwrap();
+    assert_eq!(
+        next_bearer(&relay, host_id, true),
+        format!("Bearer {ACCESS_TOKEN}")
+    );
+    assert_eq!(next_bearer(&relay, host_id, true), "Bearer refreshed");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = request(&mut desktop, json!({ "op": "relay_status" }));
+        if status["signed_in"] == false {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{status}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    // No further attempt until the login changes.
+    relay.set_nonblocking(true).unwrap();
+    thread::sleep(Duration::from_millis(1500));
+    while let Ok((tcp, _)) = relay.accept() {
+        tcp.set_nonblocking(false).unwrap();
+        let mut query = String::new();
+        #[allow(clippy::result_large_err)]
+        let record = |request: &tungstenite::handshake::server::Request,
+                      response: tungstenite::handshake::server::Response| {
+            query = request.uri().query().unwrap_or_default().to_string();
+            Ok(response)
+        };
+        let _ = tungstenite::accept_hdr(tcp, record);
+        assert_ne!(query, format!("host={host_id}"), "retried a refused login");
+    }
+    relay.set_nonblocking(false).unwrap();
+    write_login("another");
+    assert_eq!(next_bearer(&relay, host_id, false), "Bearer another");
+}
+
+#[test]
+fn a_connect_request_waits_for_the_desktop_without_holding_up_other_streams() {
+    let _guard = setup();
+    let (_daemon, mut desktop, mut relay, mut phone) = relay_phone("relay-request");
+    let link = request(&mut desktop, json!({ "op": "pair_link" }));
+    let (_, host_key, _) = parse_link(link["link"].as_str().unwrap());
+
+    // A new install asks; the desktop is told.
+    let (tablet_key, _) = jucode_daemon::noise::generate_keypair().unwrap();
+    let asking = relay.start(
+        5,
+        &caller(),
+        &tablet_key,
+        &host_key,
+        json!({ "name": "tablet", "request": true }),
+    );
+    let shown = desktop
+        .until(|f| f["type"] == "connect_request")
+        .pop()
+        .unwrap();
+    assert_eq!(shown["name"], "tablet");
+    assert_eq!(shown["client"], "jucode-mobile");
+    let id = shown["id"].as_str().unwrap().to_string();
+    let listed = request(&mut desktop, json!({ "op": "connect_requests" }));
+    assert_eq!(listed["requests"][0]["id"], id.as_str(), "{listed}");
+    // A phone may neither see nor answer requests.
+    for mut op in [
+        json!({ "op": "connect_requests" }),
+        json!({ "op": "connect_decide", "request": id, "allow": true }),
+    ] {
+        op["id"] = json!(77);
+        phone.send(&mut relay, op);
+        let reply = phone.until(&mut relay, |f| f["id"] == 77).pop().unwrap();
+        assert_eq!(reply["type"], "error", "{reply}");
+    }
+
+    // While it waits, the paired phone and the relay connection go on.
+    phone.send(&mut relay, json!({ "op": "ping", "id": 78 }));
+    let pong = phone.until(&mut relay, |f| f["id"] == 78).pop().unwrap();
+    assert_eq!(pong["type"], "pong");
+
+    // The reply and the broadcast may come in either order.
+    desktop.send(json!({ "op": "connect_decide", "request": id, "allow": true, "id": "d1" }));
+    let (mut decided, mut closed) = (Value::Null, Value::Null);
+    desktop.until(|f| {
+        if f["id"] == "d1" {
+            decided = f.clone();
+        }
+        if f["type"] == "connect_request_closed" {
+            closed = f.clone();
+        }
+        !decided.is_null() && !closed.is_null()
+    });
+    assert_eq!(
+        decided,
+        json!({ "type": "connect_decided", "request": id, "allow": true, "id": "d1" })
+    );
+    assert_eq!(
+        closed,
+        json!({ "type": "connect_request_closed", "id": id, "outcome": "allowed" })
+    );
+    let (reply, mut tablet) = relay.finish(5, asking);
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["name"], "tablet");
+    let (_, message) = relay.next_on(5);
+    let hello: Value = serde_json::from_slice(&tablet.open(&message).unwrap().unwrap()).unwrap();
+    assert_eq!(hello["type"], "hello");
+
+    // A denied one is refused; a request the client gives up on is cancelled.
+    let (other_key, _) = jucode_daemon::noise::generate_keypair().unwrap();
+    let asking = relay.start(
+        6,
+        &caller(),
+        &other_key,
+        &host_key,
+        json!({ "request": true }),
+    );
+    let id = desktop
+        .until(|f| f["type"] == "connect_request")
+        .pop()
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    request(
+        &mut desktop,
+        json!({ "op": "connect_decide", "request": id, "allow": false }),
+    );
+    let (reply, _) = relay.finish(6, asking);
+    assert_eq!(reply, json!({ "ok": false, "error": "denied" }));
+    let _ = relay.start(
+        7,
+        &caller(),
+        &other_key,
+        &host_key,
+        json!({ "request": true }),
+    );
+    desktop.until(|f| f["type"] == "connect_request");
+    relay.send(3, 7, &[]);
+    let closed = desktop
+        .until(|f| f["type"] == "connect_request_closed")
+        .pop()
+        .unwrap();
+    assert_eq!(closed["outcome"], "cancelled");
 }
 
 fn git(dir: &PathBuf, args: &[&str]) {
@@ -1254,10 +1597,9 @@ fn a_claude_conversation_moves_to_its_tui_and_back() {
 fn a_claude_session_keeps_the_custom_provider_it_started_on() {
     let _guard = setup();
     let log = fake_claude();
-    let daemon = start_daemon();
+    let (_daemon, mut desktop, mut phone) = remote_phone("daemon-claude-provider-state");
     let dir = temp_dir("daemon-claude-provider");
     fs::create_dir_all(&dir).unwrap();
-    let mut desktop = Client::connect(&daemon);
     for id in ["p1", "p2"] {
         let saved = request(
             &mut desktop,
@@ -1352,21 +1694,13 @@ fn a_claude_session_keeps_the_custom_provider_it_started_on() {
     assert_eq!(provider_of(&mut desktop, &session), Value::Null);
 
     // A paired device may not see or change the providers.
-    desktop.send(json!({ "op": "pair_start", "id": 1 }));
-    let code = desktop.until(|f| f["id"] == 1).pop().unwrap()["code"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let (_, response) = http(&daemon, &pair_request(&code));
-    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    let mut phone = Client::connect_with(&daemon, body["token"].as_str().unwrap());
     for op in [
         json!({ "op": "tool_providers", "tool": "claude" }),
         json!({ "op": "tool_provider_select", "tool": "claude", "provider_id": "" }),
         json!({ "op": "tool_provider_save", "tool": "claude", "provider": {} }),
         json!({ "op": "tool_provider_remove", "tool": "claude", "provider_id": "p2" }),
     ] {
-        let refused = request(&mut phone, op);
+        let refused = phone.request(op);
         assert_eq!(
             refused["message"], "only the desktop can manage tool providers",
             "{refused}"
@@ -1494,48 +1828,20 @@ impl RelayPhone {
     }
 }
 
-/// A daemon whose relay is a fake one, with a desktop client and a phone
-/// paired through the relay that got its `hello`.
+/// A daemon whose relay is a fake one, signed in, with a desktop client and
+/// a phone paired through the relay that got its `hello`.
 fn relay_phone(label: &str) -> (Daemon, Client, FakeRelay, RelayPhone) {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-
-    let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+    let login = sign_in();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let root = temp_dir(label);
-    let daemon = start_daemon_with(
+    let mut daemon = start_daemon_with(
         root.join("daemon"),
-        Some(format!("ws://{}/relay/v1", relay.local_addr().unwrap())),
+        Some(format!("ws://{}/v1/relay", listener.local_addr().unwrap())),
     );
     let mut desktop = Client::connect(&daemon);
-    request(&mut desktop, json!({ "op": "relay_set", "enabled": true }));
     let reply = request(&mut desktop, json!({ "op": "pair_link" }));
-    let pair = reply["link"]
-        .as_str()
-        .unwrap()
-        .split_once("/remote#pair=")
-        .unwrap()
-        .1;
-    let parts: Vec<&str> = pair.split('.').collect();
-    let (host_key, code) = (URL_SAFE_NO_PAD.decode(parts[1]).unwrap(), parts[2]);
-    // Other tests' daemons in this process may reach a reused port.
-    let mut host = loop {
-        let (tcp, _) = relay.accept().unwrap();
-        if let Ok(host) = tungstenite::accept(tcp) {
-            break host;
-        }
-    };
-    host.send(Message::text(
-        json!({ "t": "challenge", "nonce": URL_SAFE_NO_PAD.encode([7u8; 32]) }).to_string(),
-    ))
-    .unwrap();
-    host.read().unwrap();
-    host.send(Message::text(
-        json!({ "t": "ready", "host": parts[0] }).to_string(),
-    ))
-    .unwrap();
-    host.get_ref()
-        .set_read_timeout(Some(Duration::from_millis(50)))
-        .unwrap();
-    let mut relay = FakeRelay { host };
+    let (host_id, host_key, code) = parse_link(reply["link"].as_str().unwrap());
+    let (mut relay, _) = accept_host(&listener, &host_id);
     let (phone_key, _) = jucode_daemon::noise::generate_keypair().unwrap();
     let (reply, transport) = relay.connect(
         1,
@@ -1549,7 +1855,43 @@ fn relay_phone(label: &str) -> (Daemon, Client, FakeRelay, RelayPhone) {
         transport,
     };
     phone.until(&mut relay, |f| f["type"] == "hello");
+    daemon.relay = Some(listener);
+    daemon._login = Some(login);
     (daemon, desktop, relay, phone)
+}
+
+/// A paired phone with its relay, used like a local `Client`.
+struct RemotePhone {
+    relay: FakeRelay,
+    phone: RelayPhone,
+}
+
+impl RemotePhone {
+    fn send(&mut self, frame: Value) {
+        self.phone.send(&mut self.relay, frame);
+    }
+
+    fn until(&mut self, done: impl FnMut(&Value) -> bool) -> Vec<Value> {
+        self.phone.until(&mut self.relay, done)
+    }
+
+    /// `request` for the phone.
+    fn request(&mut self, mut op: Value) -> Value {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = format!(
+            "p{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        );
+        op["id"] = json!(id);
+        self.send(op);
+        self.until(|f| f["id"] == id.as_str()).pop().unwrap()
+    }
+}
+
+/// `relay_phone` with the phone as a `RemotePhone`.
+fn remote_phone(label: &str) -> (Daemon, Client, RemotePhone) {
+    let (daemon, desktop, relay, phone) = relay_phone(label);
+    (daemon, desktop, RemotePhone { relay, phone })
 }
 
 #[test]
@@ -2090,9 +2432,8 @@ fn a_codex_session_is_named_by_its_thread_and_resumes_with_its_history() {
 #[test]
 fn the_desktop_saves_mcp_servers_for_every_session_without_one() {
     let _guard = setup();
-    let daemon = start_daemon();
+    let (_daemon, mut desktop, mut phone) = remote_phone("daemon-mcp-state");
     let dir = temp_dir("daemon-mcp");
-    let mut desktop = Client::connect(&daemon);
     let session = desktop.create_session(&dir);
     let server =
         json!({ "name": "probe", "transport": "stdio", "command": "false", "enabled": false });
@@ -2117,19 +2458,11 @@ fn the_desktop_saves_mcp_servers_for_every_session_without_one() {
     });
 
     // A paired device may not name a command to run.
-    desktop.send(json!({ "op": "pair_start", "id": 1 }));
-    let code = desktop.until(|f| f["id"] == 1).pop().unwrap()["code"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let (_, response) = http(&daemon, &pair_request(&code));
-    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    let mut phone = Client::connect_with(&daemon, body["token"].as_str().unwrap());
     for op in [
         json!({ "op": "mcp_set", "server": server }),
         json!({ "op": "mcp_set", "session": session, "server": server }),
     ] {
-        let refused = request(&mut phone, op);
+        let refused = phone.request(op);
         assert_eq!(refused["type"], "error", "{refused}");
     }
 
@@ -2142,7 +2475,7 @@ fn the_desktop_saves_mcp_servers_for_every_session_without_one() {
 #[test]
 fn only_the_desktop_names_an_acp_command_and_the_agents_run_like_any_session() {
     let _guard = setup();
-    let daemon = start_daemon();
+    let (_daemon, mut desktop, mut phone) = remote_phone("daemon-acp-state");
     let dir = temp_dir("daemon-acp");
     fs::create_dir_all(&dir).unwrap();
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_acp.py");
@@ -2151,51 +2484,33 @@ fn only_the_desktop_names_an_acp_command_and_the_agents_run_like_any_session() {
         "env": { "FAKE_ACP_GREETING": "hey", "FAKE_ACP_STATE": state } });
 
     // A paired device may not name a command to run.
-    let mut desktop = Client::connect(&daemon);
-    desktop.send(json!({ "op": "pair_start", "id": 1 }));
-    let code = desktop.until(|f| f["id"] == 1).pop().unwrap()["code"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let (_, response) = http(&daemon, &pair_request(&code));
-    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    let mut phone = Client::connect_with(&daemon, body["token"].as_str().unwrap());
-    let refused = request(
-        &mut phone,
+    let refused = phone.request(
         json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": options }),
     );
     assert_eq!(
         refused["message"], "only the desktop can choose what an engine runs",
         "{refused}"
     );
-    let refused = request(
-        &mut phone,
-        json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": { "agent": "omp", "args": ["x"] } }),
+    let refused = phone.request(json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": { "agent": "omp", "args": ["x"] } }),
     );
     assert_eq!(
         refused["message"], "only the desktop can choose what an engine runs",
         "{refused}"
     );
     // A built-in agent, by id, is the daemon's to resolve: past the gate.
-    let resolved = request(
-        &mut phone,
-        json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": { "agent": "deepseek" } }),
+    let resolved = phone.request(json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": { "agent": "deepseek" } }),
     );
     assert_eq!(
         resolved["message"], "unknown ACP agent deepseek",
         "{resolved}"
     );
-    let named = request(
-        &mut phone,
-        json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": {} }),
-    );
+    let named = phone
+        .request(json!({ "op": "session_create", "cwd": dir, "engine": "acp", "options": {} }));
     assert_eq!(
         named["message"], "an ACP session needs options.agent or options.command",
         "{named}"
     );
-    let refused = request(
-        &mut phone,
-        json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": { "bin": script } }),
+    let refused = phone.request(json!({ "op": "session_create", "cwd": dir, "engine": "claude", "options": { "bin": script } }),
     );
     assert_eq!(refused["type"], "error", "{refused}");
     // A built-in agent is named, never given a command.
@@ -2264,18 +2579,13 @@ fn only_the_desktop_names_an_acp_command_and_the_agents_run_like_any_session() {
     // registered agent reopens only where its command is known.
     desktop.send(json!({ "op": "session_close", "session": session }));
     desktop.until(|f| f["type"] == "session_closed" && f["session"] == session.as_str());
-    let refused = request(
-        &mut phone,
-        json!({ "op": "session_open", "session": session }),
-    );
+    let refused = phone.request(json!({ "op": "session_open", "session": session }));
     assert_eq!(
         refused["message"], "this agent's session can only be reopened on the desktop",
         "{refused}"
     );
     // Naming a built-in agent does not turn it into one.
-    let refused = request(
-        &mut phone,
-        json!({ "op": "session_open", "session": session, "engine": "acp", "options": { "agent": "omp" } }),
+    let refused = phone.request(json!({ "op": "session_open", "session": session, "engine": "acp", "options": { "agent": "omp" } }),
     );
     assert_eq!(
         refused["message"], "this agent's session can only be reopened on the desktop",
@@ -2343,6 +2653,7 @@ fn set_jucode_api_url(url: &str) {
 fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
     let _guard = setup();
     let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    let (_daemon, mut desktop, mut phone) = remote_phone("daemon-skills-state");
     set_jucode_api_url(&fake_jucode_api(json!({
         "skills": [{
             "id": "review",
@@ -2353,8 +2664,6 @@ fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
         }],
         "default_skill_ids": ["review"]
     })));
-    let daemon = start_daemon();
-    let mut desktop = Client::connect(&daemon);
     let entry = |catalog: &Value, source: &str, id: &str| {
         catalog["skills"]
             .as_array()
@@ -2424,19 +2733,8 @@ fn the_desktop_lists_and_installs_skills_into_the_engines_directory() {
     }
 
     // A paired device cannot browse or install.
-    desktop.send(json!({ "op": "pair_start", "id": 1 }));
-    let code = desktop.until(|f| f["id"] == 1).pop().unwrap()["code"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let (_, response) = http(&daemon, &pair_request(&code));
-    let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-    let mut phone = Client::connect_with(&daemon, body["token"].as_str().unwrap());
     for op in ["skills_catalog", "skill_install"] {
-        let refused = request(
-            &mut phone,
-            json!({ "op": op, "source": "jucode", "skill": "review" }),
-        );
+        let refused = phone.request(json!({ "op": op, "source": "jucode", "skill": "review" }));
         assert_eq!(refused["type"], "error", "{refused}");
     }
 
@@ -2761,7 +3059,17 @@ fn a_worktree_task_runs_apart_and_an_unused_worktree_goes_with_its_run() {
     fs::create_dir_all(&dir).unwrap();
     for args in [
         &["init", "-q", "-b", "main"][..],
-        &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "a"],
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "a",
+        ],
     ] {
         git(&dir, args);
     }
@@ -2789,7 +3097,12 @@ fn a_worktree_task_runs_apart_and_an_unused_worktree_goes_with_its_run() {
     let entry = session_entry(&mut client, &first);
     let tree = entry["worktree"].clone();
     let path = PathBuf::from(tree["path"].as_str().unwrap());
-    let container = dir.canonicalize().unwrap().parent().unwrap().join(".jucode-worktrees/repo");
+    let container = dir
+        .canonicalize()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(".jucode-worktrees/repo");
     assert_eq!(path.parent(), Some(container.as_path()), "{entry}");
     assert_eq!(entry["cwd"], tree["path"]);
     assert_eq!(tree["base"], "main");
@@ -2807,7 +3120,10 @@ fn a_worktree_task_runs_apart_and_an_unused_worktree_goes_with_its_run() {
         assert!(start.elapsed() < Duration::from_secs(10), "worktree kept");
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_ne!(session_entry(&mut client, &second)["worktree"]["path"], tree["path"]);
+    assert_ne!(
+        session_entry(&mut client, &second)["worktree"]["path"],
+        tree["path"]
+    );
     let start = Instant::now();
     while session_entry(&mut client, &first)["worktree"]["gone"] != true {
         assert!(start.elapsed() < Duration::from_secs(10), "listed as gone");

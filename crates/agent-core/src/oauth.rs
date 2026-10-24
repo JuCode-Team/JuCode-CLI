@@ -168,12 +168,20 @@ fn exchange_code(
     parse_tokens(&json_response(response)?)
 }
 
+/// Why a refresh failed: the server refused the refresh token (revoked,
+/// expired, already used), or it could not be asked (network, server error).
+#[derive(Debug)]
+pub enum RefreshError {
+    Rejected(String),
+    Failed(String),
+}
+
 /// Exchange a refresh token for a fresh access+refresh pair (rotation).
 /// Used by the LLM client when the access token has expired or is rejected.
-pub fn refresh(api_url: &str, refresh_token: &str) -> Result<Tokens, String> {
+pub fn refresh(api_url: &str, refresh_token: &str) -> Result<Tokens, RefreshError> {
     let api_url = api_url.trim().trim_end_matches('/');
     if api_url.is_empty() {
-        return Err("JuCode API URL cannot be empty".to_string());
+        return Err(RefreshError::Failed("JuCode API URL cannot be empty".to_string()));
     }
     let url = format!("{}/v1/oauth/token", api_url);
     // ureq::Error is large; it is ureq's own type, passed through as is.
@@ -187,7 +195,12 @@ pub fn refresh(api_url: &str, refresh_token: &str) -> Result<Tokens, String> {
                 "refresh_token": refresh_token,
             }))
     });
-    parse_tokens(&json_response(response)?)
+    // 400/401 are the gateway refusing this refresh token; anything else
+    // (a dropped connection, a 5xx while its database is slow) is worth retrying.
+    let refused = matches!(&response, Err(ureq::Error::Status(400 | 401, _)));
+    json_response(response)
+        .and_then(|value| parse_tokens(&value))
+        .map_err(|error| if refused { RefreshError::Rejected(error) } else { RefreshError::Failed(error) })
 }
 
 /// Serializes session checks within the process. Refresh tokens are single
@@ -218,6 +231,25 @@ fn lock_auth_refresh() -> Result<std::fs::File, String> {
 /// Reloads auth.json and returns it holding a JuCode access token that is good
 /// for at least two more minutes, refreshing the session first when needed.
 pub fn ensure_session(api_url: &str, encrypt_secrets: bool) -> Result<AuthStore, String> {
+    session(api_url, encrypt_secrets, None)
+}
+
+/// `ensure_session` after a server refused `refused`, the access token it was
+/// given: refreshes although the token has not expired, unless another
+/// process has replaced it already.
+pub fn refresh_refused(
+    api_url: &str,
+    encrypt_secrets: bool,
+    refused: &str,
+) -> Result<AuthStore, String> {
+    session(api_url, encrypt_secrets, Some(refused))
+}
+
+fn session(
+    api_url: &str,
+    encrypt_secrets: bool,
+    refused: Option<&str>,
+) -> Result<AuthStore, String> {
     let _guard = SESSION_REFRESH
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -239,7 +271,7 @@ pub fn ensure_session(api_url: &str, encrypt_secrets: bool) -> Result<AuthStore,
     let now = unix_now();
     let (access_ok, refresh_token, refresh_alive) = match auth.jucode_tokens() {
         Some(t) => (
-            t.access_expires_at > now + 120,
+            t.access_expires_at > now + 120 && refused != Some(t.access_token.as_str()),
             t.refresh_token.clone(),
             t.refresh_expires_at > now,
         ),
@@ -266,11 +298,19 @@ pub fn ensure_session(api_url: &str, encrypt_secrets: bool) -> Result<AuthStore,
             auth.save().map_err(|error| error.to_string())?;
             Ok(auth)
         }
-        Err(error) => {
-            crate::log_error!("oauth", "token refresh failed", error = error.clone());
+        Err(RefreshError::Rejected(error)) => {
+            // Revoked or expired on the server: signed out here too, so every
+            // client shows sign-in instead of retrying a dead login.
+            crate::log_error!("oauth", "token refresh refused", error = error.clone());
+            auth.clear_jucode();
+            let _ = auth.save();
             Err(format!(
-                "failed to refresh JuCode session: {error}. Run /login."
+                "the JuCode login is no longer valid ({error}). Run /login to sign in again."
             ))
+        }
+        Err(RefreshError::Failed(error)) => {
+            crate::log_error!("oauth", "token refresh failed", error = error.clone());
+            Err(format!("failed to refresh JuCode session: {error}"))
         }
     }
 }
@@ -381,7 +421,7 @@ fn device_name() -> String {
     name
 }
 
-fn hostname() -> Option<String> {
+pub fn hostname() -> Option<String> {
     if cfg!(windows) {
         return std::env::var("COMPUTERNAME")
             .ok()
@@ -490,6 +530,33 @@ fn json_response(response: Result<ureq::Response, ureq::Error>) -> Result<Value,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server that answers one request with `status` and a JSON error.
+    fn answering(status: u16) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(4) {
+                let mut stream = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let body = r#"{"error":"nope"}"#;
+                let _ = std::io::Write::write_all(
+                    &mut stream,
+                    format!("HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes(),
+                );
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn a_refused_refresh_token_is_rejected_and_a_server_error_is_not() {
+        assert!(matches!(refresh(&answering(401), "rt"), Err(RefreshError::Rejected(_))));
+        assert!(matches!(refresh(&answering(400), "rt"), Err(RefreshError::Rejected(_))));
+        assert!(matches!(refresh(&answering(500), "rt"), Err(RefreshError::Failed(_))));
+        assert!(matches!(refresh("http://127.0.0.1:1", "rt"), Err(RefreshError::Failed(_))));
+    }
 
     #[test]
     fn parses_model_metadata_from_models_response() {

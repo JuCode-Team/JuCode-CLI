@@ -32,7 +32,7 @@ pub fn pair(listen: &str) -> io::Result<i32> {
             "jucode daemon pair: {}",
             reply["message"].as_str().unwrap_or("the daemon refused")
         );
-        eprintln!("the relay must be on: jucode daemon relay on");
+        eprintln!("remote access must be on: jucode daemon relay on");
         Ok(1)
     }
 }
@@ -70,7 +70,7 @@ pub fn relay(listen: &str, action: Option<&str>) -> io::Result<i32> {
             if let Some(enabled) = enabled {
                 store.set_setting("relay", json!(enabled))?;
             }
-            let on = store.setting("relay").as_bool().unwrap_or(false);
+            let on = store.setting("relay").as_bool().unwrap_or(true);
             println!(
                 "relay {} (daemon not running; applies when it starts)",
                 if on { "on" } else { "off" }
@@ -90,16 +90,18 @@ fn print_status(reply: &Value) {
     }
     let on = reply["enabled"].as_bool().unwrap_or(false);
     let connected = reply["connected"].as_bool().unwrap_or(false);
+    let signed_in = reply["signed_in"].as_bool().unwrap_or(false);
     println!(
-        "relay {}{} host {} ({})",
+        "relay {}{} host {} ({}), account {}",
         if on { "on" } else { "off" },
-        if on && !connected {
-            ", not connected yet,"
-        } else {
-            ","
+        match (on, signed_in, connected) {
+            (true, false, _) => ", waiting for a JuCode sign-in,",
+            (true, true, false) => ", not connected yet,",
+            _ => ",",
         },
         reply["host"].as_str().unwrap_or("-"),
-        reply["url"].as_str().unwrap_or("-")
+        reply["url"].as_str().unwrap_or("-"),
+        reply["user"].as_str().unwrap_or("-")
     );
 }
 

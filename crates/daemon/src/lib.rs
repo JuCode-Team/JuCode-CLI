@@ -1,6 +1,6 @@
 //! `jucode daemon`: hosts many JuCode sessions in one long-running process
-//! and serves them to clients (Desktop, the remote web page) over a
-//! WebSocket. Frames are the `jucode serve` JSON protocol, version 2, with a
+//! and serves them to clients over a WebSocket: Desktop locally, phones and
+//! browsers through the relay. Frames are the `jucode serve` JSON protocol, version 2, with a
 //! `session` field on every session op and event. See
 //! `docs/daemon-protocol.md`.
 
@@ -14,8 +14,8 @@ mod hub;
 pub mod install;
 mod migrate;
 pub mod noise;
+mod notify;
 mod projects;
-mod push;
 mod relay;
 mod schedules;
 mod session;
@@ -48,18 +48,16 @@ use tungstenite::{
 };
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7788";
-pub const DEFAULT_RELAY: &str = "wss://app.jucode.net/relay/v1";
+pub const DEFAULT_RELAY: &str = "wss://api.jucode.net/v1/relay";
 
 /// Serves clients on `listener` until the process exits. The token guards
-/// every WebSocket connection: local clients read it from
-/// `<state dir>/token`, paired devices hold their own. `web` is the remote
-/// page's build directory, served over plain HTTP on the same port. `relay`
-/// is the relay base URL (None: never use the relay); the connection is made
-/// only while the `relay` setting is on (`relay_set`).
+/// every local WebSocket connection: local clients read it from
+/// `<state dir>/token`. `relay` is the relay base URL (None: never use the
+/// relay); the connection is made while this computer is signed in to JuCode
+/// and the `relay` setting is not off (`relay_set`).
 pub fn serve(
     listener: TcpListener,
     store: Store,
-    web: Option<PathBuf>,
     version: &'static str,
     relay: Option<String>,
 ) -> io::Result<()> {
@@ -96,9 +94,8 @@ pub fn serve(
         let Ok(stream) = stream else { continue };
         let hub = Arc::clone(&hub);
         let token = token.clone();
-        let web = web.clone();
         thread::spawn(move || {
-            if let Err(error) = connection(&hub, stream, &token, web.as_deref()) {
+            if let Err(error) = connection(&hub, stream, &token) {
                 jucode_agent_core::log_warn!("daemon", "connection ended", error = error);
             }
         });
@@ -118,35 +115,19 @@ fn jucode_dir() -> io::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".jucode"))
 }
 
-fn connection(
-    hub: &Arc<Hub>,
-    stream: TcpStream,
-    token: &str,
-    web: Option<&std::path::Path>,
-) -> Result<(), String> {
+fn connection(hub: &Arc<Hub>, stream: TcpStream, token: &str) -> Result<(), String> {
     let head = http::peek_head(&stream)?;
     let path = head.split(' ').nth(1).unwrap_or_default();
     if gateway::is_gateway(path.split('?').next().unwrap_or_default()) {
         return gateway::serve(stream, &head);
     }
     if !http::is_websocket(&head) {
-        return http::serve(hub, stream, &head, web);
+        return http::not_found(stream, &head);
     }
-    // Some(None): the local token; Some(Some(id)): a paired device.
-    let mut authorized: Option<Option<String>> = None;
     // The error type is fixed by tungstenite's handshake callback.
     #[allow(clippy::result_large_err)]
     let authorize = |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
-        let presented = request_token(request);
-        authorized = match presented.as_deref() {
-            Some(presented) if presented == token => Some(None),
-            Some(presented) => hub
-                .store
-                .device_for_token(presented)
-                .map(|device| Some(device.id)),
-            None => None,
-        };
-        if authorized.is_some() {
+        if request_token(request).as_deref() == Some(token) {
             Ok(response)
         } else {
             let mut denied = ErrorResponse::new(Some("missing or wrong token".to_string()));
@@ -162,7 +143,7 @@ fn connection(
         .set_read_timeout(Some(Duration::from_millis(20)))
         .map_err(|error| error.to_string())?;
 
-    attach(hub, &mut socket, authorized.flatten())
+    attach(hub, &mut socket, None)
 }
 
 /// One client connection as the hub sees it: JSON text frames both ways.
@@ -299,8 +280,9 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
     let name = op["op"].as_str().unwrap_or_default();
     if matches!(
         name,
-        "pair_start"
-            | "pair_link"
+        "pair_link"
+            | "connect_decide"
+            | "connect_requests"
             | "device_list"
             | "device_revoke"
             | "relay_status"
@@ -367,18 +349,6 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
         return;
     }
     // The gateway's groups come from the network.
-    // A test notification waits for the push service; other frames go on.
-    if name == "push_test" {
-        let hub = Arc::clone(hub);
-        thread::spawn(move || {
-            let result = match hub.device_of(client) {
-                Some(device) => Ok(push::test(&hub, &device)),
-                None => Err("only a paired device tests its notifications".to_string()),
-            };
-            respond(&hub, client, &request, result);
-        });
-        return;
-    }
     if name == "gateway_catalog" {
         let hub = Arc::clone(hub);
         thread::spawn(move || respond(&hub, client, &request, Ok(gateway::catalog_json())));
@@ -589,9 +559,14 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
                 .map(|()| hub.relay.status_json()),
             None => Err("relay_set requires enabled".to_string()),
         },
-        ("pair_start", _) => hub
-            .start_pairing()
-            .map(|(code, expires_at)| json!({ "type": "pairing", "code": code, "expires_at": expires_at })),
+        ("connect_requests", _) => Ok(hub.relay.requests_json()),
+        // The request's id comes as `request` (`id` is the op's).
+        ("connect_decide", _) => match (op["request"].as_str(), op["allow"].as_bool()) {
+            (Some(id), Some(allow)) => hub.relay.decide(id, allow).map(
+                |()| json!({ "type": "connect_decided", "request": id, "allow": allow }),
+            ),
+            _ => Err("connect_decide requires request and allow".to_string()),
+        },
         ("device_list", _) => Ok(hub.devices_json()),
         ("device_revoke", _) => match op["device"].as_str() {
             Some(device) => hub
@@ -614,23 +589,6 @@ fn handle(hub: &Arc<Hub>, client: u64, text: &str) {
             })
             .map(|session| json!({ "type": "session_created", "session": session })),
         ("upload", _) => hub.uploads.receive(&op, || hub.new_id("u")),
-        // A phone's browser or the Android app asks to be notified (see `push`).
-        ("push_subscribe", _) => match hub.device_of(client) {
-            Some(device) => hub
-                .push
-                .subscribe(&device, &op["subscription"])
-                .map(|()| json!({ "type": "push_subscribed" })),
-            None => Err("only a paired device subscribes to notifications".to_string()),
-        },
-        ("push_unsubscribe", _) => hub
-            .push
-            .unsubscribe(
-                op["endpoint"]
-                    .as_str()
-                    .or(op["client_id"].as_str())
-                    .unwrap_or_default(),
-            )
-            .map(|()| json!({ "type": "push_unsubscribed" })),
         ("usage_local", _) => Ok(hub.usage.local_json(
             op["days"].as_u64().unwrap_or(30),
             op["tz_offset"].as_i64().unwrap_or(0),

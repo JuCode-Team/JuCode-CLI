@@ -76,7 +76,7 @@ fn tool_configuration_is_isolated_and_hosted_api_traffic_is_metered_once() {
     let token = store.token().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    thread::spawn(move || jucode_daemon::serve(listener, store, None, "test", None));
+    thread::spawn(move || jucode_daemon::serve(listener, store, "test", None));
     let (mut socket, _) = tungstenite::connect(format!("ws://{address}/?token={token}")).unwrap();
     if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_ref() {
         stream

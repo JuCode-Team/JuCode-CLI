@@ -234,9 +234,9 @@ USAGE:
                                          front-ends (jucode's native schema)
     jucode daemon [--listen <addr>]      host many sessions for Desktop and
                                          remote clients over a WebSocket
-                                         (--relay <url> | --no-relay: reach
-                                         it through the JuCode relay once
-                                         Desktop turns that on)
+                                         (reached through the JuCode relay
+                                         while signed in; --relay <url> |
+                                         --no-relay)
     jucode daemon install|uninstall      run the daemon at login (launchd /
                                          systemd user service)
     jucode acp                           Agent Client Protocol (ACP v1)
@@ -426,8 +426,9 @@ fn run_update() -> i32 {
 
 /// `jucode daemon [--listen <addr>]`: host sessions for Desktop and remote
 /// clients until killed. Listens on loopback unless told otherwise. The
-/// relay connection (`--relay`, default `wss://app.jucode.net/relay/v1`) is
-/// made only once a local client turns it on; `--no-relay` rules it out.
+/// relay connection (`--relay`, default `wss://api.jucode.net/v1/relay`) is
+/// made while the computer is signed in to JuCode and remote access is not
+/// turned off; `--no-relay` rules it out.
 fn run_daemon(args: &[String]) -> io::Result<i32> {
     let (action, args) = match args.first().map(String::as_str) {
         Some(action @ ("install" | "uninstall" | "pair")) => (action, &args[1..]),
@@ -448,7 +449,6 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
         _ => ("run", args),
     };
     let mut listen = jucode_daemon::DEFAULT_LISTEN.to_string();
-    let mut web = None;
     let mut relay = Some(jucode_daemon::DEFAULT_RELAY.to_string());
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -458,23 +458,15 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
         }
         match (arg.as_str(), rest.next()) {
             ("--listen", Some(address)) => listen = address.clone(),
-            ("--web", Some(dir)) => web = Some(std::path::PathBuf::from(dir)),
             ("--relay", Some(url)) => relay = Some(url.clone()),
             _ => {
                 eprintln!(
-                    "usage: jucode daemon [install|uninstall|pair] [--listen <host:port>] [--web <dir>] [--relay <wss url> | --no-relay]\n       jucode daemon relay [on|off|status] [--listen <host:port>]"
+                    "usage: jucode daemon [install|uninstall|pair] [--listen <host:port>] [--relay <wss url> | --no-relay]\n       jucode daemon relay [on|off|status] [--listen <host:port>]"
                 );
                 return Ok(2);
             }
         }
     }
-    // A release ships the remote page next to the binary.
-    let web = web.or_else(|| {
-        env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join("web")))
-            .filter(|dir| dir.join("index.html").is_file())
-    });
     let outcome = match action {
         // The service runs with the same relay choice as this command line.
         "install" => Some(jucode_daemon::install::install(
@@ -534,14 +526,7 @@ fn run_daemon(args: &[String]) -> io::Result<i32> {
         listener.local_addr()?,
         jucode_daemon::state_dir()?.join("token").display()
     );
-    if let Some(dir) = &web {
-        eprintln!(
-            "remote page: http://{}/remote (from {})",
-            listener.local_addr()?,
-            dir.display()
-        );
-    }
-    jucode_daemon::serve(listener, store, web, env!("CARGO_PKG_VERSION"), relay)?;
+    jucode_daemon::serve(listener, store, env!("CARGO_PKG_VERSION"), relay)?;
     Ok(0)
 }
 

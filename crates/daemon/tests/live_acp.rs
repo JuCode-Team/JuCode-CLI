@@ -44,7 +44,7 @@ fn start(label: &str) -> Client {
     let address = listener.local_addr().unwrap().to_string();
     let store = Store::open(temp_dir(label).join("state").join("daemon")).unwrap();
     let token = store.token().unwrap();
-    thread::spawn(move || jucode_daemon::serve(listener, store, None, "live", None));
+    thread::spawn(move || jucode_daemon::serve(listener, store, "live", None));
     let (socket, _) = tungstenite::connect(format!("ws://{address}/?token={token}")).unwrap();
     if let MaybeTlsStream::Plain(stream) = socket.get_ref() {
         stream

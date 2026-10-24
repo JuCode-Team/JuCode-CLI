@@ -1,8 +1,8 @@
 # `jucode daemon` Protocol
 
 `jucode daemon` hosts many JuCode sessions in one long-running process.
-Sessions keep running when every client disconnects. Clients (Desktop, the
-remote web page) connect over a WebSocket and speak the `jucode serve`
+Sessions keep running when every client disconnects. Desktop connects over
+a local WebSocket, phones and browsers through the JuCode relay; all speak the `jucode serve`
 protocol version 2 (`docs/serve-protocol.md`), with a `session` field that
 says which hosted session an op or event belongs to.
 
@@ -11,13 +11,9 @@ says which hosted session an op or event belongs to.
 ```sh
 jucode daemon                      # ws://127.0.0.1:7788
 jucode daemon --listen 127.0.0.1:9000
-jucode daemon --web path/to/JuCode-Desktop/build   # serve the remote page
-jucode daemon --relay wss://relay.example/relay/v1  # another relay
+jucode daemon --relay ws://127.0.0.1:8080/v1/relay  # another relay (development)
 jucode daemon --no-relay           # never connect to a relay
 ```
-
-Without `--web`, the daemon serves a `web/` directory next to its binary
-when one exists (release packages ship it there).
 
 To start it at login and restart it if it exits:
 
@@ -34,74 +30,71 @@ State lives in `~/.jucode/daemon/`:
 
 | File | Contents |
 | --- | --- |
-| `token` | Client token, created on first start, mode 0600. |
+| `token` | Local client token, created on first start, mode 0600. |
 | `sessions.jsonl` | Append log of sessions opened and closed, and their metadata (title, archive state, project...). A session recorded before sessions carried a project belongs to the one whose `path` is its `cwd`, if any, until it is moved. |
 | `actions.jsonl` | Append log of deferred actions and their decisions. |
 | `schedules.json` | Scheduled tasks (see "Scheduled tasks"). |
-| `devices.jsonl` | Paired devices (a hash of each token, never the token) and revocations. |
-| `settings.json` | Daemon settings: `relay` (whether the relay connection is on). |
+| `devices.jsonl` | Devices paired over the relay (a hash of each client's Noise static key, its OAuth authorization, client id and user) and revocations. |
+| `settings.json` | Daemon settings: `relay` (false: remote access turned off; missing: on), `relay_user` (the JuCode account the computer is registered under). |
 | `workspaces.json` | Workspaces and their projects, with a save counter `rev`. |
 | `relay-identity.json` | Relay keys (Ed25519 identity, X25519 Noise static key), mode 0600. |
 
 ## Plain HTTP
 
-The same port answers plain HTTP requests (anything that is not a
-WebSocket upgrade):
+The port serves only the WebSocket (and the local gateway). Any other plain
+HTTP request gets `404`.
 
-- `GET /` redirects to `/remote`.
-- `GET <path>` serves the remote page's files from the `--web` directory.
-  A path without a file extension gets `index.html` (the page is a
-  single-page app). Paths cannot leave the directory.
-- `POST /api/pair` with `{"code": "...", "name": "..."}` trades a pairing
-  code for a device: `200 {"device", "name", "token"}`, or `403` when the
-  code is wrong, expired or already used.
+## Remote access
 
-The files hold nothing private; every daemon op still needs a token over
-the WebSocket.
-
-## Remote devices
-
-A phone pairs once and then connects with its own token:
-
-1. A local client sends `pair_start` and shows the returned 8-character
-   `code` (valid 5 minutes, single use), for example as a QR code of
-   `<address>/remote?pair=<code>`.
-2. The phone's page posts the code to `/api/pair` and keeps the token.
-3. The phone connects to the WebSocket with that token.
-
-Device tokens reach every op except `pair_start`, `pair_link`,
-`device_list`, `device_revoke`, `relay_status` and `relay_set`, which only
-local clients (holding the daemon token) may send. `device_revoke` drops the device's open connections at once.
-
-To reach the daemon from a phone, keep it on `127.0.0.1` and expose the
-port over HTTPS with `tailscale serve` or a reverse proxy; the daemon has no
-TLS of its own. Or use the relay (below).
-
-## Relay
-
-With the relay on, the daemon keeps one outbound WebSocket to the JuCode
-relay (`--relay`, default `wss://app.jucode.net/relay/v1`) and phones reach
-it from anywhere through end-to-end encrypted streams
-(`docs/relay-protocol.md`). It is off until a local client sends
-`relay_set` with `enabled: true`; the setting survives restarts.
+Remote access belongs to the JuCode account: the daemon reaches the relay
+(`--relay`, default `wss://api.jucode.net/v1/relay`) with this computer's
+JuCode login, and only clients signed in to the same account reach it, over
+end-to-end encrypted streams (`docs/relay-protocol.md`). It is on whenever
+the computer is signed in, unless a local client turns it off with
+`relay_set` (`enabled: false`; remembered across restarts). Signed out, the
+daemon does not connect, and signing out takes it off the relay.
 `--no-relay` keeps it off whatever the setting says.
 
-1. A local client sends `pair_link` and shows the returned `link`
-   (`https://app.jucode.net/remote#pair=<host>.<key>.<code>`, the origin
-   taken from the relay URL) as a QR code. The code is a `pair_start` code.
-2. The phone's page connects through the relay with the code in its first
-   Noise message and is paired as a device keyed by its Noise static key.
-3. Later connections need no code. Relay devices show up in `device_list`;
-   `device_revoke` closes their streams.
+The relay registers the computer under the account whose token it presented
+and names that account in `ready.user`, kept as `relay_user`. When it
+differs from the one before (the computer signed in to another account),
+every paired device is revoked before any stream is served.
 
-A relay stream then behaves exactly like a device's local WebSocket.
+A client device is paired once, in one of two ways, and later connects
+without either:
+
+1. **Pairing link.** A local client sends `pair_link` and shows the returned
+   `link` (`https://app.jucode.net/remote#pair=<host>.<key>.<code>`) as a QR
+   code. The client connects through the relay with the code in its first
+   Noise message.
+2. **Connect request.** A client of the account that lists this computer
+   connects with `request: true` in its first Noise message. With no local
+   client connected the daemon refuses at once (`no_desktop`). Otherwise
+   local clients receive
+   `{"type":"connect_request","id":"cr-…","name":"<device name>","client":"jucode-mobile","at":<ms>}`
+   and answer with
+   `{"op":"connect_decide","request":"cr-…","allow":true}`, replied to with
+   `{"type":"connect_decided","request":"cr-…","allow":true}`. Every local
+   client then receives
+   `{"type":"connect_request_closed","id":"cr-…","outcome":"allowed"}`
+   (`outcome`: `allowed`, `denied`, `expired` after 120 s, or `cancelled`
+   when the client went away first). `connect_requests` lists the open ones
+   for a desktop that connects later. At most 3 wait at once.
+
+Either way the device is recorded keyed by its Noise static key, with the
+client's OAuth authorization, client id and user; it shows up in
+`device_list`, and `device_revoke` closes its streams. A relay stream then
+serves the device like a local client, except for the ops only local
+clients may send: `pair_link`, `connect_requests`, `connect_decide`,
+`device_list`, `device_revoke`, `relay_status`, `relay_set`,
+`restart_when_idle`, `usage_import_legacy` and the others marked so below.
 
 ## Connecting
 
 Connect to `ws://<listen>/?token=<token>` (or send
 `Authorization: Bearer <token>`). A missing or wrong token fails the
 handshake with HTTP 401. Local clients read the daemon token from
-`~/.jucode/daemon/token`; paired devices use their own token.
+`~/.jucode/daemon/token`; it is the only token the local WebSocket accepts.
 
 Each WebSocket text message is one JSON frame. The daemon first sends:
 
@@ -142,13 +135,14 @@ every connected client.
 | `session_close` | `session` | none; every client receives `session_closed` once the engine has stopped |
 | `watch` / `unwatch` | `session` | `watching` with `watching: true/false`; `watch` also sends this client a snapshot of the session: its state events (`startup`, `model_status`, `command_list`, `approval_mode`, `approval_mode_pending`, `mcp_servers`, `engine_caps`, `session_options`, `tool_provider`), a `transcript` of the conversation so far and `attended` |
 | `actions_list` | — | `actions`: undecided deferred actions across all sessions, and in `closed` the ones closed in the last 7 days (each with `closed_by`, `closed_reason`, `closed_at`) |
-| `pair_start` | — | `pairing` with `code` and `expires_at` (local clients only) |
-| `device_list` | — | `devices`: paired, unrevoked devices (local clients only) |
+| `device_list` | — | `devices`: paired, unrevoked devices, each with `id`, `name`, `paired_at`, `client` (the OAuth client id: `jucode-mobile`, `jucode-web`, `jucode-cli`), `authz` and `user` (local clients only) |
 | `device_revoke` | `device` | `device_revoked` (local clients only) |
-| `relay_status` | — | `relay_status` with `enabled`, `connected`, `host` (the host id), `url` (null with `--no-relay`) (local clients only) |
-| `relay_set` | `enabled` | `relay_status`; turns the relay connection on or off and remembers it (local clients only) |
+| `relay_status` | — | `relay_status` with `enabled`, `connected`, `signed_in` (this computer is signed in to JuCode with a login the relay has not refused), `host` (the host id), `url` (null with `--no-relay`), `user` (the account the computer is registered under, null until the relay first registered it) (local clients only) |
+| `relay_set` | `enabled` | `relay_status`; turns remote access on or off and remembers it (local clients only) |
+| `connect_requests` | — | `connect_requests` with `requests: [{id, name, client, at}]`, the open connect requests (local clients only; see "Remote access") |
+| `connect_decide` | `request`, `allow` | `connect_decided` with `request` and `allow`; an error when the request is no longer open (local clients only) |
 | `mcp_set` / `mcp_remove` / `mcp_toggle` | as the session ops (`server`; `name`; `name`, `enabled`), with no `session` | `mcp_saved`; saves the change to `config.json` and sends the op to every open JuCode session, which answers with `mcp_servers`. Local clients only, with or without `session` |
-| `pair_link` | — | `pair_link` with `link`, `code` and `expires_at`; an error while the relay is off (local clients only) |
+| `pair_link` | — | `pair_link` with `link` (`https://app.jucode.net/remote#pair=<host>.<static key>.<code>`), `code` (8 characters, single use) and `expires_at` (5 minutes); an error while remote access is off (local clients only) |
 | `ping` | — | `pong`. Clients behind the relay send it every minute so an idle stream is not closed |
 | `workspaces` | — | `workspaces` with `rev` and `workspaces: [{id, name, is_default?, color?, icon?, projects: [{id, name, path, dirs?, chats?, worktree?, color?, icon?}]}]`. A project's `color` and `icon` are kept as the client sent them (`{kind, id | value | markup}`, as the clients' tab icons). `dirs`: the project's extra directories (absolute paths, not including `path`); remote clients may read them, and an engine started for a session of the project may work in the project's `path` and `dirs` that exist, besides its own `cwd`: Claude Code gets one `--add-dir` each, Codex has them as writable roots of its workspace-write sandbox (and `--add-dir` in its TUI), and a JuCode session's file tools and sandbox treat them as writable workspace (ACP agents get nothing) |
 | `workspaces_set` | `rev`, `workspaces` | `workspaces`; replaces the list when `rev` is the current one, else an error (another client changed it). A project id may appear in one workspace only (sessions name their project by id). The sessions of a project a save removes (here or with `project_remove`) belong to none and are archived; every client receives the new `sessions` list. A project's `dirs`, when present, must be a list of absolute paths. Desktop imports its list with `rev: 0` into an empty daemon |
@@ -584,8 +578,9 @@ start, its turn ended on an error, it timed out or passed its budget), when
 the task switches itself off, when it waits for an approval, and when a time
 is skipped (the first in a row): every client gets
 `{"type":"schedule_event","schedule":"sch-…","name":"…","kind":"failed","detail":"…","session":"s…"}`
-(`kind`: `failed`, `stopped`, `waiting` or `skipped`), and the paired phones a
-notification that opens the session. Every client receives the full
+(`kind`: `failed`, `stopped`, `waiting` or `skipped`), and the account's
+phones and browsers a notification that opens the session (see
+"Notifications"). Every client receives the full
 `schedules` list after any change.
 
 `schedule_delete` and `schedule_run` also take the task's id as `id` when
@@ -667,8 +662,8 @@ a Claude fork closed before its first turn is forked again when reopened.
 A terminal runs on a pty of this computer and is one of two kinds:
 
 - a session's own TUI (see "A conversation in its TUI"). It belongs to its
-  session: clients (local ones and paired devices, over the LAN or the
-  relay) are its viewers.
+  session: clients (local ones and paired devices over the relay) are its
+  viewers.
 - the user's login shell, opened with `term_open` by any client, local or
   paired. It belongs to that client: the client is its only viewer, no
   other client can attach to it, and it is killed (SIGHUP, then SIGKILL)
@@ -766,19 +761,14 @@ removed so it saves its transcript.
 
 ## Notifications
 
-A paired device's browser registers its Web Push subscription with
-`{"op":"push_subscribe","subscription":{"endpoint":"…","keys":{"p256dh":"…","auth":"…"}}}`,
-the JuCode Android app its 个推 (Getui) client id with
-`{"op":"push_subscribe","subscription":{"provider":"getui","client_id":"…"}}`
-(only paired devices; dropped when the device is revoked) and removes it with
-`{"op":"push_unsubscribe","endpoint":"…"}` or `{"op":"push_unsubscribe","client_id":"…"}`.
-A client id registered again by another device moves to that device. The daemon notifies for
-scheduled runs as described in "Scheduled tasks", through the relay (relay-protocol.md, Web Push). `{"op":"push_test"}` (paired devices
-only) sends a test notification to that device's browsers now and replies
-`push_tested` with `results: [{service, status}]` (or `error`): the push
-service's host (`getui` for the Android app) and its answer, as the relay passed it on. A notification's `url` is
-the remote page; one about a session also carries `session`, which the
-Android app opens.
+Clients register for notifications with the JuCode backend
+(`POST /v1/oauth/push/register`), not with the daemon. The daemon notifies
+for scheduled runs as described in "Scheduled tasks" by posting
+`{"title","body","host","session"}` to `POST /v1/oauth/notify` with this
+computer's JuCode token; the backend sends it to every push registration of
+the account except the daemon's own. `host` is this computer's host id,
+`session` the session a tap opens. Only while signed in and with remote
+access on; failures are logged.
 
 ## Session ops
 

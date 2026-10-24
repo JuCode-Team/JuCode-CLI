@@ -58,15 +58,37 @@ pub fn jucode_gateway_credentials() -> Result<(String, String), String> {
 /// `jucode_gateway_credentials` plus when the token expires (unix seconds).
 pub fn jucode_session() -> Result<(String, String, u64), String> {
     let config = config::Config::load_or_create().map_err(|error| error.to_string())?;
-    gateway_credentials(config)
+    gateway_credentials(config, None)
 }
 
 /// The same for each request of the daemon's local gateway: config.json is
 /// read, never rewritten (concurrent requests would race on it).
 pub fn jucode_gateway_token() -> Result<(String, String), String> {
     let config = config::Config::load_existing().map_err(|error| error.to_string())?;
-    let (api, token, _) = gateway_credentials(config)?;
+    let (api, token, _) = gateway_credentials(config, None)?;
     Ok((api, token))
+}
+
+/// `jucode_gateway_token` after a server refused `refused`: a refreshed token
+/// (or the one another process saved meanwhile).
+pub fn jucode_gateway_token_refreshed(refused: &str) -> Result<(String, String), String> {
+    let config = config::Config::load_existing().map_err(|error| error.to_string())?;
+    let (api, token, _) = gateway_credentials(config, Some(refused))?;
+    Ok((api, token))
+}
+
+/// The JuCode access token saved on this computer, None when signed out (no
+/// network, no refresh): tells whether auth.json changed since a token was
+/// refused.
+pub fn jucode_saved_access_token() -> Option<String> {
+    let config = config::Config::load_existing().ok()?;
+    let auth = config::AuthStore::load_or_create(config.encrypt_secrets).ok()?;
+    auth.jucode_access_token().map(str::to_string)
+}
+
+/// This computer's host name, None when it cannot be read.
+pub fn hostname() -> Option<String> {
+    oauth::hostname()
 }
 
 /// Which kind of channel a provider id is, for usage records: `jucode`
@@ -107,8 +129,16 @@ pub fn set_login_client_label(label: &'static str) {
     oauth::set_client_label(label);
 }
 
-fn gateway_credentials(config: config::Config) -> Result<(String, String, u64), String> {
-    let auth = oauth::ensure_session(&config.jucode_api_url, config.encrypt_secrets)?;
+fn gateway_credentials(
+    config: config::Config,
+    refused: Option<&str>,
+) -> Result<(String, String, u64), String> {
+    let auth = match refused {
+        Some(refused) => {
+            oauth::refresh_refused(&config.jucode_api_url, config.encrypt_secrets, refused)?
+        }
+        None => oauth::ensure_session(&config.jucode_api_url, config.encrypt_secrets)?,
+    };
     let tokens = auth
         .jucode_tokens()
         .filter(|tokens| !tokens.access_token.is_empty())

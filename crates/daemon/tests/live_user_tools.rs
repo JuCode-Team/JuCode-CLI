@@ -41,7 +41,7 @@ fn run_turn(engine: &str, prompt: &str, last: &str) -> Vec<(String, String)> {
     let address = listener.local_addr().unwrap().to_string();
     let store = Store::open(state).unwrap();
     let token = store.token().unwrap();
-    thread::spawn(move || jucode_daemon::serve(listener, store, None, "live", None));
+    thread::spawn(move || jucode_daemon::serve(listener, store, "live", None));
     let (mut socket, _) = tungstenite::connect(format!("ws://{address}/?token={token}")).unwrap();
     if let MaybeTlsStream::Plain(stream) = socket.get_ref() {
         stream
