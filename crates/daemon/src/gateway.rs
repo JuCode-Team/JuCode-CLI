@@ -288,11 +288,15 @@ pub fn catalog_json() -> Value {
     let models: Vec<Value> = jucode_agent_core::jucode_visible_models()
         .into_iter()
         .map(|model| {
-            json!({
+            let mut entry = json!({
                 "name": model.name,
                 "display_name": model.display_name,
                 "context_window": model.context_window,
-            })
+            });
+            if model.hidden {
+                entry["hidden"] = json!(true);
+            }
+            entry
         })
         .collect();
     let groups = live_upstream()

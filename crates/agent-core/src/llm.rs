@@ -2882,6 +2882,7 @@ mod tests {
             output_cost: 0.0,
             display_name: None,
             group_windows: BTreeMap::new(),
+            hidden: false,
         }
     }
 

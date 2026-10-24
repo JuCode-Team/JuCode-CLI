@@ -4177,7 +4177,14 @@ impl AgentCore {
             .iter()
             .any(|m| m.name == self.config.model)
         {
-            if let Some(model) = self.config.models.first().map(|m| m.name.clone()) {
+            if let Some(model) = self
+                .config
+                .models
+                .iter()
+                .find(|m| !m.hidden)
+                .or_else(|| self.config.models.first())
+                .map(|m| m.name.clone())
+            {
                 self.config.model = model.clone();
                 let supported = self.reasoning_efforts_for_model(&model);
                 if !supported
@@ -4706,6 +4713,7 @@ impl AgentCore {
         self.config
             .models
             .iter()
+            .filter(|model_config| in_model_picker(model_config, &self.config.model))
             .map(|model_config| {
                 let active = model_config.name == self.config.model;
                 ModelOptionView {
@@ -4792,7 +4800,6 @@ fn current_utc_date() -> String {
 /// models instead.
 const DEFAULT_JUCODE_MODELS: &[&str] = &[
     "gpt-6.1-sol",
-    "codex-auto-review",
     "gpt-6-astra",
     "gpt-6-sol",
     "gpt-6-luna",
@@ -4811,15 +4818,32 @@ const DEFAULT_JUCODE_MODELS: &[&str] = &[
 ];
 
 fn default_jucode_models(available: &[ModelConfig]) -> Vec<ModelConfig> {
+    // A model the gateway hides from pickers is never a default.
     let picked: Vec<ModelConfig> = DEFAULT_JUCODE_MODELS
         .iter()
-        .filter_map(|name| available.iter().find(|m| m.name == *name).cloned())
+        .filter_map(|name| {
+            available
+                .iter()
+                .find(|m| m.name == *name && !m.hidden)
+                .cloned()
+        })
         .collect();
     if picked.is_empty() {
-        available.iter().take(6).cloned().collect()
+        available
+            .iter()
+            .filter(|m| !m.hidden)
+            .take(6)
+            .cloned()
+            .collect()
     } else {
         picked
     }
+}
+
+/// Hidden gateway models stay callable by name; the picker lists one only
+/// while it is the active model.
+fn in_model_picker(model: &ModelConfig, active: &str) -> bool {
+    !model.hidden || model.name == active
 }
 
 /// A gateway model as the engine runs it. Values the gateway leaves unset stay
@@ -4853,6 +4877,7 @@ fn jucode_model_config(model: &OAuthModel) -> ModelConfig {
         output_cost: 0.0,
         display_name: model.display_name.clone(),
         group_windows: model.group_windows.clone(),
+        hidden: model.hidden,
     }
 }
 
@@ -5586,6 +5611,7 @@ mod model_config_tests {
             reasoning_efforts: None,
             display_name: None,
             group_windows: Default::default(),
+            hidden: false,
         }
     }
 
@@ -5593,7 +5619,6 @@ mod model_config_tests {
     fn default_jucode_models_preserve_original_catalog_order() {
         let requested = [
             "gpt-6.1-sol",
-            "codex-auto-review",
             "gpt-6-astra",
             "gpt-6-sol",
             "gpt-6-luna",
@@ -5628,6 +5653,18 @@ mod model_config_tests {
         assert_eq!(default_jucode_models(&subset)[0].name, "claude-fable-5");
         let other = vec![jucode_model_config(&oauth_model("private-model"))];
         assert_eq!(default_jucode_models(&other)[0].name, "private-model");
+        // A model the gateway hides from pickers is never a default.
+        let mut hidden = oauth_model("gpt-6.1-sol");
+        hidden.hidden = true;
+        let mixed = vec![
+            jucode_model_config(&hidden),
+            jucode_model_config(&oauth_model("private-model")),
+        ];
+        let names: Vec<_> = default_jucode_models(&mixed)
+            .into_iter()
+            .map(|model| model.name)
+            .collect();
+        assert_eq!(names, ["private-model"]);
     }
 
     #[test]
@@ -5638,6 +5675,21 @@ mod model_config_tests {
         assert_eq!(config.max_output_tokens, 0);
         assert!(crate::config::is_thinking_disabled(
             &config.reasoning_efforts
+        ));
+    }
+
+    #[test]
+    fn hidden_gateway_model_is_left_out_of_the_picker_unless_active() {
+        let hidden = jucode_model_config(&OAuthModel {
+            hidden: true,
+            ..oauth_model("codex-auto-review")
+        });
+        assert!(hidden.hidden);
+        assert!(!in_model_picker(&hidden, "gpt-6-sol"));
+        assert!(in_model_picker(&hidden, "codex-auto-review"));
+        assert!(in_model_picker(
+            &jucode_model_config(&oauth_model("gpt-6-sol")),
+            "x"
         ));
     }
 
@@ -5707,6 +5759,7 @@ mod model_config_tests {
             reasoning_efforts: Some(vec!["low".to_string(), "high".to_string()]),
             display_name: None,
             group_windows: Default::default(),
+            hidden: false,
         };
         let config = jucode_model_config(&model);
         assert_eq!(config.reasoning_efforts, vec!["low", "high"]);

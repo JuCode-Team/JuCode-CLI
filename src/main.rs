@@ -183,14 +183,18 @@ fn main() -> io::Result<()> {
                 let models = models
                     .into_iter()
                     .map(|m| {
-                        json!({
+                        let mut entry = json!({
                             "name": m.name,
                             "display_name": m.display_name,
                             "context_window": m.context_window,
                             "max_context_window": m.max_context_window,
                             "max_output_tokens": m.max_output_tokens,
                             "reasoning_efforts": m.reasoning_efforts,
-                        })
+                        });
+                        if m.hidden {
+                            entry["hidden"] = json!(true);
+                        }
+                        entry
                     })
                     .collect::<Vec<_>>();
                 json!({ "id": id, "base_url": base_url, "protocol": protocol, "models": models })

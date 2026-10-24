@@ -61,6 +61,8 @@ pub struct OAuthModel {
     /// The window range through each of the user's groups (group id →
     /// smallest, largest).
     pub group_windows: std::collections::BTreeMap<String, (u64, u64)>,
+    /// Left out of model pickers; still callable by name.
+    pub hidden: bool,
 }
 
 pub fn login(web_url: &str, api_url: &str) -> Result<OAuthLoginResult, String> {
@@ -492,6 +494,7 @@ fn parse_model(item: &Value) -> Option<OAuthModel> {
             .filter(|label| !label.is_empty())
             .map(str::to_string),
         group_windows: crate::config::read_group_windows(item.get("group_context_windows")),
+        hidden: item.get("hidden").and_then(Value::as_bool).unwrap_or(false),
     })
 }
 
@@ -610,8 +613,18 @@ mod tests {
                     ("g-small".to_string(), (272_000, 272_000)),
                 ]
                 .into(),
+                hidden: false,
             }]
         );
+    }
+
+    #[test]
+    fn parses_hidden_flag_and_defaults_to_shown() {
+        let value =
+            json!({ "data": [{ "id": "codex-auto-review", "hidden": true }, { "id": "gpt-5.5" }] });
+        let models = parse_models_response(&value);
+        assert!(models[0].hidden);
+        assert!(!models[1].hidden);
     }
 
     #[test]
@@ -628,6 +641,7 @@ mod tests {
                 reasoning_efforts: None,
                 display_name: None,
                 group_windows: Default::default(),
+                hidden: false,
             }]
         );
     }

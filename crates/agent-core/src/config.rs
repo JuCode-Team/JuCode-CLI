@@ -383,6 +383,8 @@ pub struct ModelConfig {
     /// JuCode: the window range through each group (group id → smallest,
     /// largest), when a group's channel gives the model another window.
     pub group_windows: BTreeMap<String, (u64, u64)>,
+    /// JuCode: left out of model pickers; still callable by name.
+    pub hidden: bool,
 }
 
 impl ModelConfig {
@@ -1281,6 +1283,10 @@ fn read_model_configs(value: &Value, provider: &str) -> Vec<ModelConfig> {
                 .filter(|label| !label.is_empty())
                 .map(str::to_string),
             group_windows: read_group_windows(model.get("group_context_windows")),
+            hidden: model
+                .get("hidden")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         });
     }
 
@@ -1465,6 +1471,9 @@ fn model_config_value(model: &ModelConfig) -> Value {
     if !model.group_windows.is_empty() {
         value["group_context_windows"] = group_windows_value(&model.group_windows);
     }
+    if model.hidden {
+        value["hidden"] = json!(true);
+    }
     value
 }
 
@@ -1579,6 +1588,7 @@ fn model_config_from_catalog(model: &llm_provider_kit::omp::CatalogModel) -> Mod
         output_cost: model.output_cost,
         display_name: Some(model.name.clone()).filter(|name| !name.is_empty() && *name != model.id),
         group_windows: BTreeMap::new(),
+        hidden: false,
     }
 }
 
@@ -1598,6 +1608,7 @@ fn model_config_from_template(model: &llm_provider_kit::ModelTemplate) -> ModelC
         output_cost: 0.0,
         display_name: None,
         group_windows: BTreeMap::new(),
+        hidden: false,
     }
 }
 
@@ -1790,6 +1801,7 @@ fn default_model_config(name: &str) -> ModelConfig {
             output_cost: 0.0,
             display_name: None,
             group_windows: BTreeMap::new(),
+            hidden: false,
         })
 }
 
@@ -2017,6 +2029,7 @@ mod tests {
             output_cost: 0.0,
             display_name: None,
             group_windows: BTreeMap::new(),
+            hidden: false,
         };
         let overrides = BTreeMap::from([("gpt-6-sol".to_string(), 2_000_000)]);
         // Raised toward, but never past, the largest account window.
@@ -2043,11 +2056,22 @@ mod tests {
             output_cost: 0.0,
             display_name: Some("GPT-6 Sol".to_string()),
             group_windows: BTreeMap::from([("g-big".to_string(), (1_050_000, 1_050_000))]),
+            hidden: false,
         };
         // Saved and read back with its label and group windows.
         let read = read_model_configs(&json!({ "models": [model_config_value(&model)] }), "jucode");
         assert_eq!(read[0].display_name.as_deref(), Some("GPT-6 Sol"));
         assert_eq!(read[0].group_windows, model.group_windows);
+        assert!(!read[0].hidden);
+        // The hidden flag survives config.json; entries saved without it load as shown.
+        let hidden = ModelConfig {
+            hidden: true,
+            ..model.clone()
+        };
+        let saved = model_config_value(&hidden);
+        assert_eq!(saved["hidden"], json!(true));
+        assert!(model_config_value(&model).get("hidden").is_none());
+        assert!(read_model_configs(&json!({ "models": [saved] }), "jucode")[0].hidden);
         // Pinned to the big group: its window. Unpinned or another group:
         // the range over all groups.
         let pinned = BTreeMap::from([("gpt-6-sol".to_string(), "g-big".to_string())]);
@@ -2090,6 +2114,7 @@ mod tests {
             output_cost: 8.0,
             display_name: None,
             group_windows: BTreeMap::new(),
+            hidden: false,
         };
         // 1M non-cached input @2 + 1M cached @0.5 + 1M output @8 = 10.5
         let cost = model.cost_for(2_000_000, 1_000_000, 1_000_000);
@@ -2245,6 +2270,7 @@ mod tests {
                     output_cost: 0.0,
                     display_name: None,
                     group_windows: BTreeMap::new(),
+                    hidden: false,
                 },
                 ModelConfig {
                     name: "compact-model".to_string(),
@@ -2257,6 +2283,7 @@ mod tests {
                     output_cost: 0.0,
                     display_name: None,
                     group_windows: BTreeMap::new(),
+                    hidden: false,
                 },
             ],
             base_url: "https://api.openai.com/v1".to_string(),

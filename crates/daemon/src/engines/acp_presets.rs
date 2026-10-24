@@ -704,6 +704,7 @@ mod tests {
             output_cost: 0.0,
             display_name: None,
             group_windows: Default::default(),
+            hidden: false,
         };
         vec![
             model("gpt-6", &["low", "high"], 400_000),
