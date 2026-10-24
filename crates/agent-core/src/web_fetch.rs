@@ -394,7 +394,11 @@ pub fn decode_entities(text: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
-        let end = rest[..rest.len().min(12)].find(';');
+        // Bytes, not a str slice: the 12th byte may fall inside a
+        // character (`&` before Chinese text panicked here).
+        let end = rest.as_bytes()[..rest.len().min(12)]
+            .iter()
+            .position(|b| *b == b';');
         let Some(end) = end else {
             out.push('&');
             rest = &rest[1..];
@@ -515,6 +519,8 @@ mod tests {
         let html = "<p>a &amp; b &lt;c&gt; &quot;d&quot; &#39;e&#39; &#x41;&nbsp;f</p>";
         assert_eq!(extract_html_text(html), "a & b <c> \"d\" 'e' A f");
         assert_eq!(decode_entities("1 &unknown; 2 & 3"), "1 &unknown; 2 & 3");
+        // A bare `&` before multi-byte text: the look-ahead stays on bytes.
+        assert_eq!(decode_entities("A&五分钟后 &amp; 好"), "A&五分钟后 & 好");
     }
 
     #[test]
