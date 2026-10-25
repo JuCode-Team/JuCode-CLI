@@ -351,7 +351,7 @@ fn the_title_model_names_a_session_and_leaves_a_hand_set_title_alone() {
     // (the test model echoes what it was asked).
     client.until(|frame| {
         frame["type"] == "sessions"
-            && title_of(frame).is_some_and(|title| title.starts_with("user said: Project:"))
+            && title_of(frame).is_some_and(|title| title.starts_with("user said: <conversation>"))
     });
 
     client.send(json!({ "op": "session_meta", "session": session, "title": "my own title" }));
@@ -1475,7 +1475,7 @@ fn titled(title: &Value) -> bool {
     title == "hello"
         || title
             .as_str()
-            .is_some_and(|t| t.starts_with("user said: Project:"))
+            .is_some_and(|t| t.starts_with("user said: <conversation>"))
 }
 
 /// The end of a turn: `ready` after the reply (the first turn's init also

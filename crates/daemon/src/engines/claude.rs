@@ -1954,6 +1954,15 @@ impl Claude {
             return match subtype.as_str() {
                 // A CLI without get_settings has no ultracode: nothing to offer.
                 "get_settings" | "get_usage" => vec![],
+                // The title stays as it was; not the conversation's business.
+                "generate_session_title" => {
+                    jucode_agent_core::log_warn!(
+                        "daemon",
+                        "conversation title failed",
+                        error = message
+                    );
+                    vec![]
+                }
                 "side_question" => {
                     vec![json!({ "type": "side_answer", "question": tag, "error": message })]
                 }
@@ -1978,6 +1987,10 @@ impl Claude {
             };
         }
         match subtype.as_str() {
+            "generate_session_title" => match text(&response["response"]["title"]).trim() {
+                "" => vec![],
+                title => vec![json!({ "type": "session_title_generated", "title": title })],
+            },
             "get_usage" => {
                 if self.model_totals.is_none() {
                     self.model_totals = Some(model_totals(
@@ -2959,6 +2972,12 @@ impl Claude {
             // The user's name for the session, so `claude --resume` shows it too.
             "rename" => vec![self.control_request(
                 json!({ "subtype": "rename_session", "title": op["title"], "source": "host" }),
+                "",
+            )],
+            // Claude Code names the session and keeps the name in its
+            // transcript, so `claude --resume` lists it too.
+            "generate_title" => vec![self.control_request(
+                json!({ "subtype": "generate_session_title", "description": op["description"], "persist": true }),
                 "",
             )],
             "shutdown" => vec![],
@@ -4715,6 +4734,39 @@ mod tests {
             .unwrap()
             .iter()
             .any(|c| c["command"] == "/deploy"));
+    }
+
+    #[test]
+    fn claude_code_names_the_session_and_keeps_the_name() {
+        let mut c = claude();
+        let ask = c
+            .encode(&json!({ "op": "generate_title", "description": "[图片 #1] 修复打印乱码" }))
+            .unwrap()
+            .frames;
+        assert!(ask[0].contains(r#""description":"[图片 #1] 修复打印乱码""#));
+        assert!(ask[0].contains(r#""persist":true"#));
+        let named = frame(
+            &mut c,
+            reply(
+                request_id(&ask, "generate_session_title"),
+                json!({ "title": "打印乱码修复" }),
+            ),
+        );
+        assert_eq!(
+            named,
+            vec![json!({ "type": "session_title_generated", "title": "打印乱码修复" })]
+        );
+        // A failure leaves the title alone and the turn untouched.
+        let ask = c
+            .encode(&json!({ "op": "generate_title", "description": "x" }))
+            .unwrap()
+            .frames;
+        let id = request_id(&ask, "generate_session_title");
+        let failed = frame(
+            &mut c,
+            json!({ "type": "control_response", "response": { "subtype": "error", "request_id": id, "error": "boom" } }),
+        );
+        assert!(failed.is_empty());
     }
 
     #[test]

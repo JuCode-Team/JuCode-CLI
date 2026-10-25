@@ -1142,6 +1142,11 @@ impl Hub {
         if event["type"] == "session_title" {
             self.adopt_engine_title(session, event["title"].as_str().unwrap_or_default());
         }
+        if event["type"] == "session_title_generated" {
+            if let Some(title) = titles::clean(event["title"].as_str().unwrap_or_default()) {
+                self.set_auto_title(session, &title);
+            }
+        }
         // `over`: a turn ended.
         let (due, started, over, failed) = {
             let mut turns = lock(&self.turns);
@@ -1183,6 +1188,19 @@ impl Hub {
         let Some(record) = self.auto_titled(session) else {
             return;
         };
+        // Claude Code names it; the answer comes back as an event.
+        if record.engine.as_deref() == Some("claude") {
+            let Some(description) = lock(&self.turns).get(session).map(Turns::description) else {
+                return;
+            };
+            if let Err(error) = self.forward(
+                session,
+                json!({ "op": "generate_title", "description": description }),
+            ) {
+                jucode_agent_core::log_warn!("daemon", "conversation title failed", error = error);
+            }
+            return;
+        }
         let Some(hub) = self.me.upgrade() else {
             return;
         };
@@ -1216,20 +1234,26 @@ impl Hub {
                     None
                 }
             };
-            // Renamed by hand meanwhile, or unchanged: nothing to do.
-            let Some(title) = title else { return };
-            let Some(record) = hub.auto_titled(&id) else {
-                return;
-            };
-            if record.title.as_deref() != Some(title.as_str())
-                && hub
-                    .store
-                    .record_session_meta(&id, &json!({ "title": title, "title_auto": true }))
-                    .is_ok()
-            {
-                hub.broadcast(&hub.sessions_json());
+            if let Some(title) = title {
+                hub.set_auto_title(&id, &title);
             }
         });
+    }
+
+    /// A title the daemon came up with, unless the session was renamed by
+    /// hand meanwhile or already has it.
+    fn set_auto_title(&self, session: &str, title: &str) {
+        let Some(record) = self.auto_titled(session) else {
+            return;
+        };
+        if record.title.as_deref() != Some(title)
+            && self
+                .store
+                .record_session_meta(session, &json!({ "title": title, "title_auto": true }))
+                .is_ok()
+        {
+            self.broadcast(&self.sessions_json());
+        }
     }
 
     fn adopt_engine_title(&self, session: &str, title: &str) {
